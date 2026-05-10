@@ -1,0 +1,430 @@
+export type ConnectionState = 'ok' | 'warn' | 'error' | 'checking' | 'pending'
+
+export type LogLevel = 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR'
+
+export type LogChannel =
+  | '[HAL]'
+  | '[BACKEND]'
+  | '[CAMERA]'
+  | '[FORCE]'
+  | '[SAFETY]'
+  | '[ZMQ]'
+  | '[POLICY]'
+  | '[LEROBOT]'
+  | '[GRIPPER]'
+
+export interface LogEntry {
+  id: number
+  ts: number
+  channel: LogChannel
+  level: LogLevel
+  msg: string
+}
+
+export interface ProcessStatus {
+  name: 'hal' | 'backend' | 'policy' | 'recorder' | 'wsl'
+  label: string
+  status: 'running' | 'not_running' | 'degraded' | 'error'
+  pid?: number
+  cpuPct: number
+  memMb: number
+  vramGb?: number
+  autoRestart?: boolean
+}
+
+export interface DiagnosticItem {
+  key: string
+  label: string
+  method: string
+  metric: string
+  status: ConnectionState
+  remediation: string
+  suspect?: boolean
+}
+
+export interface CameraTelemetry {
+  key: 'global' | 'wrist_left' | 'wrist_right'
+  label: string
+  fps: number
+  timestampSkewMs: number
+  frameAgeMs: number
+  health: ConnectionState
+}
+
+export interface Omega7Telemetry {
+  side: 'left' | 'right'
+  connected: boolean
+  calibrated: boolean
+  openId: number
+  deviceId: number
+  serial: string
+  systemName: string
+  leftHanded: boolean | null
+  pose: number[]
+  clutchPressed: boolean
+  gripperPressed: boolean
+  gripperGapMm: number | null
+  lastReadOk: boolean
+  message: string
+}
+
+export interface TelemetryFrame {
+  timestamp: number
+  elapsedSec: number
+  jointPositions: number[]
+  gripperPositions: number[]
+  motionEnabled: { left: boolean | null; right: boolean | null }
+  forceLeft: number[]
+  forceRight: number[]
+  dangerIndex: number
+  recording: boolean
+  episodeCount: number
+  frameCount: number
+  halOk: boolean
+  wsOk: boolean
+  cameras: CameraTelemetry[]
+  teleopHands: Omega7Telemetry[]
+  queueDepth: { left: number; right: number }
+  resource: { uiFps: number; wsHz: number; cpuPct: number; memMb: number }
+  processStatus: ProcessStatus[]
+}
+
+export interface TelemetrySample {
+  time: number
+  joints: number[]
+  forceLeft: number[]
+  forceRight: number[]
+  danger: number
+  queueLeft: number
+  queueRight: number
+}
+
+export interface SafetyState {
+  dangerIndex: number
+  estopActive: boolean
+  manualOverride: number | null
+  confirmedAt?: number
+}
+
+export interface MotionAxisProfile {
+  startSpeed: number
+  maxSpeed: number
+  accTimeSec: number
+  decTimeSec: number
+}
+
+export interface ArmMotionProfile {
+  translation: MotionAxisProfile
+  rotation: MotionAxisProfile
+}
+
+export interface AxisSoftLimitConfig {
+  min: number
+  max: number
+}
+
+export interface ArmSoftLimitConfig {
+  x: AxisSoftLimitConfig
+  y: AxisSoftLimitConfig
+  z: AxisSoftLimitConfig
+  roll: AxisSoftLimitConfig
+  pitch: AxisSoftLimitConfig
+  yaw: AxisSoftLimitConfig
+}
+
+export interface MotionOriginConfig {
+  valid: boolean
+  leftValid: boolean
+  rightValid: boolean
+  leftPulse: number[]
+  rightPulse: number[]
+  updatedAt: number
+}
+
+export interface MotionStartupHomeConfig {
+  enabled: boolean
+  mode: 'work_origin'
+}
+
+export type ManualControlSide = 'left' | 'right'
+export type ManualControlAxis = 'X' | 'Y' | 'Z' | 'Roll' | 'Pitch' | 'Yaw'
+export type ManualSpeedMode = 'fine' | 'medium' | 'coarse'
+export type ManualGripperCommand = 'enable' | 'disable' | 'open' | 'close' | 'home' | 'target' | 'stop'
+export type PicoVisionCameraSource = CameraTelemetry['key']
+export type PicoVisionRotation = 'none' | 'cw90' | 'ccw90' | '180'
+export type Omega7StabilityMode = 'track' | 'hold' | 'free'
+
+export type RecorderPhase = 'idle' | 'recording' | 'resetting' | 'saving' | 'finishing'
+
+export interface EpisodeRecord {
+  index: number
+  frameCount: number
+  durationS: number
+  status: 'ok' | 'emergency' | 'discarded'
+  maxForceLeft: number
+  maxForceRight: number
+  lateFrames: number
+  cameraDrops: { global: number; wristLeft: number; wristRight: number }
+}
+
+export interface RecordQualityReport extends EpisodeRecord {
+  warnings: string[]
+  passed: boolean
+}
+
+export interface RecordSessionState {
+  datasetName: string
+  task: string
+  targetEpisodes: number
+  episodeTimeS: number
+  resetTimeS: number
+  currentEpisode: number
+  savedEpisodes: number
+  episodeHistory: EpisodeRecord[]
+  latestQualityReport: RecordQualityReport | null
+  phase: RecorderPhase
+  phaseStartedAt: number | null
+  recorderFps: number
+  recorderFrameCount: number
+  recorderLateFrames: number
+  recorderElapsedS: number
+  recorderTotalS: number
+  forceTareActive: boolean
+  speedMode: ManualSpeedMode
+}
+
+export type ManualControlAction =
+  | {
+      id: number
+      type: 'arm-axis'
+      ts: number
+      side: ManualControlSide
+      axis: ManualControlAxis
+      delta: number
+      unit: 'um' | '°'
+      speedMode: ManualSpeedMode
+      positionAfter: number
+    }
+  | {
+      id: number
+      type: 'gripper'
+      ts: number
+      side: ManualControlSide
+      command: ManualGripperCommand
+      targetMm: number
+      forceLimitN: number
+      enabled: boolean
+    }
+
+export interface ManualControlMemory {
+  id: number
+  name: string
+  createdAt: number
+  durationMs: number
+  actions: ManualControlAction[]
+}
+
+export interface ManualControlState {
+  selectedSide: ManualControlSide
+  selectedAxis: ManualControlAxis
+  axisStepUm: number
+  axisStepDeg: number
+  speedMode: ManualSpeedMode
+  axisBusyUntil: Record<string, number>
+  recording: boolean
+  recordingStartedAt: number | null
+  draftActions: ManualControlAction[]
+  memories: ManualControlMemory[]
+  replayingMemoryId: number | null
+  axisOffsets: Record<string, number>
+}
+
+export interface AppConfig {
+  hal: {
+    baseUrl: string
+    wsUrl: string
+    axisCount: number
+    apiConfirmed: boolean
+  }
+  cameras: {
+    global: string
+    wristLeft: string
+    wristRight: string
+    previewResolution: string
+    globalResolution?: string
+    wristLeftResolution?: string
+    wristRightResolution?: string
+    fps: number
+  }
+  force: {
+    leftIp: string
+    rightIp: string
+    port: number
+    sampleHz: number
+    recordWindowSamples: number
+    tareSamples: number
+    certificateConfirmed: boolean
+    calibrationEnabled: boolean
+    leftCalibrationPath: string
+    rightCalibrationPath: string
+    inputMode: string
+    voltageMin: number
+    voltageMax: number
+    lowpassEnabled: boolean
+    lowpassCutoffHz: number
+    swapHands: boolean
+  }
+  motion: {
+    leftCardNo: number
+    rightCardNo: number
+    motionThreadHz: number
+    jogStepUm: number
+    jogStepDeg: number
+    yawSoftLimitDeg: number
+    positionSource: 'dmc_get_position' | 'dmc_get_encoder'
+    origin: MotionOriginConfig
+    homeOnStartup: MotionStartupHomeConfig
+    leftProfile: ArmMotionProfile
+    rightProfile: ArmMotionProfile
+    leftSoftLimits: ArmSoftLimitConfig
+    rightSoftLimits: ArmSoftLimitConfig
+  }
+  gripper: {
+    leftPort: string
+    rightPort: string
+    baudrate: number
+    leftSlaveId: number
+    rightSlaveId: number
+    strokeMm: number
+    targetLeftMm: number
+    targetRightMm: number
+    leftEnabled: boolean
+    rightEnabled: boolean
+    commandForceLimitN: number
+    commandSpeed: number
+    commandTorque: number
+    forceFeedbackAvailable: boolean
+  }
+  safety: {
+    fxyWarnN: number
+    fxyStopN: number
+    fzWarnN: number
+    fzStopN: number
+    momentWarnNm: number
+    momentStopNm: number
+    yawSoftLimitDeg: number
+    watchdogMs: number
+  }
+  zmq: {
+    observationPush: string
+    actionPull: string
+    timeoutMs: number
+  }
+  storage: {
+    datasetRoot: string
+    videoCrf: number
+    pushToHub: boolean
+  }
+  auto: {
+    allowHardwareDispatch: boolean
+    translationStepUm: number
+    rotationStepDeg: number
+    translationVelocityUmS: number
+    rotationVelocityDegS: number
+  }
+  picoVision: {
+    ip: string
+    adbPort: number
+    videoPort: number
+    commandPort: number
+    gateway: string
+    ifIndex: number
+    rotation: PicoVisionRotation
+    cameraSource: PicoVisionCameraSource
+  }
+  teleop: {
+    coarse: number
+    medium: number
+    fine: number
+    inputIntervalMs: number
+    commandIntervalMs: number
+    leftOpenId: number
+    rightOpenId: number
+    leftConnected: boolean
+    rightConnected: boolean
+    leftGravityCompensation: boolean
+    rightGravityCompensation: boolean
+    leftForceFeedback: boolean
+    rightForceFeedback: boolean
+    leftTranslationScale: number
+    rightTranslationScale: number
+    leftRotationScale: number
+    rightRotationScale: number
+    translationDeadzone: number
+    rotationDeadzone: number
+    requireClutch: boolean
+    stabilityMode: Omega7StabilityMode
+    tcpFallbackPort: number
+    gripperTeleop: {
+      enabled: boolean
+      loopHz: number
+      leftGapMinMm: number
+      leftGapMaxMm: number
+      rightGapMinMm: number
+      rightGapMaxMm: number
+      openThreshold: number
+      closeThreshold: number
+      gripSpeed: number
+      gripTorque: number
+      releaseSpeed: number
+      releaseTorque: number
+      objectDetectMargin: number
+      diagLog: boolean
+    }
+  }
+  wsl: {
+    distro: string
+    condaEnv: string
+    pythonPath: string
+    pendingWindowsValidation: boolean
+  }
+}
+
+export type ParameterSnapshotScope = 'all' | 'motion-left' | 'motion-right'
+
+export interface MotionCardSnapshotConfig {
+  cardNo: number
+  motionThreadHz: number
+  yawSoftLimitDeg: number
+  positionSource: AppConfig['motion']['positionSource']
+  profile: ArmMotionProfile
+  softLimits: ArmSoftLimitConfig
+}
+
+export type ParameterSnapshot =
+  | {
+      id: string
+      name: string
+      createdAt: number
+      scope: 'all'
+      config: AppConfig
+    }
+  | {
+      id: string
+      name: string
+      createdAt: number
+      scope: 'motion-left' | 'motion-right'
+      config: MotionCardSnapshotConfig
+    }
+
+export interface QualityReport {
+  episode: number
+  durationSec: number
+  frames: number
+  task: string
+  maxSkewMs: number
+  jitterMs: number
+  maxForceLeft: number
+  maxForceRight: number
+  warnings: string[]
+}

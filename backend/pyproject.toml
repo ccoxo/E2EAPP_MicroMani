@@ -1,0 +1,41 @@
+[project]
+name = "appstation-backend"
+version = "0.1.0"
+description = "FastAPI backend for AppStation M0 hardware runtime"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115.0",
+  "nidaqmx>=1.5.0",
+  "opencv-python>=4.10.0",
+  "psutil>=5.9.0",
+  "pyserial>=3.5",
+  "uvicorn[standard]>=0.32.0",
+  "pydantic>=2.10.0",
+]
+
+[project.optional-dependencies]
+dataset = [
+  "lerobot[dataset]>=0.5.2",
+]
+dev = [
+  "httpx>=0.28.0",
+  "pytest>=8.3.0",
+  "ruff>=0.8.0",
+  "mypy>=1.14.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["."]

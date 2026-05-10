@@ -1,0 +1,36 @@
+# Dependencies
+frontend/node_modules/
+
+# Frontend build output
+frontend/dist/
+
+# Python caches and local runtime state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.app-browser-profile/
+backend/runtime/
+
+# Local test and investigation artifacts
+data_collect_test/
+test-reports/
+
+# C++ build output
+hal/build/
+
+# Logs
+*.log
+
+# Local vendor binaries; install these on the deployment machine.
+backend/vendor/jodell/*.dll
+backend/vendor/jodell/*.lib
+hal/vendor/
+
+# Environment files
+.env
+.env.*
+
+# 硬件
+硬件指南/
