@@ -22,6 +22,7 @@ __MACOSX/
 
 # Local tool config
 .claude/
+.agents/skills/speckit-git-*/
 
 # C++ build output
 hal/build/
