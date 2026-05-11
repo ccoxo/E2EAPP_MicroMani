@@ -31,6 +31,7 @@ from backend.services.policy_service import PolicyService
 from backend.services.stability_monitor import StabilityMonitorService
 from backend.services.telemetry_hub import TelemetryHub
 from backend.services.gripper_tele_service import GripperTeleService
+from backend.services.gripper_worker_service import GripperWorkerService
 from backend.services.teleop_mapping import TeleopMappingService
 
 
@@ -95,11 +96,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     logs = LogService()
     settings = SettingsService(runtime_dir or runtime_dir_from_env(), logs)
     hardware = HardwareService(settings, logs)
-    telemetry = TelemetryHub(settings, hardware)
+    gripper_workers = GripperWorkerService(settings, logs)
+    telemetry = TelemetryHub(settings, hardware, gripper_workers)
     hal = make_hal_client(settings.get_config(), logs)
-    commands = CommandService(settings, telemetry, hal, logs, hardware)
+    commands = CommandService(settings, telemetry, hal, logs, hardware, gripper_workers)
     teleop_mapper = TeleopMappingService(settings, hal, logs)
-    gripper_tele = GripperTeleService(settings, hal, hardware, logs)
+    gripper_tele = GripperTeleService(settings, hal, hardware, logs, gripper_workers)
     recorder = DatasetRecorderService(settings, hardware, hal, telemetry, logs, teleop_mapper)
     stability = StabilityMonitorService(settings, hardware, hal, logs)
     policy = PolicyService(settings, hal, logs)
@@ -110,6 +112,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     app.state.commands = commands
     app.state.hal = hal
     app.state.hardware = hardware
+    app.state.gripper_workers = gripper_workers
     app.state.teleop_mapper = teleop_mapper
     app.state.gripper_tele = gripper_tele
     app.state.recorder = recorder
@@ -171,10 +174,18 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         except RuntimeError as exc:
             logs.error("[HAL]", f"startup return-to-work-origin failed: {exc}")
 
+    @app.on_event("shutdown")
+    async def stop_gripper_workers() -> None:
+        gripper_workers.stop_all()
+
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
         hal_health = await hal.health()
-        hardware_status = await asyncio.to_thread(hardware.status)
+        health_config = settings.get_config()
+        use_gripper_workers = gripper_workers.is_enabled(health_config)
+        hardware_status = await asyncio.to_thread(hardware.status, include_gripper=not use_gripper_workers)
+        if use_gripper_workers:
+            hardware_status["gripper"] = gripper_workers.status(health_config)
         return {
             "ok": True,
             "backend": "running",
@@ -186,7 +197,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/hardware/status")
     async def hardware_status() -> dict[str, Any]:
-        return await asyncio.to_thread(hardware.status)
+        config = settings.get_config()
+        use_gripper_workers = gripper_workers.is_enabled(config)
+        status = await asyncio.to_thread(hardware.status, include_gripper=not use_gripper_workers)
+        if use_gripper_workers:
+            status["gripper"] = gripper_workers.status(config)
+        return status
 
     @app.get("/api/settings")
     async def get_settings() -> dict[str, Any]:
@@ -194,7 +210,9 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
     @app.put("/api/settings")
     async def put_settings(config: AppConfig) -> dict[str, Any]:
-        return settings.save_config(config.model_dump(mode="json"))
+        saved = settings.save_config(config.model_dump(mode="json"))
+        await asyncio.to_thread(gripper_workers.sync_config, saved)
+        return saved
 
     @app.post("/api/settings/apply")
     async def apply_settings(config: AppConfig | None = None) -> ApiEnvelope:
@@ -202,6 +220,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             active = settings.apply_config(config.model_dump(mode="json") if config is not None else None)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": str(exc)}) from exc
+        await asyncio.to_thread(gripper_workers.sync_config, active)
         return envelope({"config": active})
 
     @app.get("/api/settings/snapshots")
@@ -435,7 +454,11 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def gripper_position(side: str) -> ApiEnvelope:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
-        result = await asyncio.to_thread(hardware.gripper.position, settings.get_config(), side)
+        config = settings.get_config()
+        if gripper_workers.is_enabled(config):
+            result = await asyncio.to_thread(gripper_workers.position, config, side)
+        else:
+            result = await asyncio.to_thread(hardware.gripper.position, config, side)
         if not result.ok:
             raise HTTPException(status_code=503, detail={"code": "GRIPPER_UNAVAILABLE", "message": result.message})
         return envelope(result.__dict__)
@@ -444,7 +467,20 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def gripper_diagnose(side: str) -> ApiEnvelope:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
-        result = await asyncio.to_thread(hardware.gripper.diagnose, settings.get_config(), side)
+        config = settings.get_config()
+        if gripper_workers.is_enabled(config):
+            worker_status = await asyncio.to_thread(gripper_workers.status, config)
+            side_status = worker_status.get("sides", {}).get(side, {})
+            logs.info("[GRIPPER]", str(side_status.get("message", "worker status")))
+            return envelope(
+                {
+                    "ok": bool(side_status.get("ok")),
+                    "message": side_status.get("message", "worker status"),
+                    "position_mm": side_status.get("positionMm"),
+                    "details": side_status,
+                }
+            )
+        result = await asyncio.to_thread(hardware.gripper.diagnose, config, side)
         logs.info("[GRIPPER]" if result.ok else "[GRIPPER]", result.message)
         return envelope(result.__dict__)
 

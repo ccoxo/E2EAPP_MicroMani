@@ -1,4 +1,4 @@
-import { Button, Dropdown, Form, Input, InputNumber, Modal, Select, Slider, Space, Switch, Tabs, Tag, Typography, type MenuProps } from 'antd'
+import { Button, Dropdown, Form, Input, InputNumber, Modal, Segmented, Select, Slider, Space, Switch, Tabs, Tag, Typography, type MenuProps } from 'antd'
 import {
   Activity,
   AlertTriangle,
@@ -32,9 +32,7 @@ import {
   captureMotionOrigin,
   clearMotionOrigin,
   enableMotionSide,
-  enumerateCamera,
   homeMotionSide,
-  reconnectCamera,
   reconnectHal,
   setTeleopGravityCompensation,
   tareForceSensor,
@@ -73,6 +71,10 @@ type CameraKey = keyof typeof cameraHardwareSpecs
 
 const sideOrder: RobotSide[] = ['left', 'right']
 const cameraOrder: CameraKey[] = ['global', 'wrist_left', 'wrist_right']
+const previewResolutionOptions = [
+  { value: '640x480', label: '640x480（推荐）' },
+  { value: '320x240', label: '320x240（低负载）' },
+]
 
 const hashLabels: Record<string, string> = {
   hal: 'HAL 通信',
@@ -300,9 +302,6 @@ function HalCard({
         </Form.Item>
         <Form.Item label="轴数">
           <InputNumber min={12} max={24} value={config.hal.axisCount} onChange={(value) => updateConfig({ hal: { ...config.hal, axisCount: Number(value ?? 12) } })} />
-        </Form.Item>
-        <Form.Item label="HAL API 已验证">
-          <Switch checked={config.hal.apiConfirmed} checkedChildren="已确认" unCheckedChildren="待确认" onChange={(checked) => updateConfig({ hal: { ...config.hal, apiConfirmed: checked } })} />
         </Form.Item>
         <Form.Item label="开机回工作原点">
           <div className="motion-startup-row">
@@ -741,14 +740,12 @@ function CameraCard({
   config,
   updateConfig,
   focusHash,
-  injectLog,
 }: {
   cameraKey: CameraKey
   camera?: CameraTelemetry
   config: AppConfig
   updateConfig: (patch: Partial<AppConfig>) => void
   focusHash: string
-  injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
 }) {
   const spec = cameraHardwareSpecs[cameraKey]
   const id = cameraKey === 'global' ? 'camera-global' : cameraKey === 'wrist_left' ? 'camera-left' : 'camera-right'
@@ -757,23 +754,6 @@ function CameraCard({
     cameraKey === 'global' ? 'globalResolution' : cameraKey === 'wrist_left' ? 'wristLeftResolution' : 'wristRightResolution'
   const previewResolution = config.cameras[resolutionField] ?? config.cameras.previewResolution
   const state = camera?.health ?? 'pending'
-  const [pendingAction, setPendingAction] = useState<'enumerate' | 'reconnect' | null>(null)
-  const handleCameraAction = async (action: 'enumerate' | 'reconnect') => {
-    setPendingAction(action)
-    const actionLabel = action === 'enumerate' ? '枚举' : '重连'
-    try {
-      if (action === 'enumerate') {
-        await enumerateCamera(cameraKey)
-      } else {
-        await reconnectCamera(cameraKey)
-      }
-      commandLog(injectLog, '[CAMERA]', `${spec.label}${actionLabel}请求已发送`)
-    } catch (error) {
-      injectLog('ERROR', `${spec.label}${actionLabel}失败：${commandErrorMessage(error)}`, '[CAMERA]')
-    } finally {
-      setPendingAction(null)
-    }
-  }
 
   return (
     <HardwareConfigCard
@@ -784,16 +764,6 @@ function CameraCard({
       subtitle={`${spec.rawResolution} @ ${spec.fps}Hz · ${spec.lerobotKey}`}
       state={state}
       badges={<Tag color="processing">{spec.rawResolution}</Tag>}
-      actions={
-        <Space wrap>
-          <Button icon={<Usb size={15} />} loading={pendingAction === 'enumerate'} onClick={() => void handleCameraAction('enumerate')}>
-            枚举
-          </Button>
-          <Button icon={<RefreshCw size={15} />} loading={pendingAction === 'reconnect'} onClick={() => void handleCameraAction('reconnect')}>
-            重连
-          </Button>
-        </Space>
-      }
     >
       {camera && <CameraPreview camera={camera} compact />}
       <div className="hardware-metric-grid camera-metric-grid">
@@ -805,18 +775,14 @@ function CameraCard({
         <Form.Item label="设备">
           <Input value={config.cameras[configField]} onChange={(event) => updateConfig({ cameras: { ...config.cameras, [configField]: event.target.value } })} />
         </Form.Item>
-        <Form.Item label="预览分辨率">
+        <Form.Item label="预览分辨率" tooltip="仅影响前端预览和相机流负载；默认 640x480 足够观察。">
           <Select
             value={previewResolution}
             onChange={(value) => updateConfig({ cameras: { ...config.cameras, [resolutionField]: value } })}
-            options={[
-              { value: '640x480' },
-              { value: '320x240' },
-              { value: '1920x1080' },
-            ]}
+            options={previewResolutionOptions}
           />
         </Form.Item>
-        <Form.Item label="目标 FPS" tooltip="后端相机采集目标帧率；录制保存帧率由录制模块按实际帧计数。"><InputNumber min={1} max={60} value={config.cameras.fps} onChange={(value) => updateConfig({ cameras: { ...config.cameras, fps: Number(value ?? 30) } })} /></Form.Item>
+        <Form.Item label="相机采集目标 FPS" tooltip="后端相机预览流的目标帧率；数据保存频率在数据存储里的录制 FPS 单独设置。"><InputNumber min={1} max={60} value={config.cameras.fps} onChange={(value) => updateConfig({ cameras: { ...config.cameras, fps: Number(value ?? 30) } })} /></Form.Item>
         <Form.Item label="曝光 / 增益">
           <Slider range min={0} max={100} defaultValue={[42, 55]} />
         </Form.Item>
@@ -854,11 +820,6 @@ function ForceSensorCard({
       title={`${sideSpec.shortLabel} Nano-17 六维力`}
       subtitle={`${nano17Spec.model} · Fx/Fy/Fz=mN · Mx/My/Mz=mN·m`}
       state={state}
-      badges={
-        <Tag color={config.force.certificateConfirmed ? 'success' : 'warning'}>
-          {config.force.certificateConfirmed ? '标定证书已确认' : '标定证书待确认'}
-        </Tag>
-      }
       actions={
         <Space wrap>
           <Button
@@ -914,7 +875,7 @@ function ForceSensorCard({
               />
             </Form.Item>
             <Form.Item label="低通截止 Hz"><InputNumber min={0} value={config.force.lowpassCutoffHz} onChange={(value) => updateConfig({ force: { ...config.force, lowpassCutoffHz: Number(value ?? 10) } })} /></Form.Item>
-            <Form.Item label="实物标定证书">
+            <Form.Item label="标定证书">
               <Switch
                 checked={config.force.certificateConfirmed}
                 checkedChildren="已确认"
@@ -1028,6 +989,19 @@ function GripperCard({
             <Form.Item label="从站地址"><InputNumber value={config.gripper[slaveKey]} onChange={(value) => updateConfig({ gripper: { ...config.gripper, [slaveKey]: Number(value ?? sideSpec.gripperSlaveId) } })} /></Form.Item>
             <Form.Item label="行程 mm"><InputNumber value={config.gripper.strokeMm} onChange={(value) => updateConfig({ gripper: { ...config.gripper, strokeMm: Number(value ?? 26) } })} /></Form.Item>
             <Form.Item label="命令力限制 N"><InputNumber min={0} max={8} value={config.gripper.commandForceLimitN} onChange={(value) => updateConfig({ gripper: { ...config.gripper, commandForceLimitN: Number(value ?? 8) } })} /></Form.Item>
+            <Form.Item label="采样模式">
+              <Segmented<AppConfig['gripper']['sampleMode']>
+                value={config.gripper.sampleMode}
+                onChange={(value) => updateConfig({ gripper: { ...config.gripper, sampleMode: value } })}
+                options={[
+                  { value: 'direct', label: '直连' },
+                  { value: 'dual_worker', label: '双 worker' },
+                ]}
+              />
+            </Form.Item>
+            <Form.Item label="采样 Hz">
+              <InputNumber min={1} max={60} value={config.gripper.sampleHz} onChange={(value) => updateConfig({ gripper: { ...config.gripper, sampleHz: Number(value ?? 30) } })} />
+            </Form.Item>
             <Form.Item label="力反馈传感">
               <Switch checked={config.gripper.forceFeedbackAvailable} checkedChildren="已接入" unCheckedChildren="待确认" onChange={setForceFeedback} />
             </Form.Item>
@@ -1213,6 +1187,7 @@ function StorageCard({
   focusHash: string
 }) {
   const updateStorage = (patch: Partial<AppConfig['storage']>) => updateConfig({ storage: { ...config.storage, ...patch } })
+  const recordFps = config.storage.recordFps ?? config.cameras.fps
   return (
     <HardwareConfigCard
       id="storage"
@@ -1226,6 +1201,7 @@ function StorageCard({
     >
       <div className="hardware-metric-grid">
         <MetricBox label="当前目录" value={config.storage.datasetRoot} hint="支持绝对路径或 ~ 用户目录" />
+        <MetricBox label="录制 FPS" value={recordFps} hint="数据集保存帧率" />
         <MetricBox label="视频 CRF" value={config.storage.videoCrf} />
         <MetricBox label="Hub 上传" value={config.storage.pushToHub ? '启用' : '关闭'} />
       </div>
@@ -1236,6 +1212,9 @@ function StorageCard({
             placeholder="C:/Users/Administrator/.appstation/datasets"
             onChange={(event) => updateStorage({ datasetRoot: event.target.value })}
           />
+        </Form.Item>
+        <Form.Item label="录制 FPS" tooltip="数据集保存帧率；未设置时后端旧逻辑会回退到相机采集目标 FPS。">
+          <InputNumber min={1} max={60} value={recordFps} onChange={(value) => updateStorage({ recordFps: Number(value ?? 30) })} />
         </Form.Item>
       </Form>
     </HardwareConfigCard>
@@ -1974,7 +1953,6 @@ export function SettingsView() {
                       config={config}
                       updateConfig={updateConfig}
                       focusHash={focusHash}
-                      injectLog={injectLog}
                     />
                   ))}
                   {sideOrder.map((side) => (

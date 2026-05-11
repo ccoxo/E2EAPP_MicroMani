@@ -15,6 +15,7 @@ from backend.core.defaults import default_config
 from backend.core.logging import LogService
 from backend.drivers.camera_opencv import OpenCVCameraDriver
 from backend.hal_client.client import RealHalClient
+from backend.services.dataset_recorder import DatasetRecorderService
 
 
 def test_settings_round_trip(tmp_path: Path) -> None:
@@ -88,6 +89,32 @@ def test_command_envelope_and_telemetry_ws(tmp_path: Path, monkeypatch: MonkeyPa
     teleop_response = client.get("/api/teleop/state")
     assert teleop_response.status_code == 200
     assert len(teleop_response.json()["data"]["hands"]) == 2
+
+
+def test_hardware_status_uses_gripper_workers_in_dual_mode(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    config = client.get("/api/settings").json()
+    config["gripper"]["sampleMode"] = "dual_worker"
+    assert client.put("/api/settings", json=config).status_code == 200
+
+    include_gripper_values: list[bool] = []
+
+    def fake_hardware_status(*, include_gripper: bool = True) -> dict:
+        include_gripper_values.append(include_gripper)
+        return {"camera": {}, "force": {}, "gripper": {"ok": None}, "pico": {}}
+
+    def fake_worker_status(config: dict) -> dict:
+        return {"ok": True, "message": "dual gripper workers", "sides": {}}
+
+    monkeypatch.setattr(client.app.state.hardware, "status", fake_hardware_status)
+    monkeypatch.setattr(client.app.state.gripper_workers, "status", fake_worker_status)
+
+    response = client.get("/api/hardware/status")
+
+    assert response.status_code == 200
+    assert include_gripper_values == [False]
+    assert response.json()["gripper"]["message"] == "dual gripper workers"
 
 
 def test_motion_side_enable_and_home_routes(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -672,6 +699,75 @@ def test_real_hal_http_error_preserves_hal_message(monkeypatch: MonkeyPatch) -> 
 
     assert "HTTP 500" in message
     assert "dmc_pmove failed ret=7 card=1 axis=0" in message
+
+
+def test_real_hal_client_maps_teleop_continuous_commands(monkeypatch: MonkeyPatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    class FakeResponse:
+        status = 200
+        headers = {"Connection": "keep-alive"}
+
+        def read(self) -> bytes:
+            return b'{"ok":true}'
+
+    class FakeConnection:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            _ = (args, kwargs)
+            self.sock = type("FakeSocket", (), {"setsockopt": staticmethod(lambda *a, **k: None)})()
+
+        def connect(self) -> None:
+            return None
+
+        def request(self, method: str, path: str, *args: object, **kwargs: object) -> None:
+            _ = (args, kwargs)
+            calls.append((method, path))
+
+        def getresponse(self) -> FakeResponse:
+            return FakeResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("backend.hal_client.client.http.client.HTTPConnection", FakeConnection)
+    client = RealHalClient("http://127.0.0.1:8091", 5000, LogService())
+
+    asyncio.run(client.command("motion.teleop_target_update", {"side": "left"}))
+    asyncio.run(client.command("motion.teleop_stop_side", {"side": "left"}))
+
+    assert calls == [
+        ("POST", "/motion/teleop_target_update"),
+        ("POST", "/motion/teleop_stop_side"),
+    ]
+
+
+def test_dataset_recorder_action_vector_prefers_teleop_delta_vector() -> None:
+    class FakeTeleop:
+        def status(self) -> dict[str, object]:
+            return {
+                "lastAction": {
+                    "ts": int(time.time() * 1000),
+                    "deltaVector": [10.0, 0.0, 0.0, 0.5, 0.0, 0.0, -20.0, 0.0, 0.0, 0.0, 0.0, -0.1],
+                }
+            }
+
+    recorder = object.__new__(DatasetRecorderService)
+    recorder.teleop = FakeTeleop()
+
+    assert recorder._latest_action_vector() == [
+        10.0,
+        0.0,
+        0.0,
+        500.0,
+        0.0,
+        0.0,
+        -20.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -100.0,
+    ]
 
 
 def test_runtime_shutdown_endpoint_schedules_stop_stack(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

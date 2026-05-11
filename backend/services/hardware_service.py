@@ -19,11 +19,11 @@ class HardwareService:
         self.gripper = Rs485GripperDriver()
         self.pico = PicoAdbDriver()
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, include_gripper: bool = True) -> dict[str, Any]:
         config = self.settings.get_config()
         camera = self.cameras.probe(config)
         force = self.force.probe(config)
-        gripper = self.gripper.probe(config)
+        gripper = self.gripper.probe(config) if include_gripper else None
         pico = self.pico.status(config)
         return {
             "camera": {
@@ -32,6 +32,10 @@ class HardwareService:
                 "cameras": [item.model_dump(mode="json") for item in camera.cameras],
             },
             "force": {"ok": force.ok, "message": force.message},
-            "gripper": {"ok": gripper.ok, "message": gripper.message},
+            "gripper": (
+                {"ok": gripper.ok, "message": gripper.message}
+                if gripper is not None
+                else {"ok": None, "message": "managed by gripper workers"}
+            ),
             "pico": {"ok": pico.ok, "message": pico.message, "stdout": pico.stdout, "stderr": pico.stderr},
         }

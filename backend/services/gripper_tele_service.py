@@ -85,11 +85,13 @@ class GripperTeleService:
         hal: HalClient,
         hardware: HardwareService,
         logs: LogService,
+        gripper_workers: Any | None = None,
     ) -> None:
         self._settings = settings
         self._hal = hal
         self._hardware = hardware
         self._logs = logs
+        self._gripper_workers = gripper_workers
         self._left = SchmittGripper("left")
         self._right = SchmittGripper("right")
         self._task: asyncio.Task[None] | None = None
@@ -171,7 +173,7 @@ class GripperTeleService:
 
                     if schmitt.tick_object_detect():
                         result = await asyncio.to_thread(
-                            self._hardware.gripper.position, config, side
+                            self._read_position, config, side
                         )
                         if result.ok and result.position_mm is not None:
                             stroke_mm = float(config.get("gripper", {}).get("strokeMm", 26))
@@ -203,7 +205,14 @@ class GripperTeleService:
         cfg = copy.deepcopy(config)
         cfg["gripper"]["commandSpeed"] = speed
         cfg["gripper"]["commandTorque"] = torque
+        if self._gripper_workers is not None and self._gripper_workers.is_enabled(cfg):
+            return self._gripper_workers.command(cfg, side, cmd, None)
         return self._hardware.gripper.command(cfg, side, cmd, None)
+
+    def _read_position(self, config: dict[str, Any], side: str) -> Any:
+        if self._gripper_workers is not None and self._gripper_workers.is_enabled(config):
+            return self._gripper_workers.position(config, side)
+        return self._hardware.gripper.position(config, side)
 
     @staticmethod
     def _motion_params(cmd: str, gt_cfg: dict[str, Any]) -> tuple[int, int]:

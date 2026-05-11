@@ -49,7 +49,15 @@ def test_safety_defaults_are_stored_in_backend_units() -> None:
 def test_pico_script_defaults_point_to_reference_tools() -> None:
     config = default_config()
 
-    assert config["picoVision"]["ip"] == "10.90.131.124"
+    assert config["picoVision"]["ip"] == "10.90.132.174"
     assert config["picoVision"]["videoPort"] == 12345
     assert config["picoVision"]["commandPort"] == 13579
     assert config["picoVision"]["scriptsDir"].endswith("PicoWirelessTools")
+
+
+def test_storage_defaults_separate_recording_fps_from_camera_preview() -> None:
+    config = default_config()
+
+    assert config["cameras"]["previewResolution"] == "640x480"
+    assert config["cameras"]["fps"] == 30
+    assert config["storage"]["recordFps"] == 30

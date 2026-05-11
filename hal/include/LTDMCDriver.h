@@ -29,6 +29,16 @@ class LTDMCDriver {
       double startVelocityUiPerSec = 0.0,
       double accTimeSec = 0.0,
       double decTimeSec = 0.0);
+  void updateTeleopTargetUi(
+      Side side,
+      const std::array<double, 6>& deltaUi,
+      double translationVelocityUiPerSec,
+      double rotationVelocityUiPerSec,
+      double translationStartVelocityUiPerSec = 0.0,
+      double rotationStartVelocityUiPerSec = 0.0,
+      double accTimeSec = 0.0,
+      double decTimeSec = 0.0);
+  void stopTeleopSide(Side side);
 
  private:
   void ensureInitialized() const;
@@ -41,6 +51,8 @@ class LTDMCDriver {
   std::string lastError_;
   std::array<double, 12> pulse_{};
   std::array<bool, 12> enabled_{};
+  std::array<double, 12> teleopTargetPulse_{};
+  std::array<bool, 12> teleopTargetActive_{};
 };
 
 }  // namespace appstation::hal

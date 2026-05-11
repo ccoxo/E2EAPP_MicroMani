@@ -39,6 +39,18 @@ Object.defineProperty(window, 'ResizeObserver', {
   value: ResizeObserverMock,
 })
 
+Object.defineProperty(window, 'requestAnimationFrame', {
+  configurable: true,
+  writable: true,
+  value: (callback: FrameRequestCallback) => window.setTimeout(() => callback(Date.now()), 0),
+})
+
+Object.defineProperty(window, 'cancelAnimationFrame', {
+  configurable: true,
+  writable: true,
+  value: (id: number) => window.clearTimeout(id),
+})
+
 Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
   configurable: true,
   value: 1024,

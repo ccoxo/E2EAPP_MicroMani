@@ -355,6 +355,30 @@ void serveConnection(
             accTime,
             decTime);
         body = "{\"ok\":true}";
+      } else if (request.rfind("POST /motion/teleop_target_update ", 0) == 0) {
+        const auto bodyText = requestBody(request);
+        const auto side = parseSide(jsonStringValue(bodyText, "side"));
+        const std::array<double, 6> deltas{
+            jsonNumberValue(bodyText, "X", 0.0),
+            jsonNumberValue(bodyText, "Y", 0.0),
+            jsonNumberValue(bodyText, "Z", 0.0),
+            jsonNumberValue(bodyText, "Roll", 0.0),
+            jsonNumberValue(bodyText, "Pitch", 0.0),
+            jsonNumberValue(bodyText, "Yaw", 0.0)};
+        motion.updateTeleopTargetUi(
+            side,
+            deltas,
+            jsonNumberValue(bodyText, "translationVelocityUiPerSec", 0.0),
+            jsonNumberValue(bodyText, "rotationVelocityUiPerSec", 0.0),
+            jsonNumberValue(bodyText, "translationStartVelocityUiPerSec", 0.0),
+            jsonNumberValue(bodyText, "rotationStartVelocityUiPerSec", 0.0),
+            jsonNumberValue(bodyText, "accTimeSec", 0.0),
+            jsonNumberValue(bodyText, "decTimeSec", 0.0));
+        body = "{\"ok\":true}";
+      } else if (request.rfind("POST /motion/teleop_stop_side ", 0) == 0) {
+        const auto side = parseSide(jsonStringValue(requestBody(request), "side"));
+        motion.stopTeleopSide(side);
+        body = "{\"ok\":true}";
       } else {
         code = 404;
         body = "{\"ok\":false,\"message\":\"not found\"}";
