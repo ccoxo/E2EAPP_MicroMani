@@ -30,9 +30,34 @@ const navItems = [
   { to: '/settings', label: '设置', icon: Settings },
 ]
 
+function TopStatus({ clock }: { clock: string }) {
+  const halOk = useTelemetryStore((state) => state.frame.halOk)
+  const wsOk = useTelemetryStore((state) => state.frame.wsOk)
+  const wsHz = useTelemetryStore((state) => state.frame.resource.wsHz)
+  const dangerIndex = useTelemetryStore((state) => state.frame.dangerIndex)
+  const phase = useTelemetryStore((state) => state.recordSession.phase)
+  const recorderFps = useTelemetryStore((state) => state.recordSession.recorderFps)
+
+  return (
+    <Space className="top-status" size={8}>
+      <MetricPill state={halOk ? 'ok' : 'error'} label="HAL" />
+      <MetricPill state={wsOk ? 'ok' : 'error'} label={`WS ${wsHz}Hz`} />
+      <MetricPill state={dangerIndex > 0.7 ? 'warn' : 'ok'} label={`Safety ${dangerIndex.toFixed(2)}`} />
+      {phase === 'recording' && (
+        <Tag color="error" style={{ animation: 'blink 1s step-end infinite' }}>
+          ● REC
+        </Tag>
+      )}
+      {phase === 'saving' && <Tag color="processing">保存中</Tag>}
+      {phase === 'resetting' && <Tag color="purple">复位中</Tag>}
+      {phase !== 'idle' && <Tag>{recorderFps.toFixed(1)} Hz</Tag>}
+      <Tag color="processing">Backend 30Hz</Tag>
+      <Typography.Text>{clock}</Typography.Text>
+    </Space>
+  )
+}
+
 export function AppLayout() {
-  const frame = useTelemetryStore((state) => state.frame)
-  const recordSession = useTelemetryStore((state) => state.recordSession)
   const selectedMode = useTelemetryStore((state) => state.selectedMode)
   const setMode = useTelemetryStore((state) => state.setMode)
   const setDangerOverride = useTelemetryStore((state) => state.setDangerOverride)
@@ -78,21 +103,7 @@ export function AppLayout() {
           ]}
           onChange={(value) => setMode(value as 'Record' | 'Auto' | 'Manual')}
         />
-        <Space className="top-status" size={8}>
-          <MetricPill state={frame.halOk ? 'ok' : 'error'} label="HAL" />
-          <MetricPill state={frame.wsOk ? 'ok' : 'error'} label={`WS ${frame.resource.wsHz}Hz`} />
-          <MetricPill state={frame.dangerIndex > 0.7 ? 'warn' : 'ok'} label={`Safety ${frame.dangerIndex.toFixed(2)}`} />
-          {recordSession.phase === 'recording' && (
-            <Tag color="error" style={{ animation: 'blink 1s step-end infinite' }}>
-              ● REC
-            </Tag>
-          )}
-          {recordSession.phase === 'saving' && <Tag color="processing">保存中</Tag>}
-          {recordSession.phase === 'resetting' && <Tag color="purple">复位中</Tag>}
-          {recordSession.phase !== 'idle' && <Tag>{recordSession.recorderFps.toFixed(1)} Hz</Tag>}
-          <Tag color="processing">Backend 50Hz</Tag>
-          <Typography.Text>{clock}</Typography.Text>
-        </Space>
+        <TopStatus clock={clock} />
       </header>
 
       <div className="work-area">

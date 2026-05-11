@@ -49,10 +49,11 @@ import type {
 } from '../types'
 
 const maxLogEntries = 5000
-// History buffer drives the live charts. 120 samples at the new 30Hz WS rate
-// gives ~4s of history per chart, which is what the UI actually shows; the
-// previous 240 cap was set when the system was meant to run at 50Hz and was
-// the dominant frontend rendering cost.
+export const uiFrameIntervalMs = 66
+export const chartHistoryIntervalMs = 100
+export const mockTelemetryIntervalMs = 33
+// History buffer drives the live charts. It is intentionally a chart display
+// history, not a complete capture history; recording data stays backend-owned.
 const maxHistorySamples = 120
 const parameterSnapshotStorageKey = 'appstation.parameterSnapshots.v1'
 const cameraLabels = {
@@ -302,7 +303,7 @@ const emptyFrame: TelemetryFrame = {
     { key: 'wrist_right', label: cameraLabels.wrist_right, fps: 0, timestampSkewMs: 0, frameAgeMs: 9999, health: 'pending' },
   ],
   queueDepth: { left: 20, right: 18 },
-  resource: { uiFps: 60, wsHz: 50, cpuPct: 18, memMb: 386 },
+  resource: { uiFps: 60, wsHz: 30, cpuPct: 18, memMb: 386 },
   processStatus: [],
   teleopHands: [
     {
@@ -546,7 +547,7 @@ function buildFrame(state: TelemetryStore): TelemetryFrame {
     },
     resource: {
       uiFps: 59.4 + Math.sin(t) * 0.4,
-      wsHz: 50,
+      wsHz: 30,
       cpuPct: 22 + Math.sin(t * 0.6) * 8,
       memMb: 520 + Math.cos(t * 0.25) * 30,
     },
@@ -589,6 +590,125 @@ function telemetrySampleFromFrame(frame: TelemetryFrame): TelemetrySample {
     queueLeft: frame.queueDepth.left,
     queueRight: frame.queueDepth.right,
   }
+}
+
+function appendTelemetryHistory(history: TelemetrySample[], sample: TelemetrySample) {
+  const nextHistory = history.length >= maxHistorySamples
+    ? history.slice(history.length - maxHistorySamples + 1)
+    : history.slice()
+  nextHistory.push(sample)
+  return nextHistory
+}
+
+type TelemetryStorePatch = Partial<TelemetryStore>
+type TelemetryStoreSet = (partial: TelemetryStorePatch | ((state: TelemetryStore) => TelemetryStorePatch), replace?: false) => void
+type TelemetryStoreGet = () => TelemetryStore
+
+let pendingBackendFrame: TelemetryFrame | null = null
+let backendFrameDelayTimer: number | null = null
+let backendFrameRaf: number | null = null
+let lastBackendFrameCommitAt = 0
+let lastBackendHistoryCommitAt = 0
+
+function backendFrameCommitIsUrgent(previous: TelemetryFrame, next: TelemetryFrame) {
+  return previous.wsOk !== next.wsOk
+    || previous.halOk !== next.halOk
+    || previous.recording !== next.recording
+    || previous.episodeCount !== next.episodeCount
+    || (previous.dangerIndex < 1 && next.dangerIndex >= 1)
+}
+
+function nextRecordSessionFromBackend(state: TelemetryStore, frame: TelemetryFrame): RecordSessionState {
+  if (state.recordSession.phase !== 'recording') return state.recordSession
+  return {
+    ...state.recordSession,
+    recorderFrameCount: Math.max(state.recordSession.recorderFrameCount, frame.frameCount),
+    recorderFps: frame.recording ? Math.max(0, frame.resource.wsHz) : state.recordSession.recorderFps,
+    recorderElapsedS: state.recordSession.phaseStartedAt
+      ? Math.max(0, (Date.now() - state.recordSession.phaseStartedAt) / 1000)
+      : state.recordSession.recorderElapsedS,
+  }
+}
+
+function commitBackendFrame(set: TelemetryStoreSet, frame: TelemetryFrame, forceHistory: boolean) {
+  const now = Date.now()
+  const sample = telemetrySampleFromFrame(frame)
+  let historyCommitted = false
+  set((state) => {
+    const shouldCommitHistory =
+      forceHistory
+      || state.history.length === 0
+      || lastBackendHistoryCommitAt === 0
+      || now - lastBackendHistoryCommitAt >= chartHistoryIntervalMs
+    historyCommitted = shouldCommitHistory
+    return {
+      tick: state.tick + 1,
+      frame,
+      recording: frame.recording,
+      episodeCount: frame.episodeCount,
+      frameCount: frame.frameCount,
+      recordSession: nextRecordSessionFromBackend(state, frame),
+      ...(shouldCommitHistory ? { history: appendTelemetryHistory(state.history, sample) } : {}),
+    }
+  })
+  lastBackendFrameCommitAt = now
+  if (historyCommitted) lastBackendHistoryCommitAt = now
+}
+
+function flushPendingBackendFrame(set: TelemetryStoreSet, get: TelemetryStoreGet, force = false) {
+  const frame = pendingBackendFrame
+  if (!frame) return
+  const now = Date.now()
+  if (!force && lastBackendFrameCommitAt > 0 && now - lastBackendFrameCommitAt < uiFrameIntervalMs) {
+    schedulePendingBackendFrame(set, get)
+    return
+  }
+  pendingBackendFrame = null
+  commitBackendFrame(set, frame, force)
+}
+
+function schedulePendingBackendFrame(set: TelemetryStoreSet, get: TelemetryStoreGet) {
+  if (backendFrameDelayTimer !== null || backendFrameRaf !== null) return
+  const elapsed = lastBackendFrameCommitAt > 0 ? Date.now() - lastBackendFrameCommitAt : uiFrameIntervalMs
+  const delayMs = Math.max(0, uiFrameIntervalMs - elapsed)
+  backendFrameDelayTimer = window.setTimeout(() => {
+    backendFrameDelayTimer = null
+    const flush = () => {
+      backendFrameRaf = null
+      flushPendingBackendFrame(set, get)
+    }
+    if (typeof window.requestAnimationFrame === 'function') {
+      backendFrameRaf = window.requestAnimationFrame(flush)
+      return
+    }
+    flush()
+  }, delayMs)
+}
+
+function enqueueBackendFrame(set: TelemetryStoreSet, get: TelemetryStoreGet, frame: TelemetryFrame) {
+  const urgent = backendFrameCommitIsUrgent(get().frame, frame)
+  pendingBackendFrame = frame
+  if (urgent) {
+    clearPendingBackendFrameFlush()
+    pendingBackendFrame = frame
+    flushPendingBackendFrame(set, get, true)
+    return
+  }
+  schedulePendingBackendFrame(set, get)
+}
+
+function clearPendingBackendFrameFlush() {
+  if (backendFrameDelayTimer !== null) {
+    window.clearTimeout(backendFrameDelayTimer)
+    backendFrameDelayTimer = null
+  }
+  if (backendFrameRaf !== null && typeof window.cancelAnimationFrame === 'function') {
+    window.cancelAnimationFrame(backendFrameRaf)
+  }
+  backendFrameRaf = null
+  pendingBackendFrame = null
+  lastBackendFrameCommitAt = 0
+  lastBackendHistoryCommitAt = 0
 }
 
 function mergeConfig(current: AppConfig, patch: Partial<AppConfig>): AppConfig {
@@ -757,7 +877,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   tick: 0,
   frame: emptyFrame,
   history: [],
-  logs: [makeLog('INFO', mockMode ? 'M0 test telemetry fixture started at 50Hz' : 'Backend telemetry initializing', '[BACKEND]')],
+  logs: [makeLog('INFO', mockMode ? 'M0 test telemetry fixture started at 30Hz' : 'Backend telemetry initializing', '[BACKEND]')],
   diagnostics: defaultDiagnostics,
   config: defaultConfig,
   recording: false,
@@ -808,11 +928,13 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
           frame,
           recordSession,
           frameCount: frame.frameCount,
-          history: [...state.history, sample].slice(-maxHistorySamples),
+          history: state.history.length === 0 || tick % Math.max(1, Math.round(chartHistoryIntervalMs / mockTelemetryIntervalMs)) === 0
+            ? appendTelemetryHistory(state.history, sample)
+            : state.history,
           logs,
         }
       })
-    }, 20)
+    }, mockTelemetryIntervalMs)
     set({ mockTimer: timer })
   },
 
@@ -824,6 +946,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
 
   startBackend: () => {
     if (get().backendWs) return
+    clearPendingBackendFrameFlush()
     const reconnectTimer = get().backendReconnectTimer
     if (reconnectTimer) {
       window.clearTimeout(reconnectTimer)
@@ -871,41 +994,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
             ...message.data,
             motionEnabled: message.data.motionEnabled ?? { left: null, right: null },
           }
-          const sample = telemetrySampleFromFrame(frame)
-          // 遥测帧高频到达，历史数组只存固定长度，防止图表随运行时间变慢。
-          // Charts re-render whenever `history` changes, and ECharts is heavy
-          // enough that doing this at 50Hz dominates the main thread. We push
-          // every sample to history, but keep the array under a fixed cap by
-          // shifting in-place — array spread + slice on every WS message was
-          // allocating ~7K numbers/tick and was the dominant frontend hot spot.
-          set((state) => {
-            let nextHistory = state.history
-            if (nextHistory.length >= maxHistorySamples) {
-              nextHistory = nextHistory.slice(nextHistory.length - maxHistorySamples + 1)
-            } else {
-              nextHistory = nextHistory.slice()
-            }
-            nextHistory.push(sample)
-            const nextRecordSession = state.recordSession.phase === 'recording'
-              ? {
-                  ...state.recordSession,
-                  recorderFrameCount: Math.max(state.recordSession.recorderFrameCount, frame.frameCount),
-                  recorderFps: frame.recording ? Math.max(0, frame.resource.wsHz) : state.recordSession.recorderFps,
-                  recorderElapsedS: state.recordSession.phaseStartedAt
-                    ? Math.max(0, (Date.now() - state.recordSession.phaseStartedAt) / 1000)
-                    : state.recordSession.recorderElapsedS,
-                }
-              : state.recordSession
-            return {
-              tick: state.tick + 1,
-              frame,
-              recording: frame.recording,
-              episodeCount: frame.episodeCount,
-              frameCount: frame.frameCount,
-              recordSession: nextRecordSession,
-              history: nextHistory,
-            }
-          })
+          enqueueBackendFrame(set, get, frame)
+          // Coalesce raw WS frames so React and ECharts update on the UI cadence.
           return
         }
         if (message.type === 'log') {
@@ -960,6 +1050,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     const ws = get().backendWs
     const timer = get().backendReconnectTimer
     if (timer) window.clearTimeout(timer)
+    clearPendingBackendFrameFlush()
     set({ backendWs: null, backendReconnectTimer: null, backendReconnectAttempts: 0 })
     if (ws) ws.close()
   },

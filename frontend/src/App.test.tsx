@@ -1,16 +1,20 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
-import { useTelemetryStore } from './stores/telemetry'
+import { chartHistoryIntervalMs, uiFrameIntervalMs, useTelemetryStore } from './stores/telemetry'
+import type { TelemetryFrame } from './types'
 
 afterEach(() => {
   useTelemetryStore.getState().parameterSnapshots.forEach((snapshot) => useTelemetryStore.getState().deleteParameterSnapshot(snapshot.id))
   useTelemetryStore.getState().setDangerOverride(null)
   useTelemetryStore.getState().stopMock()
+  useTelemetryStore.getState().stopBackend()
   useTelemetryStore.getState().clearRecordSession()
   cleanup()
   window.localStorage.clear()
   window.history.pushState({}, '', '/')
+  vi.useRealTimers()
+  vi.unstubAllGlobals()
 })
 
 describe('AppStation M0 frontend', () => {
@@ -20,7 +24,75 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getByText('全局硬件状态')).toBeInTheDocument()
     expect(screen.getByText('左机械臂')).toBeInTheDocument()
     expect(screen.getByText('右机械臂')).toBeInTheDocument()
-    expect(screen.getByText('Backend 50Hz')).toBeInTheDocument()
+    expect(screen.getByText('Backend 30Hz')).toBeInTheDocument()
+  })
+
+  it('coalesces backend telemetry before committing UI frame and chart history updates', async () => {
+    vi.useFakeTimers()
+
+    class MockWebSocket {
+      static instances: MockWebSocket[] = []
+      readonly url: string
+      onopen: ((event: Event) => void) | null = null
+      onmessage: ((event: MessageEvent) => void) | null = null
+      onclose: ((event: CloseEvent) => void) | null = null
+
+      constructor(url: string) {
+        this.url = url
+        MockWebSocket.instances.push(this)
+        window.setTimeout(() => this.onopen?.(new Event('open')), 0)
+      }
+
+      close() {
+        this.onclose?.({ code: 1000 } as CloseEvent)
+      }
+
+      emitTelemetry(frame: TelemetryFrame) {
+        this.onmessage?.({ data: JSON.stringify({ type: 'telemetry', data: frame }) } as MessageEvent)
+      }
+    }
+
+    vi.stubGlobal('WebSocket', MockWebSocket)
+
+    const baseFrame = structuredClone(useTelemetryStore.getState().frame)
+    useTelemetryStore.setState({
+      tick: 0,
+      history: [],
+      frame: {
+        ...baseFrame,
+        frameCount: 0,
+        episodeCount: 0,
+        recording: false,
+        resource: { ...baseFrame.resource, wsHz: 30 },
+      },
+    })
+
+    useTelemetryStore.getState().startBackend()
+    await vi.advanceTimersByTimeAsync(0)
+    const ws = MockWebSocket.instances[0]
+    expect(ws).toBeTruthy()
+
+    for (let frameCount = 1; frameCount <= 30; frameCount += 1) {
+      ws.emitTelemetry({
+        ...baseFrame,
+        timestamp: Date.now(),
+        elapsedSec: frameCount / 30,
+        frameCount,
+        episodeCount: 0,
+        recording: false,
+        resource: { ...baseFrame.resource, wsHz: 30 },
+      })
+      await vi.advanceTimersByTimeAsync(33)
+    }
+
+    await vi.advanceTimersByTimeAsync(uiFrameIntervalMs * 2)
+    const state = useTelemetryStore.getState()
+    expect(state.frame.frameCount).toBe(30)
+    expect(state.tick).toBeGreaterThanOrEqual(10)
+    expect(state.tick).toBeLessThan(30)
+    expect(state.history.length).toBeGreaterThanOrEqual(6)
+    expect(state.history.length).toBeLessThanOrEqual(Math.ceil((30 * 33) / chartHistoryIntervalMs) + 2)
+    expect(state.history.length).toBeLessThan(state.tick)
   })
 
   it('renders the operator navigation in the requested order', () => {
@@ -38,6 +110,8 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getByText('录制控制')).toBeInTheDocument()
     expect(screen.getByText('开始采集会话')).toBeInTheDocument()
     expect(screen.getByText('力觉安全监控')).toBeInTheDocument()
+    expect(document.querySelector('.record-camera-placeholder-wrist_left')).toBeTruthy()
+    expect(document.querySelector('.record-camera-placeholder-wrist_right')).toBeTruthy()
   })
 
   it('runs the record precheck, save, and quality report flow', async () => {
@@ -115,6 +189,14 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getByText('PICO-4 视觉推流')).toBeInTheDocument()
     expect(screen.getByText('连接无线 ADB')).toBeInTheDocument()
     expect(screen.getByText('启动视觉')).toBeInTheDocument()
+    expect(screen.getAllByText('相机采集目标 FPS').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('录制 FPS').length).toBeGreaterThan(0)
+    expect(screen.queryByText('目标 FPS')).not.toBeInTheDocument()
+    expect(screen.queryByText('HAL API 已验证')).not.toBeInTheDocument()
+    const globalCameraCard = document.querySelector<HTMLElement>('#camera-global')
+    expect(globalCameraCard).toBeTruthy()
+    expect(within(globalCameraCard!).queryByRole('button', { name: '枚举' })).not.toBeInTheDocument()
+    expect(within(globalCameraCard!).queryByRole('button', { name: '重连' })).not.toBeInTheDocument()
     expect(screen.getByText('选择硬件快照')).toBeInTheDocument()
     expect(screen.getByText('保存硬件快照')).toBeInTheDocument()
     expect(screen.getAllByText('选择运动参数')).toHaveLength(2)
@@ -141,17 +223,19 @@ describe('AppStation M0 frontend', () => {
     expect(rightWristFrame?.querySelector('.camera-reticle')).toBeNull()
   })
 
-  it('syncs the force certificate badge with the confirmation switch', () => {
+  it('uses a single force certificate confirmation control', () => {
     window.history.pushState({}, '', '/settings#force-left')
     render(<App />)
     const forceCard = document.querySelector<HTMLElement>('#force-left')
     expect(forceCard).toBeTruthy()
-    expect(within(forceCard!).getByText('标定证书待确认')).toBeInTheDocument()
+    expect(within(forceCard!).queryByText('标定证书待确认')).not.toBeInTheDocument()
+    expect(within(forceCard!).getByText('标定证书')).toBeInTheDocument()
+    expect(within(forceCard!).getByText('待确认')).toBeInTheDocument()
 
     const switches = within(forceCard!).getAllByRole('switch')
     fireEvent.click(switches.at(-1)!)
 
-    expect(within(forceCard!).getByText('标定证书已确认')).toBeInTheDocument()
+    expect(within(forceCard!).getByText('已确认')).toBeInTheDocument()
   })
 
   it('saves and applies a motion parameter snapshot from settings', async () => {

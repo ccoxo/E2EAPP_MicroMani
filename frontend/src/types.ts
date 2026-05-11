@@ -303,6 +303,11 @@ export interface AppConfig {
     commandForceLimitN: number
     commandSpeed: number
     commandTorque: number
+    sampleMode: 'direct' | 'dual_worker'
+    sampleHz: number
+    sampleStaleMs: number
+    sampleEnableOnNegative: boolean
+    workerCommandTimeoutSec: number
     forceFeedbackAvailable: boolean
   }
   safety: {
@@ -322,6 +327,7 @@ export interface AppConfig {
   }
   storage: {
     datasetRoot: string
+    recordFps: number
     videoCrf: number
     pushToHub: boolean
   }

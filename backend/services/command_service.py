@@ -19,12 +19,14 @@ class CommandService:
         hal: HalClient,
         logs: LogService,
         hardware: HardwareService | None = None,
+        gripper_workers: Any | None = None,
     ) -> None:
         self.settings = settings
         self.telemetry = telemetry
         self.hal = hal
         self.logs = logs
         self.hardware = hardware
+        self.gripper_workers = gripper_workers
 
     async def generic_command(self, request: SettingsCommandRequest) -> dict[str, object]:
         self.logs.append(request.channel, request.level, request.msg)
@@ -164,7 +166,10 @@ class CommandService:
         config = self.settings.get_config()
         if self.hardware is not None and self._real_hardware_mode(config):
             # 真机成功响应后才保存目标开合度，避免 UI 记住未执行的硬件状态。
-            result = self.hardware.gripper.command(config, request.side, request.command, request.targetMm)
+            if self.gripper_workers is not None and self.gripper_workers.is_enabled(config):
+                result = self.gripper_workers.command(config, request.side, request.command, request.targetMm)
+            else:
+                result = self.hardware.gripper.command(config, request.side, request.command, request.targetMm)
             if not result.ok:
                 self.logs.error("[GRIPPER]", result.message)
                 raise RuntimeError(result.message)

@@ -163,6 +163,8 @@ class RealHalClient(HalClient):
             "motion.enable_side": "/motion/enable_side",
             "motion.home_side": "/motion/home_side",
             "motion.manual_axis_move": "/motion/manual_axis_move",
+            "motion.teleop_target_update": "/motion/teleop_target_update",
+            "motion.teleop_stop_side": "/motion/teleop_stop_side",
         }
         path = path_by_command.get(name)
         if path is None:

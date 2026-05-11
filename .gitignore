@@ -16,6 +16,12 @@ backend/runtime/
 # Local test and investigation artifacts
 data_collect_test/
 test-reports/
+frontend/output/playwright/
+.tmp_diff.txt
+__MACOSX/
+
+# Local tool config
+.claude/
 
 # C++ build output
 hal/build/
@@ -32,5 +38,5 @@ hal/vendor/
 .env
 .env.*
 
-# 硬件
+# Hardware reference files
 硬件指南/

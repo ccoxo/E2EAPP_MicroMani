@@ -13,9 +13,15 @@ from backend.services.hardware_service import HardwareService
 
 
 class TelemetryHub:
-    def __init__(self, settings: SettingsService, hardware: HardwareService | None = None) -> None:
+    def __init__(
+        self,
+        settings: SettingsService,
+        hardware: HardwareService | None = None,
+        gripper_workers: Any | None = None,
+    ) -> None:
         self.settings = settings
         self.hardware = hardware
+        self.gripper_workers = gripper_workers
         self.started = time.monotonic()
         self.tick = 0
         self.axis_offsets = [0.0] * 12
@@ -515,6 +521,12 @@ class TelemetryHub:
 
     def _refresh_gripper_positions(self, config: dict[str, Any], now: float) -> None:
         if self.hardware is None:
+            return
+        if self.gripper_workers is not None and self.gripper_workers.is_enabled(config):
+            positions = self.gripper_workers.positions(config)
+            for idx, value in enumerate(positions):
+                if value is not None:
+                    self.gripper_positions[idx] = float(value)
             return
         if self._gripper_future is not None and self._gripper_future.done():
             try:

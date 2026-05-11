@@ -212,10 +212,10 @@ class PolicyService:
         config = self.settings.get_config()
         auto_config = config.get("auto", {})
         return {
-            "translationStepUm": float(auto_config.get("translationStepUm", 100.0)),
-            "rotationStepDeg": float(auto_config.get("rotationStepDeg", 0.1)),
-            "translationVelocityUmS": float(auto_config.get("translationVelocityUmS", 100.0)),
-            "rotationVelocityDegS": float(auto_config.get("rotationVelocityDegS", 0.1)),
+            "translationStepUm": float(auto_config.get("translationStepUm", 200.0)),
+            "rotationStepDeg": float(auto_config.get("rotationStepDeg", 0.2)),
+            "translationVelocityUmS": float(auto_config.get("translationVelocityUmS", 1000.0)),
+            "rotationVelocityDegS": float(auto_config.get("rotationVelocityDegS", 0.5)),
         }
 
     def _model(self, model_id: str, name: str, status: str, note: str, latency_ms: float) -> dict[str, Any]:

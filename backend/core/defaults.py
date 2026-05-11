@@ -106,6 +106,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "commandForceLimitN": 8,
         "commandSpeed": 10,
         "commandTorque": 1,
+        "sampleMode": "direct",
+        "sampleHz": 30,
+        "sampleStaleMs": 500,
+        "sampleEnableOnNegative": True,
+        "workerCommandTimeoutSec": 2.0,
         "forceFeedbackAvailable": False,
         "jodellDllPath": (
             "F:/E2EAPP_MicroMani/backend/vendor/jodell/jodellTool.dll"
@@ -128,18 +133,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "storage": {
         "datasetRoot": "~/.appstation/datasets",
+        "recordFps": 30,
         "videoCrf": 23,
         "pushToHub": False,
     },
     "auto": {
         "allowHardwareDispatch": False,
-        "translationStepUm": 100,
-        "rotationStepDeg": 0.1,
-        "translationVelocityUmS": 100,
-        "rotationVelocityDegS": 0.1,
+        "translationStepUm": 200,
+        "rotationStepDeg": 0.2,
+        "translationVelocityUmS": 1000,
+        "rotationVelocityDegS": 0.5,
     },
     "picoVision": {
-        "ip": "10.90.131.124",
+        "ip": "10.90.132.174",
         "adbPort": 5555,
         "videoPort": 12345,
         "commandPort": 13579,

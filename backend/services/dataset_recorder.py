@@ -597,18 +597,23 @@ class DatasetRecorderService:
 
     async def _record_loop(self) -> None:
         # 录制循环按目标 FPS 调度；慢帧只记质量指标，不中断本轮采集。
-        period_s = 1.0 / max(1, self._record_fps_hz)
+        period_s = 1.0 / max(1, self._record_fps_hz) # 记录的时间戳   1 / fps
+        # 下一帧的开始时间
         next_tick = time.monotonic()
+        # 录制循环
         while self._session_active:
             try:
+                # 复位时不刷刷新 下一帧开始时间
                 if not self._recording:
                     await asyncio.sleep(0.05)
                     next_tick = time.monotonic()
                     continue
                 now = time.monotonic()
+                # 检查帧时间是否慢
                 if now > next_tick + period_s:
                     async with self._lock:
                         self._episode_late_frames += 1
+                # 记录信息
                 frame = await self._collect_frame()
                 async with self._lock:
                     self._write_frame_locked(frame)

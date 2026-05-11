@@ -91,7 +91,7 @@ export function PlatformOverview({
       state: 'pending',
       primary: 'ADB 连接与 TCP H.264 视频链路',
       secondary: '用于把上位机相机画面推送到头显显示',
-      metric: '10.90.131.124',
+      metric: '10.90.132.174',
       group: '视觉',
     },
     {

@@ -6,12 +6,30 @@ param(
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
+function Stop-ProcessTree {
+  param([int]$RootPid)
+
+  $allProcesses = Get-CimInstance Win32_Process
+  $children = $allProcesses | Where-Object { $_.ParentProcessId -eq $RootPid }
+  foreach ($child in $children) {
+    Stop-ProcessTree -RootPid $child.ProcessId
+  }
+  Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue
+}
+
 & (Join-Path $PSScriptRoot "start-hal.ps1") -Restart | Out-Host
 
 $backendPid = Get-NetTCPConnection -LocalPort $BackendPort -State Listen -ErrorAction SilentlyContinue |
   Select-Object -ExpandProperty OwningProcess -First 1
 if ($backendPid) {
-  Stop-Process -Id $backendPid -Force -ErrorAction SilentlyContinue
+  $backendRootPid = $backendPid
+  $allProcesses = Get-CimInstance Win32_Process
+  $backendProcess = $allProcesses | Where-Object { $_.ProcessId -eq $backendPid } | Select-Object -First 1
+  $backendParent = $allProcesses | Where-Object { $_.ProcessId -eq $backendProcess.ParentProcessId } | Select-Object -First 1
+  if ($backendParent -and $backendParent.CommandLine -match "backend\.app:create_app" -and $backendParent.CommandLine -match "--port\s+$BackendPort") {
+    $backendRootPid = $backendParent.ProcessId
+  }
+  Stop-ProcessTree -RootPid $backendRootPid
 }
 
 $frontendPid = Get-NetTCPConnection -LocalPort $FrontendPort -State Listen -ErrorAction SilentlyContinue |

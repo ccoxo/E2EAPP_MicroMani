@@ -1,5 +1,5 @@
 import { Card, Tag } from 'antd'
-import type { CSSProperties } from 'react'
+import { memo, type CSSProperties } from 'react'
 import { AxisGroupChart, ForceChart } from '../Charts'
 import { useTelemetryStore } from '../../stores/telemetry'
 import type { TelemetrySample } from '../../types'
@@ -46,21 +46,32 @@ function poseStyle(values: number[]) {
   } as CSSProperties
 }
 
-function ArmMonitor({
+const ArmMonitor = memo(function ArmMonitor({
   side,
   title,
-  values,
+  positions,
+  axisOffset,
   force,
   history,
 }: {
   side: 'left' | 'right'
   title: string
-  values: number[]
+  positions: number[]
+  axisOffset: number
   force: number[]
   history: TelemetrySample[]
 }) {
   const forcePeak = Math.max(...force.map((value) => Math.abs(value)))
-  const yaw = values[5] ?? 0
+  const valueAt = (index: number) => positions[axisOffset + index] ?? 0
+  const poseValues = [
+    valueAt(0),
+    valueAt(1),
+    valueAt(2),
+    valueAt(3),
+    valueAt(4),
+    valueAt(5),
+  ]
+  const yaw = valueAt(5)
   const dangerTone = forcePeak >= 4 || Math.abs(yaw) >= 70 ? 'danger' : forcePeak >= 2 || Math.abs(yaw) >= 60 ? 'warn' : 'ok'
 
   return (
@@ -80,24 +91,27 @@ function ArmMonitor({
           <div className="record-arm-pose">
             <div className="record-arm-pose-grid" />
             <div className="record-arm-pose-crosshair" />
-            <div className="record-arm-pose-dot" style={poseStyle(values)}>
+            <div className="record-arm-pose-dot" style={poseStyle(poseValues)}>
               <span />
             </div>
             <div className="record-arm-pose-label">
-              X/Y {formatAxisValue(values[0] ?? 0, 0)} / {formatAxisValue(values[1] ?? 0, 1)}
+              X/Y {formatAxisValue(valueAt(0), 0)} / {formatAxisValue(valueAt(1), 1)}
             </div>
           </div>
 
           <div className="record-axis-meter-list">
-            {axes.map((axis, index) => (
-              <div className="record-axis-meter" key={axis}>
-                <span>{axis}</span>
-                <div>
-                  <i style={{ width: `${axisRatio(values[index] ?? 0, index)}%` }} />
+            {axes.map((axis, index) => {
+              const value = valueAt(index)
+              return (
+                <div className="record-axis-meter" key={axis}>
+                  <span>{axis}</span>
+                  <div>
+                    <i style={{ width: `${axisRatio(value, index)}%` }} />
+                  </div>
+                  <b>{formatAxisValue(value, index)}</b>
                 </div>
-                <b>{formatAxisValue(values[index] ?? 0, index)}</b>
-              </div>
-            ))}
+              )
+            })}
           </div>
         </div>
 
@@ -130,7 +144,7 @@ function ArmMonitor({
       </div>
     </section>
   )
-}
+})
 
 export default function RecordTelemetryPanel() {
   const positions = useTelemetryStore((state) => state.frame.jointPositions)
@@ -141,8 +155,8 @@ export default function RecordTelemetryPanel() {
   return (
     <Card size="small" title="运动与力觉监看" styles={{ body: { padding: 8 } }}>
       <div className="record-telemetry-grid">
-        <ArmMonitor side="left" title="左臂" values={positions.slice(0, 6)} force={forceLeft} history={history} />
-        <ArmMonitor side="right" title="右臂" values={positions.slice(6, 12)} force={forceRight} history={history} />
+        <ArmMonitor side="left" title="左臂" positions={positions} axisOffset={0} force={forceLeft} history={history} />
+        <ArmMonitor side="right" title="右臂" positions={positions} axisOffset={6} force={forceRight} history={history} />
       </div>
     </Card>
   )

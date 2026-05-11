@@ -44,7 +44,7 @@ function CameraSlot({ kind, camera, resolution }: CameraSlotProps) {
           onError={handleError}
         />
       ) : (
-        <div className="record-camera-placeholder">
+        <div className={`record-camera-placeholder record-camera-placeholder-${kind}`}>
           <div className="record-camera-placeholder-copy">
             <div>{spec.model}</div>
             <small>{camera ? '模拟预览' : '无信号'}</small>
