@@ -16,7 +16,7 @@ AXES: tuple[AxisName, AxisName, AxisName, AxisName, AxisName, AxisName] = ("X", 
 TRANSLATION_STEP_UM = 200.0
 ROTATION_STEP_DEG = 0.2
 TRANSLATION_VELOCITY_UM_S = 1000.0
-ROTATION_VELOCITY_DEG_S = 0.5
+ROTATION_VELOCITY_DEG_S = 1.0
 
 
 class TeleopMappingService:

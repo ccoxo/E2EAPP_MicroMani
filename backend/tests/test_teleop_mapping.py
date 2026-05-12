@@ -61,7 +61,7 @@ def test_teleop_mapper_sends_continuous_six_axis_delta() -> None:
             "Yaw": 0.18,
         }
         assert payload["translationVelocityUiPerSec"] == 1000.0
-        assert payload["rotationVelocityUiPerSec"] == 0.5
+        assert payload["rotationVelocityUiPerSec"] == 1.0
         assert mapper.status()["lastAction"]["deltaVector"] == [
             200.0,
             -200.0,
@@ -126,7 +126,7 @@ def test_teleop_mapper_status_reports_updated_limits() -> None:
         "translationStepUm": 200.0,
         "rotationStepDeg": 0.2,
         "translationVelocityUmS": 1000.0,
-        "rotationVelocityDegS": 0.5,
+        "rotationVelocityDegS": 1.0,
     }
 
 

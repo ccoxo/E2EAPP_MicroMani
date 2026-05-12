@@ -1609,6 +1609,12 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   issueManualAxisMove: (side, axis, direction) => {
     if (!mockMode) {
       const state = get()
+      if (state.frame.motionEnabled?.[side] === false) {
+        set((current) => ({
+          logs: appendLog(current.logs, makeLog('WARNING', `${side} ${axis} jog skipped: motion side is disabled`, '[HAL]')),
+        }))
+        return
+      }
       const axisIndex = manualAxisOrder.indexOf(axis)
       const step = axisIndex < 3 ? state.manualControl.axisStepUm : state.manualControl.axisStepDeg
       const speedMode = state.manualControl.speedMode
@@ -1710,13 +1716,19 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
 
   issueManualGripperMove: (side, command, targetMm) => {
     if (!mockMode) {
+      const enabledKey = side === 'left' ? 'leftEnabled' : 'rightEnabled'
+      if (!['enable', 'disable', 'stop'].includes(command) && !get().config.gripper[enabledKey]) {
+        set((current) => ({
+          logs: appendLog(current.logs, makeLog('WARNING', `${side} gripper ${command} skipped: gripper is disabled`, '[GRIPPER]')),
+        }))
+        return
+      }
       // 夹爪启停先乐观更新 UI，再由后端持久化和回读校准最终状态。
       // Optimistically reflect enable/disable in the UI so the user can keep
       // clicking instead of waiting for a config refetch round-trip. The
       // backend persists the same change to disk; we then refetch to make sure
       // any other field (eg targetMm) is in sync.
       if (command === 'enable' || command === 'disable') {
-        const enabledKey = side === 'left' ? 'leftEnabled' : 'rightEnabled'
         set((current) => ({
           config: {
             ...current.config,

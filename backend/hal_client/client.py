@@ -63,6 +63,10 @@ class TestHalClient(HalClient):
             side = str((payload or {}).get("side", ""))
             if side in self.motion_enabled:
                 self.motion_enabled[side] = True
+        if name == "motion.disable_side":
+            side = str((payload or {}).get("side", ""))
+            if side in self.motion_enabled:
+                self.motion_enabled[side] = False
         self.logs.info("[HAL]", f"{name} accepted by TestHalClient")
         return {"mode": "test", "command": name, "payload": payload or {}}
 
@@ -161,6 +165,7 @@ class RealHalClient(HalClient):
             "motion.emergency_stop": "/motion/emergency_stop",
             "motion.home_all": "/motion/home_all",
             "motion.enable_side": "/motion/enable_side",
+            "motion.disable_side": "/motion/disable_side",
             "motion.home_side": "/motion/home_side",
             "motion.manual_axis_move": "/motion/manual_axis_move",
             "motion.teleop_target_update": "/motion/teleop_target_update",

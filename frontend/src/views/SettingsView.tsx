@@ -31,6 +31,7 @@ import {
   disconnectTeleopHand,
   captureMotionOrigin,
   clearMotionOrigin,
+  disableMotionSide,
   enableMotionSide,
   homeMotionSide,
   reconnectHal,
@@ -40,6 +41,7 @@ import {
   startGripperTeleop,
   stopGripperTeleop,
   fetchGripperTeleopStatus,
+  mockMode,
 } from '../api'
 import {
   armHardwareSpecs,
@@ -545,7 +547,7 @@ function MotionCard({
         : '仅当前侧零点已设置'
       : '当前侧零点未设置'
   const originUpdatedText = motionOrigin.updatedAt > 0 ? `最后更新 ${formatSnapshotTime(motionOrigin.updatedAt)}` : originScopeText
-  const [pendingMotionAction, setPendingMotionAction] = useState<'enable' | 'home' | null>(null)
+  const [pendingMotionAction, setPendingMotionAction] = useState<'enable' | 'disable' | 'home' | null>(null)
   const [pendingOriginAction, setPendingOriginAction] = useState<'capture' | 'clear' | null>(null)
   const [optimisticEnabled, setOptimisticEnabled] = useState<boolean | null>(null)
   const effectiveEnabled = motionEnabled ?? optimisticEnabled ?? null
@@ -563,6 +565,18 @@ function MotionCard({
       commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel}全部轴使能请求已发送`)
     } catch (error) {
       injectLog('ERROR', `${sideSpec.shortLabel}使能失败：${commandErrorMessage(error)}`, '[HAL]')
+    } finally {
+      setPendingMotionAction(null)
+    }
+  }
+  const handleDisable = async () => {
+    setPendingMotionAction('disable')
+    try {
+      await disableMotionSide(side)
+      setOptimisticEnabled(false)
+      commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel} motion axes disable requested`)
+    } catch (error) {
+      injectLog('ERROR', `${sideSpec.shortLabel} motion disable failed: ${commandErrorMessage(error)}`, '[HAL]')
     } finally {
       setPendingMotionAction(null)
     }
@@ -650,6 +664,9 @@ function MotionCard({
         <Space wrap>
           <Button icon={<PlugZap size={15} />} loading={pendingMotionAction === 'enable'} onClick={() => void handleEnable()}>
             使能全部
+          </Button>
+          <Button danger icon={<Usb size={15} />} loading={pendingMotionAction === 'disable'} onClick={() => void handleDisable()}>
+            断使能
           </Button>
           <Button icon={<RotateCcw size={15} />} loading={pendingMotionAction === 'home'} onClick={handleHome}>
             回零
@@ -913,6 +930,7 @@ function GripperCard({
   const targetKey = side === 'left' ? 'targetLeftMm' : 'targetRightMm'
   const slaveKey = side === 'left' ? 'leftSlaveId' : 'rightSlaveId'
   const enabledKey = side === 'left' ? 'leftEnabled' : 'rightEnabled'
+  const gripperEnabled = Boolean(config.gripper[enabledKey])
   const gapMinKey = side === 'left' ? 'leftGapMinMm' : 'rightGapMinMm'
   const gapMaxKey = side === 'left' ? 'leftGapMaxMm' : 'rightGapMaxMm'
   const setTarget = (value: number) => updateConfig({ gripper: { ...config.gripper, [targetKey]: value } })
@@ -1020,16 +1038,16 @@ function GripperCard({
         </div>
         <div className="gripper-action-section">
           <Button
-            type={config.gripper[enabledKey] ? 'default' : 'primary'}
+            type={gripperEnabled ? 'default' : 'primary'}
             icon={<PlugZap size={15} />}
-            onClick={() => issueManualGripperMove(side, config.gripper[enabledKey] ? 'disable' : 'enable')}
+            onClick={() => issueManualGripperMove(side, gripperEnabled ? 'disable' : 'enable')}
           >
-            {config.gripper[enabledKey] ? '断使能' : '使能'}
+            {gripperEnabled ? '断使能' : '使能'}
           </Button>
-          <Button onClick={() => issueManualGripperMove(side, 'target', config.gripper[targetKey])}>执行目标</Button>
-          <Button onClick={() => issueManualGripperMove(side, 'open')}>打开</Button>
-          <Button onClick={() => issueManualGripperMove(side, 'close')}>闭合</Button>
-          <Button icon={<RotateCcw size={15} />} onClick={() => setTargetAndRun('回零', 0)}>
+          <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'target', config.gripper[targetKey])}>执行目标</Button>
+          <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'open')}>打开</Button>
+          <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'close')}>闭合</Button>
+          <Button disabled={!gripperEnabled} icon={<RotateCcw size={15} />} onClick={() => setTargetAndRun('回零', 0)}>
             回零
           </Button>
           <Button icon={<Square size={15} />} onClick={() => issueManualGripperMove(side, 'stop')}>
@@ -1425,6 +1443,7 @@ function ManualArmControl({
   config,
   manualControl,
   nowMs,
+  motionEnabled,
   selectManualAxis,
   setManualAxisStep,
   setManualSpeedMode,
@@ -1436,6 +1455,7 @@ function ManualArmControl({
   config: AppConfig
   manualControl: ManualControlState
   nowMs: number
+  motionEnabled: boolean | null | undefined
   selectManualAxis: (side: RobotSide, axis: ManualControlAxis) => void
   setManualAxisStep: (unit: 'um' | '°', value: number) => void
   setManualSpeedMode: (mode: ManualSpeedMode) => void
@@ -1458,6 +1478,7 @@ function ManualArmControl({
   const axisBusy = busyUntil > nowMs
   const busyText = `${Math.max(0, (busyUntil - nowMs) / 1000).toFixed(1)}s`
   const speedUnit = axisIndex < 3 ? 'um/s' : '°/s'
+  const motionReady = mockMode || motionEnabled !== false
 
   return (
     <article className={`manual-arm-card ${manualControl.selectedSide === side ? 'manual-card-active' : ''}`}>
@@ -1467,7 +1488,9 @@ function ManualArmControl({
           <Typography.Text type="secondary">Card {side === 'left' ? config.motion.leftCardNo : config.motion.rightCardNo} · {sideSpec.axisOrder.join(' / ')}</Typography.Text>
         </div>
         <Space wrap>
-          <Tag color="success">使能</Tag>
+          <Tag color={motionEnabled === true ? 'success' : motionEnabled === false ? 'warning' : 'default'}>
+            {motionEnabled === true ? '已使能' : motionEnabled === false ? '未使能' : '使能未知'}
+          </Tag>
           <Tag>检测通过</Tag>
           <Tag color="processing">{manualControl.speedMode}</Tag>
         </Space>
@@ -1512,10 +1535,10 @@ function ManualArmControl({
             </Form.Item>
           </Form>
           <div className="manual-action-row">
-            <Button disabled={axisBusy} onClick={() => issueManualAxisMove(side, selectedAxis, -1)}>
+            <Button disabled={axisBusy || !motionReady} onClick={() => issueManualAxisMove(side, selectedAxis, -1)}>
               {axisBusy ? busyText : `-${stepValue}${unit}`}
             </Button>
-            <Button type="primary" disabled={axisBusy} onClick={() => issueManualAxisMove(side, selectedAxis, 1)}>
+            <Button type="primary" disabled={axisBusy || !motionReady} onClick={() => issueManualAxisMove(side, selectedAxis, 1)}>
               {axisBusy ? busyText : `+${stepValue}${unit}`}
             </Button>
             <Button icon={<Square size={15} />} onClick={() => injectLog('WARNING', `${sideSpec.shortLabel} ${selectedAxis} manual stop requested`, '[HAL]')}>
@@ -1524,7 +1547,15 @@ function ManualArmControl({
             <Button icon={<Activity size={15} />} onClick={() => injectLog('INFO', `${sideSpec.shortLabel} manual self-check requested`, '[HAL]')}>
               检测
             </Button>
-            <Button icon={<PlugZap size={15} />} onClick={() => injectLog('INFO', `${sideSpec.shortLabel} manual enable requested`, '[HAL]')}>
+            <Button
+              icon={<PlugZap size={15} />}
+              onClick={() => {
+                injectLog('INFO', `${sideSpec.shortLabel} manual enable requested`, '[HAL]')
+                void enableMotionSide(side).catch((error) =>
+                  injectLog('ERROR', `${sideSpec.shortLabel} manual enable failed: ${String(error)}`, '[HAL]'),
+                )
+              }}
+            >
               使能
             </Button>
             <Button danger icon={<ShieldAlert size={15} />} onClick={() => injectLog('ERROR', `${sideSpec.shortLabel} manual emergency stop requested`, '[SAFETY]')}>
@@ -1555,6 +1586,7 @@ function ManualGripperControl({
   const targetKey = side === 'left' ? 'targetLeftMm' : 'targetRightMm'
   const slaveKey = side === 'left' ? 'leftSlaveId' : 'rightSlaveId'
   const enabledKey = side === 'left' ? 'leftEnabled' : 'rightEnabled'
+  const gripperEnabled = Boolean(config.gripper[enabledKey])
   const setTarget = (value: number) => updateConfig({ gripper: { ...config.gripper, [targetKey]: value } })
   const currentText = formatGripperPosition(currentMm)
   const jawMm = safeGripperPosition(currentMm)
@@ -1592,13 +1624,13 @@ function ManualGripperControl({
             </Form.Item>
           </Form>
           <div className="manual-action-row">
-            <Button type={config.gripper[enabledKey] ? 'default' : 'primary'} icon={<PlugZap size={15} />} onClick={() => issueManualGripperMove(side, config.gripper[enabledKey] ? 'disable' : 'enable')}>
-              {config.gripper[enabledKey] ? '断使能' : '使能'}
+            <Button type={gripperEnabled ? 'default' : 'primary'} icon={<PlugZap size={15} />} onClick={() => issueManualGripperMove(side, gripperEnabled ? 'disable' : 'enable')}>
+              {gripperEnabled ? '断使能' : '使能'}
             </Button>
-            <Button onClick={() => issueManualGripperMove(side, 'target', config.gripper[targetKey])}>执行目标</Button>
-            <Button onClick={() => issueManualGripperMove(side, 'open')}>打开</Button>
-            <Button onClick={() => issueManualGripperMove(side, 'close')}>闭合</Button>
-            <Button icon={<RotateCcw size={15} />} onClick={() => issueManualGripperMove(side, 'home')}>回零</Button>
+            <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'target', config.gripper[targetKey])}>执行目标</Button>
+            <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'open')}>打开</Button>
+            <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'close')}>闭合</Button>
+            <Button disabled={!gripperEnabled} icon={<RotateCcw size={15} />} onClick={() => issueManualGripperMove(side, 'home')}>回零</Button>
             <Button icon={<Square size={15} />} onClick={() => issueManualGripperMove(side, 'stop')}>停止</Button>
           </div>
         </div>
@@ -1719,6 +1751,7 @@ function ManualControlPanel({
   updateConfig,
   manualControl,
   nowMs,
+  motionEnabled,
   selectManualAxis,
   setManualAxisStep,
   setManualSpeedMode,
@@ -1738,6 +1771,7 @@ function ManualControlPanel({
   updateConfig: (patch: Partial<AppConfig>) => void
   manualControl: ManualControlState
   nowMs: number
+  motionEnabled: TelemetryFrame['motionEnabled']
   selectManualAxis: (side: RobotSide, axis: ManualControlAxis) => void
   setManualAxisStep: (unit: 'um' | '°', value: number) => void
   setManualSpeedMode: (mode: ManualSpeedMode) => void
@@ -1768,6 +1802,7 @@ function ManualControlPanel({
             config={config}
             manualControl={manualControl}
             nowMs={nowMs}
+            motionEnabled={motionEnabled?.[side] ?? null}
             selectManualAxis={selectManualAxis}
             setManualAxisStep={setManualAxisStep}
             setManualSpeedMode={setManualSpeedMode}
@@ -2007,6 +2042,7 @@ export function SettingsView() {
                 updateConfig={updateConfig}
                 manualControl={manualControl}
                 nowMs={manualClockMs}
+                motionEnabled={frame.motionEnabled}
                 selectManualAxis={selectManualAxis}
                 setManualAxisStep={setManualAxisStep}
                 setManualSpeedMode={setManualSpeedMode}

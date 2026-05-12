@@ -46,7 +46,7 @@ export function PlatformOverview({
       state: frame.wsOk ? processState(frame.processStatus, 'backend') : 'error',
       primary: `Telemetry ${frame.resource.wsHz}Hz`,
       secondary: `UI ${frame.resource.uiFps.toFixed(1)} FPS，内存 ${frame.resource.memMb.toFixed(0)} MB`,
-      metric: 'ws://localhost:8080/ws',
+      metric: 'ws://127.0.0.1:18082/ws',
       group: '通信',
     },
     {

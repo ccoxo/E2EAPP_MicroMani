@@ -4,7 +4,7 @@ import asyncio
 from typing import Any
 
 from backend.core.defaults import default_config
-from backend.core.schemas import GripperCommandRequest
+from backend.core.schemas import GripperCommandRequest, ManualAxisMoveRequest
 from backend.drivers.gripper_rs485 import GripperResult
 from backend.services.command_service import CommandService
 from backend.services.gripper_worker_service import GripperWorkerService
@@ -28,9 +28,25 @@ class FakeTelemetry:
         _ = (side, command, target_mm)
         return 0.0
 
+    def apply_axis_move(self, side: str, axis: str, direction: int, step: float) -> float:
+        _ = (side, axis, direction)
+        return step
+
+    def set_motion_enabled(self, side: str, enabled: bool | None) -> None:
+        _ = (side, enabled)
+
 
 class FakeHal:
-    pass
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self.commands: list[tuple[str, dict[str, Any]]] = []
+
+    async def motion_state(self) -> dict[str, Any]:
+        return {"enabled": [self.enabled] * 12}
+
+    async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        self.commands.append((name, payload or {}))
+        return {"command": name, "payload": payload or {}}
 
 
 class FakeLogs:
@@ -73,6 +89,7 @@ class FakeWorkers:
 def test_gripper_command_uses_dual_worker_when_enabled() -> None:
     config = default_config()
     config["gripper"]["sampleMode"] = "dual_worker"
+    config["gripper"]["leftEnabled"] = True
     settings = FakeSettings(config)
     hardware = FakeHardware()
     workers = FakeWorkers()
@@ -90,6 +107,7 @@ def test_gripper_command_uses_dual_worker_when_enabled() -> None:
 
 def test_gripper_command_keeps_direct_driver_when_worker_disabled() -> None:
     config = default_config()
+    config["gripper"]["rightEnabled"] = True
     settings = FakeSettings(config)
     hardware = FakeHardware()
     workers = FakeWorkers()
@@ -103,6 +121,58 @@ def test_gripper_command_keeps_direct_driver_when_worker_disabled() -> None:
     assert workers.calls == []
     assert hardware.gripper.calls == [("right", "target", 6.0)]
     assert settings.config["gripper"]["targetRightMm"] == 6.0
+
+
+def test_gripper_motion_command_rejects_disabled_side() -> None:
+    config = default_config()
+    settings = FakeSettings(config)
+    service = CommandService(settings, FakeTelemetry(), FakeHal(), FakeLogs(), FakeHardware(), FakeWorkers())
+
+    try:
+        asyncio.run(service.gripper_command(GripperCommandRequest(side="left", command="open")))
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected disabled gripper command to fail")
+
+    assert "left gripper is disabled" in message
+
+
+def test_manual_axis_move_rejects_disabled_motion_side() -> None:
+    config = default_config()
+    settings = FakeSettings(config)
+    hal = FakeHal(enabled=False)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    try:
+        asyncio.run(
+            service.manual_axis_move(
+                ManualAxisMoveRequest(side="left", axis="X", direction=1, step=100, speedMode="fine")
+            )
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected disabled motion side to fail")
+
+    assert "left motion axes are disabled" in message
+    assert hal.commands == []
+
+
+def test_manual_axis_move_allows_enabled_motion_side() -> None:
+    config = default_config()
+    settings = FakeSettings(config)
+    hal = FakeHal(enabled=True)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    result = asyncio.run(
+        service.manual_axis_move(
+            ManualAxisMoveRequest(side="right", axis="X", direction=-1, step=100, speedMode="fine")
+        )
+    )
+
+    assert result["hal"]["command"] == "motion.manual_axis_move"
+    assert hal.commands[0][0] == "motion.manual_axis_move"
 
 
 def test_gripper_worker_sync_stops_workers_when_disabled() -> None:
