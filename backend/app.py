@@ -128,6 +128,32 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         config["teleop"][f"{side}Connected"] = connected
         return settings.save_config(config, emit_log=False)
 
+    async def release_runtime_handles(reason: str) -> dict[str, Any]:
+        gripper_tele.stop()
+        released_grippers: list[str] = []
+        gripper_errors: dict[str, str] = {}
+        for side in ("left", "right"):
+            try:
+                await commands.gripper_command(GripperCommandRequest(side=side, command="disable"))
+                released_grippers.append(side)
+            except RuntimeError as exc:
+                gripper_errors[side] = str(exc)
+                logs.error("[GRIPPER]", f"{side} gripper close-release failed: {exc}")
+            set_teleop_logical_connection(side, False)
+        config = settings.get_config()
+        config["gripper"]["leftEnabled"] = False
+        config["gripper"]["rightEnabled"] = False
+        settings.save_config(config, emit_log=False)
+        gripper_workers.stop_all()
+        await teleop_mapper.stop("teleop-connect")
+        await teleop_mapper.stop("recording")
+        logs.warning("[BACKEND]", f"runtime handles released: {reason}")
+        return {
+            "releasedGrippers": released_grippers,
+            "gripperErrors": gripper_errors,
+            "teleopConnected": {"left": False, "right": False},
+        }
+
     async def delayed_runtime_shutdown(reason: str) -> None:
         # 浏览器关闭后延迟停栈，给快速刷新或 WebSocket 重连留出缓冲时间。
         delay_sec = float(os.environ.get("APPSTATION_CLOSE_SHUTDOWN_DELAY_SEC", "5"))
@@ -256,11 +282,17 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/runtime/shutdown")
     async def runtime_shutdown(payload: dict[str, Any] | None = None) -> ApiEnvelope:
         reason = str((payload or {}).get("reason", "browser-close"))
+        release = await release_runtime_handles(reason)
         existing_task = app.state.shutdown_task
         if existing_task is not None and not existing_task.done():
             existing_task.cancel()
         app.state.shutdown_task = asyncio.create_task(delayed_runtime_shutdown(reason))
-        return envelope({"scheduled": True, "activeClients": len(app.state.ws_clients)})
+        return envelope({"scheduled": True, "activeClients": len(app.state.ws_clients), "release": release})
+
+    @app.post("/api/runtime/release_handles")
+    async def runtime_release_handles(payload: dict[str, Any] | None = None) -> ApiEnvelope:
+        reason = str((payload or {}).get("reason", "browser-close"))
+        return envelope(await release_runtime_handles(reason))
 
     @app.post("/api/hal/reconnect")
     async def reconnect_hal() -> ApiEnvelope:
@@ -396,6 +428,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             return envelope(await commands.enable_motion_side(side))
         except RuntimeError as exc:
             logs.error("[HAL]", f"enable_motion_side failed: {exc}")
+            raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
+
+    @app.post("/api/motion/{side}/disable_all")
+    async def disable_motion_side(side: str) -> ApiEnvelope:
+        if side not in {"left", "right"}:
+            raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
+        try:
+            return envelope(await commands.disable_motion_side(side))
+        except RuntimeError as exc:
+            logs.error("[HAL]", f"disable_motion_side failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
 
     @app.post("/api/motion/{side}/home")

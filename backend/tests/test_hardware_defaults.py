@@ -17,10 +17,10 @@ def test_motion_translation_profile_uses_um_units() -> None:
     config = default_config()
 
     translation = config["motion"]["leftProfile"]["translation"]
-    assert translation["startSpeed"] == 10
-    assert translation["maxSpeed"] == 100
-    assert translation["accTimeSec"] == 0.02
-    assert translation["decTimeSec"] == 0.02
+    assert translation["startSpeed"] == 100
+    assert translation["maxSpeed"] == 1000
+    assert translation["accTimeSec"] == 0.05
+    assert translation["decTimeSec"] == 0.05
     assert "acceleration" not in translation
     assert "maxAcceleration" not in translation
 

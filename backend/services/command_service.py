@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, cast
 
 from backend.core.config import SettingsService
 from backend.core.logging import LogService, now_ms
@@ -45,7 +45,19 @@ class CommandService:
         return result
 
     async def home_all(self) -> dict[str, object]:
-        result = await self.hal.command("motion.home_all")
+        config = self.settings.get_config()
+        origin = self._normalized_motion_origin(config)
+        if not bool(origin["valid"]):
+            raise RuntimeError("motion work origin is not captured")
+        left_pulse = cast(list[float], origin["leftPulse"])
+        right_pulse = cast(list[float], origin["rightPulse"])
+        result = await self.hal.command(
+            "motion.home_all",
+            {
+                "leftPulse": left_pulse,
+                "rightPulse": right_pulse,
+            },
+        )
         self.telemetry.home_all()
         self.logs.info("[HAL]", "home all requested")
         return result
@@ -56,6 +68,14 @@ class CommandService:
         self.telemetry.set_motion_enabled(side, True)
         side_label = "left" if side == "left" else "right"
         self.logs.info("[HAL]", f"{side_label} motion axes enable requested")
+        return result
+
+    async def disable_motion_side(self, side: str) -> dict[str, object]:
+        self._validate_side(side)
+        result = await self.hal.command("motion.disable_side", {"side": side})
+        self.telemetry.set_motion_enabled(side, False)
+        side_label = "left" if side == "left" else "right"
+        self.logs.info("[HAL]", f"{side_label} motion axes disable requested")
         return result
 
     async def home_motion_side(self, side: str) -> dict[str, object]:
@@ -132,6 +152,7 @@ class CommandService:
         # 所有手动 jog 都先过后端安全边界，再决定发往真机还是本地模拟。
         self._validate_manual_axis_safety(config, request)
         if self._real_hardware_mode(config):
+            await self._validate_motion_side_enabled(request.side)
             profile = self._axis_profile(config, request)
             hal_result = await self.hal.command(
                 "motion.manual_axis_move",
@@ -164,6 +185,7 @@ class CommandService:
 
     async def gripper_command(self, request: GripperCommandRequest) -> dict[str, object]:
         config = self.settings.get_config()
+        self._validate_gripper_command_enabled(config, request)
         if self.hardware is not None and self._real_hardware_mode(config):
             # 真机成功响应后才保存目标开合度，避免 UI 记住未执行的硬件状态。
             if self.gripper_workers is not None and self.gripper_workers.is_enabled(config):
@@ -214,6 +236,13 @@ class CommandService:
             config["gripper"][f"{request.side}Enabled"] = False
         self.settings.save_config(config, emit_log=False)
 
+    def _validate_gripper_command_enabled(self, config: dict[str, Any], request: GripperCommandRequest) -> None:
+        if request.command in {"enable", "disable", "stop"}:
+            return
+        enabled_key = f"{request.side}Enabled"
+        if not bool(config.get("gripper", {}).get(enabled_key, False)):
+            raise RuntimeError(f"{request.side} gripper is disabled; enable it before motion commands")
+
     def _validate_manual_axis_safety(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> None:
         # Per-jog safety bounds. The HAL applies its own absolute ceilings on top
         # of these and the soft-limit table further constrains the absolute
@@ -227,6 +256,20 @@ class CommandService:
             raise RuntimeError("manual rotation step must be <= 2 degree for hardware testing")
         if self._axis_profile(config, request)["maxVelocity"] <= 0:
             raise RuntimeError("manual axis velocity must be positive")
+
+    async def _validate_motion_side_enabled(self, side: str) -> None:
+        state = await self.hal.motion_state()
+        raw_enabled = state.get("enabled")
+        side_enabled: bool | None = None
+        if isinstance(raw_enabled, list) and len(raw_enabled) == 12:
+            values = raw_enabled[:6] if side == "left" else raw_enabled[6:12]
+            side_enabled = all(bool(value) for value in values)
+        elif isinstance(raw_enabled, dict):
+            value = raw_enabled.get(side)
+            if isinstance(value, bool):
+                side_enabled = value
+        if side_enabled is not True:
+            raise RuntimeError(f"{side} motion axes are disabled; enable the side before manual jog")
 
     def _axis_profile(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> dict[str, float]:
         motion = config["motion"]

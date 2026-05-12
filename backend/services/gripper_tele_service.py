@@ -104,12 +104,12 @@ class GripperTeleService:
             return
         self._stop_event = asyncio.Event()
         self._task = asyncio.get_running_loop().create_task(self._loop())
-        self._logs.info("[GRIPPER_TELE]", "gripper teleop started")
+        self._logs.info("[GRIPPER]", "gripper teleop started")
 
     def stop(self) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
-        self._logs.info("[GRIPPER_TELE]", "gripper teleop stopped")
+        self._logs.info("[GRIPPER]", "gripper teleop stopped")
 
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
@@ -149,6 +149,9 @@ class GripperTeleService:
                 }
 
                 for side, schmitt in (("left", self._left), ("right", self._right)):
+                    if not bool(config.get("gripper", {}).get(f"{side}Enabled", False)):
+                        schmitt.reset()
+                        continue
                     hand = hands.get(side, {})
                     if not hand.get("connected"):
                         continue
@@ -159,7 +162,7 @@ class GripperTeleService:
 
                     if diag:
                         self._logs.info(
-                            "[GRIPPER_TELE]",
+                            "[GRIPPER]",
                             f"{side} gap={gap_mm:.2f}mm state={schmitt.state}",
                         )
 
@@ -169,7 +172,7 @@ class GripperTeleService:
                         result = await asyncio.to_thread(
                             self._issue_command, config, side, cmd, speed, torque
                         )
-                        self._logs.info("[GRIPPER_TELE]", f"{side} cmd={cmd} → {result.message}")
+                        self._logs.info("[GRIPPER]", f"{side} cmd={cmd} → {result.message}")
 
                     if schmitt.tick_object_detect():
                         result = await asyncio.to_thread(
@@ -183,12 +186,12 @@ class GripperTeleService:
                             schmitt.set_object_detected(detected)
                             label = "已夹持物体" if detected else "未检出物体"
                             self._logs.info(
-                                "[GRIPPER_TELE]",
+                                "[GRIPPER]",
                                 f"{side} 物体检出: {label} pos={result.position_mm:.1f}mm",
                             )
 
             except Exception as exc:
-                self._logs.warning("[GRIPPER_TELE]", f"loop error: {exc}")
+                self._logs.warning("[GRIPPER]", f"loop error: {exc}")
 
             await asyncio.sleep(1.0 / loop_hz)
 
@@ -203,6 +206,8 @@ class GripperTeleService:
         torque: int,
     ) -> Any:
         cfg = copy.deepcopy(config)
+        if not bool(cfg.get("gripper", {}).get(f"{side}Enabled", False)):
+            raise RuntimeError(f"{side} gripper is disabled; enable it before teleop")
         cfg["gripper"]["commandSpeed"] = speed
         cfg["gripper"]["commandTorque"] = torque
         if self._gripper_workers is not None and self._gripper_workers.is_enabled(cfg):

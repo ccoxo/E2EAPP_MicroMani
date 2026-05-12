@@ -5,10 +5,10 @@ from typing import Any
 
 DEFAULT_MOTION_PROFILE: dict[str, Any] = {
     "translation": {
-        "startSpeed": 10,
-        "maxSpeed": 100,
-        "accTimeSec": 0.02,
-        "decTimeSec": 0.02,
+        "startSpeed": 100,
+        "maxSpeed": 1000,
+        "accTimeSec": 0.05,
+        "decTimeSec": 0.05,
     },
     "rotation": {
         "startSpeed": 0.3,
@@ -41,8 +41,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "cameras": {
         "global": "AR0234 / index 2",
+        "globalIdentity": "USB\\VID_1D6B&PID_0102&MI_00\\7&235CBC02&0&0000",
         "wristLeft": "IMX258 / index 1",
+        "wristLeftIdentity": "USB\\VID_0EDC&PID_3080&MI_00\\7&38B4EA25&0&0000",
         "wristRight": "IMX258 / index 0",
+        "wristRightIdentity": "USB\\VID_0EDC&PID_3080&MI_00\\6&1BBFDB86&0&0000",
         "previewResolution": "640x480",
         "globalResolution": "640x480",
         "wristLeftResolution": "640x480",
