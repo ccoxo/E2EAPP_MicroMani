@@ -67,7 +67,16 @@ class GripperWorkerService:
         with self._lock:
             self._ensure_workers(config)
             self._drain_status()
-            return {side: dict(sample) for side, sample in self._latest.items()}
+            stale_ms = float(config.get("gripper", {}).get("sampleStaleMs", 500))
+            result: dict[str, dict[str, Any]] = {}
+            for side, sample in self._latest.items():
+                # 调用方需要区分“读到旧值”和“读不到值”，因此在缓存层统一标记过期状态。
+                item = dict(sample)
+                age_ms = self._sample_age_ms(item)
+                item["ageMs"] = age_ms
+                item["stale"] = age_ms > stale_ms
+                result[side] = item
+            return result
 
     def position(self, config: dict[str, Any], side: str, timeout_sec: float = 0.25) -> GripperResult:
         if not self.is_enabled(config):

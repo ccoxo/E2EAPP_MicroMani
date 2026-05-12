@@ -16,10 +16,10 @@
 
 **目的**：建立契约测试夹具、确认当前代码入口，并把设计文档中的验证基线落到可执行测试文件。
 
-- [ ] T001 在 `backend/tests/test_dataset_recorder.py` 增加 LeRobot v3 feature 契约常量夹具，覆盖 14 维 `observation.state`、14 维 `action`、12 维 `observation.pulses`、双路 6 维力觉和三路相机字段
-- [ ] T002 [P] 在 `backend/tests/test_app.py` 增加 `/api/record/session/create`、`/api/record/episode/save`、`/api/record/status`、`/api/datasets` 的 API 响应契约样例
-- [ ] T003 在 `backend/tests/test_dataset_recorder.py` 增加 HAL motion、Omega、force、camera、gripper 的 fake source helper，包含 sample timestamp、timeout 和 stale 标记
-- [ ] T004 在 `backend/tests/test_app.py` 增加 Mock HAL/Mock camera 的 FastAPI test client 初始化 helper，隔离 `APPSTATION_RUNTIME_DIR` 和 `APPSTATION_HAL_MODE`
+- [X] T001 在 `backend/tests/test_dataset_recorder.py` 增加 LeRobot v3 feature 契约常量夹具，覆盖 14 维 `observation.state`、14 维 `action`、12 维 `observation.pulses`、双路 6 维力觉和三路相机字段
+- [X] T002 [P] 在 `backend/tests/test_app.py` 增加 `/api/record/session/create`、`/api/record/episode/save`、`/api/record/status`、`/api/datasets` 的 API 响应契约样例
+- [X] T003 在 `backend/tests/test_dataset_recorder.py` 增加 HAL motion、Omega、force、camera、gripper 的 fake source helper，包含 sample timestamp、timeout 和 stale 标记
+- [X] T004 在 `backend/tests/test_app.py` 增加 Mock HAL/Mock camera 的 FastAPI test client 初始化 helper，隔离 `APPSTATION_RUNTIME_DIR` 和 `APPSTATION_HAL_MODE`
 - [X] T005 在 `specs/001-data-collection-spec/quickstart.md` 记录当前实现与 `specs/001-data-collection-spec/contracts/dataset-metadata-v3.md` 的差距核对项，并补充 Windows LeRobot 预检：conda 环境、`ffmpeg=7.1.1`、`av`、`libsvtav1`、禁止整体 import `lerobot.scripts.lerobot_record`、`LeRobotDataset.create(repo_id="user/name", root=...)`
 
 ---
@@ -40,8 +40,8 @@
 - [X] T013 [P] 在 `hal/include/HalTypes.h` 为 motion state 和 Omega state 增加读取时间字段
 - [X] T014 [P] 在 `hal/src/HalServer.cpp` 为 `/motion/state` 和 `/omega/state` JSON 输出增加读取时间字段
 - [X] T015 [P] 在 `backend/services/telemetry_hub.py` 保持 `/ws` 现有字段兼容，并仅以 additive 方式暴露 recording、episodeCount、frameCount 和硬件可信度相关字段
-- [ ] T016 [P] 在 `backend/tests/test_dataset_recorder.py` 增加 14 维 state/action、12 维 pulses、standard features、工作原点换算、HAL telemetry fallback 和 `observation.gripper` 排除测试
-- [ ] T017 [P] 在 `backend/tests/test_app.py` 增加 HAL/Omega timestamp 归一化测试，覆盖 real client、test client、HAL jog 单步/Yaw 限制和采集中 enabled/home/jog 状态保留
+- [X] T016 [P] 在 `backend/tests/test_dataset_recorder.py` 增加 14 维 state/action、12 维 pulses、standard features、工作原点换算、HAL telemetry fallback 和 `observation.gripper` 排除测试
+- [X] T017 [P] 在 `backend/tests/test_app.py` 增加 HAL/Omega timestamp 归一化测试，覆盖 real client、test client、HAL jog 单步/Yaw 限制和采集中 enabled/home/jog 状态保留
 
 **检查点**：recorder 能表达新的数据契约；HAL/Omega 时间字段能进入后端；API/WS 兼容性有测试保护。
 
@@ -49,9 +49,9 @@
 
 ## 阶段 3：用户故事 1 - 录制可复核的双臂数据（优先级：P1，MVP）
 
-**目标**：操作员完成一次短采集并保存 episode 后，可复核 14 维 state、14 维 action、12 轴 pulses、双路力觉、力觉窗口和三路相机数据。
+**目标**：操作员完成一次短采集并保存 episode 后，可复核 14 维 state、14 维 action、12 轴 pulses、双路 6 维力觉和三路相机数据。
 
-**独立测试**：使用 Mock HAL/Mock camera 创建会话、保存 episode，然后检查帧数、任务描述、标准 feature shape、力觉窗口、三路图像和相机缓存兜底。
+**独立测试**：使用 Mock HAL/Mock camera 创建会话、保存 episode，然后检查帧数、任务描述、标准 feature shape、双路力觉、三路图像和相机缓存兜底。
 
 ### 用户故事 1 测试
 
@@ -65,7 +65,7 @@
 
 - [X] T023 [US1] 在 `backend/services/dataset_recorder.py` 更新 `_features()` 和 fallback metadata 写入，使其输出 LeRobot v3 标准 features
 - [X] T024 [US1] 在 `backend/services/dataset_recorder.py` 更新 `_native_features()`，复用 LeRobot v3 标准 features 并排除标准 `observation.gripper`
-- [X] T025 [US1] 在 `backend/services/dataset_recorder.py` 更新 `_collect_frame()`，在每帧生成 14 维 `observation.state`、14 维 `action`、12 维 `observation.pulses`、force windows、force offsets 和 camera payload
+- [X] T025 [US1] 在 `backend/services/dataset_recorder.py` 更新 `_collect_frame()`，在每帧生成 14 维 `observation.state`、14 维 `action`、12 维 `observation.pulses`、双路 6 维力觉和 camera payload，且不写入旧 force-window 调试字段
 - [X] T026 [US1] 在 `backend/services/dataset_recorder.py` 更新 fallback frame writer，使 `episodes.jsonl` 和 frame JSONL 持久化 v3 兼容字段
 - [X] T027 [US1] 在 `backend/services/dataset_recorder.py` 更新 native frame writer，只向 `LeRobotDataset.add_frame()` 写入标准训练字段和 LeRobot 索引字段
 - [X] T028 [US1] 在 `backend/services/dataset_recorder.py` 更新 LeRobot native 路径，先执行 Windows 兼容预检且不得整体 import `lerobot.scripts.lerobot_record`，再优先使用 `LeRobotDataset.create(repo_id="user/name", root=...)`、`LeRobotDataset.resume()`、`add_frame()`、`save_episode()` 和 `finalize()`
@@ -88,7 +88,7 @@
 - [X] T032 [P] [US2] 在 `backend/tests/test_app.py` 增加 `GET /api/datasets` 读取 v3 metadata、fps、format、episode count 和 visible episode list 的失败优先测试
 - [X] T033 [US2] 在 `backend/tests/test_app.py` 增加 `GET /api/datasets/{dataset_id}/episodes/{episode_id}` 暴露 feature shape 摘要和 episode 抽样信息的失败优先测试
 - [X] T034 [US2] 在 `backend/tests/test_app.py` 增加 `GET /api/datasets/{dataset_id}/frame_image` 从三路 v3 image key 抽样图像的失败优先测试
-- [ ] T035 [US2] 在 `backend/tests/test_app.py` 增加数据集 create、rename、review save、stats、split、clean、export、push 以及 episode rename、status mark、delete 后不再作为可用样本展示的失败优先测试
+- [X] T035 [US2] 在 `backend/tests/test_app.py` 增加数据集 create、rename、review save、stats、split、clean、export、push 以及 episode rename、status mark、delete 后不再作为可用样本展示的失败优先测试
 
 ### 用户故事 2 实现
 
@@ -99,7 +99,7 @@
 - [X] T040 [US2] 在 `backend/services/dataset_recorder.py` 更新 `resolve_frame_image()`，支持 `observation.images.global`、`observation.images.wrist_left`、`observation.images.wrist_right` 和旧 camera key alias
 - [X] T041 [US2] 在 `backend/services/dataset_recorder.py` 更新 dataset create、update、review save、stats、split、clean、export、push、`update_episode()` 和 `delete_episode()`，确保 invalid/deleted episode 不再进入 visible usable sample 列表，外部推送未启用时明确返回本地数据已就绪但未推送
 - [X] T042 [US2] 在 `backend/app.py` 增加或修正 `GET /api/datasets/{dataset_id}/episodes/{episode_id}` 路由，并检查 dataset create、review save、stats、split、clean、export、push 路由都返回兼容 envelope
-- [ ] T043 [P] [US2] 在 `frontend/src/types.ts` 更新 dataset、episode、feature summary 和 sample image 的 TypeScript 类型
+- [X] T043 [P] [US2] 在 `frontend/src/types.ts` 更新 dataset、episode、feature summary 和 sample image 的 TypeScript 类型
 - [X] T044 [US2] 在 `frontend/src/api/index.ts` 更新数据集 API client，消费新增 episode detail、frame image、dataset lifecycle 和本地就绪未推送字段且保持旧字段兼容
 - [X] T045 [US2] 在 `frontend/src/views/DatasetView.tsx` 更新数据集复核 UI，显示 v3 feature shape、帧数、时长、力觉摘要、抽样轨迹、三路图像样本和各相机分辨率来源
 
@@ -115,11 +115,11 @@
 
 ### 用户故事 3 测试
 
-- [ ] T046 [P] [US3] 在 `backend/tests/test_app.py` 增加 Mock HAL/Mock camera 端到端录制、保存、列出、复核的失败优先测试
-- [ ] T047 [P] [US3] 在 `backend/tests/test_dataset_recorder.py` 增加 LeRobot 原生依赖不可用时 fallback 录制与复核兼容性的失败优先测试
+- [X] T046 [P] [US3] 在 `backend/tests/test_app.py` 增加 Mock HAL/Mock camera 端到端录制、保存、列出、复核的失败优先测试
+- [X] T047 [P] [US3] 在 `backend/tests/test_dataset_recorder.py` 增加 LeRobot 原生依赖不可用时 fallback 录制与复核兼容性的失败优先测试
 - [X] T048 [US3] 在 `backend/tests/test_dataset_recorder.py` 增加同一 tick 内并发启动 HAL、force、gripper、Omega 和 camera source tasks 的失败优先测试
-- [X] T049 [US3] 在 `backend/tests/test_dataset_recorder.py` 增加 HAL skew、camera skew、source timeout、source stale 和 force-window offsets 的失败优先测试
-- [ ] T050 [P] [US3] 在 `backend/tests/test_force_nidaq_driver.py` 增加强制力觉窗口采样失败或 timeout 时使用 latest scalar/ring-buffer fallback 的失败优先测试
+- [X] T049 [US3] 在 `backend/tests/test_dataset_recorder.py` 增加 HAL skew、camera skew、source timeout、source stale 和 force cache fallback 的失败优先测试
+- [X] T050 [P] [US3] 在 `backend/tests/test_force_nidaq_driver.py` 增加强制力觉窗口采样失败或 timeout 时使用 latest scalar/ring-buffer fallback 的失败优先测试
 
 ### 用户故事 3 实现
 
@@ -127,11 +127,11 @@
 - [X] T052 [US3] 在 `backend/services/dataset_recorder.py` 将 `_collect_frame()` 改为同一 tick 内创建 HAL、force、gripper、Omega 和三路 camera tasks 后再等待结果
 - [X] T053 [US3] 在 `backend/services/dataset_recorder.py` 为各来源执行 per-source timeout，任何单来源 timeout 或异常都不得阻塞其他来源写入当前帧
 - [X] T054 [US3] 在 `backend/services/dataset_recorder.py` 为三路相机维护最近一次有效帧缓存；当前帧不可用时直接使用缓存，启动无缓存时才使用占位帧
-- [ ] T055 [US3] 在 `backend/services/dataset_recorder.py` 记录 source start/finish、sample time、skew、timeout、stale 和 cache_used，用于判断同一 tick 对齐契约
-- [ ] T056 [US3] 在 `backend/drivers/force_nidaq.py` 实现或整理力觉连续采样/ring-buffer 窗口接口，使 recorder 可读取当前 tick 前最近一帧周期的窗口
-- [ ] T057 [US3] 在 `backend/services/dataset_recorder.py` 使用 `backend/drivers/force_nidaq.py` 的 ring-buffer 窗口接口计算 force window offsets，避免每帧阻塞采样
-- [ ] T058 [US3] 在 `backend/services/gripper_worker_service.py` 为夹爪 worker 缓存值增加 sample timestamp 或 stale marker，供 recorder 采集帧使用
-- [ ] T059 [US3] 在 `backend/services/telemetry_hub.py` 为直接夹爪采样路径返回按侧区分的 sample timestamp 和 age 信息，供 recorder 降级使用
+- [X] T055 [US3] 在 `backend/services/dataset_recorder.py` 记录 source start/finish、sample time、skew、timeout、stale 和 cache_used，用于判断同一 tick 对齐契约
+- [X] T056 [US3] 在 `backend/drivers/force_nidaq.py` 实现或整理力觉连续采样/ring-buffer 窗口接口，使 recorder 可读取当前 tick 前最近一帧周期的缓存
+- [X] T057 [US3] 在 `backend/services/dataset_recorder.py` 使用 `backend/drivers/force_nidaq.py` 的缓存接口读取当前 tick 的双路 6 维力觉，避免每帧阻塞采样且不写入旧 force-window offsets
+- [X] T058 [US3] 在 `backend/services/gripper_worker_service.py` 为夹爪 worker 缓存值增加 sample timestamp 或 stale marker，供 recorder 采集帧使用
+- [X] T059 [US3] 在 `backend/services/telemetry_hub.py` 为直接夹爪采样路径返回按侧区分的 sample timestamp 和 age 信息，供 recorder 降级使用
 - [X] T060 [US3] 在 `backend/services/dataset_recorder.py` 保留 LeRobot native 可用时的 native 写入路径，并在不可用时自动回退到 JSON/JPEG fallback 路径
 - [X] T061 [P] [US3] 在 `hal/src/LTDMCDriver.cpp` 确认真实硬件不可用、DLL 缺失或控制卡不足时错误状态可由 HAL health 明确暴露，并验证 jog 平移单步、旋转单步、Yaw 限位和采集中 enabled/home/jog 状态保留，不得误报真机验证通过
 - [X] T062 [P] [US3] 在 `hal/src/Omega7Driver.cpp` 确认 Omega.7 读取失败、单手缺失或按钮状态缺失时状态字段仍可返回并标记不可完全可信
@@ -144,14 +144,14 @@
 
 **目的**：完成质量门禁、文档记录、契约同步和硬件冒烟。
 
-- [ ] T063 [P] 在 `backend/tests/test_app.py` 增加 `/ws` telemetry 兼容性和结构化日志测试，确认 `recording`、`episodeCount`、`frameCount`、`jointPositions`、`forceLeft`、`forceRight`、`gripperPositions`、`cameras` 字段未被移除，并断言采集、保存、丢弃、结束、恢复写入 LEROBOT/CAMERA/FORCE/SAFETY/HAL/BACKEND 中的适用通道
+- [X] T063 [P] 在 `backend/tests/test_app.py` 增加 `/ws` telemetry 兼容性和结构化日志测试，确认 `recording`、`episodeCount`、`frameCount`、`jointPositions`、`forceLeft`、`forceRight`、`gripperPositions`、`cameras` 字段未被移除，并断言采集、保存、丢弃、结束、恢复写入 LEROBOT/CAMERA/FORCE/SAFETY/HAL/BACKEND 中的适用通道
 - [ ] T064 [P] 在 `backend/tests/test_dataset_recorder.py` 增加 20 秒 mock episode 至少达到 95% 目标帧数的 timing 冒烟测试
 - [ ] T065 [P] 如果实现改变 API 或 telemetry response 字段名，在 `specs/001-data-collection-spec/contracts/recording-api.md` 同步更新录制和数据集 API 契约
 - [ ] T066 [P] 如果实现改变 `/ws` 字段，在 `specs/001-data-collection-spec/contracts/telemetry-ws.md` 同步更新 telemetry additive 字段说明
-- [ ] T067 在 `backend/tests/test_dataset_recorder.py` 和 `backend/tests/test_app.py` 运行相关后端测试，并把结果记录到 `specs/001-data-collection-spec/quickstart.md`
-- [ ] T068 在 `backend/pyproject.toml` 所在后端环境运行 `ruff check .`，并把结果记录到 `specs/001-data-collection-spec/quickstart.md`
-- [ ] T069 从项目根目录运行 `mypy backend`，并把结果记录到 `specs/001-data-collection-spec/quickstart.md`
-- [ ] T070 如果前端类型、API client 或 UI 变更，在 `frontend/package.json` 所在目录运行 `npm run build`，并把结果记录到 `specs/001-data-collection-spec/quickstart.md`
+- [X] T067 在 `backend/tests/test_dataset_recorder.py` 和 `backend/tests/test_app.py` 运行相关后端测试，并把结果记录到 `specs/001-data-collection-spec/quickstart.md`
+- [X] T068 在 `backend/pyproject.toml` 所在后端环境运行 `ruff check .`，并把结果记录到 `specs/001-data-collection-spec/quickstart.md`
+- [X] T069 从项目根目录运行 `mypy backend`，并把结果记录到 `specs/001-data-collection-spec/quickstart.md`
+- [X] T070 如果前端类型、API client 或 UI 变更，在 `frontend/package.json` 所在目录运行 `npm run build`，并把结果记录到 `specs/001-data-collection-spec/quickstart.md`
 - [ ] T071 执行 `specs/001-data-collection-spec/quickstart.md` 的 Windows LeRobot native 预检和 Mock HAL/Mock camera 冒烟流程，并记录 dependency preflight、dataset metadata、episode summary 和 frame image 输出
 - [ ] T072 在真实硬件工作站执行 `specs/001-data-collection-spec/quickstart.md` 的真实硬件冒烟清单，并把 HAL、camera、force、Omega 和 episode 保存结果记录到 `hal/README.md`
 

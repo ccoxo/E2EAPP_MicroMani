@@ -36,9 +36,28 @@ DATASET_LIST_CONTRACT_EXAMPLE = {
 }
 
 
+def create_mock_record_client(tmp_path: Path, monkeypatch: MonkeyPatch) -> TestClient:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    monkeypatch.setenv("APPSTATION_LEROBOT_NATIVE", "0")
+    return TestClient(create_app(tmp_path / "runtime"))
+
+
 def _clear_camera_identities(config: dict) -> None:
     for key in ("globalIdentity", "wristLeftIdentity", "wristRightIdentity"):
         config["cameras"][key] = ""
+
+
+def test_recording_api_contract_examples_cover_required_routes() -> None:
+    assert set(RECORDING_SAVE_CONTRACT_EXAMPLE) == {"episode", "status"}
+    assert "recording" in RECORDING_SAVE_CONTRACT_EXAMPLE["status"]
+    assert DATASET_LIST_CONTRACT_EXAMPLE["format"].startswith("lerobot-v3")
+    for path in (
+        "/api/record/session/create",
+        "/api/record/episode/save",
+        "/api/record/status",
+        "/api/datasets",
+    ):
+        assert path.startswith("/api/")
 
 
 def test_settings_round_trip(tmp_path: Path) -> None:
@@ -104,14 +123,49 @@ def test_command_envelope_and_telemetry_ws(tmp_path: Path, monkeypatch: MonkeyPa
     assert message["type"] == "telemetry"
     frame = message["data"]
     assert len(frame["jointPositions"]) == 12
+    assert len(frame["gripperPositions"]) == 2
     assert frame["motionEnabled"] == {"left": None, "right": None}
     assert len(frame["forceLeft"]) == 6
+    assert len(frame["forceRight"]) == 6
+    assert frame["recording"] is False
+    assert isinstance(frame["episodeCount"], int)
+    assert isinstance(frame["frameCount"], int)
+    assert len(frame["cameras"]) == 3
     assert len(frame["teleopHands"]) == 2
     assert frame["wsOk"] is True
 
     teleop_response = client.get("/api/teleop/state")
     assert teleop_response.status_code == 200
     assert len(teleop_response.json()["data"]["hands"]) == 2
+
+
+def test_websocket_telemetry_compatibility_and_log_shape(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    assert client.post(
+        "/api/settings/log_command",
+        json={"channel": "[LEROBOT]", "msg": "recording compatibility check", "level": "INFO"},
+    ).status_code == 200
+
+    with client.websocket_connect("/ws") as websocket:
+        telemetry = websocket.receive_json()
+        log = websocket.receive_json()
+
+    assert telemetry["type"] == "telemetry"
+    frame = telemetry["data"]
+    for key in (
+        "recording",
+        "episodeCount",
+        "frameCount",
+        "jointPositions",
+        "forceLeft",
+        "forceRight",
+        "gripperPositions",
+        "cameras",
+    ):
+        assert key in frame
+    assert log["type"] == "log"
+    assert {"id", "ts", "channel", "level", "msg"}.issubset(log["data"])
 
 
 def test_hardware_status_uses_gripper_workers_in_dual_mode(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -359,18 +413,52 @@ def test_record_session_writes_lerobot_fallback_dataset(tmp_path: Path, monkeypa
 
         data_path = dataset_root / "unit_test_dataset" / episode["dataPath"]
         assert data_path.exists()
+        info = json.loads((dataset_root / "unit_test_dataset" / "meta" / "info.json").read_text(encoding="utf-8"))
+        assert set(info) == {"name", "codebase_version", "robot_type", "fps", "features"}
         first_line = data_path.read_text(encoding="utf-8").splitlines()[0]
         frame = json.loads(first_line)
+        assert frame["timestamp"] == frame["frame_index"] / config["storage"]["recordFps"]
         assert len(frame["observation.state"]) == 14
         assert len(frame["observation.force_left"]) == 6
-        assert len(frame["observation.force_left_window"]) == 134
-        assert len(frame["observation.force_left_window"][0]) == 6
-        assert len(frame["observation.force_window_dt"]) == 134
+        assert "observation.force_left_window" not in frame
+        assert "observation.force_right_window" not in frame
+        assert "observation.force_window_dt" not in frame
+        assert "appstation.observation.gripper" not in frame
+        assert "appstation.sources" not in frame
+        assert "appstation.omega" not in frame
         assert "observation.gripper" not in frame
         assert len(frame["action"]) == 14
 
         finish_response = client.post("/api/record/session/finish")
         assert finish_response.status_code == 200
+
+
+def test_mock_hal_camera_end_to_end_record_save_list_review(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    dataset_root = tmp_path / "datasets"
+    with create_mock_record_client(tmp_path, monkeypatch) as client:
+        config = client.get("/api/settings").json()
+        config["storage"]["datasetRoot"] = str(dataset_root)
+        assert client.put("/api/settings", json=config).status_code == 200
+
+        assert client.post(
+            "/api/record/session/create",
+            json={"dataset_name": "mock_e2e_dataset", "task": "mock review"},
+        ).status_code == 200
+        time.sleep(0.12)
+        save_response = client.post("/api/record/episode/save")
+        assert save_response.status_code == 200
+        episode_id = save_response.json()["data"]["episode"]["id"]
+
+        list_response = client.get("/api/datasets")
+        assert list_response.status_code == 200
+        dataset = next(item for item in list_response.json()["data"]["datasets"] if item["id"] == "mock_e2e_dataset")
+        assert dataset["episodes"][0]["id"] == episode_id
+
+        detail_response = client.get(f"/api/datasets/mock_e2e_dataset/episodes/{episode_id}")
+        assert detail_response.status_code == 200
+        assert detail_response.json()["data"]["episode"]["features"]["observation.state"]["shape"] == [14]
+
+        assert client.post("/api/record/session/finish").status_code == 200
 
 
 def test_record_session_writes_native_lerobot_dataset_when_available(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -492,6 +580,47 @@ def test_dataset_review_and_export_endpoints(tmp_path: Path, monkeypatch: Monkey
     push_response = client.post("/api/datasets/review_dataset/push", json={"repoId": "local/test", "dryRun": True})
     assert push_response.status_code == 200
     assert push_response.json()["data"]["pushed"] is False
+
+
+def test_dataset_episode_update_and_delete_hide_usable_sample(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    dataset_root = tmp_path / "datasets"
+    with create_mock_record_client(tmp_path, monkeypatch) as client:
+        config = client.get("/api/settings").json()
+        config["storage"]["datasetRoot"] = str(dataset_root)
+        assert client.put("/api/settings", json=config).status_code == 200
+
+        assert client.post(
+            "/api/record/session/create",
+            json={"dataset_name": "review_lifecycle", "task": "lifecycle"},
+        ).status_code == 200
+        time.sleep(0.12)
+        save_response = client.post("/api/record/episode/save")
+        assert save_response.status_code == 200
+        episode_id = save_response.json()["data"]["episode"]["id"]
+
+        rename_response = client.patch(
+            f"/api/datasets/review_lifecycle/episodes/{episode_id}",
+            json={"name": "renamed episode", "status": "invalid"},
+        )
+        assert rename_response.status_code == 200
+        detail_response = client.get(f"/api/datasets/review_lifecycle/episodes/{episode_id}")
+        assert detail_response.status_code == 200
+        detail = detail_response.json()["data"]["episode"]
+        assert detail["name"] == "renamed episode"
+        assert detail["status"] == "invalid"
+        list_after_invalid = client.get("/api/datasets")
+        invalid_dataset = next(
+            item for item in list_after_invalid.json()["data"]["datasets"] if item["id"] == "review_lifecycle"
+        )
+        assert invalid_dataset["episodes"] == []
+
+        delete_response = client.delete(f"/api/datasets/review_lifecycle/episodes/{episode_id}")
+        assert delete_response.status_code == 200
+        list_response = client.get("/api/datasets")
+        dataset = next(item for item in list_response.json()["data"]["datasets"] if item["id"] == "review_lifecycle")
+        assert dataset["episodes"] == []
+
+        assert client.post("/api/record/session/finish").status_code == 200
 
 
 def test_create_dataset_can_resume_native_lerobot_recording(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -974,16 +1103,12 @@ def test_real_hal_client_maps_teleop_continuous_commands(monkeypatch: MonkeyPatc
 
 
 def test_hal_state_clients_include_receive_timestamps(monkeypatch: MonkeyPatch) -> None:
-def test_real_hal_client_serializes_home_all_work_origin(monkeypatch: MonkeyPatch) -> None:
-    calls: list[tuple[str, str, dict[str, object]]] = []
-
     class FakeResponse:
         status = 200
         headers = {"Connection": "keep-alive"}
 
         def read(self) -> bytes:
             return b'{"positions":[]}'
-            return b'{"ok":true}'
 
     class FakeConnection:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -995,11 +1120,6 @@ def test_real_hal_client_serializes_home_all_work_origin(monkeypatch: MonkeyPatc
 
         def request(self, *args: object, **kwargs: object) -> None:
             _ = (args, kwargs)
-        def request(self, method: str, path: str, *args: object, **kwargs: object) -> None:
-            _ = args
-            body = kwargs.get("body")
-            assert isinstance(body, bytes)
-            calls.append((method, path, json.loads(body.decode("utf-8"))))
 
         def getresponse(self) -> FakeResponse:
             return FakeResponse()
@@ -1019,6 +1139,39 @@ def test_real_hal_client_serializes_home_all_work_origin(monkeypatch: MonkeyPatc
     assert isinstance(real_state["received_monotonic_ms"], int)
     assert isinstance(test_state["timestamp_ms"], int)
     assert isinstance(test_state["received_monotonic_ms"], int)
+
+
+def test_real_hal_client_serializes_home_all_work_origin(monkeypatch: MonkeyPatch) -> None:
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    class FakeResponse:
+        status = 200
+        headers = {"Connection": "keep-alive"}
+
+        def read(self) -> bytes:
+            return b'{"ok":true}'
+
+    class FakeConnection:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            _ = (args, kwargs)
+            self.sock = type("FakeSocket", (), {"setsockopt": staticmethod(lambda *a, **k: None)})()
+
+        def connect(self) -> None:
+            return None
+
+        def request(self, method: str, path: str, *args: object, **kwargs: object) -> None:
+            _ = args
+            body = kwargs.get("body")
+            assert isinstance(body, bytes)
+            calls.append((method, path, json.loads(body.decode("utf-8"))))
+
+        def getresponse(self) -> FakeResponse:
+            return FakeResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("backend.hal_client.client.http.client.HTTPConnection", FakeConnection)
     client = RealHalClient("http://127.0.0.1:8091", 5000, LogService())
 
     asyncio.run(

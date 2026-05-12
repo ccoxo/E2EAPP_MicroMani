@@ -194,6 +194,70 @@ export interface RecordSessionState {
   speedMode: ManualSpeedMode
 }
 
+export type DatasetEpisodeStatusApi = 'valid' | 'review' | 'invalid'
+export type DatasetCameraKeyApi = 'global' | 'wrist_left' | 'wrist_right'
+
+export interface DatasetFeatureApi {
+  dtype?: string
+  shape?: number[]
+  names?: string[]
+}
+
+export type DatasetFeatureSummaryApi = Record<string, DatasetFeatureApi>
+
+export interface DatasetCameraResolutionApi {
+  physical?: string
+  capture?: string
+  preview?: string
+  saved?: string
+}
+
+export interface DatasetEpisodeSampleApi {
+  frame: number
+  leftJoints: number[]
+  rightJoints: number[]
+  leftPulses?: number[]
+  rightPulses?: number[]
+  forceLeft: number[]
+  forceRight: number[]
+  images?: Partial<Record<DatasetCameraKeyApi, string>>
+}
+
+export interface DatasetEpisodeApi {
+  id: string
+  name: string
+  task: string
+  status: DatasetEpisodeStatusApi
+  quality: number
+  frames: number
+  fps: number
+  durationS: number
+  createdAt: number
+  warnings: string[]
+  samples: DatasetEpisodeSampleApi[]
+  lateFrames?: number
+  cameraDrops?: Partial<Record<DatasetCameraKeyApi, number>>
+  maxForceLeft?: number
+  maxForceRight?: number
+  features?: DatasetFeatureSummaryApi
+  featureSummary?: DatasetFeatureSummaryApi
+  cameraResolutions?: Partial<Record<DatasetCameraKeyApi, DatasetCameraResolutionApi>>
+}
+
+export interface DatasetApi {
+  id: string
+  name: string
+  status: 'local' | 'dry-run' | '待审核' | string
+  fps: number
+  format: string
+  root?: string
+  createdAt?: number
+  updatedAt?: number
+  featureSummary?: DatasetFeatureSummaryApi
+  cameraResolutions?: Partial<Record<DatasetCameraKeyApi, DatasetCameraResolutionApi>>
+  episodes: DatasetEpisodeApi[]
+}
+
 export type ManualControlAction =
   | {
       id: number
