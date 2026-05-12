@@ -145,6 +145,63 @@ def test_dataset_recorder_timed_source_records_timeout_drop() -> None:
     assert recorder._source_fail_streaks["hal"] == 1
 
 
+def test_dataset_recorder_uses_cached_camera_frame_on_snapshot_failure(tmp_path: Path, monkeypatch) -> None:
+    class FakeCameras:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def snapshot(self, _config: dict[str, object], key: str) -> bytes:
+            self.calls += 1
+            if self.calls <= 3:
+                return f"{key}-first".encode()
+            raise RuntimeError(f"{key} offline")
+
+    class FakeHardware:
+        def __init__(self) -> None:
+            self.cameras = FakeCameras()
+
+    class FakeLogs:
+        def warning(self, _channel: str, _message: str) -> None:
+            return None
+
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._native_dataset = None
+    recorder._dataset_dir = tmp_path
+    recorder._episode_index = 0
+    recorder._episode_frames = 0
+    recorder._current_episode_paths = []
+    recorder._camera_drops = {"global": 0, "wrist_left": 0, "wrist_right": 0}
+    recorder._drop_counts = {"global": 0, "wrist_left": 0, "wrist_right": 0}
+    recorder._last_camera_frames = {}
+    recorder._source_warnings = []
+    recorder.hardware = FakeHardware()
+    recorder.logs = FakeLogs()
+
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+    config = {"hal": {"mode": "real"}}
+    first = asyncio.run(recorder._capture_cameras(config))
+    recorder._episode_frames = 1
+    second = asyncio.run(recorder._capture_cameras(config))
+
+    assert set(first) == {
+        "observation.images.global",
+        "observation.images.wrist_left",
+        "observation.images.wrist_right",
+    }
+    assert set(second) == set(first)
+    cached_path = tmp_path / second["observation.images.global"]
+    assert cached_path.read_bytes() == b"global-first"
+    assert recorder._camera_drops["global"] == 1
+    assert "global camera cache used" in recorder._source_warnings
+
+
+def test_native_preflight_does_not_import_lerobot_record_script() -> None:
+    source = (Path(__file__).resolve().parents[1] / "services" / "dataset_recorder.py").read_text(encoding="utf-8")
+
+    assert "lerobot.scripts.lerobot_record" not in source
+    assert "lerobot.datasets.lerobot_dataset" in source
+
+
 def test_dataset_recorder_composes_14d_state_and_absolute_action() -> None:
     class FakeTeleop:
         def status(self) -> dict[str, object]:

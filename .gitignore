@@ -39,9 +39,18 @@ out/
 *.a
 *.so
 *.exe
+*.dll
 
 # Logs
 *.log
+*.tmp
+*.swp
+
+# OS/editor metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
 
 # Local vendor binaries; install these on the deployment machine.
 backend/vendor/jodell/*.dll
@@ -54,3 +63,6 @@ hal/vendor/
 
 # Hardware reference files
 硬件指南/
+
+# Nested project checkout
+cc_data_collection/

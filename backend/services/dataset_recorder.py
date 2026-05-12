@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib
 import importlib.util
 import json
@@ -92,6 +93,18 @@ SOURCE_TIMEOUT_S: dict[str, float] = {
 # timeout 用 drop 边界，warning 用更严格的 skew 边界；这样慢但成功的源也会进入质量报告。
 SOURCE_WARNING_SKEW_MS: dict[str, float] = {"hal": 20.0, "camera": 16.7}
 SOURCE_DROP_SKEW_MS: dict[str, float] = {"camera": 33.3}
+PLACEHOLDER_JPEG_BYTES = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////"
+    "////////////////////////////2wBDAf//////////////////////////////////////////////////////////"
+    "////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/"
+    "xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAH/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/"
+    "9oACAEBAAEFAqf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/ASP/xAAUEQEAAAAAAAAAAAA"
+    "AAAAAAAAA/9oACAECAQE/ASP/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAY/Al//"
+    "xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/IV//2gAMAwEAAgADAAAAEP/"
+    "EABQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQMBAT8QH//EABQRAQAAAAAAAAAAAAAAAAAAABD/"
+    "2gAIAQIBAT8QH//EABQQAQAAAAAAAAAAAA"
+    "AAAAAAABD/2gAIAQEAAT8QH//Z"
+)
 
 
 @dataclass(frozen=True)
@@ -158,6 +171,8 @@ class DatasetRecorderService:
         self._native_error = ""
         self._native_use_videos = False
         self._native_dataset_from_index = 0
+        self._last_camera_frames: dict[str, bytes] = {}
+        self._last_native_camera_frames: dict[str, Any] = {}
         self._record_fps_hz = 30
         self._force_sample_hz = 200.0
         self._force_window_samples_per_frame = 7
@@ -167,6 +182,7 @@ class DatasetRecorderService:
         self._last_saved_episode: dict[str, Any] | None = None
 
     async def start_session(self, dataset_name: str, task: str) -> dict[str, Any]:
+        """创建录制会话并初始化 native/fallback 数据集写入路径。"""
         async with self._lock:
             if self._session_active:
                 raise RuntimeError("record session already active")
@@ -185,6 +201,8 @@ class DatasetRecorderService:
             self._dataset_dir = dataset_root / self._dataset_id
             self._native_dataset = None
             self._native_error = ""
+            self._last_camera_frames = {}
+            self._last_native_camera_frames = {}
             native_started = self._try_begin_native_dataset_locked(config)
             if native_started:
                 self._write_appstation_info(self._require_dataset_dir(), config)
@@ -204,6 +222,7 @@ class DatasetRecorderService:
         return self.status()
 
     async def save_episode(self) -> dict[str, Any]:
+        """保存当前 episode，返回 episode 摘要和最新录制状态。"""
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
@@ -217,6 +236,7 @@ class DatasetRecorderService:
         return {"episode": episode, "status": self.status()}
 
     async def discard_episode(self) -> dict[str, Any]:
+        """丢弃当前或最近保存的 episode，并立即开始同序号重录。"""
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
@@ -237,6 +257,7 @@ class DatasetRecorderService:
         return self.status()
 
     async def skip_reset(self) -> dict[str, Any]:
+        """跳过复位确认并开始下一条 episode 录制。"""
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
@@ -249,6 +270,7 @@ class DatasetRecorderService:
         return self.status()
 
     async def finish_session(self) -> dict[str, Any]:
+        """结束录制会话，清理未保存帧并关闭 native 数据集资源。"""
         async with self._lock:
             if self._session_active and self._recording:
                 self._close_writer_locked()
@@ -272,6 +294,7 @@ class DatasetRecorderService:
         return self.status()
 
     def status(self) -> dict[str, Any]:
+        """返回当前录制会话、帧计数、频率和数据集路径状态。"""
         elapsed = time.monotonic() - self._episode_started_at if self._recording else 0.0
         return {
             "session": self._session_id,
@@ -294,6 +317,7 @@ class DatasetRecorderService:
         }
 
     def list_datasets(self) -> list[dict[str, Any]]:
+        """列出本地数据集，并附带可见 episode 的复核摘要。"""
         root = self._dataset_root(self.settings.get_config())
         if not root.exists():
             return []
@@ -330,6 +354,7 @@ class DatasetRecorderService:
         return sorted(datasets, key=lambda item: int(item.get("updatedAt", 0)), reverse=True)
 
     def create_dataset(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """按请求名称创建空数据集，优先生成 LeRobot v3 native metadata。"""
         config = self.settings.get_config()
         name = str(payload.get("name") or f"dataset_{now_ms()}").strip()
         dataset_id = self._safe_id(name)
@@ -350,6 +375,7 @@ class DatasetRecorderService:
         return {"dataset": self._episode_dataset_stub(dataset_dir)}
 
     def update_dataset(self, dataset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """更新数据集展示名称并保留原有 metadata 和 episode 索引。"""
         dataset_dir = self._dataset_path(dataset_id)
         info_path = dataset_dir / "meta" / "info.json"
         info = self._read_json(info_path)
@@ -374,6 +400,7 @@ class DatasetRecorderService:
         return {"dataset": self._episode_dataset_stub(dataset_dir)}
 
     def delete_dataset(self, dataset_id: str) -> dict[str, Any]:
+        """删除指定本地数据集，并拒绝越过配置的数据集根目录。"""
         dataset_dir = self._dataset_path(dataset_id)
         root = self._dataset_root(self.settings.get_config()).resolve()
         target = dataset_dir.resolve()
@@ -387,6 +414,7 @@ class DatasetRecorderService:
         return {"deleted": dataset_id}
 
     def save_review(self, dataset_id: str) -> dict[str, Any]:
+        """保存复核结果时间戳，保持 native 和 fallback metadata 兼容。"""
         dataset_dir = self._dataset_path(dataset_id)
         info_path = dataset_dir / "meta" / "info.json"
         info = self._read_json(info_path)
@@ -406,6 +434,7 @@ class DatasetRecorderService:
         return {"saved": dataset_id, "updatedAt": info["updatedAt"]}
 
     def export_dataset(self, dataset_id: str) -> dict[str, Any]:
+        """返回本地导出状态；Hub 推送未启用时只确认数据集已就绪。"""
         dataset_dir = self._dataset_path(dataset_id)
         if not (dataset_dir / "meta" / "info.json").exists():
             raise FileNotFoundError(dataset_id)
@@ -422,6 +451,7 @@ class DatasetRecorderService:
         }
 
     def dataset_stats(self, dataset_id: str) -> dict[str, Any]:
+        """汇总可见 episode 的帧数、时长、状态和力觉质量指标。"""
         dataset_dir = self._dataset_path(dataset_id)
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
@@ -457,7 +487,26 @@ class DatasetRecorderService:
             "features": info.get("features", {}),
         }
 
+    def episode_detail(self, dataset_id: str, episode_id: str) -> dict[str, Any]:
+        """读取单条 episode 详情，包含 feature shape、样本和相机分辨率来源。"""
+        dataset_dir = self._dataset_path(dataset_id)
+        info = self._read_json(dataset_dir / "meta" / "info.json")
+        if not info:
+            raise FileNotFoundError(dataset_id)
+        episode = next(
+            (
+                item
+                for item in self._visible_episodes_for_dataset(dataset_dir, info)
+                if str(item.get("id")) == episode_id
+            ),
+            None,
+        )
+        if episode is None:
+            raise FileNotFoundError(episode_id)
+        return {"episode": self._episode_for_api(dataset_dir, dataset_id, episode)}
+
     def split_dataset(self, dataset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """基于可见 episode 生成 train/val/test 本地划分文件。"""
         dataset_dir = self._dataset_path(dataset_id)
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
@@ -484,6 +533,7 @@ class DatasetRecorderService:
         return payload_out
 
     def clean_dataset(self, dataset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """按帧数和迟帧比例检查可见 episode，并可选择标记为 invalid。"""
         dataset_dir = self._dataset_path(dataset_id)
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
@@ -522,6 +572,7 @@ class DatasetRecorderService:
         return report
 
     def push_dataset(self, dataset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """在启用 Hub 推送时上传数据集；默认 dry-run 只返回本地就绪状态。"""
         dataset_dir = self._dataset_path(dataset_id)
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
@@ -549,6 +600,7 @@ class DatasetRecorderService:
         return {"dataset": dataset_id, "repoId": repo_id, "pushed": True, "dryRun": False}
 
     def update_episode(self, dataset_id: str, episode_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """更新 episode 名称或复核状态，供前端复核页直接调用。"""
         dataset_dir = self._dataset_path(dataset_id)
         episodes = self._read_episodes(dataset_dir)
         updated = False
@@ -570,6 +622,7 @@ class DatasetRecorderService:
         return {"episode": episode_id}
 
     def delete_episode(self, dataset_id: str, episode_id: str) -> dict[str, Any]:
+        """软删除 episode 并标记 invalid，避免继续作为可用训练样本展示。"""
         dataset_dir = self._dataset_path(dataset_id)
         episodes = self._read_episodes(dataset_dir)
         updated = False
@@ -586,6 +639,7 @@ class DatasetRecorderService:
         return {"deleted": episode_id}
 
     def resolve_file(self, dataset_id: str, relative_path: str) -> Path:
+        """解析数据集内部文件路径，并阻止路径逃逸到数据集根目录之外。"""
         dataset_dir = self._dataset_path(dataset_id)
         target = (dataset_dir / relative_path).resolve()
         root = dataset_dir.resolve()
@@ -598,6 +652,7 @@ class DatasetRecorderService:
         return target
 
     def resolve_frame_image(self, dataset_id: str, episode_id: str, camera: str, frame: int) -> bytes:
+        """读取 fallback 或 native episode 的指定相机帧并返回 JPEG 字节。"""
         if camera not in CAMERA_FEATURE_KEYS:
             raise FileNotFoundError(camera)
         dataset_dir = self._dataset_path(dataset_id)
@@ -843,10 +898,6 @@ class DatasetRecorderService:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for key, result in zip(CAMERA_KEYS, results, strict=True):
-            if isinstance(result, BaseException):
-                self._camera_drops[key] = self._camera_drops.get(key, 0) + 1
-                self._drop_counts[key] = self._drop_counts.get(key, 0) + 1
-                continue
             relative = (
                 Path("videos")
                 / "chunk-000"
@@ -855,6 +906,14 @@ class DatasetRecorderService:
                 / f"frame_{self._episode_frames:06d}.jpg"
             )
             target = self._dataset_dir / relative
+            if isinstance(result, BaseException):
+                self._camera_drops[key] = self._camera_drops.get(key, 0) + 1
+                self._drop_counts[key] = self._drop_counts.get(key, 0) + 1
+                result = self._last_camera_frames.get(key) or self._placeholder_camera_jpeg()
+                self._source_warnings.append(f"{key} camera cache used")
+                self.logs.warning("[CAMERA]", f"{key} snapshot failed; cached frame written")
+            else:
+                self._last_camera_frames[key] = result
             target.parent.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(target.write_bytes, result)
             self._current_episode_paths.append(target)
@@ -1166,6 +1225,7 @@ class DatasetRecorderService:
             },
             "hardware": {
                 "cameras": config.get("cameras", {}),
+                "cameraResolutions": self._camera_resolution_summary_from_config(config),
                 "force": {
                     "leftIp": config.get("force", {}).get("leftIp"),
                     "rightIp": config.get("force", {}).get("rightIp"),
@@ -1199,6 +1259,7 @@ class DatasetRecorderService:
             "updatedAt": now_ms(),
             "hardware": {
                 "cameras": config.get("cameras", {}),
+                "cameraResolutions": self._camera_resolution_summary_from_config(config),
                 "force": {
                     "leftIp": config.get("force", {}).get("leftIp"),
                     "rightIp": config.get("force", {}).get("rightIp"),
@@ -1229,6 +1290,10 @@ class DatasetRecorderService:
 
     def _create_native_dataset_metadata(self, dataset_dir: Path, config: dict[str, Any]) -> bool:
         if not self._native_recording_requested():
+            return False
+        preflight = self._native_preflight()
+        if preflight:
+            self._native_error = preflight
             return False
         imports = self._native_imports()
         if imports is None:
@@ -1266,6 +1331,10 @@ class DatasetRecorderService:
         # 原生 LeRobot 可用时优先使用；失败时调用方会退回 JSONL/JPEG 兼容格式。
         if not self._native_recording_requested():
             self._native_error = "native LeRobot disabled by APPSTATION_LEROBOT_NATIVE"
+            return False
+        preflight = self._native_preflight()
+        if preflight:
+            self._native_error = preflight
             return False
         imports = self._native_imports()
         if imports is None:
@@ -1364,6 +1433,23 @@ class DatasetRecorderService:
             return None
         return module.LeRobotDataset, np
 
+    def _native_preflight(self) -> str:
+        imports = self._native_imports()
+        if imports is None:
+            return "lerobot[dataset] is not installed in backend runtime"
+        if self._native_use_videos_requested():
+            try:
+                av = importlib.import_module("av")
+            except Exception as exc:  # noqa: BLE001
+                return f"PyAV is required for native LeRobot video recording: {exc}"
+            codec = self._native_vcodec().lower()
+            if codec in {"av1", "libsvtav1", "svt_av1"}:
+                try:
+                    av.Codec("libsvtav1", "w")
+                except Exception as exc:  # noqa: BLE001
+                    return f"libsvtav1 encoder is unavailable for native LeRobot video recording: {exc}"
+        return ""
+
     def _native_recording_requested(self) -> bool:
         value = os.environ.get("APPSTATION_LEROBOT_NATIVE", "auto").strip().lower()
         return value not in {"0", "false", "off", "no"}
@@ -1442,14 +1528,22 @@ class DatasetRecorderService:
             if isinstance(result, BaseException):
                 self._camera_drops[key] = self._camera_drops.get(key, 0) + 1
                 self._drop_counts[key] = self._drop_counts.get(key, 0) + 1
-                images[feature_key] = self._synthetic_camera_frame(feature_key)
+                images[feature_key] = (
+                    self._last_native_camera_frames.get(feature_key) or self._synthetic_camera_frame(feature_key)
+                )
+                self._source_warnings.append(f"{key} camera cache used")
+                self.logs.warning("[CAMERA]", f"{key} snapshot failed; cached native frame used")
                 continue
             try:
                 images[feature_key] = self._decode_jpeg_to_rgb(result, config, key)
+                self._last_native_camera_frames[feature_key] = images[feature_key]
             except Exception:  # noqa: BLE001
                 self._camera_drops[key] = self._camera_drops.get(key, 0) + 1
                 self._drop_counts[key] = self._drop_counts.get(key, 0) + 1
-                images[feature_key] = self._synthetic_camera_frame(feature_key)
+                images[feature_key] = (
+                    self._last_native_camera_frames.get(feature_key) or self._synthetic_camera_frame(feature_key)
+                )
+                self._source_warnings.append(f"{key} camera cache used")
         return images
 
     def _decode_jpeg_to_rgb(self, jpeg: bytes, config: dict[str, Any], camera: str = "global") -> Any:
@@ -1485,6 +1579,24 @@ class DatasetRecorderService:
         frame[:, :, 1] = (self._episode_frames * 7) % 255
         frame[:, :, 2] = (camera_index + 1) * 70
         return frame
+
+    def _placeholder_camera_jpeg(self) -> bytes:
+        try:
+            imports = self._native_imports()
+            if imports is None:
+                return PLACEHOLDER_JPEG_BYTES
+            _LeRobotDataset, np = imports
+            cv2 = importlib.import_module("cv2")
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            frame[:, :, 0] = 60
+            frame[:, :, 1] = 30
+            frame[:, :, 2] = 20
+            ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+            if ok:
+                return bytes(buffer)
+        except Exception:  # noqa: BLE001
+            pass
+        return PLACEHOLDER_JPEG_BYTES
 
     def _np_float32(self, values: object) -> Any:
         imports = self._native_imports()
@@ -1590,6 +1702,8 @@ class DatasetRecorderService:
     def _episode_for_api(self, dataset_dir: Path, dataset_id: str, episode: dict[str, Any]) -> dict[str, Any]:
         samples = self._episode_samples(dataset_dir, dataset_id, episode)
         quality = self._episode_quality(episode)
+        features = self._feature_summary(dataset_dir)
+        camera_resolutions = self._camera_resolution_summary(dataset_dir)
         return {
             "id": str(episode.get("id", "")),
             "name": str(episode.get("name") or episode.get("id") or "episode"),
@@ -1606,7 +1720,69 @@ class DatasetRecorderService:
             "cameraDrops": episode.get("cameraDrops", {}),
             "maxForceLeft": float(episode.get("maxForceLeft", 0.0)),
             "maxForceRight": float(episode.get("maxForceRight", 0.0)),
+            "features": features,
+            "featureSummary": features,
+            "cameraResolutions": camera_resolutions,
         }
+
+    def _feature_summary(self, dataset_dir: Path) -> dict[str, Any]:
+        info = self._read_json(dataset_dir / "meta" / "info.json")
+        features = info.get("features", {})
+        if not isinstance(features, dict):
+            return {}
+        wanted = [
+            "observation.state",
+            "action",
+            "observation.pulses",
+            "observation.force_left",
+            "observation.force_right",
+            *CAMERA_FEATURE_KEYS.values(),
+        ]
+        summary: dict[str, Any] = {}
+        for key in wanted:
+            value = features.get(key)
+            if not isinstance(value, dict):
+                continue
+            summary[key] = {
+                "shape": value.get("shape", []),
+                "dtype": value.get("dtype", ""),
+                "names": value.get("names", []),
+            }
+        return summary
+
+    def _camera_resolution_summary(self, dataset_dir: Path) -> dict[str, dict[str, str]]:
+        info = self._read_json(dataset_dir / "meta" / "info.json")
+        app_info = self._read_json(dataset_dir / "meta" / "appstation_info.json")
+        hardware = app_info.get("hardware") if app_info else info.get("hardware", {})
+        if isinstance(hardware, dict):
+            existing = hardware.get("cameraResolutions")
+            if isinstance(existing, dict):
+                return existing
+            return self._camera_resolution_summary_from_config({"cameras": hardware.get("cameras", {})})
+        return self._camera_resolution_summary_from_config({})
+
+    def _camera_resolution_summary_from_config(self, config: dict[str, Any]) -> dict[str, dict[str, str]]:
+        cameras = config.get("cameras", {}) if isinstance(config.get("cameras"), dict) else {}
+        preview = str(cameras.get("previewResolution", "native"))
+        result: dict[str, dict[str, str]] = {}
+        for key in CAMERA_KEYS:
+            width, height = CAMERA_CAPTURE_SIZES[key]
+            configured = self._configured_camera_resolution(cameras, key)
+            result[key] = {
+                "physical": str(cameras.get(f"{key}PhysicalResolution", "native")),
+                "capture": configured,
+                "preview": preview,
+                "saved": f"{width}x{height}",
+            }
+        return result
+
+    def _configured_camera_resolution(self, cameras: dict[str, Any], camera: str) -> str:
+        key = f"{camera}Resolution"
+        if camera == "wrist_left":
+            key = "wristLeftResolution"
+        elif camera == "wrist_right":
+            key = "wristRightResolution"
+        return str(cameras.get(key, cameras.get("previewResolution", "native")))
 
     def _episode_samples(
         self,

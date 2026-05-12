@@ -348,6 +348,14 @@ def test_record_session_writes_lerobot_fallback_dataset(tmp_path: Path, monkeypa
         dataset = next(item for item in datasets if item["id"] == "unit_test_dataset")
         assert dataset["format"] == "lerobot-v3-jsonl-fallback"
         assert dataset["episodes"][0]["samples"]
+        detail_response = client.get(f"/api/datasets/unit_test_dataset/episodes/{episode['id']}")
+        assert detail_response.status_code == 200
+        detail = detail_response.json()["data"]["episode"]
+        assert detail["features"]["observation.state"]["shape"] == [14]
+        assert detail["features"]["action"]["shape"] == [14]
+        assert detail["cameraResolutions"]["global"]["saved"] == "640x480"
+        assert detail["maxForceLeft"] >= 0
+        assert detail["samples"]
 
         data_path = dataset_root / "unit_test_dataset" / episode["dataPath"]
         assert data_path.exists()

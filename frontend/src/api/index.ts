@@ -18,6 +18,22 @@ export const mockMode = import.meta.env.MODE === 'test'
 export const autoShutdownOnClose = import.meta.env.VITE_AUTO_SHUTDOWN_ON_CLOSE === 'true'
 
 export type DatasetEpisodeStatusApi = 'valid' | 'review' | 'invalid'
+export type DatasetCameraKeyApi = 'global' | 'wrist_left' | 'wrist_right'
+
+export interface DatasetFeatureApi {
+  dtype?: string
+  shape?: number[]
+  names?: string[]
+}
+
+export type DatasetFeatureSummaryApi = Record<string, DatasetFeatureApi>
+
+export interface DatasetCameraResolutionApi {
+  physical?: string
+  capture?: string
+  preview?: string
+  saved?: string
+}
 
 export interface DatasetEpisodeSampleApi {
   frame: number
@@ -25,7 +41,7 @@ export interface DatasetEpisodeSampleApi {
   rightJoints: number[]
   forceLeft: number[]
   forceRight: number[]
-  images?: Partial<Record<'global' | 'wrist_left' | 'wrist_right', string>>
+  images?: Partial<Record<DatasetCameraKeyApi, string>>
 }
 
 export interface DatasetEpisodeApi {
@@ -40,6 +56,13 @@ export interface DatasetEpisodeApi {
   createdAt: number
   warnings: string[]
   samples: DatasetEpisodeSampleApi[]
+  lateFrames?: number
+  cameraDrops?: Partial<Record<DatasetCameraKeyApi, number>>
+  maxForceLeft?: number
+  maxForceRight?: number
+  features?: DatasetFeatureSummaryApi
+  featureSummary?: DatasetFeatureSummaryApi
+  cameraResolutions?: Partial<Record<DatasetCameraKeyApi, DatasetCameraResolutionApi>>
 }
 
 export interface DatasetApi {
@@ -48,6 +71,11 @@ export interface DatasetApi {
   status: 'local' | 'dry-run' | '待审核' | string
   fps: number
   format: string
+  root?: string
+  createdAt?: number
+  updatedAt?: number
+  featureSummary?: DatasetFeatureSummaryApi
+  cameraResolutions?: Partial<Record<DatasetCameraKeyApi, DatasetCameraResolutionApi>>
   episodes: DatasetEpisodeApi[]
 }
 
@@ -280,12 +308,39 @@ export const finishSession = () => postCommand('/record/session/finish')
 
 export const skipReset = () => postCommand('/record/reset/skip')
 
+/**
+ * 读取本地数据集列表。
+ *
+ * 业务背景：复核页依赖该列表展示可见 episode、schema 摘要和本地数据集状态。
+ *
+ * @returns 数据集摘要数组；mock 模式下返回空数组。
+ * @throws 当 HTTP 状态非 2xx 时抛出 Error。
+ */
 export async function fetchDatasets(): Promise<DatasetApi[]> {
   if (mockMode) return []
   const response = await fetch(`${apiBase}/api/datasets`)
   if (!response.ok) throw new Error(`datasets fetch failed: ${response.status}`)
   const payload = await response.json() as { data?: { datasets?: DatasetApi[] } }
   return payload.data?.datasets ?? []
+}
+
+/**
+ * 读取指定 episode 的复核详情。
+ *
+ * 业务背景：复核页需要按需查看 feature shape、抽样轨迹和相机分辨率来源，
+ * 该函数保留后端 ok/data/ts envelope，只向调用方暴露 data.episode。
+ *
+ * @param datasetId 本地数据集 ID，必须是后端可解析的安全目录名。
+ * @param episodeId episode ID，例如 episode_000001。
+ * @returns 后端返回的 episode 详情；mock 模式下返回 null。
+ * @throws 当 HTTP 状态非 2xx 时抛出 Error。
+ */
+export async function fetchDatasetEpisodeApi(datasetId: string, episodeId: string): Promise<DatasetEpisodeApi | null> {
+  if (mockMode) return null
+  const response = await fetch(`${apiBase}/api/datasets/${encodeURIComponent(datasetId)}/episodes/${encodeURIComponent(episodeId)}`)
+  if (!response.ok) throw new Error(`episode fetch failed: ${response.status}`)
+  const payload = await response.json() as { data?: { episode?: DatasetEpisodeApi } }
+  return payload.data?.episode ?? null
 }
 
 export async function createDatasetApi(name: string) {
