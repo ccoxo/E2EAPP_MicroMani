@@ -47,6 +47,29 @@ EXPECTED_V3_FEATURES = {
             "right_gripper_target_mm",
         ],
     },
+    "observation.pulses": {
+        "dtype": "float32",
+        "shape": [12],
+        "names": [
+            "left_x_pulse",
+            "left_y_pulse",
+            "left_z_pulse",
+            "left_roll_pulse",
+            "left_pitch_pulse",
+            "left_yaw_pulse",
+            "right_x_pulse",
+            "right_y_pulse",
+            "right_z_pulse",
+            "right_roll_pulse",
+            "right_pitch_pulse",
+            "right_yaw_pulse",
+        ],
+    },
+    "observation.force_left": {"dtype": "float32", "shape": [6], "names": ["fx", "fy", "fz", "mx", "my", "mz"]},
+    "observation.force_right": {"dtype": "float32", "shape": [6], "names": ["fx", "fy", "fz", "mx", "my", "mz"]},
+    "observation.images.global": {"dtype": "video", "shape": [480, 640, 3]},
+    "observation.images.wrist_left": {"dtype": "video", "shape": [480, 640, 3]},
+    "observation.images.wrist_right": {"dtype": "video", "shape": [480, 640, 3]},
 }
 
 
@@ -78,6 +101,26 @@ def source_sample_fixture(source: str, timestamp_s: float = 1.0) -> dict[str, ob
         "monotonic_s": timestamp_s,
         "ok": True,
         "message": "",
+        "timeout": False,
+        "stale": False,
+        "cacheUsed": False,
+    }
+
+
+def force_source_fixture(timestamp_s: float = 1.0) -> dict[str, object]:
+    return {
+        **source_sample_fixture("force", timestamp_s),
+        "left": [0.0] * 6,
+        "right": [0.0] * 6,
+        "leftWindow": [[0.0] * 6],
+        "rightWindow": [[0.0] * 6],
+    }
+
+
+def camera_source_fixture(timestamp_s: float = 1.0) -> dict[str, object]:
+    return {
+        **source_sample_fixture("camera", timestamp_s),
+        "cacheUsedByCamera": {"global": False, "wrist_left": False, "wrist_right": False},
     }
 
 
@@ -112,6 +155,18 @@ def test_dataset_recorder_native_features_follow_v3_contract() -> None:
     assert features["action"]["shape"] == (14,)
     assert features["observation.images.global"]["dtype"] == "video"
     assert features["observation.images.global"]["shape"] == (480, 640, 3)
+    assert "observation.gripper" not in features
+
+
+def test_dataset_recorder_fallback_features_follow_v3_contract() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+
+    features = recorder._features()
+
+    for key, expected in EXPECTED_V3_FEATURES.items():
+        assert key in features
+        assert features[key]["dtype"] == expected["dtype"]
+        assert list(features[key]["shape"]) == expected["shape"]
     assert "observation.gripper" not in features
 
 
@@ -189,14 +244,10 @@ def test_dataset_recorder_gripper_source_uses_worker_sample_timestamp() -> None:
     config = {"hal": {"mode": "real"}, "gripper": {"sampleHz": 30, "sampleStaleMs": 500}}
 
     sample = asyncio.run(recorder._gripper_source(config, time.monotonic()))
-    metadata = recorder._source_frame_metadata(sample)["gripper"]
 
     assert sample.ok is True
     assert sample.value == [4.0, 5.0]
     assert sample.monotonic_s == recorder.telemetry._last_gripper_sample_at
-    assert metadata["targetSampleHz"] == 30.0
-    assert metadata["sides"]["left"]["sampleHz"] == 30.0
-    assert metadata["sides"]["right"]["monotonicMs"] == metadata["sides"]["left"]["monotonicMs"]
 
 
 def test_dataset_recorder_uses_cached_camera_frame_on_snapshot_failure(tmp_path: Path, monkeypatch) -> None:
@@ -256,6 +307,43 @@ def test_native_preflight_does_not_import_lerobot_record_script() -> None:
     assert "lerobot.datasets.lerobot_dataset" in source
 
 
+def test_dataset_recorder_falls_back_when_native_lerobot_unavailable(monkeypatch) -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    monkeypatch.setattr(recorder, "_native_imports", lambda: None)
+
+    assert recorder._native_preflight() == "lerobot[dataset] is not installed in backend runtime"
+
+
+def test_dataset_recorder_uses_nonblocking_force_latest_window(monkeypatch) -> None:
+    class FakeForce:
+        def __init__(self) -> None:
+            self.latest_calls = 0
+            self.sample_calls = 0
+
+        def latest_window(self, _config: dict[str, object], samples: int) -> object:
+            self.latest_calls += 1
+            return {"samples": samples}
+
+        def sample_window(self, _config: dict[str, object], _samples: int) -> object:
+            self.sample_calls += 1
+            return {}
+
+    class FakeHardware:
+        def __init__(self) -> None:
+            self.force = FakeForce()
+
+    recorder = object.__new__(DatasetRecorderService)
+    recorder.hardware = FakeHardware()
+    recorder._force_window_samples_per_frame = 5
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    result = asyncio.run(recorder._force_window_sample({"hal": {"mode": "real"}}))
+
+    assert result == {"samples": 5}
+    assert recorder.hardware.force.latest_calls == 1
+    assert recorder.hardware.force.sample_calls == 0
+
+
 def test_dataset_recorder_composes_14d_state_and_absolute_action() -> None:
     class FakeTeleop:
         def status(self) -> dict[str, object]:
@@ -278,3 +366,32 @@ def test_dataset_recorder_composes_14d_state_and_absolute_action() -> None:
         state,
         {"gripper": {"targetLeftMm": 6.0, "targetRightMm": 7.0}},
     ) == [11, 2, 3, 600.0, 200.0, 300.0, 6.0, -13, 8, 9, 400.0, 500.0, 500.0, 7.0]
+
+
+def test_dataset_recorder_applies_work_origin_pulse_conversion() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    origin = {
+        "leftValid": True,
+        "rightValid": False,
+        "leftPulse": [100.0, -200.0, 300.0, 0.0, 0.0, 0.0],
+        "rightPulse": [0.0] * 6,
+    }
+    pulses = [
+        -8900.0,
+        -10200.0,
+        -9700.0,
+        1666.666667,
+        2500.0,
+        3333.333333,
+        10.0,
+        20.0,
+        30.0,
+        40.0,
+        50.0,
+        60.0,
+    ]
+
+    relative = recorder._recording_motion_positions({"motion": {"origin": origin}}, [42.0] * 12, pulses)
+
+    assert relative[:4] == [1000.0, 1000.0, 1000.0, 1.0]
+    assert relative[6] == 42.0

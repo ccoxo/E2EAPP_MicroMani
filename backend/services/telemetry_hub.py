@@ -573,6 +573,17 @@ class TelemetryHub:
                 for idx, value in enumerate(positions):
                     if value is not None:
                         self.gripper_positions[idx] = float(value)
+                        side = "left" if idx == 0 else "right"
+                        # 直接读取路径也写入统一样本缓存，录制端才能判断夹爪数据是否过期。
+                        self.gripper_samples[side] = {
+                            "ok": True,
+                            "positionMm": float(value),
+                            "sampleHz": 1.0,
+                            "ageMs": 0.0,
+                            "tsMs": int(time.time() * 1000),
+                            "monotonicMs": int(now * 1000),
+                            "message": "direct gripper sample",
+                        }
                         self._last_gripper_sample_at = now
             except Exception:
                 pass

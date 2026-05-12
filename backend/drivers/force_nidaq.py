@@ -233,17 +233,10 @@ class NidaqForceDriver:
                 nidaqmx = import_module("nidaqmx")
                 constants = import_module("nidaqmx.constants")
             except Exception as exc:
-                left = [0.0] * 6
-                right = [0.0] * 6
-                self._last_sample = ForceProbeResult(
-                    False,
-                    f"NI-DAQmx import failed: {exc}",
-                    left,
-                    right,
-                    [left for _ in range(sample_count)],
-                    [right for _ in range(sample_count)],
+                self._last_sample = self._window_from_latest_locked(
                     sample_hz,
                     sample_count,
+                    f"NI-DAQmx import failed: {exc}",
                 )
                 self._last_sample_at = now
                 return self._last_sample
@@ -268,17 +261,10 @@ class NidaqForceDriver:
             except Exception as exc:
                 self._left_task.close()
                 self._right_task.close()
-                left = [0.0] * 6
-                right = [0.0] * 6
-                self._last_sample = ForceProbeResult(
-                    False,
-                    f"NI-DAQmx force window sample failed: {exc}",
-                    left,
-                    right,
-                    [left for _ in range(sample_count)],
-                    [right for _ in range(sample_count)],
+                self._last_sample = self._window_from_latest_locked(
                     sample_hz,
                     sample_count,
+                    f"NI-DAQmx force window sample failed: {exc}",
                 )
             else:
                 left = left_window[-1]
@@ -296,6 +282,44 @@ class NidaqForceDriver:
                 )
             self._last_sample_at = now
             return self._last_sample
+
+    def latest_window(self, config: dict[str, Any], samples_per_channel: int) -> ForceProbeResult:
+        """返回最近一次力觉窗口，避免录制 tick 被同步采样阻塞。"""
+        sample_hz = self._sample_hz(config)
+        sample_count = max(1, min(int(samples_per_channel), 512))
+        with self._sample_lock:
+            return self._window_from_latest_locked(sample_hz, sample_count, "latest force window cache")
+
+    def _window_from_latest_locked(self, sample_hz: float, sample_count: int, message: str) -> ForceProbeResult:
+        # NI-DAQmx 失败时复用最近标量，保证当前帧仍有可写入的 6 维力觉值。
+        latest = self._last_sample
+        left = list(latest.left or [0.0] * 6)
+        right = list(latest.right or [0.0] * 6)
+        left_window = self._fit_window(latest.left_window, left, sample_count)
+        right_window = self._fit_window(latest.right_window, right, sample_count)
+        ok = bool(latest.ok and latest.sample_count > 0)
+        status = message if ok else f"{message}; using scalar fallback"
+        return ForceProbeResult(
+            ok,
+            status,
+            left,
+            right,
+            left_window,
+            right_window,
+            sample_hz,
+            sample_count,
+            latest.calibration,
+        )
+
+    def _fit_window(self, window: list[list[float]], latest: list[float], sample_count: int) -> list[list[float]]:
+        # 历史窗口不足时用最早样本补齐，保持调用方看到固定长度。
+        rows = [([float(value) for value in row] + [0.0] * 6)[:6] for row in window if isinstance(row, list)]
+        if not rows:
+            row = (list(latest) + [0.0] * 6)[:6]
+            return [list(row) for _ in range(sample_count)]
+        if len(rows) < sample_count:
+            rows = [list(rows[0]) for _ in range(sample_count - len(rows))] + rows
+        return rows[-sample_count:]
 
     def tare(self, config: dict[str, Any], side: str | None = None) -> ForceProbeResult:
         target = side or "both"

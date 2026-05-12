@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import importlib
-import importlib.util
 import json
 import math
 import os
@@ -109,12 +108,19 @@ PLACEHOLDER_JPEG_BYTES = base64.b64decode(
 
 @dataclass(frozen=True)
 class SourceSample:
+    # 记录每个硬件源相对同一录制 tick 的时序，用于质量统计而不写入训练帧。
     source: str
     value: Any
     monotonic_s: float
     ok: bool = True
     message: str = ""
-    details: dict[str, Any] | None = None
+    target_monotonic_s: float = 0.0
+    started_monotonic_s: float = 0.0
+    finished_monotonic_s: float = 0.0
+    elapsed_ms: float = 0.0
+    timed_out: bool = False
+    stale: bool = False
+    cache_used: bool = False
 
 
 class DatasetRecorderService:
@@ -174,10 +180,10 @@ class DatasetRecorderService:
         self._native_dataset_from_index = 0
         self._last_camera_frames: dict[str, bytes] = {}
         self._last_native_camera_frames: dict[str, Any] = {}
+        self._last_camera_cache_used: dict[str, bool] = {key: False for key in CAMERA_KEYS}
         self._record_fps_hz = 30
         self._force_sample_hz = 200.0
         self._force_window_samples_per_frame = 7
-        self._force_window_enabled = True
         self._current_data_path: Path | None = None
         self._current_episode_paths: list[Path] = []
         self._last_saved_episode: dict[str, Any] | None = None
@@ -196,7 +202,6 @@ class DatasetRecorderService:
             self._record_fps_hz = self._record_fps_from_config(config)
             self._force_sample_hz = self._force_sample_hz_from_config(config)
             self._force_window_samples_per_frame = self._force_window_samples_from_config(config)
-            self._force_window_enabled = True
             dataset_root = self._dataset_root(config)
             dataset_root.mkdir(parents=True, exist_ok=True)
             self._dataset_dir = dataset_root / self._dataset_id
@@ -204,6 +209,7 @@ class DatasetRecorderService:
             self._native_error = ""
             self._last_camera_frames = {}
             self._last_native_camera_frames = {}
+            self._last_camera_cache_used = {key: False for key in CAMERA_KEYS}
             native_started = self._try_begin_native_dataset_locked(config)
             if native_started:
                 self._write_appstation_info(self._require_dataset_dir(), config)
@@ -334,7 +340,11 @@ class DatasetRecorderService:
             episodes = self._read_episodes(dataset_dir)
             if not episodes and native_format:
                 episodes = self._native_episodes_from_meta(dataset_dir, info)
-            visible_episodes = [episode for episode in episodes if not bool(episode.get("deleted", False))]
+            visible_episodes = [
+                episode
+                for episode in episodes
+                if not bool(episode.get("deleted", False)) and str(episode.get("status", "review")) != "invalid"
+            ]
             datasets.append(
                 {
                     "id": dataset_dir.name,
@@ -728,8 +738,6 @@ class DatasetRecorderService:
         motion_pulses = [0.0] * 12
         force_left = list(self.telemetry.force_left)
         force_right = list(self.telemetry.force_right)
-        force_left_window = self._force_window_from_latest(force_left)
-        force_right_window = self._force_window_from_latest(force_right)
         # 同一个 tick 内并发启动主要硬件源，避免 HAL、力觉和相机串行耗时累加。
         # 单个源超时或失败只降级该源，不能阻塞其他源写入当前帧。
         (
@@ -757,8 +765,6 @@ class DatasetRecorderService:
         if force_sample.ok and getattr(force_result, "ok", False):
             force_left = [float(value) for value in force_result.left]
             force_right = [float(value) for value in force_result.right]
-            force_left_window = self._normalize_force_window(force_result.left_window, force_left)
-            force_right_window = self._normalize_force_window(force_result.right_window, force_right)
         gripper_positions = (
             list(gripper_sample.value)
             if gripper_sample.ok and isinstance(gripper_sample.value, list)
@@ -767,24 +773,13 @@ class DatasetRecorderService:
         observation_state = self._compose_observation_state(motion_positions, gripper_positions)
         image_payload = camera_sample.value if camera_sample.ok and isinstance(camera_sample.value, dict) else {}
         action = self._latest_action_vector(observation_state, config)
+        # 训练帧只保留 LeRobot v3 标准字段；调试用 appstation/force-window 字段避免进入数据集。
         return {
-            "timestamp": time.time(),
+            "timestamp": self._episode_frames / max(1, self._record_fps_hz),
             "observation.state": observation_state,
             "observation.pulses": motion_pulses,
             "observation.force_left": force_left,
             "observation.force_right": force_right,
-            "observation.force_left_window": force_left_window,
-            "observation.force_right_window": force_right_window,
-            "observation.force_window_dt": self._force_window_offsets(),
-            "appstation.observation.gripper": gripper_positions,
-            "appstation.sources": self._source_frame_metadata(
-                hal_sample,
-                force_sample,
-                camera_sample,
-                gripper_sample,
-                omega_sample,
-            ),
-            "appstation.omega": omega_sample.value if omega_sample.ok else {},
             "action": action,
             "images": image_payload,
         }
@@ -793,6 +788,14 @@ class DatasetRecorderService:
         # mock 模式直接使用遥测缓存；真机模式才进入 NI-DAQmx 窗口读取。
         if not self._real_hardware_mode(config):
             return None
+        # 录制线程只读取驱动缓存，避免 NI-DAQmx 同步采样拖慢 30Hz 主循环。
+        latest_window = getattr(self.hardware.force, "latest_window", None)
+        if callable(latest_window):
+            return await asyncio.to_thread(
+                latest_window,
+                config,
+                self._force_window_samples_per_frame,
+            )
         return await asyncio.to_thread(
             self.hardware.force.sample_window,
             config,
@@ -801,7 +804,17 @@ class DatasetRecorderService:
 
     async def _cached_source(self, source: str, value: Any, target_monotonic_s: float) -> SourceSample:
         # 缓存型源本身不阻塞，但仍记录采样时间，便于质量报告统一处理。
-        sample = SourceSample(source, value, time.monotonic(), True, "")
+        now = time.monotonic()
+        sample = SourceSample(
+            source,
+            value,
+            now,
+            True,
+            "",
+            target_monotonic_s=target_monotonic_s,
+            started_monotonic_s=now,
+            finished_monotonic_s=now,
+        )
         self._record_source_quality(sample, target_monotonic_s, 0.0)
         return sample
 
@@ -822,7 +835,10 @@ class DatasetRecorderService:
             last_sample_at if last_sample_at > 0 else time.monotonic(),
             ok,
             message,
-            self._gripper_source_details(age_s, config),
+            target_monotonic_s=target_monotonic_s,
+            started_monotonic_s=target_monotonic_s,
+            finished_monotonic_s=time.monotonic(),
+            stale=not ok,
         )
         self._record_source_quality(sample, target_monotonic_s, 0.0)
         return sample
@@ -834,23 +850,40 @@ class DatasetRecorderService:
             await asyncio.to_thread(refresh_gripper, config, time.monotonic())
 
     async def _timed_source(self, source: str, awaitable: Any, target_monotonic_s: float) -> SourceSample:
-        # wait_for 约束当前帧等待时间；即使底层 to_thread 还在结束，也不拖慢 30Hz tick。
+        # 单源超时只影响该源质量标记，不能拖慢同一 tick 的其他硬件源。
         started = time.monotonic()
         try:
             value = await asyncio.wait_for(awaitable, timeout=self._source_timeout_s(source))
             ok = True
             message = ""
+            timed_out = False
         except asyncio.TimeoutError:
             value = None
             ok = False
             message = f"{source} timeout"
+            timed_out = True
         except Exception as exc:  # noqa: BLE001
             value = None
             ok = False
             message = f"{source} failed: {exc}"
+            timed_out = False
         finished = time.monotonic()
-        sample = SourceSample(source, value, self._source_sample_monotonic(value, finished), ok, message)
-        self._record_source_quality(sample, target_monotonic_s, (finished - started) * 1000.0)
+        elapsed_ms = (finished - started) * 1000.0
+        sample = SourceSample(
+            source,
+            value,
+            self._source_sample_monotonic(value, finished),
+            ok,
+            message,
+            target_monotonic_s=target_monotonic_s,
+            started_monotonic_s=started,
+            finished_monotonic_s=finished,
+            elapsed_ms=elapsed_ms,
+            timed_out=timed_out,
+            stale=not ok,
+            cache_used=source == "camera" and any(self._last_camera_cache_used.values()),
+        )
+        self._record_source_quality(sample, target_monotonic_s, elapsed_ms)
         return sample
 
     def _source_timeout_s(self, source: str) -> float:
@@ -890,46 +923,8 @@ class DatasetRecorderService:
         if streak >= 3:
             self._source_warnings.append(f"{sample.source} consecutive failures: {streak}")
 
-    def _source_frame_metadata(self, *samples: SourceSample) -> dict[str, dict[str, Any]]:
-        metadata: dict[str, dict[str, Any]] = {}
-        for sample in samples:
-            item = {
-                "ok": sample.ok,
-                "message": sample.message,
-                "monotonicS": round(sample.monotonic_s, 6),
-            }
-            if sample.details:
-                item.update(sample.details)
-            metadata[sample.source] = item
-        return metadata
-
-    def _gripper_source_details(self, age_s: float, config: dict[str, Any]) -> dict[str, Any]:
-        samples = getattr(self.telemetry, "gripper_samples", {})
-        gripper_config = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
-        details: dict[str, Any] = {
-            "ageMs": round(age_s * 1000.0, 3) if math.isfinite(age_s) else None,
-            "targetSampleHz": self._positive_ratio(gripper_config.get("sampleHz"), 30.0),
-        }
-        if isinstance(samples, dict) and samples:
-            sides: dict[str, dict[str, Any]] = {}
-            for side in ("left", "right"):
-                sample = samples.get(side)
-                if isinstance(sample, dict):
-                    sides[side] = {
-                        "ok": bool(sample.get("ok")),
-                        "positionMm": sample.get("positionMm"),
-                        "readMs": sample.get("readMs"),
-                        "sampleHz": sample.get("sampleHz"),
-                        "tsMs": sample.get("tsMs"),
-                        "monotonicMs": sample.get("monotonicMs"),
-                        "message": sample.get("message", ""),
-                    }
-            if sides:
-                details["mode"] = "dual_worker"
-                details["sides"] = sides
-        return details
-
     async def _capture_cameras(self, config: dict[str, Any]) -> dict[str, Any]:
+        self._last_camera_cache_used = {key: False for key in CAMERA_KEYS}
         if self._native_dataset is not None:
             return await self._capture_native_camera_arrays(config)
         if self._dataset_dir is None:
@@ -955,6 +950,7 @@ class DatasetRecorderService:
             if isinstance(result, BaseException):
                 self._camera_drops[key] = self._camera_drops.get(key, 0) + 1
                 self._drop_counts[key] = self._drop_counts.get(key, 0) + 1
+                self._last_camera_cache_used[key] = True
                 result = self._last_camera_frames.get(key) or self._placeholder_camera_jpeg()
                 self._source_warnings.append(f"{key} camera cache used")
                 self.logs.warning("[CAMERA]", f"{key} snapshot failed; cached frame written")
@@ -988,12 +984,6 @@ class DatasetRecorderService:
             "observation.pulses": pulses,
             "observation.force_left": force_left,
             "observation.force_right": force_right,
-            "observation.force_left_window": frame["observation.force_left_window"],
-            "observation.force_right_window": frame["observation.force_right_window"],
-            "observation.force_window_dt": frame["observation.force_window_dt"],
-            "appstation.observation.gripper": frame["appstation.observation.gripper"],
-            "appstation.sources": frame.get("appstation.sources", {}),
-            "appstation.omega": frame.get("appstation.omega", {}),
             "action": frame["action"],
             "next.done": False,
             "images": frame["images"],
@@ -1084,6 +1074,7 @@ class DatasetRecorderService:
         self._source_elapsed_ms = {key: [] for key in SOURCE_KEYS}
         self._source_fail_streaks = {key: 0 for key in SOURCE_KEYS}
         self._source_warnings = []
+        self._last_camera_cache_used = {key: False for key in CAMERA_KEYS}
         self._max_force_left = 0.0
         self._max_force_right = 0.0
         self._current_episode_paths = []
@@ -1238,46 +1229,13 @@ class DatasetRecorderService:
 
     def _write_info(self, dataset_dir: Path, config: dict[str, Any]) -> None:
         info_path = dataset_dir / "meta" / "info.json"
-        info = self._read_json(info_path)
-        created_at = int(info.get("createdAt", now_ms())) if info else now_ms()
+        # fallback metadata 仅保留训练契约需要的核心字段，避免和 native metadata 语义混用。
         payload = {
             "name": self._dataset_name,
-            "status": str(info.get("status", "local")) if info else "local",
             "codebase_version": "v3.0",
             "robot_type": "dual_arm_micro_assembly",
             "fps": self._record_fps_from_config(config),
-            "format": "lerobot-v3-jsonl-fallback",
-            "nativeLeRobotAvailable": importlib.util.find_spec("lerobot") is not None,
-            "screenCaptureAvailable": self._screen_capture_available(),
-            "createdAt": created_at,
-            "updatedAt": now_ms(),
             "features": self._features(),
-            "units": {
-                "observation.state": "translations um, rotations 0.001 degree",
-                "observation.pulses": "raw LTDMC pulse counts from dmc_get_position",
-                "frontend.state": "translations um, rotations degree",
-                "force": "raw NI-DAQ values; calibration transform pending",
-                "appstation.force_*_window": "high-rate force samples aligned to each LeRobot frame",
-                "appstation.force_window_dt": "seconds relative to frame timestamp; last sample is closest to frame",
-            },
-            "recording": {
-                "fps": self._record_fps_from_config(config),
-                "forceSampleHz": self._force_sample_hz_from_config(config),
-                "forceWindowSamples": self._force_window_samples_from_config(config),
-                "alignment": (
-                    "LeRobot frame timestamp is frame_index/fps; "
-                    "force windows store per-frame high-rate history"
-                ),
-            },
-            "hardware": {
-                "cameras": config.get("cameras", {}),
-                "cameraResolutions": self._camera_resolution_summary_from_config(config),
-                "force": {
-                    "leftIp": config.get("force", {}).get("leftIp"),
-                    "rightIp": config.get("force", {}).get("rightIp"),
-                    "sampleHz": config.get("force", {}).get("sampleHz"),
-                },
-            },
         }
         self._write_json(info_path, payload)
 
@@ -1560,6 +1518,7 @@ class DatasetRecorderService:
         return str(info.get("format", "")) == "lerobot-v3-native"
 
     async def _capture_native_camera_arrays(self, config: dict[str, Any]) -> dict[str, Any]:
+        self._last_camera_cache_used = {key: False for key in CAMERA_KEYS}
         real_mode = self._real_hardware_mode(config)
         if not real_mode:
             return {
@@ -1574,6 +1533,7 @@ class DatasetRecorderService:
             if isinstance(result, BaseException):
                 self._camera_drops[key] = self._camera_drops.get(key, 0) + 1
                 self._drop_counts[key] = self._drop_counts.get(key, 0) + 1
+                self._last_camera_cache_used[key] = True
                 images[feature_key] = (
                     self._last_native_camera_frames.get(feature_key) or self._synthetic_camera_frame(feature_key)
                 )
@@ -1586,6 +1546,7 @@ class DatasetRecorderService:
             except Exception:  # noqa: BLE001
                 self._camera_drops[key] = self._camera_drops.get(key, 0) + 1
                 self._drop_counts[key] = self._drop_counts.get(key, 0) + 1
+                self._last_camera_cache_used[key] = True
                 images[feature_key] = (
                     self._last_native_camera_frames.get(feature_key) or self._synthetic_camera_frame(feature_key)
                 )
@@ -1677,50 +1638,12 @@ class DatasetRecorderService:
         fps = self._record_fps_from_config(config)
         return min(max(int(math.ceil(sample_hz / max(1, fps))), 1), 512)
 
-    def _force_window_from_latest(self, values: list[float]) -> list[list[float]]:
-        row = (list(values) + [0.0] * 6)[:6]
-        return [list(row) for _ in range(self._force_window_samples_per_frame)]
-
-    def _normalize_force_window(self, window: object, latest: list[float]) -> list[list[float]]:
-        if not isinstance(window, list):
-            return self._force_window_from_latest(latest)
-        rows: list[list[float]] = []
-        for item in window:
-            if not isinstance(item, list):
-                continue
-            rows.append(([float(value) for value in item] + [0.0] * 6)[:6])
-        if not rows:
-            return self._force_window_from_latest(latest)
-        target = self._force_window_samples_per_frame
-        if len(rows) < target:
-            rows = [list(rows[0]) for _ in range(target - len(rows))] + rows
-        return rows[-target:]
-
-    def _force_window_offsets(self) -> list[float]:
-        sample_hz = max(self._force_sample_hz, 1.0)
-        count = self._force_window_samples_per_frame
-        return [round((index - count + 1) / sample_hz, 9) for index in range(count)]
-
     def _sync_recording_shape_from_native_info(self, dataset_dir: Path) -> None:
         info = self._read_json(dataset_dir / "meta" / "info.json")
         try:
             self._record_fps_hz = int(info.get("fps", self._record_fps_hz))
         except (TypeError, ValueError):
             pass
-        features = info.get("features", {})
-        if not isinstance(features, dict):
-            return
-        force_window = features.get("observation.force_left_window")
-        if not isinstance(force_window, dict):
-            self._force_window_enabled = False
-            return
-        shape = force_window.get("shape", [])
-        if isinstance(shape, list) and shape:
-            try:
-                self._force_window_samples_per_frame = min(max(int(shape[0]), 1), 512)
-                self._force_window_enabled = True
-            except (TypeError, ValueError):
-                pass
 
     def _camera_size(self, config: dict[str, Any], camera: str = "global") -> tuple[int, int]:
         cameras = config.get("cameras", {})
@@ -2283,9 +2206,6 @@ class DatasetRecorderService:
     def _real_hardware_mode(self, config: dict[str, Any]) -> bool:
         mode = os.environ.get("APPSTATION_HAL_MODE") or config.get("hal", {}).get("mode", "real")
         return str(mode).lower() == "real"
-
-    def _screen_capture_available(self) -> bool:
-        return importlib.util.find_spec("mss") is not None or importlib.util.find_spec("PIL") is not None
 
     def _force_norm(self, values: object) -> float:
         if not isinstance(values, list) or len(values) < 3:

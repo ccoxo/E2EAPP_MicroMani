@@ -4,6 +4,7 @@ from pathlib import Path
 
 from backend.core.defaults import default_config
 from backend.drivers.force_nidaq import NidaqForceDriver
+from backend.drivers.force_nidaq import ForceProbeResult
 
 
 def test_force_driver_applies_reference_calibration_fallback() -> None:
@@ -57,3 +58,50 @@ def test_force_driver_loads_ati_xml_calibration_file(tmp_path: Path) -> None:
 
     assert left[0] == [1, 2, 3, 0.004, 0.005, 0.006]
     assert driver.calibration_info(config)["left"]["source"].startswith("file:")
+
+
+def test_force_driver_latest_window_repeats_last_scalar_without_blocking() -> None:
+    config = default_config()
+    config["force"]["sampleHz"] = 1000
+    driver = NidaqForceDriver()
+    driver._last_sample = ForceProbeResult(
+        True,
+        "cached",
+        [1, 2, 3, 4, 5, 6],
+        [6, 5, 4, 3, 2, 1],
+        sample_hz=1000,
+        sample_count=1,
+    )
+
+    result = driver.latest_window(config, 4)
+
+    assert result.ok is True
+    assert result.sample_count == 4
+    assert result.left_window == [[1, 2, 3, 4, 5, 6]] * 4
+    assert result.right_window == [[6, 5, 4, 3, 2, 1]] * 4
+
+
+def test_force_driver_sample_window_failure_uses_latest_scalar_fallback(monkeypatch) -> None:
+    config = default_config()
+    driver = NidaqForceDriver()
+    driver._last_sample = ForceProbeResult(
+        True,
+        "cached",
+        [1, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0],
+        sample_hz=200,
+        sample_count=1,
+    )
+
+    monkeypatch.setattr("backend.drivers.force_nidaq.import_module", lambda _name: object())
+    monkeypatch.setattr(
+        driver,
+        "_read_channel_window",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("daq timeout")),
+    )
+
+    result = driver.sample_window(config, 3)
+
+    assert result.ok is True
+    assert "daq timeout" in result.message
+    assert result.left_window == [[1, 0, 0, 0, 0, 0]] * 3
