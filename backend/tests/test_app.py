@@ -36,6 +36,11 @@ DATASET_LIST_CONTRACT_EXAMPLE = {
 }
 
 
+def _clear_camera_identities(config: dict) -> None:
+    for key in ("globalIdentity", "wristLeftIdentity", "wristRightIdentity"):
+        config["cameras"][key] = ""
+
+
 def test_settings_round_trip(tmp_path: Path) -> None:
     client = TestClient(create_app(tmp_path))
 
@@ -152,6 +157,11 @@ def test_motion_side_enable_and_home_routes(tmp_path: Path, monkeypatch: MonkeyP
     assert home_response.status_code == 200
     assert home_response.json()["data"]["command"] == "motion.home_side"
 
+    disable_response = client.post("/api/motion/left/disable_all")
+    assert disable_response.status_code == 200
+    state = asyncio.run(client.app.state.hal.motion_state())
+    assert state["enabled"][:6] == [False] * 6
+
     bad_side_response = client.post("/api/motion/center/enable_all")
     assert bad_side_response.status_code == 400
 
@@ -182,6 +192,26 @@ def test_motion_origin_capture_clear_and_per_side_config(tmp_path: Path, monkeyp
     assert left_origin["leftValid"] is True
     assert left_origin["rightValid"] is False
     assert left_origin["valid"] is False
+
+
+def test_home_all_requires_and_sends_captured_work_origin(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+
+    missing_response = client.post("/api/motion/home_all")
+    assert missing_response.status_code == 503
+    assert "work origin is not captured" in missing_response.json()["detail"]["message"]
+
+    assert client.post("/api/motion/origin/capture").status_code == 200
+    home_response = client.post("/api/motion/home_all")
+
+    assert home_response.status_code == 200
+    data = home_response.json()["data"]
+    assert data["command"] == "motion.home_all"
+    assert data["payload"] == {
+        "leftPulse": [0.0] * 6,
+        "rightPulse": [0.0] * 6,
+    }
 
 
 def test_motion_origin_relative_positions_are_applied_per_side(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -234,6 +264,26 @@ def test_websocket_reconnect_cancels_runtime_shutdown(tmp_path: Path, monkeypatc
 
     assert message["type"] == "telemetry"
     assert client.app.state.shutdown_task is None
+
+
+def test_runtime_release_handles_disconnects_teleop_and_grippers(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    config = client.get("/api/settings").json()
+    config["gripper"]["leftEnabled"] = True
+    config["gripper"]["rightEnabled"] = True
+    config["teleop"]["leftConnected"] = True
+    config["teleop"]["rightConnected"] = True
+    assert client.put("/api/settings", json=config).status_code == 200
+
+    response = client.post("/api/runtime/release_handles", json={"reason": "unit-test"})
+
+    assert response.status_code == 200
+    saved = client.get("/api/settings").json()
+    assert saved["gripper"]["leftEnabled"] is False
+    assert saved["gripper"]["rightEnabled"] is False
+    assert saved["teleop"]["leftConnected"] is False
+    assert saved["teleop"]["rightConnected"] is False
 
 
 def test_teleop_logical_connect_disconnect_does_not_touch_motion(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -535,6 +585,7 @@ def test_camera_snapshot_endpoint_returns_jpeg(tmp_path: Path, monkeypatch: Monk
     monkeypatch.setattr("backend.drivers.camera_opencv.import_module", lambda name: FakeCv2)
     client = TestClient(create_app(tmp_path))
     config = client.get("/api/settings").json()
+    _clear_camera_identities(config)
     config["cameras"]["global"] = "Global UVC / index 0"
     assert client.put("/api/settings", json=config).status_code == 200
 
@@ -598,6 +649,7 @@ def test_camera_driver_falls_back_when_first_windows_backend_fails(tmp_path: Pat
     monkeypatch.setattr("backend.drivers.camera_opencv.import_module", lambda name: FakeCv2)
     client = TestClient(create_app(tmp_path))
     config = client.get("/api/settings").json()
+    _clear_camera_identities(config)
     config["cameras"]["global"] = "Global UVC / index 0"
     assert client.put("/api/settings", json=config).status_code == 200
 
@@ -607,8 +659,73 @@ def test_camera_driver_falls_back_when_first_windows_backend_fails(tmp_path: Pat
     assert calls[:2] == [(0, 1400), (0, 700)]
 
 
+def test_camera_driver_reopens_stale_capture() -> None:
+    driver = OpenCVCameraDriver()
+    captures: list[FakeCapture] = []
+
+    class FakeCapture:
+        def __init__(self, index: int, backend: int) -> None:
+            self.index = index
+            self.backend = backend
+            self.released = False
+            captures.append(self)
+
+        def isOpened(self) -> bool:
+            return not self.released
+
+        def set(self, prop: int, value: int) -> None:
+            _ = (prop, value)
+
+        def get(self, prop: int) -> float:
+            _ = prop
+            return 30.0
+
+        def read(self) -> tuple[bool, object | None]:
+            time.sleep(0.01)
+            return False, None
+
+        def release(self) -> None:
+            self.released = True
+
+    class FakeCv2:
+        CAP_ANY = 0
+        CAP_MSMF = 1400
+        CAP_DSHOW = 700
+        CAP_PROP_FRAME_WIDTH = 3
+        CAP_PROP_FRAME_HEIGHT = 4
+        CAP_PROP_FPS = 5
+        CAP_PROP_FOURCC = 6
+        CAP_PROP_BUFFERSIZE = 7
+        IMWRITE_JPEG_QUALITY = 1
+
+        @staticmethod
+        def VideoCapture(index: int, backend: int) -> FakeCapture:
+            return FakeCapture(index, backend)
+
+        @staticmethod
+        def VideoWriter_fourcc(a: str, b: str, c: str, d: str) -> int:
+            _ = (a, b, c, d)
+            return 1
+
+        @staticmethod
+        def imencode(ext: str, frame: object, options: list[int]) -> tuple[bool, bytes]:
+            _ = (ext, frame, options)
+            return True, b"\xff\xd8fake-jpeg\xff\xd9"
+
+    first = driver._get_capture(FakeCv2, 0, 640, 480, 30)  # noqa: SLF001
+    assert first is captures[0]
+    driver._latest_at[0] = time.monotonic() - 3.0  # noqa: SLF001
+
+    second = driver._get_capture(FakeCv2, 0, 640, 480, 30)  # noqa: SLF001
+
+    assert second is captures[1]
+    assert first.released is True
+    driver._drop_capture(0)  # noqa: SLF001
+
+
 def test_global_camera_auto_index_uses_remaining_device(monkeypatch: MonkeyPatch) -> None:
     config = default_config()
+    _clear_camera_identities(config)
     config["cameras"]["global"] = "Global UVC / index -1"
     config["cameras"]["wristLeft"] = "IMX258 / index 2"
     config["cameras"]["wristRight"] = "IMX258 / index 0"
@@ -627,12 +744,43 @@ def test_global_camera_auto_index_uses_remaining_device(monkeypatch: MonkeyPatch
     assert resolved == {"global": 1, "wrist_left": 2, "wrist_right": 0}
 
 
+def test_camera_identity_overrides_stale_index(monkeypatch: MonkeyPatch) -> None:
+    config = default_config()
+    config["cameras"]["global"] = "AR0234 / index 0"
+    config["cameras"]["globalIdentity"] = "USB\\VID_1D6B&PID_0102&MI_00\\7&235CBC02&0&0000"
+    driver = OpenCVCameraDriver()
+
+    monkeypatch.setattr(
+        driver,
+        "_camera_identities_by_index",
+        lambda: {
+            0: {
+                "name": "OBS Virtual Camera",
+                "devicePath": "",
+                "displayName": "@device:sw:{860BB310-5D01-11D0-BD3B-00A0C911CE86}\\{A3FCE0F5}",
+            },
+            2: {
+                "name": "UVC Camera",
+                "devicePath": "\\\\?\\usb#vid_1d6b&pid_0102&mi_00#7&235cbc02&0&0000#{guid}\\global",
+                "displayName": "@device:pnp:\\\\?\\usb#vid_1d6b&pid_0102&mi_00#7&235cbc02&0&0000#{guid}\\global",
+            },
+        },
+    )
+
+    resolved = driver._resolved_indices(object(), config, 30)
+
+    assert resolved["global"] == 2
+
+
 def test_default_camera_mapping_matches_deployment_hardware() -> None:
     config = default_config()
 
-    assert config["cameras"]["global"] == "AR0234 / index 1"
-    assert config["cameras"]["wristLeft"] == "IMX258 / index 2"
+    assert config["cameras"]["global"] == "AR0234 / index 2"
+    assert config["cameras"]["globalIdentity"] == "USB\\VID_1D6B&PID_0102&MI_00\\7&235CBC02&0&0000"
+    assert config["cameras"]["wristLeft"] == "IMX258 / index 1"
+    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0EDC&PID_3080&MI_00\\7&38B4EA25&0&0000"
     assert config["cameras"]["wristRight"] == "IMX258 / index 0"
+    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0EDC&PID_3080&MI_00\\6&1BBFDB86&0&0000"
     assert config["cameras"]["previewResolution"] == "640x480"
     assert config["cameras"]["globalResolution"] == "640x480"
     assert config["cameras"]["wristLeftResolution"] == "640x480"
@@ -671,8 +819,8 @@ def test_real_hal_mode_reports_unavailable_without_service(tmp_path: Path, monke
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
     monkeypatch.setenv("APPSTATION_HAL_BASE_URL", "http://127.0.0.1:65530")
 
-    def fake_hardware_status(self: object) -> dict[str, object]:
-        _ = self
+    def fake_hardware_status(self: object, *, include_gripper: bool = True) -> dict[str, object]:
+        _ = (self, include_gripper)
         return {}
 
     monkeypatch.setattr("backend.services.hardware_service.HardwareService.status", fake_hardware_status)
@@ -766,12 +914,16 @@ def test_real_hal_client_maps_teleop_continuous_commands(monkeypatch: MonkeyPatc
 
 
 def test_hal_state_clients_include_receive_timestamps(monkeypatch: MonkeyPatch) -> None:
+def test_real_hal_client_serializes_home_all_work_origin(monkeypatch: MonkeyPatch) -> None:
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
     class FakeResponse:
         status = 200
         headers = {"Connection": "keep-alive"}
 
         def read(self) -> bytes:
             return b'{"positions":[]}'
+            return b'{"ok":true}'
 
     class FakeConnection:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -783,6 +935,11 @@ def test_hal_state_clients_include_receive_timestamps(monkeypatch: MonkeyPatch) 
 
         def request(self, *args: object, **kwargs: object) -> None:
             _ = (args, kwargs)
+        def request(self, method: str, path: str, *args: object, **kwargs: object) -> None:
+            _ = args
+            body = kwargs.get("body")
+            assert isinstance(body, bytes)
+            calls.append((method, path, json.loads(body.decode("utf-8"))))
 
         def getresponse(self) -> FakeResponse:
             return FakeResponse()
@@ -802,6 +959,28 @@ def test_hal_state_clients_include_receive_timestamps(monkeypatch: MonkeyPatch) 
     assert isinstance(real_state["received_monotonic_ms"], int)
     assert isinstance(test_state["timestamp_ms"], int)
     assert isinstance(test_state["received_monotonic_ms"], int)
+    client = RealHalClient("http://127.0.0.1:8091", 5000, LogService())
+
+    asyncio.run(
+        client.command(
+            "motion.home_all",
+            {
+                "leftPulse": [1, 2, 3, 4, 5, 6],
+                "rightPulse": [-1, -2, -3, -4, -5, -6],
+            },
+        )
+    )
+
+    assert calls == [
+        (
+            "POST",
+            "/motion/home_all",
+            {
+                "leftPulse": [1, 2, 3, 4, 5, 6],
+                "rightPulse": [-1, -2, -3, -4, -5, -6],
+            },
+        )
+    ]
 
 
 def test_dataset_recorder_action_vector_prefers_teleop_delta_vector() -> None:

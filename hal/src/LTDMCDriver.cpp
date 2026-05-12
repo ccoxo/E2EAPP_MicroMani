@@ -399,6 +399,9 @@ void LTDMCDriver::moveRelativeUi(
   if (deltaPulse == 0) {
     throw std::runtime_error("jog delta rounds to zero pulses");
   }
+  if (!enabled_[index]) {
+    throw std::runtime_error("axis is not servo-enabled");
+  }
   const auto card = side == Side::Left ? static_cast<unsigned short>(1) : static_cast<unsigned short>(0);
   const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
   const auto pulseScale = std::abs(pulsePerUnit(side, axis));
@@ -485,6 +488,9 @@ void LTDMCDriver::updateTeleopTargetUi(
       continue;
     }
     const auto index = stateIndex(side, axis);
+    if (!enabled_[index]) {
+      throw std::runtime_error("teleop axis is not servo-enabled");
+    }
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
     if (!teleopTargetActive_[index] && dmcGetPosition) {
@@ -511,9 +517,11 @@ void LTDMCDriver::updateTeleopTargetUi(
       throw std::runtime_error(dmcAxisFailureMessage("axis busy before teleop target", -1, card, axisNo));
     }
     if (moving) {
-      const auto retUpdate = dmcUpdateTargetPosition(card, axisNo, deltaPulse, 0);
+      const auto updateTargetPulse = static_cast<long>(std::llround(targetPulse));
+      const auto retUpdate = dmcUpdateTargetPosition(card, axisNo, updateTargetPulse, 1);
       if (retUpdate != 0) {
-        throw std::runtime_error(dmcFailureMessage("dmc_update_target_position", retUpdate, card, axisNo, deltaPulse));
+        throw std::runtime_error(
+            dmcFailureMessage("dmc_update_target_position", retUpdate, card, axisNo, updateTargetPulse));
       }
     } else {
       applyMotionProfile(card, axisNo, startVelocityPulse, maxVelocityPulse, tacc, tdec, deltaPulse);

@@ -259,6 +259,56 @@ double jsonNumberValue(const std::string& body, const std::string& key, double f
   return end == start ? fallback : value;
 }
 
+bool jsonNumberArrayValue(const std::string& body, const std::string& key, size_t index, double* out) {
+  const auto marker = std::string("\"") + key + "\"";
+  auto pos = body.find(marker);
+  if (pos == std::string::npos) {
+    return false;
+  }
+  pos = body.find('[', pos + marker.size());
+  if (pos == std::string::npos) {
+    return false;
+  }
+  ++pos;
+  for (size_t current = 0; current <= index; ++current) {
+    while (pos < body.size() && std::isspace(static_cast<unsigned char>(body[pos]))) {
+      ++pos;
+    }
+    const char* start = body.c_str() + pos;
+    char* end = nullptr;
+    const double value = std::strtod(start, &end);
+    if (end == start) {
+      return false;
+    }
+    if (current == index) {
+      *out = value;
+      return true;
+    }
+    pos = static_cast<size_t>(end - body.c_str());
+    while (pos < body.size() && std::isspace(static_cast<unsigned char>(body[pos]))) {
+      ++pos;
+    }
+    if (pos >= body.size() || body[pos] != ',') {
+      return false;
+    }
+    ++pos;
+  }
+  return false;
+}
+
+std::array<double, 12> jsonWorkOriginPulse(const std::string& body) {
+  std::array<double, 12> pulses{};
+  for (size_t i = 0; i < 6; ++i) {
+    if (!jsonNumberArrayValue(body, "leftPulse", i, &pulses[i])) {
+      throw std::runtime_error("home_all requires leftPulse[6] work origin payload");
+    }
+    if (!jsonNumberArrayValue(body, "rightPulse", i, &pulses[i + 6])) {
+      throw std::runtime_error("home_all requires rightPulse[6] work origin payload");
+    }
+  }
+  return pulses;
+}
+
 appstation::hal::Side parseSide(const std::string& value) {
   // 后端只允许左右两侧，解析失败直接返回 500 给调用方暴露配置错误。
   if (value == "left") {
@@ -333,11 +383,15 @@ void serveConnection(
         motion.emergencyStop();
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/home_all ", 0) == 0) {
-        motion.homeAll({-49168, 63684, -299991, -322906, -47164, -2947, -100233, -114583, -4202, 4427, 18890, -180});
+        motion.homeAll(jsonWorkOriginPulse(requestBody(request)));
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/enable_side ", 0) == 0) {
         const auto side = parseSide(jsonStringValue(requestBody(request), "side"));
         motion.enableSide(side, true);
+        body = "{\"ok\":true}";
+      } else if (request.rfind("POST /motion/disable_side ", 0) == 0) {
+        const auto side = parseSide(jsonStringValue(requestBody(request), "side"));
+        motion.enableSide(side, false);
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/home_side ", 0) == 0) {
         const auto side = parseSide(jsonStringValue(requestBody(request), "side"));

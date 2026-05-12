@@ -273,6 +273,12 @@ describe('AppStation M0 frontend', () => {
 
   it('records arm and gripper manual actions into replay memory', () => {
     window.history.pushState({}, '', '/settings#manual')
+    useTelemetryStore.setState((state) => ({
+      config: {
+        ...state.config,
+        gripper: { ...state.config.gripper, leftEnabled: true },
+      },
+    }))
     render(<App />)
     fireEvent.click(screen.getByText('开始记录').closest('button')!)
     const leftArmCard = screen.getByText('左臂手动控制').closest('article')

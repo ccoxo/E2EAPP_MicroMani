@@ -1948,6 +1948,12 @@ class DatasetRecorderService:
         delta_vector = last_action.get("deltaVector")
         if isinstance(delta_vector, list):
             return self._motion_delta_to_action_delta(delta_vector)
+        if isinstance(delta_vector, list) and len(delta_vector) == 12:
+            converted: list[float] = []
+            for index, raw_value in enumerate(delta_vector):
+                value = float(raw_value)
+                converted.append(value * 1000.0 if index % 6 >= 3 else value)
+            return converted
         side = last_action.get("side")
         axis = last_action.get("axis")
         if side not in {"left", "right"} or axis not in {"X", "Y", "Z", "Roll", "Pitch", "Yaw"}:

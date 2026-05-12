@@ -173,10 +173,10 @@ export const omega7Spec = {
 
 export const defaultMotionProfile = {
   translation: {
-    startSpeed: 10,
-    maxSpeed: 100,
-    accTimeSec: 0.02,
-    decTimeSec: 0.02,
+    startSpeed: 100,
+    maxSpeed: 1000,
+    accTimeSec: 0.05,
+    decTimeSec: 0.05,
   },
   rotation: {
     startSpeed: 0.3,

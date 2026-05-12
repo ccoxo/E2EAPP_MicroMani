@@ -12,8 +12,8 @@ import type {
   ParameterSnapshotScope,
 } from '../types'
 
-export const apiBase = import.meta.env.VITE_API_BASE || 'http://localhost:8080'
-export const wsUrl = import.meta.env.VITE_WS_URL || 'ws://localhost:8080/ws'
+export const apiBase = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:18082'
+export const wsUrl = import.meta.env.VITE_WS_URL || 'ws://127.0.0.1:18082/ws'
 export const mockMode = import.meta.env.MODE === 'test'
 export const autoShutdownOnClose = import.meta.env.VITE_AUTO_SHUTDOWN_ON_CLOSE === 'true'
 
@@ -92,6 +92,28 @@ export function installAutoShutdownOnClose() {
     }).catch(() => undefined)
   }
   window.addEventListener('pagehide', requestShutdown, { once: true })
+}
+
+export function installRuntimeReleaseOnClose() {
+  if (mockMode || typeof window === 'undefined') return
+  let sent = false
+  const requestRelease = () => {
+    if (sent) return
+    sent = true
+    const url = `${apiBase}/api/runtime/release_handles`
+    const body = JSON.stringify({ reason: 'browser-close' })
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }))
+      return
+    }
+    void fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+      keepalive: true,
+    }).catch(() => undefined)
+  }
+  window.addEventListener('pagehide', requestRelease, { once: true })
 }
 
 export async function fetchConfig(): Promise<AppConfig> {
@@ -210,6 +232,9 @@ export async function manualAxisMove(
 
 export const enableMotionSide = (side: ManualControlSide) =>
   postCommand(`/motion/${side}/enable_all`)
+
+export const disableMotionSide = (side: ManualControlSide) =>
+  postCommand(`/motion/${side}/disable_all`)
 
 export const homeMotionSide = (side: ManualControlSide) =>
   postCommand(`/motion/${side}/home`)
