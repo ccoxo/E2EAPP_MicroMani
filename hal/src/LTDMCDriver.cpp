@@ -1,6 +1,7 @@
 #include "LTDMCDriver.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <sstream>
 
@@ -11,6 +12,11 @@
 namespace appstation::hal {
 
 namespace {
+std::int64_t unixTimeMs() {
+  const auto now = std::chrono::system_clock::now().time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+}
+
 #ifdef _WIN32
 using DmcBoardInit = short(__stdcall*)();
 using DmcGetPosition = long(__stdcall*)(unsigned short, unsigned short);
@@ -200,6 +206,7 @@ MotionState LTDMCDriver::readState() {
   std::scoped_lock lock(mutex_);
   ensureInitialized();
   MotionState state;
+  state.readTimestampMs = unixTimeMs();
   state.estopActive = estopActive_;
   for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
@@ -363,7 +370,7 @@ void LTDMCDriver::moveAllUi(const std::array<double, 12>& targetUi, const std::a
     }
   }
 #ifdef APPSTATION_ENABLE_VENDOR_SDKS
-  // TODO: map semantic axes to physicalAxis(side, axis), apply profiles, and submit motion commands.
+  // TODO: 将语义轴映射到 physicalAxis(side, axis)，应用运动参数并提交运动命令。
 #endif
 }
 
@@ -378,8 +385,8 @@ void LTDMCDriver::moveRelativeUi(
   std::scoped_lock lock(mutex_);
   ensureInitialized();
   const auto rotation = isRotation(axis);
-  // Hardware-test safety bound: keep relative jogs from accidentally driving the
-  // axis off-stage. Higher-level callers should also enforce per-task limits.
+  // 硬件测试安全边界：避免相对 jog 误把轴带出工作台范围。
+  // 上层调用方仍需按任务继续施加软限位。
   const auto maxStep = rotation ? 2.0 : 5000.0;
   if (std::abs(deltaUi) > maxStep) {
     throw std::runtime_error(rotation ? "rotation jog exceeds 2 degree" : "translation jog exceeds 5000 um");
@@ -398,9 +405,8 @@ void LTDMCDriver::moveRelativeUi(
   const auto card = side == Side::Left ? static_cast<unsigned short>(1) : static_cast<unsigned short>(0);
   const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
   const auto pulseScale = std::abs(pulsePerUnit(side, axis));
-  // pulsePerUnit is pulses-per-mm for translation, pulses-per-degree for
-  // rotation. UI velocity is um/s or deg/s respectively, so the translation
-  // form needs a /1000 to convert mm->um.
+  // pulsePerUnit 对平移表示 pulse/mm，对旋转表示 pulse/degree。
+  // UI 速度分别是 um/s 和 deg/s，因此平移速度需要 /1000 做单位转换。
   const auto velocityScale = rotation ? pulseScale : pulseScale / 1000.0;
   const auto maxVelocityPulse = (std::max)(1.0, maxVelocityUiPerSec * velocityScale);
   double startVelocityPulse;
@@ -409,14 +415,13 @@ void LTDMCDriver::moveRelativeUi(
   } else {
     startVelocityPulse = (std::max)(1.0, maxVelocityPulse * 0.2);
   }
-  // The LTDMC firmware refuses Min_Vel == Max_Vel on dmc_set_profile (returns
-  // a parameter error and the next dmc_pmove silently uses leftover profile
-  // state). Force a small headroom so the SDK always gets a real ramp.
+  // LTDMC 固件不接受 dmc_set_profile 中 Min_Vel == Max_Vel。
+  // 否则会返回参数错误，后续 dmc_pmove 可能沿用旧 profile；这里强制留出小斜坡。
   if (startVelocityPulse >= maxVelocityPulse) {
     startVelocityPulse = (std::max)(1.0, maxVelocityPulse * 0.5);
   }
-  // dmc_set_profile takes Tacc/Tdec in seconds (time to ramp from start->max).
-  // If the caller did not pass a positive value, default to a safe 50ms ramp.
+  // dmc_set_profile 的 Tacc/Tdec 单位是秒，表示从 start ramp 到 max 的时间。
+  // 调用方未传正数时，默认使用较保守的 50ms 斜坡。
   const double tacc = accTimeSec > 0 ? accTimeSec : 0.05;
   const double tdec = decTimeSec > 0 ? decTimeSec : 0.05;
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)

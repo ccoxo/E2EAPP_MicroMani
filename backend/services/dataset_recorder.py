@@ -9,12 +9,13 @@ import os
 import re
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
 from backend.core.config import SettingsService
 from backend.core.logging import LogService, now_ms
-from backend.core.units import lerobot_to_ui_state, pulses_to_ui_state, ui_to_lerobot_state
+from backend.core.units import lerobot_to_ui_state, pulses_to_ui_state
 from backend.hal_client.client import HalClient
 from backend.services.hardware_service import HardwareService
 from backend.services.telemetry_hub import TelemetryHub
@@ -29,9 +30,9 @@ CAMERA_FEATURE_KEYS: dict[str, str] = {
     "wrist_right": "observation.images.wrist_right",
 }
 CAMERA_CAPTURE_SIZES: dict[str, tuple[int, int]] = {
-    "global": (1920, 1080),
-    "wrist_left": (1920, 1080),
-    "wrist_right": (1920, 1080),
+    "global": (640, 480),
+    "wrist_left": (640, 480),
+    "wrist_right": (640, 480),
 }
 STATE_FEATURE_NAMES: tuple[str, ...] = (
     "left_x_um",
@@ -40,12 +41,14 @@ STATE_FEATURE_NAMES: tuple[str, ...] = (
     "left_roll_mdeg",
     "left_pitch_mdeg",
     "left_yaw_mdeg",
+    "left_gripper_gap_mm",
     "right_x_um",
     "right_y_um",
     "right_z_um",
     "right_roll_mdeg",
     "right_pitch_mdeg",
     "right_yaw_mdeg",
+    "right_gripper_gap_mm",
 )
 PULSE_FEATURE_NAMES: tuple[str, ...] = (
     "left_x_pulse",
@@ -68,15 +71,36 @@ ACTION_FEATURE_NAMES: tuple[str, ...] = (
     "left_droll_mdeg",
     "left_dpitch_mdeg",
     "left_dyaw_mdeg",
+    "left_gripper_target_mm",
     "right_dx_um",
     "right_dy_um",
     "right_dz_um",
     "right_droll_mdeg",
     "right_dpitch_mdeg",
     "right_dyaw_mdeg",
+    "right_gripper_target_mm",
 )
 FORCE_FEATURE_NAMES: tuple[str, ...] = ("fx", "fy", "fz", "mx", "my", "mz")
 GRIPPER_FEATURE_NAMES: tuple[str, str] = ("left_gap_mm", "right_gap_mm")
+SOURCE_KEYS: tuple[str, ...] = ("hal", "camera", "force", "gripper", "omega")
+SOURCE_TIMEOUT_S: dict[str, float] = {
+    "hal": 0.020,
+    "camera": 0.0333,
+    "force": 0.020,
+    "omega": 0.020,
+}
+# timeout 用 drop 边界，warning 用更严格的 skew 边界；这样慢但成功的源也会进入质量报告。
+SOURCE_WARNING_SKEW_MS: dict[str, float] = {"hal": 20.0, "camera": 16.7}
+SOURCE_DROP_SKEW_MS: dict[str, float] = {"camera": 33.3}
+
+
+@dataclass(frozen=True)
+class SourceSample:
+    source: str
+    value: Any
+    monotonic_s: float
+    ok: bool = True
+    message: str = ""
 
 
 class DatasetRecorderService:
@@ -118,6 +142,15 @@ class DatasetRecorderService:
         self._episode_frames = 0
         self._episode_late_frames = 0
         self._camera_drops = {key: 0 for key in CAMERA_KEYS}
+        self._tick_target_monotonic_s = 0.0
+        self._tick_capture_monotonic_s = 0.0
+        self._tick_skews_ms: list[float] = []
+        self._drop_counts: dict[str, int] = {key: 0 for key in (*CAMERA_KEYS, *SOURCE_KEYS)}
+        self._late_source_frames: dict[str, int] = {}
+        self._source_skews_ms: dict[str, list[float]] = {key: [] for key in SOURCE_KEYS}
+        self._source_elapsed_ms: dict[str, list[float]] = {key: [] for key in SOURCE_KEYS}
+        self._source_fail_streaks: dict[str, int] = {key: 0 for key in SOURCE_KEYS}
+        self._source_warnings: list[str] = []
         self._max_force_left = 0.0
         self._max_force_right = 0.0
         self._writer: TextIO | None = None
@@ -597,7 +630,7 @@ class DatasetRecorderService:
 
     async def _record_loop(self) -> None:
         # 录制循环按目标 FPS 调度；慢帧只记质量指标，不中断本轮采集。
-        period_s = 1.0 / max(1, self._record_fps_hz) # 记录的时间戳   1 / fps
+        period_s = 1.0 / max(1, self._record_fps_hz)  # 录制主轴周期：1 / fps。
         # 下一帧的开始时间
         next_tick = time.monotonic()
         # 录制循环
@@ -613,9 +646,14 @@ class DatasetRecorderService:
                 if now > next_tick + period_s:
                     async with self._lock:
                         self._episode_late_frames += 1
-                # 记录信息
-                frame = await self._collect_frame()
+                # 记录当前 tick 的实际采集时间，用于 episode 质量统计。
+                target_tick = next_tick
+                capture_tick = time.monotonic()
+                frame = await self._collect_frame(target_tick)
                 async with self._lock:
+                    self._tick_target_monotonic_s = target_tick
+                    self._tick_capture_monotonic_s = capture_tick
+                    self._tick_skews_ms.append((capture_tick - target_tick) * 1000.0)
                     self._write_frame_locked(frame)
                 next_tick += period_s
                 await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
@@ -625,52 +663,169 @@ class DatasetRecorderService:
                 self.logs.error("[LEROBOT]", f"record loop recovered: {exc}")
                 await asyncio.sleep(0.2)
 
-    async def _collect_frame(self) -> dict[str, Any]:
+    async def _collect_frame(self, target_monotonic_s: float | None = None) -> dict[str, Any]:
         config = self.settings.get_config()
+        target_monotonic_s = target_monotonic_s if target_monotonic_s is not None else time.monotonic()
         motion_positions = list(self.telemetry.motion_positions)
         motion_pulses = [0.0] * 12
-        try:
-            # 录制优先读取 HAL 的即时位置，遥测缓存只作为短暂不可用时的兜底。
-            motion_state = await self.hal.motion_state()
-            raw_positions = motion_state.get("positions")
-            if isinstance(raw_positions, list) and len(raw_positions) == 12:
-                motion_positions = [float(value) for value in raw_positions]
-            raw_pulses = motion_state.get("pulses")
-            if isinstance(raw_pulses, list) and len(raw_pulses) == 12:
-                motion_pulses = [float(value) for value in raw_pulses]
-        except Exception:
-            pass
-        motion_positions = self._recording_motion_positions(config, motion_positions, motion_pulses)
         force_left = list(self.telemetry.force_left)
         force_right = list(self.telemetry.force_right)
         force_left_window = self._force_window_from_latest(force_left)
         force_right_window = self._force_window_from_latest(force_right)
-        if self._real_hardware_mode(config):
-            # 真机模式用窗口采样保存力传感器短时上下文，方便后续训练识别接触变化。
-            force_result = await asyncio.to_thread(
-                self.hardware.force.sample_window,
-                config,
-                self._force_window_samples_per_frame,
-            )
-            if force_result.ok:
-                force_left = [float(value) for value in force_result.left]
-                force_right = [float(value) for value in force_result.right]
-                force_left_window = self._normalize_force_window(force_result.left_window, force_left)
-                force_right_window = self._normalize_force_window(force_result.right_window, force_right)
-        image_payload = await self._capture_cameras(config)
-        action = self._latest_action_vector()
+        # 同一个 tick 内并发启动主要硬件源，避免 HAL、力觉和相机串行耗时累加。
+        # 单个源超时或失败只降级该源，不能阻塞其他源写入当前帧。
+        (
+            hal_sample,
+            force_sample,
+            camera_sample,
+            gripper_sample,
+            omega_sample,
+        ) = await asyncio.gather(
+            self._timed_source("hal", self.hal.motion_state(), target_monotonic_s),
+            self._timed_source("force", self._force_window_sample(config), target_monotonic_s),
+            self._timed_source("camera", self._capture_cameras(config), target_monotonic_s),
+            self._gripper_source(config, target_monotonic_s),
+            self._timed_source("omega", self.hal.omega_state(), target_monotonic_s),
+        )
+        motion_state = hal_sample.value if hal_sample.ok and isinstance(hal_sample.value, dict) else {}
+        raw_positions = motion_state.get("positions") if isinstance(motion_state, dict) else None
+        if isinstance(raw_positions, list) and len(raw_positions) == 12:
+            motion_positions = [float(value) for value in raw_positions]
+        raw_pulses = motion_state.get("pulses") if isinstance(motion_state, dict) else None
+        if isinstance(raw_pulses, list) and len(raw_pulses) == 12:
+            motion_pulses = [float(value) for value in raw_pulses]
+        motion_positions = self._recording_motion_positions(config, motion_positions, motion_pulses)
+        force_result = force_sample.value
+        if force_sample.ok and getattr(force_result, "ok", False):
+            force_left = [float(value) for value in force_result.left]
+            force_right = [float(value) for value in force_result.right]
+            force_left_window = self._normalize_force_window(force_result.left_window, force_left)
+            force_right_window = self._normalize_force_window(force_result.right_window, force_right)
+        gripper_positions = (
+            list(gripper_sample.value)
+            if gripper_sample.ok and isinstance(gripper_sample.value, list)
+            else list(self.telemetry.gripper_positions)
+        )
+        observation_state = self._compose_observation_state(motion_positions, gripper_positions)
+        image_payload = camera_sample.value if camera_sample.ok and isinstance(camera_sample.value, dict) else {}
+        action = self._latest_action_vector(observation_state, config)
         return {
             "timestamp": time.time(),
-            "observation.state": ui_to_lerobot_state(motion_positions),
+            "observation.state": observation_state,
             "observation.pulses": motion_pulses,
             "observation.force_left": force_left,
             "observation.force_right": force_right,
             "observation.force_left_window": force_left_window,
             "observation.force_right_window": force_right_window,
             "observation.force_window_dt": self._force_window_offsets(),
-            "observation.gripper": list(self.telemetry.gripper_positions),
+            "appstation.observation.gripper": gripper_positions,
+            "appstation.sources": self._source_frame_metadata(
+                hal_sample,
+                force_sample,
+                camera_sample,
+                gripper_sample,
+                omega_sample,
+            ),
+            "appstation.omega": omega_sample.value if omega_sample.ok else {},
             "action": action,
             "images": image_payload,
+        }
+
+    async def _force_window_sample(self, config: dict[str, Any]) -> Any | None:
+        # mock 模式直接使用遥测缓存；真机模式才进入 NI-DAQmx 窗口读取。
+        if not self._real_hardware_mode(config):
+            return None
+        return await asyncio.to_thread(
+            self.hardware.force.sample_window,
+            config,
+            self._force_window_samples_per_frame,
+        )
+
+    async def _cached_source(self, source: str, value: Any, target_monotonic_s: float) -> SourceSample:
+        # 缓存型源本身不阻塞，但仍记录采样时间，便于质量报告统一处理。
+        sample = SourceSample(source, value, time.monotonic(), True, "")
+        self._record_source_quality(sample, target_monotonic_s, 0.0)
+        return sample
+
+    async def _gripper_source(self, config: dict[str, Any], target_monotonic_s: float) -> SourceSample:
+        # 夹爪位置由 telemetry/worker 后台刷新；录制帧只读取缓存并检查是否过期。
+        if not self._real_hardware_mode(config):
+            return await self._cached_source("gripper", list(self.telemetry.gripper_positions), target_monotonic_s)
+        stale_after_s = self._positive_ratio(config.get("gripper", {}).get("sampleStaleMs"), 2500.0) / 1000.0
+        stale_after_s = max(0.5, stale_after_s)
+        last_sample_at = float(getattr(self.telemetry, "_last_gripper_sample_at", 0.0) or 0.0)
+        age_s = time.monotonic() - last_sample_at if last_sample_at > 0 else math.inf
+        ok = age_s <= stale_after_s
+        message = "" if ok else f"gripper stale: {round(age_s, 3)}s"
+        sample = SourceSample("gripper", list(self.telemetry.gripper_positions), time.monotonic(), ok, message)
+        self._record_source_quality(sample, target_monotonic_s, 0.0)
+        return sample
+
+    async def _timed_source(self, source: str, awaitable: Any, target_monotonic_s: float) -> SourceSample:
+        # wait_for 约束当前帧等待时间；即使底层 to_thread 还在结束，也不拖慢 30Hz tick。
+        started = time.monotonic()
+        try:
+            value = await asyncio.wait_for(awaitable, timeout=self._source_timeout_s(source))
+            ok = True
+            message = ""
+        except asyncio.TimeoutError:
+            value = None
+            ok = False
+            message = f"{source} timeout"
+        except Exception as exc:  # noqa: BLE001
+            value = None
+            ok = False
+            message = f"{source} failed: {exc}"
+        finished = time.monotonic()
+        sample = SourceSample(source, value, self._source_sample_monotonic(value, finished), ok, message)
+        self._record_source_quality(sample, target_monotonic_s, (finished - started) * 1000.0)
+        return sample
+
+    def _source_timeout_s(self, source: str) -> float:
+        return SOURCE_TIMEOUT_S.get(source, 0.020)
+
+    def _source_sample_monotonic(self, value: Any, fallback_monotonic_s: float) -> float:
+        # HAL/Omega 会携带后端接收时的 monotonic 时间；其他源退回完成时间。
+        if not isinstance(value, dict):
+            return fallback_monotonic_s
+        raw = value.get("received_monotonic_ms")
+        try:
+            return float(raw) / 1000.0
+        except (TypeError, ValueError):
+            return fallback_monotonic_s
+
+    def _record_source_quality(self, sample: SourceSample, target_monotonic_s: float, elapsed_ms: float) -> None:
+        # 所有源使用同一套质量统计：skew、耗时、drop、连续失败和 warning。
+        skew_ms = (sample.monotonic_s - target_monotonic_s) * 1000.0
+        abs_skew_ms = abs(skew_ms)
+        self._source_skews_ms.setdefault(sample.source, []).append(skew_ms)
+        self._source_elapsed_ms.setdefault(sample.source, []).append(elapsed_ms)
+        warning_threshold = SOURCE_WARNING_SKEW_MS.get(sample.source)
+        if warning_threshold is not None and abs_skew_ms > warning_threshold:
+            self._late_source_frames[sample.source] = self._late_source_frames.get(sample.source, 0) + 1
+            self._source_warnings.append(f"{sample.source} skew {round(abs_skew_ms, 3)}ms")
+        drop_threshold = SOURCE_DROP_SKEW_MS.get(sample.source)
+        if sample.ok and drop_threshold is not None and abs_skew_ms > drop_threshold:
+            self._drop_counts[sample.source] = self._drop_counts.get(sample.source, 0) + 1
+        if sample.ok:
+            self._source_fail_streaks[sample.source] = 0
+            return
+        self._drop_counts[sample.source] = self._drop_counts.get(sample.source, 0) + 1
+        streak = self._source_fail_streaks.get(sample.source, 0) + 1
+        self._source_fail_streaks[sample.source] = streak
+        if sample.message:
+            self._source_warnings.append(sample.message)
+        if streak >= 3:
+            self._source_warnings.append(f"{sample.source} consecutive failures: {streak}")
+
+    def _source_frame_metadata(self, *samples: SourceSample) -> dict[str, dict[str, Any]]:
+        return {
+            sample.source: {
+                "ok": sample.ok,
+                "message": sample.message,
+                "monotonicS": round(sample.monotonic_s, 6),
+            }
+            for sample in samples
         }
 
     async def _capture_cameras(self, config: dict[str, Any]) -> dict[str, Any]:
@@ -690,6 +845,7 @@ class DatasetRecorderService:
         for key, result in zip(CAMERA_KEYS, results, strict=True):
             if isinstance(result, BaseException):
                 self._camera_drops[key] = self._camera_drops.get(key, 0) + 1
+                self._drop_counts[key] = self._drop_counts.get(key, 0) + 1
                 continue
             relative = (
                 Path("videos")
@@ -730,7 +886,9 @@ class DatasetRecorderService:
             "observation.force_left_window": frame["observation.force_left_window"],
             "observation.force_right_window": frame["observation.force_right_window"],
             "observation.force_window_dt": frame["observation.force_window_dt"],
-            "observation.gripper": frame["observation.gripper"],
+            "appstation.observation.gripper": frame["appstation.observation.gripper"],
+            "appstation.sources": frame.get("appstation.sources", {}),
+            "appstation.omega": frame.get("appstation.omega", {}),
             "action": frame["action"],
             "next.done": False,
             "images": frame["images"],
@@ -750,18 +908,9 @@ class DatasetRecorderService:
             "observation.pulses": self._np_float32(frame["observation.pulses"]),
             "observation.force_left": self._np_float32(frame["observation.force_left"]),
             "observation.force_right": self._np_float32(frame["observation.force_right"]),
-            "observation.gripper": self._np_float32(frame["observation.gripper"]),
             "action": self._np_float32(frame["action"]),
             "task": self._task,
         }
-        if self._force_window_enabled:
-            native_frame["observation.force_left_window"] = self._np_float32(
-                frame["observation.force_left_window"]
-            )
-            native_frame["observation.force_right_window"] = self._np_float32(
-                frame["observation.force_right_window"]
-            )
-            native_frame["observation.force_window_dt"] = self._np_float32(frame["observation.force_window_dt"])
         images = frame.get("images", {})
         if isinstance(images, dict):
             for feature_key in CAMERA_FEATURE_KEYS.values():
@@ -821,6 +970,15 @@ class DatasetRecorderService:
         self._episode_frames = 0
         self._episode_late_frames = 0
         self._camera_drops = {key: 0 for key in CAMERA_KEYS}
+        self._tick_target_monotonic_s = 0.0
+        self._tick_capture_monotonic_s = 0.0
+        self._tick_skews_ms = []
+        self._drop_counts = {key: 0 for key in (*CAMERA_KEYS, *SOURCE_KEYS)}
+        self._late_source_frames = {}
+        self._source_skews_ms = {key: [] for key in SOURCE_KEYS}
+        self._source_elapsed_ms = {key: [] for key in SOURCE_KEYS}
+        self._source_fail_streaks = {key: 0 for key in SOURCE_KEYS}
+        self._source_warnings = []
         self._max_force_left = 0.0
         self._max_force_right = 0.0
         self._current_episode_paths = []
@@ -846,6 +1004,8 @@ class DatasetRecorderService:
         if native:
             self._save_native_episode_locked()
         episode_id = f"episode_{self._episode_index:06d}"
+        skew = self._skew_stats()
+        source_skew = self._source_skew_stats()
         # 统一写入 AppStation 自己的 episode 索引，兼容原生 LeRobot 和 JSONL fallback。
         episode = {
             "id": episode_id,
@@ -864,6 +1024,13 @@ class DatasetRecorderService:
             "native": native,
             "lateFrames": self._episode_late_frames,
             "cameraDrops": dict(self._camera_drops),
+            "dropCounts": dict(self._drop_counts),
+            "maxSkewMs": skew["maxSkewMs"],
+            "avgSkewMs": skew["avgSkewMs"],
+            "jitterMs": skew["jitterMs"],
+            "sourceMaxSkewMs": source_skew["maxSkewMs"],
+            "sourceAvgSkewMs": source_skew["avgSkewMs"],
+            "sourceJitterMs": source_skew["jitterMs"],
             "maxForceLeft": round(self._max_force_left, 6),
             "maxForceRight": round(self._max_force_right, 6),
             "warnings": self._quality_warnings(),
@@ -971,9 +1138,10 @@ class DatasetRecorderService:
         payload = {
             "name": self._dataset_name,
             "status": str(info.get("status", "local")) if info else "local",
+            "codebase_version": "v3.0",
             "robot_type": "dual_arm_micro_assembly",
             "fps": self._record_fps_from_config(config),
-            "format": "lerobot-compatible-jsonl-fallback",
+            "format": "lerobot-v3-jsonl-fallback",
             "nativeLeRobotAvailable": importlib.util.find_spec("lerobot") is not None,
             "screenCaptureAvailable": self._screen_capture_available(),
             "createdAt": created_at,
@@ -984,8 +1152,8 @@ class DatasetRecorderService:
                 "observation.pulses": "raw LTDMC pulse counts from dmc_get_position",
                 "frontend.state": "translations um, rotations degree",
                 "force": "raw NI-DAQ values; calibration transform pending",
-                "observation.force_*_window": "high-rate force samples aligned to each LeRobot frame",
-                "observation.force_window_dt": "seconds relative to frame timestamp; last sample is closest to frame",
+                "appstation.force_*_window": "high-rate force samples aligned to each LeRobot frame",
+                "appstation.force_window_dt": "seconds relative to frame timestamp; last sample is closest to frame",
             },
             "recording": {
                 "fps": self._record_fps_from_config(config),
@@ -1014,6 +1182,7 @@ class DatasetRecorderService:
             "name": str(info.get("name") or self._dataset_name),
             "status": str(info.get("status", "local")) if info else "local",
             "format": "lerobot-v3-native",
+            "codebase_version": "v3.0",
             "nativeLeRobotAvailable": True,
             "useVideos": self._native_use_videos,
             "vcodec": self._native_vcodec(),
@@ -1041,37 +1210,20 @@ class DatasetRecorderService:
 
     def _features(self) -> dict[str, Any]:
         image_features = {}
-        config = self.settings.get_config()
         for key in CAMERA_KEYS:
-            width, height = self._camera_size(config, key)
+            width, height = CAMERA_CAPTURE_SIZES[key]
             image_features[CAMERA_FEATURE_KEYS[key]] = {
-                "dtype": "image",
-                "shape": [3, height, width],
-                "names": ["channels", "height", "width"],
+                "dtype": "video",
+                "shape": [height, width, 3],
+                "names": ["height", "width", "channels"],
                 "encoding": "jpeg_sequence",
             }
         return {
-            "observation.state": {"dtype": "float32", "shape": [12], "names": list(STATE_FEATURE_NAMES)},
+            "observation.state": {"dtype": "float32", "shape": [14], "names": list(STATE_FEATURE_NAMES)},
             "observation.pulses": {"dtype": "float32", "shape": [12], "names": list(PULSE_FEATURE_NAMES)},
-            "action": {"dtype": "float32", "shape": [12], "names": list(ACTION_FEATURE_NAMES)},
+            "action": {"dtype": "float32", "shape": [14], "names": list(ACTION_FEATURE_NAMES)},
             "observation.force_left": {"dtype": "float32", "shape": [6], "names": list(FORCE_FEATURE_NAMES)},
             "observation.force_right": {"dtype": "float32", "shape": [6], "names": list(FORCE_FEATURE_NAMES)},
-            "observation.force_left_window": {
-                "dtype": "float32",
-                "shape": [self._force_window_samples_from_config(self.settings.get_config()), 6],
-                "names": ["sample", list(FORCE_FEATURE_NAMES)],
-            },
-            "observation.force_right_window": {
-                "dtype": "float32",
-                "shape": [self._force_window_samples_from_config(self.settings.get_config()), 6],
-                "names": ["sample", list(FORCE_FEATURE_NAMES)],
-            },
-            "observation.force_window_dt": {
-                "dtype": "float32",
-                "shape": [self._force_window_samples_from_config(self.settings.get_config())],
-                "names": ["sample_offset_s"],
-            },
-            "observation.gripper": {"dtype": "float32", "shape": [2], "names": list(GRIPPER_FEATURE_NAMES)},
             **image_features,
         }
 
@@ -1189,34 +1341,18 @@ class DatasetRecorderService:
         # feature shape 是训练/回放的契约；这里集中生成，避免录制路径出现字段漂移。
         image_dtype = "video" if self._native_use_videos else "image"
         features: dict[str, Any] = {
-            "observation.state": {"dtype": "float32", "shape": (12,), "names": list(STATE_FEATURE_NAMES)},
+            "observation.state": {"dtype": "float32", "shape": (14,), "names": list(STATE_FEATURE_NAMES)},
             "observation.pulses": {"dtype": "float32", "shape": (12,), "names": list(PULSE_FEATURE_NAMES)},
             "observation.force_left": {"dtype": "float32", "shape": (6,), "names": list(FORCE_FEATURE_NAMES)},
             "observation.force_right": {"dtype": "float32", "shape": (6,), "names": list(FORCE_FEATURE_NAMES)},
-            "observation.force_left_window": {
-                "dtype": "float32",
-                "shape": (self._force_window_samples_per_frame, 6),
-                "names": ["sample", list(FORCE_FEATURE_NAMES)],
-            },
-            "observation.force_right_window": {
-                "dtype": "float32",
-                "shape": (self._force_window_samples_per_frame, 6),
-                "names": ["sample", list(FORCE_FEATURE_NAMES)],
-            },
-            "observation.force_window_dt": {
-                "dtype": "float32",
-                "shape": (self._force_window_samples_per_frame,),
-                "names": ["sample_offset_s"],
-            },
-            "observation.gripper": {"dtype": "float32", "shape": (2,), "names": list(GRIPPER_FEATURE_NAMES)},
-            "action": {"dtype": "float32", "shape": (12,), "names": list(ACTION_FEATURE_NAMES)},
+            "action": {"dtype": "float32", "shape": (14,), "names": list(ACTION_FEATURE_NAMES)},
         }
         for key, feature_key in CAMERA_FEATURE_KEYS.items():
-            width, height = self._camera_size(config, key)
+            width, height = CAMERA_CAPTURE_SIZES[key]
             features[feature_key] = {
                 "dtype": image_dtype,
-                "shape": (3, height, width),
-                "names": ["channels", "height", "width"],
+                "shape": (height, width, 3),
+                "names": ["height", "width", "channels"],
             }
         return features
 
@@ -1289,7 +1425,7 @@ class DatasetRecorderService:
             self._native_error = str(exc)
 
     def _is_native_dataset_info(self, info: dict[str, Any]) -> bool:
-        return str(info.get("codebase_version", "")).startswith("v3.")
+        return str(info.get("format", "")) == "lerobot-v3-native"
 
     async def _capture_native_camera_arrays(self, config: dict[str, Any]) -> dict[str, Any]:
         real_mode = self._real_hardware_mode(config)
@@ -1305,12 +1441,14 @@ class DatasetRecorderService:
             feature_key = CAMERA_FEATURE_KEYS[key]
             if isinstance(result, BaseException):
                 self._camera_drops[key] = self._camera_drops.get(key, 0) + 1
+                self._drop_counts[key] = self._drop_counts.get(key, 0) + 1
                 images[feature_key] = self._synthetic_camera_frame(feature_key)
                 continue
             try:
                 images[feature_key] = self._decode_jpeg_to_rgb(result, config, key)
             except Exception:  # noqa: BLE001
                 self._camera_drops[key] = self._camera_drops.get(key, 0) + 1
+                self._drop_counts[key] = self._drop_counts.get(key, 0) + 1
                 images[feature_key] = self._synthetic_camera_frame(feature_key)
         return images
 
@@ -1325,7 +1463,7 @@ class DatasetRecorderService:
         if frame is None:
             raise RuntimeError("JPEG decode failed")
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        width, height = self._camera_size(config, camera)
+        width, height = CAMERA_CAPTURE_SIZES.get(camera, CAMERA_CAPTURE_SIZES["global"])
         if rgb.shape[:2] != (height, width):
             rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_AREA)
         return rgb
@@ -1336,7 +1474,7 @@ class DatasetRecorderService:
             return None
         _LeRobotDataset, np = imports
         camera = next((key for key, value in CAMERA_FEATURE_KEYS.items() if value == feature_key), "global")
-        width, height = self._camera_size(self.settings.get_config(), camera)
+        width, height = CAMERA_CAPTURE_SIZES.get(camera, CAMERA_CAPTURE_SIZES["global"])
         frame = np.zeros((height, width, 3), dtype=np.uint8)
         camera_index = (
             list(CAMERA_FEATURE_KEYS.values()).index(feature_key)
@@ -1499,11 +1637,12 @@ class DatasetRecorderService:
             except json.JSONDecodeError:
                 continue
             state_raw = item.get("observation.state")
-            state = (
-                lerobot_to_ui_state([float(value) for value in state_raw])
-                if isinstance(state_raw, list)
-                else [0.0] * 12
-            )
+            if isinstance(state_raw, list) and len(state_raw) >= 14:
+                state = self._lerobot14_to_ui_motion_state([float(value) for value in state_raw])
+            elif isinstance(state_raw, list):
+                state = lerobot_to_ui_state([float(value) for value in state_raw])
+            else:
+                state = [0.0] * 12
             pulses_raw = item.get("observation.pulses")
             pulses = [float(value) for value in pulses_raw] if isinstance(pulses_raw, list) else [0.0] * 12
             images_raw = item.get("images")
@@ -1555,7 +1694,7 @@ class DatasetRecorderService:
                 item = dataset[absolute_index]
             except Exception:
                 continue
-            state = self._tensor_to_float_list(item.get("observation.state"), expected=12)
+            state = self._tensor_to_float_list(item.get("observation.state"), expected=14)
             pulses = self._tensor_to_float_list(item.get("observation.pulses"), expected=12)
             force_left = self._tensor_to_float_list(item.get("observation.force_left"), expected=6)
             force_right = self._tensor_to_float_list(item.get("observation.force_right"), expected=6)
@@ -1570,8 +1709,8 @@ class DatasetRecorderService:
             samples.append(
                 {
                     "frame": frame,
-                    "leftJoints": lerobot_to_ui_state(state)[:6],
-                    "rightJoints": lerobot_to_ui_state(state)[6:12],
+                    "leftJoints": self._lerobot14_to_ui_motion_state(state)[:6],
+                    "rightJoints": self._lerobot14_to_ui_motion_state(state)[6:12],
                     "leftPulses": pulses[:6],
                     "rightPulses": pulses[6:12],
                     "forceLeft": force_left,
@@ -1631,6 +1770,13 @@ class DatasetRecorderService:
                         "native": True,
                         "lateFrames": 0,
                         "cameraDrops": {key: 0 for key in CAMERA_KEYS},
+                        "dropCounts": {key: 0 for key in (*CAMERA_KEYS, *SOURCE_KEYS)},
+                        "maxSkewMs": 0.0,
+                        "avgSkewMs": 0.0,
+                        "jitterMs": 0.0,
+                        "sourceMaxSkewMs": {key: 0.0 for key in SOURCE_KEYS},
+                        "sourceAvgSkewMs": {key: 0.0 for key in SOURCE_KEYS},
+                        "sourceJitterMs": {key: 0.0 for key in SOURCE_KEYS},
                         "maxForceLeft": 0.0,
                         "maxForceRight": 0.0,
                         "warnings": [],
@@ -1650,6 +1796,54 @@ class DatasetRecorderService:
         except (TypeError, ValueError):
             parsed = default
         return max(parsed, 0.0)
+
+    def _compose_observation_state(self, motion_positions: list[float], gripper_positions: list[Any]) -> list[float]:
+        # 将 12 维从臂位姿和 2 维从手夹爪开口合成为 LeRobot v3 的 14 维 state。
+        motion = (list(motion_positions) + [0.0] * 12)[:12]
+        gripper = [self._float_or_zero(value) for value in (list(gripper_positions) + [0.0, 0.0])[:2]]
+        return [
+            motion[0],
+            motion[1],
+            motion[2],
+            motion[3] * 1000.0,
+            motion[4] * 1000.0,
+            motion[5] * 1000.0,
+            gripper[0],
+            motion[6],
+            motion[7],
+            motion[8],
+            motion[9] * 1000.0,
+            motion[10] * 1000.0,
+            motion[11] * 1000.0,
+            gripper[1],
+        ]
+
+    def _lerobot14_to_ui_motion_state(self, state: list[float]) -> list[float]:
+        # 回放/预览仍使用 12 维 UI 位姿，因此需要跳过 state 中的夹爪维度。
+        values = (list(state) + [0.0] * 14)[:14]
+        return [
+            values[0],
+            values[1],
+            values[2],
+            values[3] / 1000.0,
+            values[4] / 1000.0,
+            values[5] / 1000.0,
+            values[7],
+            values[8],
+            values[9],
+            values[10] / 1000.0,
+            values[11] / 1000.0,
+            values[12] / 1000.0,
+        ]
+
+    def _float_or_zero(self, value: Any) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(result) or result < 0:
+            return 0.0
+        return result
 
     def _encode_rgb_tensor_to_jpeg(self, image: Any, np: Any) -> bytes:
         if image is None:
@@ -1685,13 +1879,66 @@ class DatasetRecorderService:
         warnings: list[str] = []
         if self._episode_late_frames:
             warnings.append(f"late frames: {self._episode_late_frames}")
+        skew = self._skew_stats()
+        if skew["maxSkewMs"] > 20.0:
+            warnings.append(f"max skew: {skew['maxSkewMs']}ms")
+        warnings.extend(dict.fromkeys(self._source_warnings))
         for key, count in self._camera_drops.items():
             if count:
                 warnings.append(f"{key} camera drops: {count}")
         return warnings
 
-    def _latest_action_vector(self) -> list[float]:
-        vector = [0.0] * 12
+    def _skew_stats(self) -> dict[str, float]:
+        # 当前阶段先统计录制 tick 与实际采集开始时间的偏差，后续再细化到每个硬件源。
+        values = [abs(value) for value in self._tick_skews_ms]
+        if not values:
+            return {"maxSkewMs": 0.0, "avgSkewMs": 0.0, "jitterMs": 0.0}
+        deltas = [
+            abs(values[index] - values[index - 1])
+            for index in range(1, len(values))
+        ]
+        jitter = sum(deltas) / len(deltas) if deltas else 0.0
+        return {
+            "maxSkewMs": round(max(values), 3),
+            "avgSkewMs": round(sum(values) / len(values), 3),
+            "jitterMs": round(jitter, 3),
+        }
+
+    def _source_skew_stats(self) -> dict[str, dict[str, float]]:
+        max_skew: dict[str, float] = {}
+        avg_skew: dict[str, float] = {}
+        jitter: dict[str, float] = {}
+        for source, raw_values in self._source_skews_ms.items():
+            values = [abs(value) for value in raw_values]
+            if not values:
+                max_skew[source] = 0.0
+                avg_skew[source] = 0.0
+                jitter[source] = 0.0
+                continue
+            deltas = [abs(values[index] - values[index - 1]) for index in range(1, len(values))]
+            max_skew[source] = round(max(values), 3)
+            avg_skew[source] = round(sum(values) / len(values), 3)
+            jitter[source] = round(sum(deltas) / len(deltas), 3) if deltas else 0.0
+        return {"maxSkewMs": max_skew, "avgSkewMs": avg_skew, "jitterMs": jitter}
+
+    def _latest_action_vector(
+        self,
+        observation_state: list[float] | None = None,
+        config: dict[str, Any] | None = None,
+    ) -> list[float]:
+        # action 记录从臂绝对目标：当前 observation.state 加主手增量，夹爪目标取配置值。
+        base = (list(observation_state) + [0.0] * 14)[:14] if observation_state is not None else [0.0] * 14
+        config = config or {}
+        vector = self._latest_action_delta_vector()
+        action = [base[index] + vector[index] for index in range(14)]
+        gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
+        if gripper:
+            action[6] = self._float_or_zero(gripper.get("targetLeftMm", base[6]))
+            action[13] = self._float_or_zero(gripper.get("targetRightMm", base[13]))
+        return action
+
+    def _latest_action_delta_vector(self) -> list[float]:
+        vector = [0.0] * 14
         last_action = self.teleop.status().get("lastAction")
         if not isinstance(last_action, dict):
             return vector
@@ -1699,6 +1946,8 @@ class DatasetRecorderService:
         if now_ms() - ts > 1000:
             return vector
         delta_vector = last_action.get("deltaVector")
+        if isinstance(delta_vector, list):
+            return self._motion_delta_to_action_delta(delta_vector)
         if isinstance(delta_vector, list) and len(delta_vector) == 12:
             converted: list[float] = []
             for index, raw_value in enumerate(delta_vector):
@@ -1710,10 +1959,35 @@ class DatasetRecorderService:
         if side not in {"left", "right"} or axis not in {"X", "Y", "Z", "Roll", "Pitch", "Yaw"}:
             return vector
         axis_index = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"].index(str(axis))
-        state_index = (0 if side == "left" else 6) + axis_index
+        state_index = (0 if side == "left" else 7) + axis_index
         value = float(last_action.get("delta", 0.0))
         vector[state_index] = value * 1000.0 if axis_index >= 3 else value
         return vector
+
+    def _motion_delta_to_action_delta(self, delta_vector: list[Any]) -> list[float]:
+        # teleop delta 仍是 12 维位姿增量，这里插入左右夹爪槽位并把旋转从度转成 mdeg。
+        motion = [0.0] * 12
+        for index, value in enumerate(delta_vector[:12]):
+            try:
+                motion[index] = float(value)
+            except (TypeError, ValueError):
+                motion[index] = 0.0
+        return [
+            motion[0],
+            motion[1],
+            motion[2],
+            motion[3] * 1000.0,
+            motion[4] * 1000.0,
+            motion[5] * 1000.0,
+            0.0,
+            motion[6],
+            motion[7],
+            motion[8],
+            motion[9] * 1000.0,
+            motion[10] * 1000.0,
+            motion[11] * 1000.0,
+            0.0,
+        ]
 
     def _dataset_root(self, config: dict[str, Any]) -> Path:
         raw = str(config.get("storage", {}).get("datasetRoot", "~/.appstation/datasets"))

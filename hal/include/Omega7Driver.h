@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <mutex>
 #include <string>
 
@@ -21,6 +22,7 @@ struct Omega7State {
   double gripperGap{};
   bool gripperGapAvailable{};
   bool lastReadOk{};
+  std::int64_t readTimestampMs{};
   std::string lastReadError;
 };
 

@@ -4,11 +4,17 @@
 #include <windows.h>
 #endif
 
+#include <chrono>
 #include <sstream>
 
 namespace appstation::hal {
 
 namespace {
+std::int64_t unixTimeMs() {
+  const auto now = std::chrono::system_clock::now().time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+}
+
 #ifdef _WIN32
 // Force Dimension SDK 通过 DLL 导出 C 接口。这里声明函数指针类型，
 // 后面用 GetProcAddress 动态绑定，避免编译期强依赖具体 SDK import lib。
@@ -174,6 +180,7 @@ std::string Omega7Driver::lastError() const {
 
 std::array<Omega7State, 2> Omega7Driver::readState() {
   std::scoped_lock lock(mutex_);
+  const auto readTimestampMs = unixTimeMs();
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   // 逐台读取已打开设备的实时状态。这里不重新打开设备，只复用 initialize
   // 保存下来的 deviceId，因此 readState 应该是轻量的周期性轮询。
@@ -212,6 +219,7 @@ std::array<Omega7State, 2> Omega7Driver::readState() {
   // 目前没有接入 SDK 校准状态查询，保持 false，避免前端误以为已经完成校准。
   for (auto& item : state_) {
     item.calibrated = false;
+    item.readTimestampMs = readTimestampMs;
   }
   return state_;
 }
