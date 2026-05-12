@@ -828,6 +828,14 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail={"code": "DATASET_PUSH_FAILED", "message": str(exc)}) from exc
 
+    @app.get("/api/datasets/{dataset_id}/episodes/{episode_id}")
+    async def dataset_episode_detail(dataset_id: str, episode_id: str) -> ApiEnvelope:
+        """返回单条 episode 复核详情，保持 ok/data/ts envelope 契约。"""
+        try:
+            return envelope(recorder.episode_detail(dataset_id, episode_id))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail={"code": "EPISODE_NOT_FOUND", "message": episode_id}) from exc
+
     @app.patch("/api/datasets/{dataset_id}/episodes/{episode_id}")
     async def update_dataset_episode(dataset_id: str, episode_id: str, payload: dict[str, Any]) -> ApiEnvelope:
         try:

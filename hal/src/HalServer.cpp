@@ -19,6 +19,15 @@
 
 namespace {
 
+long long unixTimeMs() {
+  const auto now = std::chrono::system_clock::now().time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+}
+
+long long timestampOrNow(long long value) {
+  return value > 0 ? value : unixTimeMs();
+}
+
 std::string jsonEscape(const std::string& value) {
   // HAL 直接拼接小型 JSON，因此所有外部字符串都先做转义。
   std::ostringstream out;
@@ -59,7 +68,8 @@ std::string jsonHealth(const appstation::hal::HalHealth& motionHealth, bool omeg
 
 std::string jsonMotionState(const appstation::hal::MotionState& state) {
   std::ostringstream out;
-  out << "{\"estop_active\":" << (state.estopActive ? "true" : "false") << ",\"positions\":[";
+  out << "{\"timestamp_ms\":" << timestampOrNow(state.readTimestampMs)
+      << ",\"estop_active\":" << (state.estopActive ? "true" : "false") << ",\"positions\":[";
   for (size_t i = 0; i < state.axes.size(); ++i) {
     if (i > 0) {
       out << ",";
@@ -86,7 +96,7 @@ std::string jsonMotionState(const appstation::hal::MotionState& state) {
 
 std::string jsonOmegaState(const std::array<appstation::hal::Omega7State, 2>& state) {
   std::ostringstream out;
-  out << "{\"hands\":[";
+  out << "{\"timestamp_ms\":" << timestampOrNow(state[0].readTimestampMs) << ",\"hands\":[";
   for (size_t i = 0; i < state.size(); ++i) {
     const auto& hand = state[i];
     if (i > 0) {
@@ -169,7 +179,7 @@ bool wantsClose(const std::string& request) {
   const auto marker = std::string("connection:");
   const auto markerPos = headers.find(marker);
   if (markerPos == std::string::npos) {
-    // HTTP/1.1 default is keep-alive when no Connection header is present.
+    // HTTP/1.1 未显式声明 Connection 时默认保持 keep-alive。
     return false;
   }
   auto valueStart = markerPos + marker.size();
@@ -180,15 +190,14 @@ bool wantsClose(const std::string& request) {
 }
 
 #ifdef _WIN32
-// Read a single HTTP/1.1 request from `client`. Returns an empty string when the
-// peer closed without sending another request (so the caller can break the loop).
+// 从 client 读取一个 HTTP/1.1 请求；对端未发送新请求就关闭时返回空字符串。
 std::string readHttpRequest(SOCKET client) {
   std::string request;
   std::array<char, 4096> buffer{};
   while (true) {
     const int bytes = recv(client, buffer.data(), static_cast<int>(buffer.size()), 0);
     if (bytes == 0) {
-      return {};  // peer closed cleanly
+      return {};  // 对端正常关闭
     }
     if (bytes < 0) {
       if (request.empty()) {
@@ -334,15 +343,14 @@ std::string httpResponse(int code, const std::string& body, bool keepAlive) {
 }
 
 #ifdef _WIN32
-// Service one TCP connection. Loops while the client keeps the socket open
-// (HTTP/1.1 keep-alive), so the FastAPI WS bridge stops paying TCP setup costs
-// every 33ms.
+// 服务单个 TCP 连接。客户端保持 HTTP/1.1 keep-alive 时持续处理请求，
+// 避免 FastAPI WS 桥接层每 33ms 都付出一次 TCP 建连成本。
 void serveConnection(
     SOCKET client,
     appstation::hal::LTDMCDriver& motion,
     appstation::hal::Omega7Driver& omega,
     const std::chrono::steady_clock::time_point& started) {
-  // Bound how long a single keep-alive socket can sit idle before we reclaim it.
+  // 限制单个 keep-alive socket 的空闲时间，避免长期占用连接资源。
   DWORD recv_timeout_ms = 30000;
   setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recv_timeout_ms), sizeof(recv_timeout_ms));
   BOOL nodelay = TRUE;
@@ -356,7 +364,7 @@ void serveConnection(
       break;
     }
     if (request.empty()) {
-      break;  // peer closed
+      break;  // 对端关闭连接
     }
 
     bool keepAlive = !wantsClose(request);
@@ -498,9 +506,8 @@ int main() {
     if (client == INVALID_SOCKET) {
       continue;
     }
-    // Each TCP connection runs on its own thread so a slow keep-alive client
-    // can't starve the next caller (the WS bridge keeps one connection open
-    // while UI commands fire from other threads).
+    // 每个 TCP 连接使用独立线程，避免慢速 keep-alive 客户端阻塞其他调用方。
+    // WS 桥接层会长期占用一个连接，UI 命令则可能从其他线程发起。
     std::thread([client, &motion, &omega, &started]() {
       try {
         serveConnection(client, motion, omega, started);

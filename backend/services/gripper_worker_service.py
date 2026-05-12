@@ -54,15 +54,20 @@ class GripperWorkerService:
             self.stop_all()
 
     def positions(self, config: dict[str, Any]) -> list[float | None]:
+        samples = self.samples(config)
+        return [
+            self._sample_position(samples.get("left")),
+            self._sample_position(samples.get("right")),
+        ]
+
+    def samples(self, config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """返回左右 worker 的最新样本，不等待新的串口读取。"""
         if not self.is_enabled(config):
-            return [None, None]
+            return {}
         with self._lock:
             self._ensure_workers(config)
             self._drain_status()
-            return [
-                self._latest_position("left"),
-                self._latest_position("right"),
-            ]
+            return {side: dict(sample) for side, sample in self._latest.items()}
 
     def position(self, config: dict[str, Any], side: str, timeout_sec: float = 0.25) -> GripperResult:
         if not self.is_enabled(config):
@@ -202,7 +207,9 @@ class GripperWorkerService:
                     self._latest[side] = sample
 
     def _latest_position(self, side: str) -> float | None:
-        sample = self._latest.get(side)
+        return self._sample_position(self._latest.get(side))
+
+    def _sample_position(self, sample: dict[str, Any] | None) -> float | None:
         if not sample or not sample.get("ok"):
             return None
         value = sample.get("positionMm")

@@ -32,6 +32,7 @@ struct AxisState {
 struct MotionState {
   std::array<AxisState, 12> axes{};
   bool estopActive{};
+  std::int64_t readTimestampMs{};
 };
 
 struct HalHealth {

@@ -14,8 +14,26 @@ from backend.app import create_app
 from backend.core.defaults import default_config
 from backend.core.logging import LogService
 from backend.drivers.camera_opencv import OpenCVCameraDriver
-from backend.hal_client.client import RealHalClient
+from backend.hal_client.client import RealHalClient, TestHalClient
 from backend.services.dataset_recorder import DatasetRecorderService
+
+RECORDING_SAVE_CONTRACT_EXAMPLE = {
+    "episode": {
+        "status": "review",
+        "lateFrames": 0,
+        "dropCounts": {"global": 0, "wrist_left": 0, "wrist_right": 0},
+        "maxSkewMs": 0.0,
+        "avgSkewMs": 0.0,
+        "jitterMs": 0.0,
+    },
+    "status": {"recording": False},
+}
+
+DATASET_LIST_CONTRACT_EXAMPLE = {
+    "format": "lerobot-v3-jsonl-fallback",
+    "fps": 30,
+    "episodes": [],
+}
 
 
 def _clear_camera_identities(config: dict) -> None:
@@ -319,24 +337,37 @@ def test_record_session_writes_lerobot_fallback_dataset(tmp_path: Path, monkeypa
         assert save_response.status_code == 200
         episode = save_response.json()["data"]["episode"]
         assert episode["frames"] > 0
+        assert "dropCounts" in episode
+        assert "maxSkewMs" in episode
+        assert "avgSkewMs" in episode
+        assert "jitterMs" in episode
 
         datasets_response = client.get("/api/datasets")
         assert datasets_response.status_code == 200
         datasets = datasets_response.json()["data"]["datasets"]
         dataset = next(item for item in datasets if item["id"] == "unit_test_dataset")
-        assert dataset["format"] == "lerobot-compatible-jsonl-fallback"
+        assert dataset["format"] == "lerobot-v3-jsonl-fallback"
         assert dataset["episodes"][0]["samples"]
+        detail_response = client.get(f"/api/datasets/unit_test_dataset/episodes/{episode['id']}")
+        assert detail_response.status_code == 200
+        detail = detail_response.json()["data"]["episode"]
+        assert detail["features"]["observation.state"]["shape"] == [14]
+        assert detail["features"]["action"]["shape"] == [14]
+        assert detail["cameraResolutions"]["global"]["saved"] == "640x480"
+        assert detail["maxForceLeft"] >= 0
+        assert detail["samples"]
 
         data_path = dataset_root / "unit_test_dataset" / episode["dataPath"]
         assert data_path.exists()
         first_line = data_path.read_text(encoding="utf-8").splitlines()[0]
         frame = json.loads(first_line)
-        assert len(frame["observation.state"]) == 12
+        assert len(frame["observation.state"]) == 14
         assert len(frame["observation.force_left"]) == 6
         assert len(frame["observation.force_left_window"]) == 134
         assert len(frame["observation.force_left_window"][0]) == 6
         assert len(frame["observation.force_window_dt"]) == 134
-        assert len(frame["action"]) == 12
+        assert "observation.gripper" not in frame
+        assert len(frame["action"]) == 14
 
         finish_response = client.post("/api/record/session/finish")
         assert finish_response.status_code == 200
@@ -391,8 +422,9 @@ def test_record_session_writes_native_lerobot_dataset_when_available(tmp_path: P
         info_path = dataset_root / "native_unit_test_dataset" / "meta" / "info.json"
         assert info_path.exists()
         info = json.loads(info_path.read_text(encoding="utf-8"))
-        assert info["features"]["observation.force_left_window"]["shape"] == [34, 6]
-        assert info["features"]["observation.force_window_dt"]["shape"] == [34]
+        assert info["features"]["observation.state"]["shape"] == [14]
+        assert info["features"]["action"]["shape"] == [14]
+        assert "observation.gripper" not in info["features"]
         assert (dataset_root / "native_unit_test_dataset" / "data" / "chunk-000" / "file-000.parquet").exists()
 
         finish_response = client.post("/api/record/session/finish")
@@ -417,7 +449,7 @@ def test_native_recording_resizes_camera_frames_to_feature_shape(tmp_path: Path,
 
     frame = recorder._decode_jpeg_to_rgb(bytes(buffer), config)
 
-    assert frame.shape == (120, 160, 3)
+    assert frame.shape == (480, 640, 3)
     assert frame.dtype == np.uint8
 
 
@@ -941,6 +973,7 @@ def test_real_hal_client_maps_teleop_continuous_commands(monkeypatch: MonkeyPatc
     ]
 
 
+def test_hal_state_clients_include_receive_timestamps(monkeypatch: MonkeyPatch) -> None:
 def test_real_hal_client_serializes_home_all_work_origin(monkeypatch: MonkeyPatch) -> None:
     calls: list[tuple[str, str, dict[str, object]]] = []
 
@@ -949,6 +982,7 @@ def test_real_hal_client_serializes_home_all_work_origin(monkeypatch: MonkeyPatc
         headers = {"Connection": "keep-alive"}
 
         def read(self) -> bytes:
+            return b'{"positions":[]}'
             return b'{"ok":true}'
 
     class FakeConnection:
@@ -959,6 +993,8 @@ def test_real_hal_client_serializes_home_all_work_origin(monkeypatch: MonkeyPatc
         def connect(self) -> None:
             return None
 
+        def request(self, *args: object, **kwargs: object) -> None:
+            _ = (args, kwargs)
         def request(self, method: str, path: str, *args: object, **kwargs: object) -> None:
             _ = args
             body = kwargs.get("body")
@@ -972,6 +1008,17 @@ def test_real_hal_client_serializes_home_all_work_origin(monkeypatch: MonkeyPatc
             return None
 
     monkeypatch.setattr("backend.hal_client.client.http.client.HTTPConnection", FakeConnection)
+    real = RealHalClient("http://127.0.0.1:8091", 5000, LogService())
+    test = TestHalClient(LogService())
+
+    real_state = asyncio.run(real.motion_state())
+    test_state = asyncio.run(test.omega_state())
+
+    assert isinstance(real_state["timestamp_ms"], int)
+    assert isinstance(real_state["received_timestamp_ms"], int)
+    assert isinstance(real_state["received_monotonic_ms"], int)
+    assert isinstance(test_state["timestamp_ms"], int)
+    assert isinstance(test_state["received_monotonic_ms"], int)
     client = RealHalClient("http://127.0.0.1:8091", 5000, LogService())
 
     asyncio.run(
@@ -1016,12 +1063,14 @@ def test_dataset_recorder_action_vector_prefers_teleop_delta_vector() -> None:
         500.0,
         0.0,
         0.0,
+        0.0,
         -20.0,
         0.0,
         0.0,
         0.0,
         0.0,
         -100.0,
+        0.0,
     ]
 
 
