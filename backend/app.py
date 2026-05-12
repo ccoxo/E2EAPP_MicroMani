@@ -915,6 +915,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     motion_positions = None
                     motion_estop_active = None
                     motion_enabled = None
+                    motion_axis_enabled = None
                     if motion_state is not None:
                         raw_positions = motion_state.get("positions")
                         if isinstance(raw_positions, list) and len(raw_positions) == 12:
@@ -923,9 +924,13 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                             motion_estop_active = bool(motion_state["estop_active"])
                         raw_enabled = motion_state.get("enabled")
                         if isinstance(raw_enabled, list) and len(raw_enabled) == 12:
+                            motion_axis_enabled = {
+                                "left": [bool(value) for value in raw_enabled[:6]],
+                                "right": [bool(value) for value in raw_enabled[6:12]],
+                            }
                             motion_enabled = {
-                                "left": all(bool(value) for value in raw_enabled[:6]),
-                                "right": all(bool(value) for value in raw_enabled[6:12]),
+                                "left": all(motion_axis_enabled["left"]),
+                                "right": all(motion_axis_enabled["right"]),
                             }
                         elif isinstance(raw_enabled, dict):
                             raw_left_enabled = raw_enabled.get("left")
@@ -954,6 +959,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         motion_positions,
                         motion_estop_active=motion_estop_active,
                         motion_enabled=motion_enabled,
+                        motion_axis_enabled=motion_axis_enabled,
                         omega_hands=omega_hands,
                         hal_ok=hal_ok,
                     )

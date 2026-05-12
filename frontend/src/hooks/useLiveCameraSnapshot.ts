@@ -12,9 +12,10 @@ function cameraSnapshotUrl(cameraKey: CameraTelemetry['key']) {
 export function useLiveCameraSnapshot(cameraKey: CameraTelemetry['key'], health?: CameraTelemetry['health']) {
   const [snapshotUrl, setSnapshotUrl] = useState<string | null>(null)
   const refreshTimer = useRef<number | null>(null)
-  const liveImageEnabled = !mockMode && health === 'ok' && snapshotUrl !== null
+  const canRequestSnapshot = health === 'ok' || health === 'checking'
+  const liveImageEnabled = !mockMode && canRequestSnapshot && snapshotUrl !== null
   const handleLoad = useCallback(() => undefined, [])
-  const handleError = useCallback(() => setSnapshotUrl(null), [])
+  const handleError = useCallback(() => undefined, [])
 
   const clearRefreshTimer = useCallback(() => {
     if (refreshTimer.current === null) return
@@ -25,7 +26,7 @@ export function useLiveCameraSnapshot(cameraKey: CameraTelemetry['key'], health?
   useEffect(() => {
     clearRefreshTimer()
     setSnapshotUrl(null)
-    if (mockMode || health !== 'ok') return clearRefreshTimer
+    if (mockMode || !canRequestSnapshot) return clearRefreshTimer
 
     let cancelled = false
 
@@ -55,7 +56,7 @@ export function useLiveCameraSnapshot(cameraKey: CameraTelemetry['key'], health?
       cancelled = true
       clearRefreshTimer()
     }
-  }, [cameraKey, clearRefreshTimer, health])
+  }, [cameraKey, canRequestSnapshot, clearRefreshTimer])
 
   return {
     liveImageEnabled,

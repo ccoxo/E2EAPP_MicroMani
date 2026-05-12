@@ -490,7 +490,8 @@ class OpenCVCameraDriver:
             deadline = time.monotonic() + 0.2
             while index not in self._latest_jpegs and time.monotonic() < deadline:
                 time.sleep(0.02)
-            readable.append(index)
+            if index in self._latest_jpegs:
+                readable.append(index)
         return readable
 
     def _get_capture(self, cv2: Any, index: int, width: int, height: int, fps: float) -> Any | None:

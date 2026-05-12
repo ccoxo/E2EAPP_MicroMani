@@ -699,6 +699,58 @@ def test_camera_driver_reopens_stale_capture() -> None:
     driver._drop_capture(0)  # noqa: SLF001
 
 
+def test_camera_auto_discovery_requires_encoded_frame() -> None:
+    driver = OpenCVCameraDriver()
+
+    class FakeCapture:
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, prop: int, value: int) -> None:
+            _ = (prop, value)
+
+        def get(self, prop: int) -> float:
+            _ = prop
+            return 30.0
+
+        def read(self) -> tuple[bool, object | None]:
+            return False, None
+
+        def release(self) -> None:
+            return None
+
+    class FakeCv2:
+        CAP_ANY = 0
+        CAP_MSMF = 1400
+        CAP_DSHOW = 700
+        CAP_PROP_FRAME_WIDTH = 3
+        CAP_PROP_FRAME_HEIGHT = 4
+        CAP_PROP_FPS = 5
+        CAP_PROP_FOURCC = 6
+        CAP_PROP_BUFFERSIZE = 7
+        IMWRITE_JPEG_QUALITY = 1
+
+        @staticmethod
+        def VideoCapture(index: int, backend: int) -> FakeCapture:
+            _ = (index, backend)
+            return FakeCapture()
+
+        @staticmethod
+        def VideoWriter_fourcc(a: str, b: str, c: str, d: str) -> int:
+            _ = (a, b, c, d)
+            return 1
+
+        @staticmethod
+        def imencode(ext: str, frame: object, options: list[int]) -> tuple[bool, bytes]:
+            _ = (ext, frame, options)
+            return True, b"\xff\xd8fake-jpeg\xff\xd9"
+
+    readable = driver._discover_readable_indices(FakeCv2, 640, 480, 30, 1)  # noqa: SLF001
+
+    assert readable == []
+    driver._drop_capture(0)  # noqa: SLF001
+
+
 def test_global_camera_auto_index_uses_remaining_device(monkeypatch: MonkeyPatch) -> None:
     config = default_config()
     _clear_camera_identities(config)

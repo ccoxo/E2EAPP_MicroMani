@@ -289,6 +289,7 @@ const emptyFrame: TelemetryFrame = {
   jointPositions: Array.from({ length: 12 }, () => 0),
   gripperPositions: [-1, -1],
   motionEnabled: { left: null, right: null },
+  motionAxisEnabled: { left: Array.from({ length: 6 }, () => null), right: Array.from({ length: 6 }, () => null) },
   forceLeft: [0, 0, 0, 0, 0, 0],
   forceRight: [0, 0, 0, 0, 0, 0],
   dangerIndex: 0,
@@ -455,6 +456,10 @@ function buildFrame(state: TelemetryStore): TelemetryFrame {
       clamp(state.config.gripper.targetRightMm + Math.cos(t * 0.55) * 0.25, 0, state.config.gripper.strokeMm),
     ],
     motionEnabled: { left: false, right: false },
+    motionAxisEnabled: {
+      left: Array.from({ length: 6 }, () => false),
+      right: Array.from({ length: 6 }, () => false),
+    },
     forceLeft,
     forceRight,
     dangerIndex,
@@ -615,6 +620,10 @@ function backendFrameCommitIsUrgent(previous: TelemetryFrame, next: TelemetryFra
     || previous.halOk !== next.halOk
     || previous.recording !== next.recording
     || previous.episodeCount !== next.episodeCount
+    || previous.motionEnabled.left !== next.motionEnabled.left
+    || previous.motionEnabled.right !== next.motionEnabled.right
+    || previous.motionAxisEnabled.left.some((value, index) => value !== next.motionAxisEnabled.left[index])
+    || previous.motionAxisEnabled.right.some((value, index) => value !== next.motionAxisEnabled.right[index])
     || (previous.dangerIndex < 1 && next.dangerIndex >= 1)
 }
 
@@ -993,6 +1002,10 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
           const frame = {
             ...message.data,
             motionEnabled: message.data.motionEnabled ?? { left: null, right: null },
+            motionAxisEnabled: message.data.motionAxisEnabled ?? {
+              left: Array.from({ length: 6 }, () => null),
+              right: Array.from({ length: 6 }, () => null),
+            },
           }
           enqueueBackendFrame(set, get, frame)
           // Coalesce raw WS frames so React and ECharts update on the UI cadence.
@@ -1609,13 +1622,13 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   issueManualAxisMove: (side, axis, direction) => {
     if (!mockMode) {
       const state = get()
-      if (state.frame.motionEnabled?.[side] === false) {
+      const axisIndex = manualAxisOrder.indexOf(axis)
+      if (state.frame.motionAxisEnabled?.[side]?.[axisIndex] === false) {
         set((current) => ({
-          logs: appendLog(current.logs, makeLog('WARNING', `${side} ${axis} jog skipped: motion side is disabled`, '[HAL]')),
+          logs: appendLog(current.logs, makeLog('WARNING', `${side} ${axis} jog skipped: motion axis is disabled`, '[HAL]')),
         }))
         return
       }
-      const axisIndex = manualAxisOrder.indexOf(axis)
       const step = axisIndex < 3 ? state.manualControl.axisStepUm : state.manualControl.axisStepDeg
       const speedMode = state.manualControl.speedMode
       const busyKey = manualAxisBusyKey(side, axis)
@@ -1723,6 +1736,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
         }))
         return
       }
+      const previousEnabled = Boolean(get().config.gripper[enabledKey])
       // 夹爪启停先乐观更新 UI，再由后端持久化和回读校准最终状态。
       // Optimistically reflect enable/disable in the UI so the user can keep
       // clicking instead of waiting for a config refetch round-trip. The
@@ -1755,6 +1769,15 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
         })
         .catch((error) => {
           set((current) => ({
+            config: command === 'enable' || command === 'disable'
+              ? {
+                  ...current.config,
+                  gripper: {
+                    ...current.config.gripper,
+                    [enabledKey]: previousEnabled,
+                  },
+                }
+              : current.config,
             logs: appendLog(current.logs, makeLog('ERROR', `gripper command failed: ${String(error)}`, '[GRIPPER]')),
           }))
         })

@@ -1,5 +1,6 @@
 import { Alert, Button, Checkbox, Modal, Steps } from 'antd'
 import { useState } from 'react'
+import { homeAll } from '../../api'
 import { useTelemetryStore } from '../../stores/telemetry'
 import type { RecordSessionState, TelemetryFrame } from '../../types'
 
@@ -8,29 +9,32 @@ interface StepDef {
   description: string
   autoCheck: boolean
   check: ((frame: TelemetryFrame, recordSession: RecordSessionState) => boolean) | null
+  required?: boolean
   actionButton?: { label: string; apiCall: () => void }
 }
 
 const STEPS: StepDef[] = [
   {
     title: '硬件连接',
-    description: '确认所有硬件指示灯为绿色，相机帧率稳定在 30Hz 附近。',
+    description: '确认 HAL、WebSocket 正常，三路相机在线且帧率高于 25Hz。',
     autoCheck: true,
     check: (frame) =>
       frame.halOk &&
       frame.wsOk &&
-      frame.cameras.every((camera) => camera.fps >= 28 && camera.health === 'ok'),
+      frame.cameras.every((camera) => camera.fps >= 25 && camera.health === 'ok'),
   },
   {
-    title: '移动到工作原点',
-    description: '通过 Jog Panel 或遥操作将双臂移动到工作原点，并保持静止。',
+    title: '自动回到工作原点',
+    description: '点击自动回零，将左右从臂移动到已采集的工作原点；确认停止后勾选完成。',
     autoCheck: false,
     check: null,
+    actionButton: { label: '自动回零', apiCall: () => { void homeAll().catch(() => undefined) } },
   },
   {
     title: '力觉 Tare',
-    description: '点击“执行 Tare”，等待静止状态下零力标定完成，约 3 秒。',
+    description: '当前现场暂不具备条件，此项仅保留操作入口，不阻塞开始采集。',
     autoCheck: true,
+    required: false,
     check: (frame, recordSession) =>
       recordSession.forceTareActive &&
       Math.abs(frame.forceLeft[2] ?? 0) < 0.1 &&
@@ -38,8 +42,9 @@ const STEPS: StepDef[] = [
   },
   {
     title: '验证力觉示数',
-    description: '静止时所有分量应接近 0，确认无异常。',
+    description: '当前现场暂不具备条件，此项仅作为参考，不阻塞开始采集。',
     autoCheck: true,
+    required: false,
     check: (frame) =>
       frame.forceLeft.every((v) => Math.abs(v) < 0.2) &&
       frame.forceRight.every((v) => Math.abs(v) < 0.2),
@@ -65,8 +70,8 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
     return manualChecked[i] ?? false
   })
 
-  const allDone = stepStatuses.every(Boolean)
-  const currentStep = stepStatuses.findIndex((ok) => !ok)
+  const allDone = STEPS.every((step, i) => step.required === false || stepStatuses[i])
+  const currentStep = STEPS.findIndex((step, i) => step.required !== false && !stepStatuses[i])
   const activeStep = currentStep === -1 ? STEPS.length : currentStep
 
   const handleClose = () => {
@@ -102,6 +107,7 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
         style={{ marginTop: 8 }}
         items={STEPS.map((step, i) => {
           const ok = stepStatuses[i]
+          const required = step.required !== false
           return {
             title: step.title,
             description: (
@@ -112,8 +118,8 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
 
                 {step.autoCheck && step.check && (
                   <Alert
-                    type={ok ? 'success' : 'warning'}
-                    message={ok ? '检查通过' : '等待条件满足'}
+                    type={ok ? 'success' : required ? 'warning' : 'info'}
+                    message={ok ? '检查通过' : required ? '等待条件满足' : '暂不阻塞'}
                     style={{ padding: '2px 8px', fontSize: 11 }}
                     showIcon={false}
                   />

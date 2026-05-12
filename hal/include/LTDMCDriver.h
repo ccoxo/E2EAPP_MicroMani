@@ -14,7 +14,7 @@ class LTDMCDriver {
   HalHealth health(double uptimeS) const;
   MotionState readState();
   void emergencyStop();
-  void enableSide(Side side, bool enabled = true);
+  std::string enableSide(Side side, bool enabled = true);
   void homeSide(Side side);
   void homeAll(const std::array<double, 12>& workOriginPulse);
   void moveAllUi(const std::array<double, 12>& targetUi, const std::array<AxisLimit, 12>& limits);

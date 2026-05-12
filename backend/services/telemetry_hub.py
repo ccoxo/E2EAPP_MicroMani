@@ -27,6 +27,10 @@ class TelemetryHub:
         self.axis_offsets = [0.0] * 12
         self.motion_positions = [0.0] * 12
         self.motion_enabled: dict[Literal["left", "right"], bool | None] = {"left": None, "right": None}
+        self.motion_axis_enabled: dict[Literal["left", "right"], list[bool | None]] = {
+            "left": [None] * 6,
+            "right": [None] * 6,
+        }
         self.gripper_positions = [-1.0, -1.0]
         self.estop_active = False
         self.force_tare_active = False
@@ -59,6 +63,7 @@ class TelemetryHub:
         *,
         motion_estop_active: bool | None = None,
         motion_enabled: dict[str, bool | None] | None = None,
+        motion_axis_enabled: dict[str, list[bool | None]] | None = None,
         omega_hands: list[dict[str, Any]] | None = None,
         hal_ok: bool = True,
     ) -> TelemetryFrame:
@@ -81,6 +86,11 @@ class TelemetryHub:
                 self.motion_enabled = {
                     "left": motion_enabled.get("left"),
                     "right": motion_enabled.get("right"),
+                }
+            if motion_axis_enabled is not None:
+                self.motion_axis_enabled = {
+                    "left": list(motion_axis_enabled.get("left", [None] * 6))[:6],
+                    "right": list(motion_axis_enabled.get("right", [None] * 6))[:6],
                 }
             joint_positions = list(self.motion_positions)
         else:
@@ -113,6 +123,10 @@ class TelemetryHub:
             jointPositions=joint_positions,
             gripperPositions=list(self.gripper_positions),
             motionEnabled=dict(self.motion_enabled),
+            motionAxisEnabled={
+                "left": list(self.motion_axis_enabled["left"]),
+                "right": list(self.motion_axis_enabled["right"]),
+            },
             forceLeft=force_left,
             forceRight=force_right,
             dangerIndex=danger,
@@ -173,6 +187,16 @@ class TelemetryHub:
     def set_motion_enabled(self, side: str, enabled: bool | None) -> None:
         if side in self.motion_enabled:
             self.motion_enabled[side] = enabled
+            self.motion_axis_enabled[side] = [enabled] * 6
+
+    def set_motion_axis_enabled(self, side: str, values: list[bool | None]) -> None:
+        if side not in self.motion_enabled:
+            return
+        normalized = list(values[:6])
+        while len(normalized) < 6:
+            normalized.append(None)
+        self.motion_axis_enabled[side] = normalized
+        self.motion_enabled[side] = all(value is True for value in normalized)
 
     def emergency_stop(self) -> None:
         self.recording = False

@@ -16,7 +16,7 @@ const cameraResolution = (config: AppConfig, kind: keyof typeof cameraSpecs) => 
 }
 
 const getFpsColor = (hz: number) => {
-  if (hz >= 28) return '#52c41a'
+  if (hz >= 25) return '#52c41a'
   if (hz >= 20) return '#E65100'
   return '#cf1322'
 }

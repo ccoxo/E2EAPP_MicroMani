@@ -46,6 +46,7 @@ class _GripperWorker:
         self.stroke_mm = float(gripper.get("strokeMm", 26))
         self.sample_hz = max(1.0, float(gripper.get("sampleHz", 30)))
         self.enable_on_negative = bool(gripper.get("sampleEnableOnNegative", True))
+        self.enabled = bool(gripper.get(f"{side}Enabled", False))
         self.dll: Any | None = None
         self.last_sample_perf = 0.0
         self.actual_hz = 0.0
@@ -107,11 +108,17 @@ class _GripperWorker:
 
     def _execute_command(self, command: str, target_mm: Any) -> tuple[bool, str, float | None]:
         assert self.dll is not None
+        if command not in {"enable", "disable", "stop"} and not self.enabled:
+            return False, f"{self.side} gripper is disabled; enable it before motion commands", None
         if command == "enable":
             ret = int(self.dll.clawEnable(self.slave, True))
+            if ret in {0, 1}:
+                self.enabled = True
             return ret in {0, 1}, f"enable COM{self.port}, slave={self.slave}, ret={ret}", None
         if command == "disable":
             ret = int(self.dll.clawEnable(self.slave, False))
+            if ret in {0, 1}:
+                self.enabled = False
             return ret in {0, 1}, f"disable COM{self.port}, slave={self.slave}, ret={ret}", None
         if command == "home":
             ret = int(self.dll.clawEncoderZero(self.slave))
@@ -122,6 +129,7 @@ class _GripperWorker:
         ret_enable = int(self.dll.clawEnable(self.slave, True))
         if ret_enable not in {0, 1}:
             return False, f"motion prepare COM{self.port}, slave={self.slave}, enable={ret_enable}", None
+        self.enabled = True
         pos, speed, torque, position_mm = self.driver._motion_params(
             command,
             float(target_mm) if target_mm is not None else None,
@@ -145,7 +153,7 @@ class _GripperWorker:
             assert self.dll is not None
             raw = int(self.dll.getClawCurrentLocation(self.slave))
             enable_ret: int | None = None
-            if raw < 0 and self.enable_on_negative:
+            if raw < 0 and self.enable_on_negative and self.enabled:
                 enable_ret = int(self.dll.clawEnable(self.slave, True))
                 time.sleep(0.05)
                 raw = int(self.dll.getClawCurrentLocation(self.slave))

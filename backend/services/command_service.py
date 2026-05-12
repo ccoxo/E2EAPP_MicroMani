@@ -65,7 +65,7 @@ class CommandService:
     async def enable_motion_side(self, side: str) -> dict[str, object]:
         self._validate_side(side)
         result = await self.hal.command("motion.enable_side", {"side": side})
-        self.telemetry.set_motion_enabled(side, True)
+        await self._refresh_motion_enabled(side)
         side_label = "left" if side == "left" else "right"
         self.logs.info("[HAL]", f"{side_label} motion axes enable requested")
         return result
@@ -73,7 +73,7 @@ class CommandService:
     async def disable_motion_side(self, side: str) -> dict[str, object]:
         self._validate_side(side)
         result = await self.hal.command("motion.disable_side", {"side": side})
-        self.telemetry.set_motion_enabled(side, False)
+        await self._refresh_motion_enabled(side)
         side_label = "left" if side == "left" else "right"
         self.logs.info("[HAL]", f"{side_label} motion axes disable requested")
         return result
@@ -152,7 +152,7 @@ class CommandService:
         # 所有手动 jog 都先过后端安全边界，再决定发往真机还是本地模拟。
         self._validate_manual_axis_safety(config, request)
         if self._real_hardware_mode(config):
-            await self._validate_motion_side_enabled(request.side)
+            await self._validate_motion_axis_enabled(request.side, request.axis)
             profile = self._axis_profile(config, request)
             hal_result = await self.hal.command(
                 "motion.manual_axis_move",
@@ -257,19 +257,32 @@ class CommandService:
         if self._axis_profile(config, request)["maxVelocity"] <= 0:
             raise RuntimeError("manual axis velocity must be positive")
 
-    async def _validate_motion_side_enabled(self, side: str) -> None:
+    async def _refresh_motion_enabled(self, side: str) -> None:
         state = await self.hal.motion_state()
         raw_enabled = state.get("enabled")
-        side_enabled: bool | None = None
         if isinstance(raw_enabled, list) and len(raw_enabled) == 12:
             values = raw_enabled[:6] if side == "left" else raw_enabled[6:12]
-            side_enabled = all(bool(value) for value in values)
+            self.telemetry.set_motion_axis_enabled(side, [bool(value) for value in values])
+            return
+        if isinstance(raw_enabled, dict):
+            value = raw_enabled.get(side)
+            if isinstance(value, bool):
+                self.telemetry.set_motion_enabled(side, value)
+
+    async def _validate_motion_axis_enabled(self, side: str, axis: str) -> None:
+        state = await self.hal.motion_state()
+        raw_enabled = state.get("enabled")
+        axis_enabled: bool | None = None
+        if isinstance(raw_enabled, list) and len(raw_enabled) == 12:
+            axis_index = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"].index(axis)
+            state_index = (0 if side == "left" else 6) + axis_index
+            axis_enabled = bool(raw_enabled[state_index])
         elif isinstance(raw_enabled, dict):
             value = raw_enabled.get(side)
             if isinstance(value, bool):
-                side_enabled = value
-        if side_enabled is not True:
-            raise RuntimeError(f"{side} motion axes are disabled; enable the side before manual jog")
+                axis_enabled = value
+        if axis_enabled is not True:
+            raise RuntimeError(f"{side} {axis} motion axis is disabled; enable the axis before manual jog")
 
     def _axis_profile(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> dict[str, float]:
         motion = config["motion"]

@@ -125,7 +125,6 @@ describe('AppStation M0 frontend', () => {
     const confirmButton = screen.getByText('确认开始').closest('button')!
     expect(confirmButton).toBeDisabled()
     fireEvent.click(screen.getByRole('checkbox', { name: '已完成' }))
-    fireEvent.click(screen.getByText('执行 Tare').closest('button')!)
     await waitFor(() => expect(confirmButton).not.toBeDisabled())
     fireEvent.click(confirmButton)
 

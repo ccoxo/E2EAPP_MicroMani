@@ -62,6 +62,18 @@ class SchmittGripper:
             return "open"
         return None
 
+    def update_button(self, pressed: bool) -> str | None:
+        if self._state == "open" and pressed:
+            self._state = "closed"
+            self._post_close_countdown = 30
+            self._object_detected = False
+            return "close"
+        if self._state == "closed" and not pressed:
+            self._state = "open"
+            self._post_close_countdown = 0
+            return "open"
+        return None
+
     def tick_object_detect(self) -> bool:
         """Decrement post-close countdown. Returns True exactly when it reaches zero."""
         if self._post_close_countdown > 0:
@@ -157,16 +169,23 @@ class GripperTeleService:
                         continue
                     gap_mm = hand.get("gripperGapMm")
                     if gap_mm is None:
-                        continue
-                    gap_mm = float(gap_mm)
-
-                    if diag:
-                        self._logs.info(
-                            "[GRIPPER]",
-                            f"{side} gap={gap_mm:.2f}mm state={schmitt.state}",
-                        )
-
-                    cmd = schmitt.update(gap_mm, gt_cfg)
+                        if not bool(gt_cfg.get("buttonFallback", True)):
+                            continue
+                        pressed = bool(hand.get("gripperPressed", False))
+                        if diag:
+                            self._logs.info(
+                                "[GRIPPER]",
+                                f"{side} gap unavailable, button={pressed} state={schmitt.state}",
+                            )
+                        cmd = schmitt.update_button(pressed)
+                    else:
+                        gap_mm = float(gap_mm)
+                        if diag:
+                            self._logs.info(
+                                "[GRIPPER]",
+                                f"{side} gap={gap_mm:.2f}mm state={schmitt.state}",
+                            )
+                        cmd = schmitt.update(gap_mm, gt_cfg)
                     if cmd is not None:
                         speed, torque = self._motion_params(cmd, gt_cfg)
                         result = await asyncio.to_thread(

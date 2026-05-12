@@ -17,6 +17,11 @@ function cameraByKey(frame: TelemetryFrame, key: 'global' | 'wrist_left' | 'wris
   return frame.cameras.find((camera) => camera.key === key)
 }
 
+function cameraOk(frame: TelemetryFrame, key: 'global' | 'wrist_left' | 'wrist_right') {
+  const camera = cameraByKey(frame, key)
+  return (camera?.fps ?? 0) >= 25 && camera?.health === 'ok'
+}
+
 const HW_ITEMS: HwItem[] = [
   {
     name: 'HAL Service',
@@ -36,17 +41,17 @@ const HW_ITEMS: HwItem[] = [
   {
     name: '相机 全局',
     getValue: (frame) => `${(cameraByKey(frame, 'global')?.fps ?? 0).toFixed(1)} Hz`,
-    getOk: (frame) => (cameraByKey(frame, 'global')?.fps ?? 0) >= 28,
+    getOk: (frame) => cameraOk(frame, 'global'),
   },
   {
     name: '相机 左腕',
     getValue: (frame) => `${(cameraByKey(frame, 'wrist_left')?.fps ?? 0).toFixed(1)} Hz`,
-    getOk: (frame) => (cameraByKey(frame, 'wrist_left')?.fps ?? 0) >= 28,
+    getOk: (frame) => cameraOk(frame, 'wrist_left'),
   },
   {
     name: '相机 右腕',
     getValue: (frame) => `${(cameraByKey(frame, 'wrist_right')?.fps ?? 0).toFixed(1)} Hz`,
-    getOk: (frame) => (cameraByKey(frame, 'wrist_right')?.fps ?? 0) >= 28,
+    getOk: (frame) => cameraOk(frame, 'wrist_right'),
   },
   {
     name: 'Omega.7 左/右',

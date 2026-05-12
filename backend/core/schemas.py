@@ -89,6 +89,9 @@ class TelemetryFrame(BaseModel):
     motionEnabled: dict[Literal["left", "right"], bool | None] = Field(
         default_factory=lambda: {"left": None, "right": None}
     )
+    motionAxisEnabled: dict[Literal["left", "right"], list[bool | None]] = Field(
+        default_factory=lambda: {"left": [None] * 6, "right": [None] * 6}
+    )
     forceLeft: list[float] = Field(min_length=6, max_length=6)
     forceRight: list[float] = Field(min_length=6, max_length=6)
     dangerIndex: float

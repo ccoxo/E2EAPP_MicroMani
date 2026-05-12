@@ -32,7 +32,7 @@ class SettingsService:
     def get_config(self) -> dict[str, Any]:
         try:
             data = json.loads(self.config_path.read_text(encoding="utf-8"))
-            merged = self._merge_defaults(data)
+            merged = self._migrate_config(self._merge_defaults(data))
             validated = AppConfig.model_validate(merged).model_dump(mode="json")
             if merged != data:
                 self.save_config(validated, emit_log=False)
@@ -172,3 +172,17 @@ class SettingsService:
             return current if current is not None else default
 
         return cast(dict[str, Any], merge(default_config(), data))
+
+    def _migrate_config(self, config: dict[str, Any]) -> dict[str, Any]:
+        teleop = config.get("teleop", {})
+        gripper_teleop = teleop.get("gripperTeleop", {})
+        if isinstance(gripper_teleop, dict):
+            default_thresholds = (
+                float(gripper_teleop.get("openThreshold", 0.30)) == 0.30
+                and float(gripper_teleop.get("closeThreshold", 0.70)) == 0.70
+            )
+            if default_thresholds:
+                for key in ("leftGapMaxMm", "rightGapMaxMm"):
+                    if float(gripper_teleop.get(key, 25.0)) == 50.0:
+                        gripper_teleop[key] = 25.0
+        return config

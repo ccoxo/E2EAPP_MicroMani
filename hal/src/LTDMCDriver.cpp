@@ -241,9 +241,12 @@ void LTDMCDriver::emergencyStop() {
   }
 }
 
-void LTDMCDriver::enableSide(Side side, bool enabled) {
+std::string LTDMCDriver::enableSide(Side side, bool enabled) {
   std::scoped_lock lock(mutex_);
   ensureInitialized();
+  int succeeded = 0;
+  int failed = 0;
+  std::ostringstream failures;
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   if (!dmcWriteSevonPin) {
     throw std::runtime_error("required LTDMC export missing: dmc_write_sevon_pin");
@@ -253,22 +256,47 @@ void LTDMCDriver::enableSide(Side side, bool enabled) {
     const auto axis = static_cast<SemanticAxis>(axisIndex);
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
     if (!enabled && dmcCheckDone(card, axisNo) == 0) {
-      throw std::runtime_error(dmcAxisFailureMessage("disable servo while axis moving", -1, card, axisNo));
+      if (failed > 0) {
+        failures << "; ";
+      }
+      failures << dmcAxisFailureMessage("disable servo while axis moving", -1, card, axisNo);
+      enabled_[stateIndex(side, axis)] = true;
+      ++failed;
+      continue;
     }
     const auto ret = dmcWriteSevonPin(card, axisNo, enabled ? 1 : 0);
     if (ret != 0) {
-      throw std::runtime_error(dmcAxisFailureMessage("dmc_write_sevon_pin", ret, card, axisNo));
+      if (failed > 0) {
+        failures << "; ";
+      }
+      failures << dmcAxisFailureMessage("dmc_write_sevon_pin", ret, card, axisNo);
+      enabled_[stateIndex(side, axis)] = false;
+      ++failed;
+      continue;
     }
     enabled_[stateIndex(side, axis)] = enabled;
+    ++succeeded;
   }
 #else
   (void)side;
   (void)enabled;
+  succeeded = 6;
 #endif
   estopActive_ = false;
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     teleopTargetActive_[stateIndex(side, static_cast<SemanticAxis>(axisIndex))] = false;
   }
+  if (succeeded == 0 && failed > 0) {
+    throw std::runtime_error(failures.str());
+  }
+  std::ostringstream message;
+  message << (enabled ? "enable" : "disable") << " side completed"
+          << " succeeded=" << succeeded
+          << " failed=" << failed;
+  if (failed > 0) {
+    message << " failures=" << failures.str();
+  }
+  return message.str();
 }
 
 void LTDMCDriver::homeSide(Side side) {

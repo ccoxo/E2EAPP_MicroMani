@@ -123,6 +123,18 @@ def test_gripper_command_keeps_direct_driver_when_worker_disabled() -> None:
     assert settings.config["gripper"]["targetRightMm"] == 6.0
 
 
+def test_dual_worker_gripper_command_rejects_disabled_side() -> None:
+    config = default_config()
+    config["gripper"]["sampleMode"] = "dual_worker"
+    config["gripper"]["leftEnabled"] = False
+    service = GripperWorkerService(FakeSettings(config), FakeLogs())
+
+    result = service.command(config, "left", "open", None)
+
+    assert result.ok is False
+    assert "left gripper is disabled" in result.message
+
+
 def test_gripper_motion_command_rejects_disabled_side() -> None:
     config = default_config()
     settings = FakeSettings(config)
@@ -155,7 +167,7 @@ def test_manual_axis_move_rejects_disabled_motion_side() -> None:
     else:
         raise AssertionError("expected disabled motion side to fail")
 
-    assert "left motion axes are disabled" in message
+    assert "left X motion axis is disabled" in message
     assert hal.commands == []
 
 

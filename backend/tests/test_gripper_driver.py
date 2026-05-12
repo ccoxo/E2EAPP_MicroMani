@@ -100,3 +100,85 @@ def test_gripper_diagnose_checks_port_enable_and_position_without_motion(monkeyp
     assert result.details["positionRaw"] == 128
     assert fake.serial_calls == [(9, 115200, True)]
     assert fake.motion_calls == 0
+
+
+def test_gripper_command_rejects_motion_when_disabled(monkeypatch: MonkeyPatch) -> None:
+    config = default_config()
+    config["gripper"]["leftEnabled"] = False
+    driver = Rs485GripperDriver()
+
+    def fail_load(active_config: dict[str, object]) -> object:
+        _ = active_config
+        raise AssertionError("disabled motion command should not load vendor DLL")
+
+    monkeypatch.setattr(driver, "_load_dll", fail_load)
+
+    result = driver.command(config, "left", "open", None)
+
+    assert result.ok is False
+    assert "left gripper is disabled" in result.message
+
+
+def test_gripper_position_does_not_auto_enable_disabled_side(monkeypatch: MonkeyPatch) -> None:
+    config = default_config()
+    config["gripper"]["leftEnabled"] = False
+    config["gripper"]["sampleEnableOnNegative"] = True
+    driver = Rs485GripperDriver()
+
+    class FakeDll:
+        def __init__(self) -> None:
+            self.enable_calls: list[tuple[int, bool]] = []
+
+        def serialOperation(self, port: int, baudrate: int, status: bool) -> int:
+            _ = (port, baudrate, status)
+            return 1
+
+        def clawEnable(self, slave: int, status: bool) -> int:
+            self.enable_calls.append((slave, status))
+            return 1
+
+        def getClawCurrentLocation(self, slave: int) -> int:
+            _ = slave
+            return -1
+
+    fake = FakeDll()
+    monkeypatch.setattr(driver, "_load_dll", lambda active_config: fake)
+
+    result = driver.position(config, "left")
+
+    assert result.ok is False
+    assert fake.enable_calls == []
+
+
+def test_gripper_position_may_auto_enable_enabled_side_on_negative_read(monkeypatch: MonkeyPatch) -> None:
+    config = default_config()
+    config["gripper"]["rightEnabled"] = True
+    config["gripper"]["sampleEnableOnNegative"] = True
+    driver = Rs485GripperDriver()
+
+    class FakeDll:
+        def __init__(self) -> None:
+            self.enable_calls: list[tuple[int, bool]] = []
+            self.reads = 0
+
+        def serialOperation(self, port: int, baudrate: int, status: bool) -> int:
+            _ = (port, baudrate, status)
+            return 1
+
+        def clawEnable(self, slave: int, status: bool) -> int:
+            self.enable_calls.append((slave, status))
+            return 1
+
+        def getClawCurrentLocation(self, slave: int) -> int:
+            _ = slave
+            self.reads += 1
+            return -1 if self.reads == 1 else 255
+
+    fake = FakeDll()
+    monkeypatch.setattr(driver, "_load_dll", lambda active_config: fake)
+
+    result = driver.position(config, "right")
+
+    assert result.ok is True
+    assert result.position_mm == 0
+    assert fake.enable_calls == [(9, True)]

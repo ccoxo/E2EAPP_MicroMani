@@ -511,6 +511,7 @@ function MotionCard({
   focusHash,
   positions,
   motionEnabled,
+  motionAxisEnabled,
   injectLog,
   snapshotMenu,
   openSnapshotModal,
@@ -521,6 +522,7 @@ function MotionCard({
   focusHash: string
   positions: number[]
   motionEnabled: boolean | null | undefined
+  motionAxisEnabled?: Array<boolean | null>
   injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
   snapshotMenu: (scope: ParameterSnapshotScope) => MenuProps
   openSnapshotModal: (scope: ParameterSnapshotScope) => void
@@ -550,10 +552,19 @@ function MotionCard({
   const [pendingMotionAction, setPendingMotionAction] = useState<'enable' | 'disable' | 'home' | null>(null)
   const [pendingOriginAction, setPendingOriginAction] = useState<'capture' | 'clear' | null>(null)
   const [optimisticEnabled, setOptimisticEnabled] = useState<boolean | null>(null)
-  const effectiveEnabled = motionEnabled ?? optimisticEnabled ?? null
+  useEffect(() => {
+    if (optimisticEnabled !== null && motionEnabled !== null && motionEnabled !== undefined) {
+      setOptimisticEnabled(null)
+    }
+  }, [motionEnabled, optimisticEnabled])
+  const effectiveEnabled = optimisticEnabled ?? motionEnabled ?? null
+  const knownAxisEnabled = motionAxisEnabled?.filter((value) => value !== null && value !== undefined) ?? []
+  const partialEnabled = effectiveEnabled !== true && knownAxisEnabled.some((value) => value === true)
   const enableTag =
     effectiveEnabled === true
       ? <Tag color="success">已使能</Tag>
+      : partialEnabled
+        ? <Tag color="warning">部分使能</Tag>
       : effectiveEnabled === false
         ? <Tag color="warning">未使能</Tag>
         : <Tag color="default">使能状态未知</Tag>
@@ -561,7 +572,7 @@ function MotionCard({
     setPendingMotionAction('enable')
     try {
       await enableMotionSide(side)
-      setOptimisticEnabled(true)
+      setOptimisticEnabled(null)
       commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel}全部轴使能请求已发送`)
     } catch (error) {
       injectLog('ERROR', `${sideSpec.shortLabel}使能失败：${commandErrorMessage(error)}`, '[HAL]')
@@ -1444,6 +1455,7 @@ function ManualArmControl({
   manualControl,
   nowMs,
   motionEnabled,
+  motionAxisEnabled,
   selectManualAxis,
   setManualAxisStep,
   setManualSpeedMode,
@@ -1456,6 +1468,7 @@ function ManualArmControl({
   manualControl: ManualControlState
   nowMs: number
   motionEnabled: boolean | null | undefined
+  motionAxisEnabled?: Array<boolean | null>
   selectManualAxis: (side: RobotSide, axis: ManualControlAxis) => void
   setManualAxisStep: (unit: 'um' | '°', value: number) => void
   setManualSpeedMode: (mode: ManualSpeedMode) => void
@@ -1478,7 +1491,43 @@ function ManualArmControl({
   const axisBusy = busyUntil > nowMs
   const busyText = `${Math.max(0, (busyUntil - nowMs) / 1000).toFixed(1)}s`
   const speedUnit = axisIndex < 3 ? 'um/s' : '°/s'
-  const motionReady = mockMode || motionEnabled !== false
+  const [pendingMotionAction, setPendingMotionAction] = useState<'enable' | 'disable' | null>(null)
+  const [optimisticEnabled, setOptimisticEnabled] = useState<boolean | null>(null)
+  useEffect(() => {
+    if (optimisticEnabled !== null && motionEnabled !== null && motionEnabled !== undefined) {
+      setOptimisticEnabled(null)
+    }
+  }, [motionEnabled, optimisticEnabled])
+  const effectiveMotionEnabled = optimisticEnabled ?? motionEnabled ?? null
+  const selectedAxisEnabled = motionAxisEnabled?.[axisIndex] ?? effectiveMotionEnabled
+  const knownAxisEnabled = motionAxisEnabled?.filter((value) => value !== null && value !== undefined) ?? []
+  const partialMotionEnabled = effectiveMotionEnabled !== true && knownAxisEnabled.some((value) => value === true)
+  const motionReady = mockMode || selectedAxisEnabled !== false
+  const nextMotionAction = effectiveMotionEnabled === true ? 'disable' : 'enable'
+  const toggleMotionEnabled = async () => {
+    setPendingMotionAction(nextMotionAction)
+    try {
+      if (nextMotionAction === 'enable') {
+        await enableMotionSide(side)
+      } else {
+        await disableMotionSide(side)
+      }
+      setOptimisticEnabled(nextMotionAction === 'enable' ? null : false)
+      injectLog(
+        'INFO',
+        `${sideSpec.shortLabel} manual ${nextMotionAction === 'enable' ? 'enable' : 'disable'} requested`,
+        '[HAL]',
+      )
+    } catch (error) {
+      injectLog(
+        'ERROR',
+        `${sideSpec.shortLabel} manual ${nextMotionAction === 'enable' ? 'enable' : 'disable'} failed: ${String(error)}`,
+        '[HAL]',
+      )
+    } finally {
+      setPendingMotionAction(null)
+    }
+  }
 
   return (
     <article className={`manual-arm-card ${manualControl.selectedSide === side ? 'manual-card-active' : ''}`}>
@@ -1488,8 +1537,8 @@ function ManualArmControl({
           <Typography.Text type="secondary">Card {side === 'left' ? config.motion.leftCardNo : config.motion.rightCardNo} · {sideSpec.axisOrder.join(' / ')}</Typography.Text>
         </div>
         <Space wrap>
-          <Tag color={motionEnabled === true ? 'success' : motionEnabled === false ? 'warning' : 'default'}>
-            {motionEnabled === true ? '已使能' : motionEnabled === false ? '未使能' : '使能未知'}
+          <Tag color={effectiveMotionEnabled === true ? 'success' : effectiveMotionEnabled === false || partialMotionEnabled ? 'warning' : 'default'}>
+            {effectiveMotionEnabled === true ? '已使能' : partialMotionEnabled ? '部分使能' : effectiveMotionEnabled === false ? '未使能' : '使能未知'}
           </Tag>
           <Tag>检测通过</Tag>
           <Tag color="processing">{manualControl.speedMode}</Tag>
@@ -1549,14 +1598,11 @@ function ManualArmControl({
             </Button>
             <Button
               icon={<PlugZap size={15} />}
-              onClick={() => {
-                injectLog('INFO', `${sideSpec.shortLabel} manual enable requested`, '[HAL]')
-                void enableMotionSide(side).catch((error) =>
-                  injectLog('ERROR', `${sideSpec.shortLabel} manual enable failed: ${String(error)}`, '[HAL]'),
-                )
-              }}
+              danger={nextMotionAction === 'disable'}
+              loading={pendingMotionAction !== null}
+              onClick={() => void toggleMotionEnabled()}
             >
-              使能
+              {nextMotionAction === 'enable' ? '使能' : '断使能'}
             </Button>
             <Button danger icon={<ShieldAlert size={15} />} onClick={() => injectLog('ERROR', `${sideSpec.shortLabel} manual emergency stop requested`, '[SAFETY]')}>
               急停
@@ -1752,6 +1798,7 @@ function ManualControlPanel({
   manualControl,
   nowMs,
   motionEnabled,
+  motionAxisEnabled,
   selectManualAxis,
   setManualAxisStep,
   setManualSpeedMode,
@@ -1772,6 +1819,7 @@ function ManualControlPanel({
   manualControl: ManualControlState
   nowMs: number
   motionEnabled: TelemetryFrame['motionEnabled']
+  motionAxisEnabled: TelemetryFrame['motionAxisEnabled']
   selectManualAxis: (side: RobotSide, axis: ManualControlAxis) => void
   setManualAxisStep: (unit: 'um' | '°', value: number) => void
   setManualSpeedMode: (mode: ManualSpeedMode) => void
@@ -1803,6 +1851,7 @@ function ManualControlPanel({
             manualControl={manualControl}
             nowMs={nowMs}
             motionEnabled={motionEnabled?.[side] ?? null}
+            motionAxisEnabled={motionAxisEnabled?.[side] ?? undefined}
             selectManualAxis={selectManualAxis}
             setManualAxisStep={setManualAxisStep}
             setManualSpeedMode={setManualSpeedMode}
@@ -1975,6 +2024,7 @@ export function SettingsView() {
                       focusHash={focusHash}
                       positions={frame.jointPositions}
                       motionEnabled={frame.motionEnabled?.[side] ?? null}
+                      motionAxisEnabled={frame.motionAxisEnabled?.[side] ?? undefined}
                       injectLog={injectLog}
                       snapshotMenu={snapshotMenu}
                       openSnapshotModal={openSnapshotModal}
@@ -2043,6 +2093,7 @@ export function SettingsView() {
                 manualControl={manualControl}
                 nowMs={manualClockMs}
                 motionEnabled={frame.motionEnabled}
+                motionAxisEnabled={frame.motionAxisEnabled}
                 selectManualAxis={selectManualAxis}
                 setManualAxisStep={setManualAxisStep}
                 setManualSpeedMode={setManualSpeedMode}

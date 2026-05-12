@@ -61,3 +61,12 @@ def test_storage_defaults_separate_recording_fps_from_camera_preview() -> None:
     assert config["cameras"]["previewResolution"] == "640x480"
     assert config["cameras"]["fps"] == 30
     assert config["storage"]["recordFps"] == 30
+
+
+def test_gripper_teleop_defaults_match_omega7_gap_range() -> None:
+    config = default_config()
+    gripper_teleop = config["teleop"]["gripperTeleop"]
+
+    assert gripper_teleop["leftGapMaxMm"] == 25.0
+    assert gripper_teleop["rightGapMaxMm"] == 25.0
+    assert gripper_teleop["buttonFallback"] is True

@@ -57,12 +57,14 @@ class Rs485GripperDriver:
         return GripperResult(True, "jodell RS485 gripper ports open")
 
     def command(self, config: dict[str, Any], side: str, command: str, target_mm: float | None) -> GripperResult:
+        gripper = config["gripper"]
+        if command not in {"enable", "disable", "stop"} and not bool(gripper.get(f"{side}Enabled", False)):
+            return GripperResult(False, f"{side} gripper is disabled; enable it before motion commands", target_mm)
         try:
             dll = self._load_dll(config)
         except Exception as exc:
             return GripperResult(False, f"jodellTool.dll load failed: {exc}", target_mm)
 
-        gripper = config["gripper"]
         port = self._port_number(str(gripper["leftPort" if side == "left" else "rightPort"]))
         slave = int(gripper["leftSlaveId" if side == "left" else "rightSlaveId"])
         baudrate = int(gripper.get("baudrate", 115200))
@@ -145,6 +147,9 @@ class Rs485GripperDriver:
         port = self._port_number(str(gripper["leftPort" if side == "left" else "rightPort"]))
         slave = int(gripper["leftSlaveId" if side == "left" else "rightSlaveId"])
         baudrate = int(gripper.get("baudrate", 115200))
+        allow_sample_enable = bool(gripper.get(f"{side}Enabled", False)) and bool(
+            gripper.get("sampleEnableOnNegative", True)
+        )
 
         with self._io_lock:
             ret_open = self._select_port(dll, port, baudrate)
@@ -153,6 +158,8 @@ class Rs485GripperDriver:
             try:
                 raw = int(dll.getClawCurrentLocation(slave))
                 if raw < 0:
+                    if not allow_sample_enable:
+                        return GripperResult(False, f"getClawCurrentLocation slave={slave}, ret={raw}")
                     enable_ret = int(dll.clawEnable(slave, True))
                     time.sleep(0.05)
                     raw = int(dll.getClawCurrentLocation(slave))

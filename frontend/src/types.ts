@@ -74,6 +74,7 @@ export interface TelemetryFrame {
   jointPositions: number[]
   gripperPositions: number[]
   motionEnabled: { left: boolean | null; right: boolean | null }
+  motionAxisEnabled: { left: Array<boolean | null>; right: Array<boolean | null> }
   forceLeft: number[]
   forceRight: number[]
   dangerIndex: number
@@ -385,6 +386,7 @@ export interface AppConfig {
       releaseSpeed: number
       releaseTorque: number
       objectDetectMargin: number
+      buttonFallback: boolean
       diagLog: boolean
     }
   }

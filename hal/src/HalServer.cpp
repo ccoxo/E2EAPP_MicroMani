@@ -379,12 +379,12 @@ void serveConnection(
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/enable_side ", 0) == 0) {
         const auto side = parseSide(jsonStringValue(requestBody(request), "side"));
-        motion.enableSide(side, true);
-        body = "{\"ok\":true}";
+        const auto message = motion.enableSide(side, true);
+        body = "{\"ok\":true,\"message\":\"" + jsonEscape(message) + "\"}";
       } else if (request.rfind("POST /motion/disable_side ", 0) == 0) {
         const auto side = parseSide(jsonStringValue(requestBody(request), "side"));
-        motion.enableSide(side, false);
-        body = "{\"ok\":true}";
+        const auto message = motion.enableSide(side, false);
+        body = "{\"ok\":true,\"message\":\"" + jsonEscape(message) + "\"}";
       } else if (request.rfind("POST /motion/home_side ", 0) == 0) {
         const auto side = parseSide(jsonStringValue(requestBody(request), "side"));
         motion.homeSide(side);

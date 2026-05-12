@@ -88,6 +88,8 @@ class GripperWorkerService:
     def command(self, config: dict[str, Any], side: str, command: str, target_mm: float | None) -> GripperResult:
         if not self.is_enabled(config):
             return GripperResult(False, "gripper workers disabled", target_mm)
+        if command not in {"enable", "disable", "stop"} and not bool(config.get("gripper", {}).get(f"{side}Enabled", False)):
+            return GripperResult(False, f"{side} gripper is disabled; enable it before motion commands", target_mm)
         timeout_sec = float(config.get("gripper", {}).get("workerCommandTimeoutSec", 2.0))
         request_id = uuid4().hex
         with self._lock:
