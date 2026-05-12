@@ -33,6 +33,7 @@ class TelemetryHub:
         self.force_left = [0.0] * 6
         self.force_right = [0.0] * 6
         self.force_ok = False
+        self.gripper_samples: dict[str, dict[str, Any]] = {}
         self.recording = False
         self.episode_count = 0
         self.frame_count = 0
@@ -97,7 +98,7 @@ class TelemetryHub:
         if self.hardware is not None and real_mode:
             # 真机传感器用缓存值出帧，采样频率由后台 future 控制。
             self._refresh_force_values(config, now)
-            self._refresh_gripper_positions(config, now)
+            self.refresh_gripper_positions(config, now)
             force_ok = self.force_ok
             force_left = list(self.force_left)
             force_right = list(self.force_right)
@@ -519,14 +520,28 @@ class TelemetryHub:
             self._last_camera_sample_at = now
             self._camera_future = self._hardware_executor.submit(self.hardware.cameras.probe, config)
 
-    def _refresh_gripper_positions(self, config: dict[str, Any], now: float) -> None:
+    def refresh_gripper_positions(self, config: dict[str, Any], now: float | None = None) -> None:
+        """从当前采样后端刷新夹爪缓存位置。"""
+        now = time.monotonic() if now is None else now
         if self.hardware is None:
             return
         if self.gripper_workers is not None and self.gripper_workers.is_enabled(config):
-            positions = self.gripper_workers.positions(config)
-            for idx, value in enumerate(positions):
+            samples = self.gripper_workers.samples(config)
+            if samples:
+                self.gripper_samples = samples
+            updated = False
+            latest_sample_at = 0.0
+            for side, idx in (("left", 0), ("right", 1)):
+                sample = samples.get(side, {})
+                value = sample.get("positionMm")
                 if value is not None:
                     self.gripper_positions[idx] = float(value)
+                    updated = True
+                monotonic_ms = sample.get("monotonicMs")
+                if monotonic_ms is not None:
+                    latest_sample_at = max(latest_sample_at, float(monotonic_ms) / 1000.0)
+            if updated:
+                self._last_gripper_sample_at = latest_sample_at or now
             return
         if self._gripper_future is not None and self._gripper_future.done():
             try:
@@ -534,6 +549,7 @@ class TelemetryHub:
                 for idx, value in enumerate(positions):
                     if value is not None:
                         self.gripper_positions[idx] = float(value)
+                        self._last_gripper_sample_at = now
             except Exception:
                 pass
             finally:
@@ -542,6 +558,9 @@ class TelemetryHub:
             # 夹爪位置变化较慢，低频采样足够支撑状态面板。
             self._last_gripper_sample_at = now
             self._gripper_future = self._hardware_executor.submit(self._sample_gripper_positions, config)
+
+    def _refresh_gripper_positions(self, config: dict[str, Any], now: float) -> None:
+        self.refresh_gripper_positions(config, now)
 
     def _sample_gripper_positions(self, config: dict[str, Any]) -> list[float | None]:
         if self.hardware is None:

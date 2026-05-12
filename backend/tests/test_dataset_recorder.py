@@ -145,6 +145,60 @@ def test_dataset_recorder_timed_source_records_timeout_drop() -> None:
     assert recorder._source_fail_streaks["hal"] == 1
 
 
+def test_dataset_recorder_gripper_source_uses_worker_sample_timestamp() -> None:
+    class FakeTelemetry:
+        def __init__(self) -> None:
+            self.gripper_positions = [-1.0, -1.0]
+            self.gripper_samples: dict[str, dict[str, object]] = {}
+            self._last_gripper_sample_at = 0.0
+
+        def refresh_gripper_positions(self, _config: dict[str, object], now: float) -> None:
+            sample_at = now - 0.01
+            sample_ms = int(sample_at * 1000)
+            self.gripper_positions = [4.0, 5.0]
+            self._last_gripper_sample_at = sample_at
+            self.gripper_samples = {
+                "left": {
+                    "ok": True,
+                    "positionMm": 4.0,
+                    "readMs": 1.5,
+                    "sampleHz": 30.0,
+                    "tsMs": 1000,
+                    "monotonicMs": sample_ms,
+                    "message": "left ok",
+                },
+                "right": {
+                    "ok": True,
+                    "positionMm": 5.0,
+                    "readMs": 1.7,
+                    "sampleHz": 30.0,
+                    "tsMs": 1001,
+                    "monotonicMs": sample_ms,
+                    "message": "right ok",
+                },
+            }
+
+    recorder = object.__new__(DatasetRecorderService)
+    recorder.telemetry = FakeTelemetry()
+    recorder._drop_counts = {"gripper": 0}
+    recorder._late_source_frames = {}
+    recorder._source_skews_ms = {"gripper": []}
+    recorder._source_elapsed_ms = {"gripper": []}
+    recorder._source_fail_streaks = {"gripper": 0}
+    recorder._source_warnings = []
+    config = {"hal": {"mode": "real"}, "gripper": {"sampleHz": 30, "sampleStaleMs": 500}}
+
+    sample = asyncio.run(recorder._gripper_source(config, time.monotonic()))
+    metadata = recorder._source_frame_metadata(sample)["gripper"]
+
+    assert sample.ok is True
+    assert sample.value == [4.0, 5.0]
+    assert sample.monotonic_s == recorder.telemetry._last_gripper_sample_at
+    assert metadata["targetSampleHz"] == 30.0
+    assert metadata["sides"]["left"]["sampleHz"] == 30.0
+    assert metadata["sides"]["right"]["monotonicMs"] == metadata["sides"]["left"]["monotonicMs"]
+
+
 def test_dataset_recorder_uses_cached_camera_frame_on_snapshot_failure(tmp_path: Path, monkeypatch) -> None:
     class FakeCameras:
         def __init__(self) -> None:
