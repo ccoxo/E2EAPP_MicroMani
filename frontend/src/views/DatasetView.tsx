@@ -25,8 +25,10 @@ import {
   saveDatasetReviewApi,
   updateDatasetEpisodeApi,
   type DatasetApi,
+  type DatasetCameraResolutionApi,
   type DatasetEpisodeApi,
   type DatasetEpisodeStatusApi,
+  type DatasetFeatureSummaryApi,
 } from '../api'
 import { useTelemetryStore } from '../stores/telemetry'
 import type { EpisodeRecord } from '../types'
@@ -63,11 +65,21 @@ interface ReviewEpisode {
   createdAt: string
   warnings: string[]
   samples: EpisodeSample[]
+  lateFrames?: number
+  maxForceLeft?: number
+  maxForceRight?: number
+  featureSummary?: DatasetFeatureSummaryApi
+  cameraResolutions?: Partial<Record<CameraKey, DatasetCameraResolutionApi>>
 }
 
 interface ReviewDataset {
   id: string
   name: string
+  root?: string
+  fps?: number
+  format?: string
+  featureSummary?: DatasetFeatureSummaryApi
+  cameraResolutions?: Partial<Record<CameraKey, DatasetCameraResolutionApi>>
   status: 'local' | 'dry-run' | '待审核' | string
   episodes: ReviewEpisode[]
 }
@@ -159,6 +171,11 @@ function episodeFromApi(episode: DatasetEpisodeApi): ReviewEpisode {
     createdAt: formatCreatedAt(episode.createdAt),
     warnings: episode.warnings,
     samples: episode.samples,
+    lateFrames: episode.lateFrames,
+    maxForceLeft: episode.maxForceLeft,
+    maxForceRight: episode.maxForceRight,
+    featureSummary: episode.featureSummary ?? episode.features,
+    cameraResolutions: episode.cameraResolutions,
   }
 }
 
@@ -167,8 +184,36 @@ function datasetFromApi(dataset: DatasetApi): ReviewDataset {
     id: dataset.id,
     name: dataset.name,
     status: dataset.status,
+    root: dataset.root,
+    fps: dataset.fps,
+    format: dataset.format,
+    featureSummary: dataset.featureSummary,
+    cameraResolutions: dataset.cameraResolutions,
     episodes: dataset.episodes.map(episodeFromApi),
   }
+}
+
+function camerasForReview(dataset: ReviewDataset, episode: ReviewEpisode): ReviewCamera[] {
+  const resolutions = episode.cameraResolutions ?? dataset.cameraResolutions ?? {}
+  return cameras.map((camera) => {
+    const resolution = resolutions[camera.key]
+    const saved = resolution?.saved || camera.resolution
+    const capture = resolution?.capture || 'native'
+    const preview = resolution?.preview || 'native'
+    return {
+      ...camera,
+      resolution: saved,
+      model: `${camera.model} | capture ${capture} | preview ${preview}`,
+    }
+  })
+}
+
+function featureShapeText(features?: DatasetFeatureSummaryApi) {
+  if (!features) return 'features unavailable'
+  const state = features['observation.state']?.shape?.join('x') || '?'
+  const action = features.action?.shape?.join('x') || '?'
+  const pulses = features['observation.pulses']?.shape?.join('x') || '?'
+  return `state ${state} | action ${action} | pulses ${pulses}`
 }
 
 const baseDatasets: ReviewDataset[] = [
@@ -378,6 +423,14 @@ function applyEpisodeOverrides(episode: ReviewEpisode, nameOverrides: Record<str
   }
 }
 
+/**
+ * 渲染数据集复核工作台。
+ *
+ * 业务背景：复核人员需要在同一页面检查 episode 轨迹、力觉曲线、
+ * 三路相机样本和 LeRobot v3 feature shape，并对样本做有效性标记。
+ *
+ * @returns 数据集复核页面的 React 组件。
+ */
 export function DatasetView() {
   const recordSession = useTelemetryStore((state) => state.recordSession)
   const [selectedDatasetId, setSelectedDatasetId] = useState('micro_assembly_v1')
@@ -439,6 +492,7 @@ export function DatasetView() {
     ?? datasets.find((dataset) => dataset.episodes.length > 0)
     ?? datasets[0]
   const selectedEpisode = selectedDataset?.episodes.find((episode) => episode.id === selectedEpisodeId) ?? selectedDataset?.episodes[0]
+  const selectedCameras = selectedDataset && selectedEpisode ? camerasForReview(selectedDataset, selectedEpisode) : cameras
   const validEpisodes = selectedDataset?.episodes.filter((episode) => episode.status === 'valid').length ?? 0
   const avgQuality = selectedDataset && selectedDataset.episodes.length > 0
     ? Math.round(selectedDataset.episodes.reduce((sum, episode) => sum + episode.quality, 0) / selectedDataset.episodes.length)
@@ -656,12 +710,14 @@ export function DatasetView() {
                   <span>同步视频检查</span>
                   <Space size={6} wrap>
                     {statusTag(selectedEpisode.status)}
+                    <Tag>{featureShapeText(selectedEpisode.featureSummary ?? selectedDataset.featureSummary)}</Tag>
+                    <Tag>Fmax L/R {(selectedEpisode.maxForceLeft ?? 0).toFixed(2)} / {(selectedEpisode.maxForceRight ?? 0).toFixed(2)}</Tag>
                     <Tag color={selectedEpisode.quality >= 85 ? 'success' : 'warning'}>质量 {selectedEpisode.quality}%</Tag>
                   </Space>
                 </div>
                 <div className="dataset-cockpit-grid">
                   <div className="dataset-video-grid">
-                    {cameras.map((camera) => (
+                    {selectedCameras.map((camera) => (
                       <DatasetVideoPane camera={camera} episode={selectedEpisode} frameIndex={frameIndex} key={camera.key} />
                     ))}
                   </div>

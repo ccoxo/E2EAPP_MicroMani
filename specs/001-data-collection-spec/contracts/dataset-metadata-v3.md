@@ -1,5 +1,11 @@
 # Contract: LeRobot v3 Dataset Metadata
 
+## Scope
+
+LeRobot 的 `so_follower` 示例是单臂数据，只用于说明 Dataset v3 metadata/features 的形状。本项目只保留双臂微装配采集必要的硬件语义字段：双臂轴状态、双臂动作、12 轴脉冲、双路力传感器和三路相机。
+
+`total_episodes`、`total_frames`、`total_tasks`、`chunks_size`、文件大小、`splits`、`data_path` 和 `video_path` 等全局统计或路径字段由 LeRobot 数据集库生成和维护，不在 AppStation 手写硬件 feature 契约中重复定义。
+
 ## Dataset Header
 
 ```json
@@ -81,17 +87,22 @@
 - dtype: `video`
 - shape: `[480, 640, 3]`
 - names: `height`, `width`, `channels`
+- info:
+  - `video.height`: `480`
+  - `video.width`: `640`
+  - `video.codec`: `av1`
+  - `video.pix_fmt`: `yuv420p`
+  - `video.is_depth_map`: `false`
+  - `video.fps`: `30`
+  - `video.channels`: `3`
+  - `has_audio`: `false`
 
-## AppStation Extensions
+## LeRobot Index Fields
 
-AppStation may persist additional review metadata outside standard features:
+LeRobot may persist these frame bookkeeping fields as standard dataset indices. They are not robot hardware semantic dimensions:
 
-- force windows and force sample offsets
-- HAL health
-- motion enabled/estop
-- Omega.7 master hand state
-- per-source timeout/stale status
-- per-source skew/jitter/late/drop metrics
-- warnings and quality status
-
-Extensions must not change standard feature names, dtype, shape, or order.
+- `timestamp`: dtype `float32`, shape `[1]`, names `null`
+- `frame_index`: dtype `int64`, shape `[1]`, names `null`
+- `episode_index`: dtype `int64`, shape `[1]`, names `null`
+- `index`: dtype `int64`, shape `[1]`, names `null`
+- `task_index`: dtype `int64`, shape `[1]`, names `null`

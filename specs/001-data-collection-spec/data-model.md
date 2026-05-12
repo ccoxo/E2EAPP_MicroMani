@@ -39,17 +39,14 @@
 - `skew_by_source_ms`: 每个来源相对 tick 的偏差
 - `timeout_by_source`: 每个来源是否触发 per-source timeout
 - `stale_by_source`: 每个来源是否使用过期或缓存数据
-- `late_flags`: 每个来源是否 late
-- `drop_flags`: 每个来源是否 drop
+- `camera_cache_used`: 每路相机是否使用上一帧有效缓存
 
 **Validation Rules**:
 
 - 每个 tick 必须有稳定 frame index。
 - HAL、力觉、夹爪、Omega 和相机来源必须在同一 tick 内并发启动；仅相机内部并行不满足该模型。
 - 每个来源必须受 per-source timeout 约束，单来源 timeout 不得阻塞其他来源写入当前帧。
-- HAL skew >20 ms 产生 warning。
-- 相机 skew >33.3 ms 或无可用帧计为 late/drop。
-- 同一关键源连续 3 帧无法对齐产生 warning，连续 10 帧或整段不可用标记 invalid。
+- 相机当前帧不可用时必须使用上一帧有效缓存；无缓存时才允许使用占位帧。
 
 ## DatasetFrame
 
@@ -65,6 +62,7 @@
 - `observation.images.global`: video frame `[480, 640, 3]`
 - `observation.images.wrist_left`: video frame `[480, 640, 3]`
 - `observation.images.wrist_right`: video frame `[480, 640, 3]`
+- LeRobot index fields: `timestamp`, `frame_index`, `episode_index`, `index`, `task_index`
 - `task`: task text
 
 **State Names**:
@@ -80,6 +78,8 @@
 - State/action shape 必须为 14。
 - Pulses shape 必须为 12，且只包含 LTDMC 运动轴。
 - 力觉字段必须为 N/Nm 语义。
+- 相机字段必须保留 video shape、height/width/channels names 和必要 video info。
+- LeRobot index fields 仅用于帧、episode 和 task 索引，不得混入硬件观测或动作维度。
 - 标准 features 不包含 `observation.gripper` 作为训练主字段。
 
 ## HardwareSampleSet
@@ -89,45 +89,19 @@
 **Fields**:
 
 - `hal_motion`: positions、pulses、enabled、estop、sample_time
-- `hal_health`: LTDMC/Omega.7 可用性、版本、消息
 - `omega_hands`: 左右主手连接、openId、deviceId、pose、按钮、gripperGap、read status
 - `force`: left/right scalar force、left/right windows、window offsets
-- `cameras`: global/wrist_left/wrist_right image or drop reason
+- `cameras`: global/wrist_left/wrist_right 当前图像、上一帧缓存图像或启动占位帧
 - `gripper`: slave actual gap and target gap
 - `teleop_action`: latest 14D action target
-- `timeout_status`: `hal`、`force`、`camera`、`gripper`、`omega` 的 timeout/stale/drop 结果
+- `timeout_status`: `hal`、`force`、`camera`、`gripper`、`omega` 的 timeout 或缓存兜底结果
 
 **Validation Rules**:
 
 - 所有来源必须携带采样时间或可推导的 tick 偏移。
 - 单个来源失败不得阻塞其他来源写入。
-- 来源失败必须进入 quality report。
+- 来源失败必须使用缓存或占位兜底，不得阻塞当前帧。
 - 来源 timeout 必须和普通采样失败区分记录，便于判断是硬件慢、不可用还是缓存降级。
-
-## EpisodeQualityReport
-
-**Purpose**: 保存 episode 后提供给审核人员的质量摘要。
-
-**Fields**:
-
-- `frames`: 保存帧数
-- `duration_s`: episode 时长
-- `late_frames`: late frame 总数
-- `drop_counts`: 按相机和关键来源统计的 drop 次数
-- `timeout_counts`: 按 HAL、相机、力觉、夹爪和 Omega 来源统计的 timeout 次数
-- `max_force_left`, `max_force_right`: 最大力觉幅值
-- `max_skew_ms`: 按来源统计的最大偏差
-- `avg_skew_ms`: 按来源统计的平均偏差
-- `jitter_ms`: 按来源统计的 tick 间抖动
-- `warnings`: warning 列表
-- `status`: `ok`、`warning`、`invalid`
-
-**Validation Rules**:
-
-- 质量报告必须包含 max skew、avg skew、jitter、late frames、drop counts。
-- 质量报告必须能区分 late、drop、timeout 和 stale，且按来源定位。
-- estop_active 为 true 的 episode 不得默认为 `ok`。
-- HAL/Omega/相机/力觉/夹爪不可用必须有可定位 warning。
 
 ## DatasetMetadata
 
@@ -139,9 +113,8 @@
 - `robot_type`: `dual_arm_micro_assembly`
 - `fps`: 默认 30
 - `features`: 标准 LeRobot features
-- `appstation_info`: AppStation 扩展信息，包括采集配置、质量扩展、硬件来源、对齐策略
+- `lerobot_bookkeeping`: LeRobot 自动维护的数据集统计、切分、路径和索引字段
 
 **Validation Rules**:
 
 - 标准 `features` 必须与 contract 完全一致。
-- AppStation 扩展不得改变标准 features shape、dtype、names。

@@ -34,39 +34,7 @@
   "episode": {
     "episodeIndex": 0,
     "frames": 600,
-    "durationSec": 20.0,
-    "status": "ok | warning | invalid"
-  },
-  "quality": {
-    "lateFrames": 0,
-    "dropCounts": {
-      "global": 0,
-      "wrist_left": 0,
-      "wrist_right": 0,
-      "hal": 0,
-      "force": 0,
-      "gripper": 0
-    },
-    "timeoutCounts": {
-      "hal": 0,
-      "camera": 0,
-      "force": 0,
-      "gripper": 0,
-      "omega": 0
-    },
-    "staleCounts": {
-      "hal": 0,
-      "camera": 0,
-      "force": 0,
-      "gripper": 0,
-      "omega": 0
-    },
-    "maxSkewMs": {},
-    "avgSkewMs": {},
-    "jitterMs": {},
-    "maxForceLeft": 0.0,
-    "maxForceRight": 0.0,
-    "warnings": []
+    "durationSec": 20.0
   }
 }
 ```
@@ -81,7 +49,7 @@ Finish the active recording session. Unsaved active episode is discarded.
 
 ## GET /api/record/status
 
-Must remain compatible with existing frontend recording state. New quality/schema fields are additive. When present, recording quality must expose source-level late/drop/timeout/stale information without requiring old frontend consumers to parse it.
+Must remain compatible with existing frontend recording state. New schema fields are additive.
 
 ## GET /api/datasets
 
@@ -93,11 +61,10 @@ Dataset summary must include:
 - fps
 - episode count
 - visible episode list
-- latest quality summary when available
 
 ## GET /api/datasets/{dataset_id}/episodes/{episode_id}
 
-Episode detail must expose quality report and enough metadata to validate standard feature shape.
+Episode detail must expose enough metadata to validate standard feature shape.
 
 ## GET /api/datasets/{dataset_id}/frame_image
 

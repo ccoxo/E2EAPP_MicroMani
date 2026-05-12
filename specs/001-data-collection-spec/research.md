@@ -20,7 +20,7 @@
 
 ## Decision: 使用 asyncio 按录制 tick 并发采集不同硬件
 
-**Rationale**: HAL、三路相机、力觉窗口、夹爪和 Omega.7 状态具有不同采样耗时和阻塞模型。按 30 Hz monotonic tick 创建采集上下文，在同一 tick 内先创建所有来源任务，再用 `asyncio.gather()`、`asyncio.to_thread()` 和 per-source timeout 并发读取，可以降低串行等待导致的 skew，并让 timeout、late、drop 和 stale 按来源计数。仅三路相机内部并行不能证明 HAL/力觉/相机整体满足同一 tick 对齐。
+**Rationale**: HAL、三路相机、力觉窗口、夹爪和 Omega.7 状态具有不同采样耗时和阻塞模型。按 30 Hz monotonic tick 创建采集上下文，在同一 tick 内先创建所有来源任务，再用 `asyncio.gather()`、`asyncio.to_thread()` 和 per-source timeout 并发读取，可以降低串行等待导致的 skew。相机当前帧不可用时直接使用上一帧有效缓存，仅三路相机内部并行不能证明 HAL/力觉/相机整体满足同一 tick 对齐。
 
 **Alternatives considered**:
 
@@ -28,14 +28,14 @@
 - 为每个硬件新建独立进程：超出当前需求，增加跨进程同步和部署复杂度。
 - 只让三路相机内部并行：仍然保留 HAL、力觉窗口和相机之间的串行等待，无法证明 30 Hz 录制和 HAL/相机 skew 阈值。
 
-## Decision: 标准 features 与 AppStation 质量扩展分离
+## Decision: 标准 features 只保留训练必要字段
 
-**Rationale**: 用户给定的标准 features 不包含力觉窗口、HAL health、enabled/estop、Omega.7 和对齐指标，但 spec 需要这些数据用于复核和质量判断。标准训练字段保持 LeRobot v3.0 兼容，扩展信息写入 episode quality metadata 或 AppStation 专属 metadata，避免污染标准 features。
+**Rationale**: 用户给定的标准 features 只需要双臂状态、动作、12 轴脉冲、双路力觉、三路相机和 LeRobot 索引字段。标准训练字段保持 LeRobot v3.0 兼容，不加入额外运行状态字段。
 
 **Alternatives considered**:
 
-- 把所有扩展都塞进 LeRobot features：会改变训练主契约，增加下游读取复杂度。
-- 完全不持久化扩展：无法满足采集可信度、对齐质量和复核要求。
+- 把额外运行状态塞进 LeRobot features：会改变训练主契约，增加下游读取复杂度。
+- 继续保留独立 `observation.gripper`：会与 14 维 state/action 标准结构重复。
 
 ## Decision: 14 维 state/action 替代独立 observation.gripper 作为标准主字段
 
@@ -45,12 +45,3 @@
 
 - 保持 12 维 state/action + 独立 gripper：与用户提供的标准 metadata 不一致。
 - 把夹爪脉冲加入 pulses：夹爪不是 LTDMC 12 运动轴脉冲，加入会破坏 pulses 语义。
-
-## Decision: 质量报告记录 skew/jitter/late/drop
-
-**Rationale**: spec 要求 HAL、相机、力觉、夹爪对齐到同一 tick。质量报告必须能让审核人员判断 episode 是否可用于训练，因此记录 max skew、avg skew、jitter、late frames 和 drop counts，并按来源定位。
-
-**Alternatives considered**:
-
-- 只记录总帧数和相机掉帧：无法判断 HAL/力觉/夹爪是否时间错位。
-- 每帧只记录原始 timestamp：信息充分但审核成本高，仍需要汇总指标。
