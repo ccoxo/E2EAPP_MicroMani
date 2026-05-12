@@ -221,6 +221,7 @@ class _GripperWorker:
             "readMs": read_ms,
             "sampleHz": self.actual_hz,
             "tsMs": int(time.time() * 1000),
+            "monotonicMs": int(time.monotonic() * 1000),
         }
         try:
             self.status_queue.put_nowait(payload)

@@ -8,6 +8,7 @@ from backend.core.schemas import GripperCommandRequest, ManualAxisMoveRequest
 from backend.drivers.gripper_rs485 import GripperResult
 from backend.services.command_service import CommandService
 from backend.services.gripper_worker_service import GripperWorkerService
+from backend.services.telemetry_hub import TelemetryHub
 
 
 class FakeSettings:
@@ -107,6 +108,7 @@ def test_gripper_command_uses_dual_worker_when_enabled() -> None:
 
 def test_gripper_command_keeps_direct_driver_when_worker_disabled() -> None:
     config = default_config()
+    config["gripper"]["sampleMode"] = "direct"
     config["gripper"]["rightEnabled"] = True
     settings = FakeSettings(config)
     hardware = FakeHardware()
@@ -199,3 +201,28 @@ def test_gripper_worker_sync_keeps_workers_when_enabled() -> None:
     service.sync_config(config)
 
     assert calls == []
+
+
+def test_telemetry_uses_dual_worker_sample_timestamps_for_gripper_cache() -> None:
+    class FakeWorkerSamples:
+        def is_enabled(self, _config: dict[str, Any]) -> bool:
+            return True
+
+        def samples(self, _config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+            return {
+                "left": {"ok": True, "positionMm": 3.0, "sampleHz": 30.0, "monotonicMs": 120000},
+                "right": {"ok": True, "positionMm": 4.0, "sampleHz": 30.0, "monotonicMs": 120033},
+            }
+
+    telemetry = object.__new__(TelemetryHub)
+    telemetry.hardware = object()
+    telemetry.gripper_workers = FakeWorkerSamples()
+    telemetry.gripper_positions = [-1.0, -1.0]
+    telemetry.gripper_samples = {}
+    telemetry._last_gripper_sample_at = 0.0
+
+    telemetry.refresh_gripper_positions({"gripper": {"sampleMode": "dual_worker"}}, now=999.0)
+
+    assert telemetry.gripper_positions == [3.0, 4.0]
+    assert telemetry.gripper_samples["left"]["sampleHz"] == 30.0
+    assert telemetry._last_gripper_sample_at == 120.033

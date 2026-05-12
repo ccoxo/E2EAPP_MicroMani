@@ -366,7 +366,7 @@ export const defaultConfig: AppConfig = {
     commandForceLimitN: 8,
     commandSpeed: 10,
     commandTorque: 1,
-    sampleMode: 'direct',
+    sampleMode: 'dual_worker',
     sampleHz: 30,
     sampleStaleMs: 500,
     sampleEnableOnNegative: true,

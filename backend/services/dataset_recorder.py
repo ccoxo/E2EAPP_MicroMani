@@ -91,7 +91,7 @@ SOURCE_TIMEOUT_S: dict[str, float] = {
     "omega": 0.020,
 }
 # timeout 用 drop 边界，warning 用更严格的 skew 边界；这样慢但成功的源也会进入质量报告。
-SOURCE_WARNING_SKEW_MS: dict[str, float] = {"hal": 20.0, "camera": 16.7}
+SOURCE_WARNING_SKEW_MS: dict[str, float] = {"hal": 20.0, "camera": 16.7, "gripper": 33.4}
 SOURCE_DROP_SKEW_MS: dict[str, float] = {"camera": 33.3}
 PLACEHOLDER_JPEG_BYTES = base64.b64decode(
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////"
@@ -114,6 +114,7 @@ class SourceSample:
     monotonic_s: float
     ok: bool = True
     message: str = ""
+    details: dict[str, Any] | None = None
 
 
 class DatasetRecorderService:
@@ -217,6 +218,8 @@ class DatasetRecorderService:
             self.telemetry.episode_count = self._episode_index
             self.telemetry.frame_count = 0
             self.telemetry.recording = True
+        if self._real_hardware_mode(config):
+            await self._refresh_gripper_cache(config)
         await self.teleop.start("recording")
         self.logs.info("[LEROBOT]", f"record session started: {self._dataset_name} episode={self._episode_index:06d}")
         return self.status()
@@ -806,15 +809,29 @@ class DatasetRecorderService:
         # 夹爪位置由 telemetry/worker 后台刷新；录制帧只读取缓存并检查是否过期。
         if not self._real_hardware_mode(config):
             return await self._cached_source("gripper", list(self.telemetry.gripper_positions), target_monotonic_s)
+        await self._refresh_gripper_cache(config)
         stale_after_s = self._positive_ratio(config.get("gripper", {}).get("sampleStaleMs"), 2500.0) / 1000.0
         stale_after_s = max(0.5, stale_after_s)
         last_sample_at = float(getattr(self.telemetry, "_last_gripper_sample_at", 0.0) or 0.0)
         age_s = time.monotonic() - last_sample_at if last_sample_at > 0 else math.inf
         ok = age_s <= stale_after_s
         message = "" if ok else f"gripper stale: {round(age_s, 3)}s"
-        sample = SourceSample("gripper", list(self.telemetry.gripper_positions), time.monotonic(), ok, message)
+        sample = SourceSample(
+            "gripper",
+            list(self.telemetry.gripper_positions),
+            last_sample_at if last_sample_at > 0 else time.monotonic(),
+            ok,
+            message,
+            self._gripper_source_details(age_s, config),
+        )
         self._record_source_quality(sample, target_monotonic_s, 0.0)
         return sample
+
+    async def _refresh_gripper_cache(self, config: dict[str, Any]) -> None:
+        refresh_gripper = getattr(self.telemetry, "refresh_gripper_positions", None)
+        if callable(refresh_gripper):
+            # 录制循环主动刷新 worker 缓存，避免依赖 WebSocket 帧驱动夹爪采样。
+            await asyncio.to_thread(refresh_gripper, config, time.monotonic())
 
     async def _timed_source(self, source: str, awaitable: Any, target_monotonic_s: float) -> SourceSample:
         # wait_for 约束当前帧等待时间；即使底层 to_thread 还在结束，也不拖慢 30Hz tick。
@@ -874,14 +891,43 @@ class DatasetRecorderService:
             self._source_warnings.append(f"{sample.source} consecutive failures: {streak}")
 
     def _source_frame_metadata(self, *samples: SourceSample) -> dict[str, dict[str, Any]]:
-        return {
-            sample.source: {
+        metadata: dict[str, dict[str, Any]] = {}
+        for sample in samples:
+            item = {
                 "ok": sample.ok,
                 "message": sample.message,
                 "monotonicS": round(sample.monotonic_s, 6),
             }
-            for sample in samples
+            if sample.details:
+                item.update(sample.details)
+            metadata[sample.source] = item
+        return metadata
+
+    def _gripper_source_details(self, age_s: float, config: dict[str, Any]) -> dict[str, Any]:
+        samples = getattr(self.telemetry, "gripper_samples", {})
+        gripper_config = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
+        details: dict[str, Any] = {
+            "ageMs": round(age_s * 1000.0, 3) if math.isfinite(age_s) else None,
+            "targetSampleHz": self._positive_ratio(gripper_config.get("sampleHz"), 30.0),
         }
+        if isinstance(samples, dict) and samples:
+            sides: dict[str, dict[str, Any]] = {}
+            for side in ("left", "right"):
+                sample = samples.get(side)
+                if isinstance(sample, dict):
+                    sides[side] = {
+                        "ok": bool(sample.get("ok")),
+                        "positionMm": sample.get("positionMm"),
+                        "readMs": sample.get("readMs"),
+                        "sampleHz": sample.get("sampleHz"),
+                        "tsMs": sample.get("tsMs"),
+                        "monotonicMs": sample.get("monotonicMs"),
+                        "message": sample.get("message", ""),
+                    }
+            if sides:
+                details["mode"] = "dual_worker"
+                details["sides"] = sides
+        return details
 
     async def _capture_cameras(self, config: dict[str, Any]) -> dict[str, Any]:
         if self._native_dataset is not None:
