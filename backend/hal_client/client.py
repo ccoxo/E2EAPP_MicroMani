@@ -67,7 +67,12 @@ class TestHalClient(HalClient):
         return {"mode": "test", "command": name, "payload": payload or {}}
 
     async def motion_state(self) -> dict[str, Any]:
+        now_unix_ms = int(time.time() * 1000)
+        now_monotonic_ms = int(time.monotonic() * 1000)
         return {
+            "timestamp_ms": now_unix_ms,
+            "received_timestamp_ms": now_unix_ms,
+            "received_monotonic_ms": now_monotonic_ms,
             "estop_active": False,
             "positions": [0.0] * 12,
             "pulses": [0.0] * 12,
@@ -75,7 +80,12 @@ class TestHalClient(HalClient):
         }
 
     async def omega_state(self) -> dict[str, Any]:
+        now_unix_ms = int(time.time() * 1000)
+        now_monotonic_ms = int(time.monotonic() * 1000)
         return {
+            "timestamp_ms": now_unix_ms,
+            "received_timestamp_ms": now_unix_ms,
+            "received_monotonic_ms": now_monotonic_ms,
             "hands": [
                 {
                     "side": "left",
@@ -114,12 +124,11 @@ class TestHalClient(HalClient):
 
 
 class RealHalClient(HalClient):
-    """HTTP client with keep-alive: reuses one TCP connection per worker thread.
+    """带 keep-alive 的 HAL HTTP 客户端：每个工作线程复用自己的 TCP 连接。
 
-    The previous implementation rebuilt a urllib socket on every call, which on
-    Windows localhost adds 2-5ms TCP setup + the HAL server's `Connection:
-    close` linger. The WS telemetry loop made two calls per 20ms tick, so this
-    overhead alone was 200-1000ms/s of dead time on the event loop.
+    旧实现每次调用都会重建 urllib socket；在 Windows localhost 上会增加 2-5ms
+    TCP 建连和服务端关闭连接的等待。WS 遥测循环每 20ms tick 会调用两次 HAL，
+    因此这部分开销会显著拖慢事件循环。
     """
 
     def __init__(self, base_url: str, timeout_ms: int, logs: LogService) -> None:
@@ -175,10 +184,17 @@ class RealHalClient(HalClient):
         return {"mode": "real", "command": name, "response": response}
 
     async def motion_state(self) -> dict[str, Any]:
-        return await self._request("GET", "/motion/state")
+        return self._with_receive_timestamp(await self._request("GET", "/motion/state"))
 
     async def omega_state(self) -> dict[str, Any]:
-        return await self._request("GET", "/omega/state")
+        return self._with_receive_timestamp(await self._request("GET", "/omega/state"))
+
+    def _with_receive_timestamp(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now_unix_ms = int(time.time() * 1000)
+        payload.setdefault("timestamp_ms", now_unix_ms)
+        payload["received_timestamp_ms"] = now_unix_ms
+        payload["received_monotonic_ms"] = int(time.monotonic() * 1000)
+        return payload
 
     async def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         return await asyncio.to_thread(self._request_sync, method, path, body)
@@ -189,7 +205,7 @@ class RealHalClient(HalClient):
             return conn
         conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout_s)
         # 每个工作线程复用自己的连接，避免跨线程共享 socket 带来的竞态。
-        # TCP_NODELAY and reuse keep small JSON payloads from getting stuck in Nagle on localhost.
+        # 复用连接并开启 TCP_NODELAY，避免 localhost 上的小 JSON 包被 Nagle 延迟。
         try:
             conn.connect()
             conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -216,14 +232,14 @@ class RealHalClient(HalClient):
         headers = {"Content-Type": "application/json", "Connection": "keep-alive"}
 
         # 首次失败通常来自服务端关闭了旧 keep-alive 连接；重建一次即可恢复。
-        for attempt in range(2):  # one retry across a stale connection
+        for attempt in range(2):  # 旧连接失效时只重试一次
             try:
                 conn = self._get_connection()
                 conn.request(method, path, body=data, headers=headers)
                 response = conn.getresponse()
                 raw = response.read().decode("utf-8")
                 status = response.status
-                # If server signals close, drop our cached connection so the next call reconnects.
+                # 服务端要求关闭连接时丢弃缓存，下次调用重新连接。
                 if response.headers.get("Connection", "").lower() == "close":
                     self._drop_connection()
                 if status >= 400:
@@ -244,7 +260,7 @@ class RealHalClient(HalClient):
                     raise RuntimeError("HAL response must be a JSON object")
                 return parsed
             except (http.client.HTTPException, ConnectionError, OSError, TimeoutError) as exc:
-                # Connection went bad; drop and retry once with a fresh socket.
+                # 连接已失效，丢弃后用新 socket 重试一次。
                 self._drop_connection()
                 if attempt >= 1:
                     raise RuntimeError(f"HAL request failed: {self.base_url}{path}: {exc}") from exc

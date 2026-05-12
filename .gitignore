@@ -7,9 +7,14 @@ frontend/dist/
 # Python caches and local runtime state
 __pycache__/
 *.py[cod]
+.venv/
+venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+dist/
+build/
+*.egg-info/
 .app-browser-profile/
 backend/runtime/
 
@@ -22,10 +27,18 @@ __MACOSX/
 
 # Local tool config
 .claude/
+.agents/
 .agents/skills/speckit-git-*/
 
 # C++ build output
 hal/build/
+bin/
+obj/
+out/
+*.o
+*.a
+*.so
+*.exe
 
 # Logs
 *.log

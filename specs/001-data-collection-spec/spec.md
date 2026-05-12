@@ -13,7 +13,7 @@
 
 **Why this priority**: 这是数据收集功能的核心价值；没有稳定、完整、可复核的 episode，就无法进行后续数据集管理、模型推理或微调。
 
-**Independent Test**: 使用 Mock HAL/Mock camera 或真实硬件完成一次短采集，保存 episode 后检查该 episode 有帧数、任务描述、12 轴状态、12 维动作、双路 6 维力觉、力觉时间窗口、夹爪状态和三路相机数据或可识别的相机缺失记录。
+**Independent Test**: 使用 Mock HAL/Mock camera 或真实硬件完成一次短采集，保存 episode 后检查该 episode 有帧数、任务描述、14 维状态、14 维动作、12 轴脉冲、双路 6 维力觉、力觉时间窗口和三路相机数据或可识别的相机缺失记录。
 
 **Acceptance Scenarios**:
 
@@ -61,7 +61,7 @@
 
 **Why this priority**: 数据集中的双臂状态和动作必须来自受控硬件边界。HAL 状态若不可信，采集出的 episode 即使文件完整，也不能作为高质量训练数据。
 
-**Independent Test**: 启动 HAL 骨架或真实 HAL 后读取健康、运动状态和主手状态，确认采集会话记录的 12 轴状态、脉冲、enabled、estop 和主手按钮/位姿状态能在质量报告或复核视图中定位到可信来源；在 HAL 未初始化、急停或部分 Omega.7 连接时，系统显示明确 warning。
+**Independent Test**: 启动 HAL 骨架或真实 HAL 后读取健康、运动状态和主手状态，确认采集会话记录的 14 维状态、12 轴脉冲、enabled、estop 和主手按钮/位姿状态能在质量报告或复核视图中定位到可信来源；在 HAL 未初始化、急停或部分 Omega.7 连接时，系统显示明确 warning。
 
 **Acceptance Scenarios**:
 
@@ -94,9 +94,9 @@
 - **FR-001**: 系统 MUST 支持创建一个录制会话，并记录数据集名称、任务说明、会话标识、起始 episode 序号、目标帧率、力觉采样率和当前数据格式。
 - **FR-002**: 系统 MUST 在同一时间只允许一个活动录制会话，重复创建会话时必须返回明确错误且不得覆盖当前数据。
 - **FR-003**: 系统 MUST 以 30 Hz 为默认目标采样节奏采集 episode，并允许从配置读取 1-60 Hz 范围内的录制帧率。
-- **FR-004**: 每个采集帧 MUST 包含 12 轴状态、12 轴原始脉冲、双路 6 维力觉、双路力觉时间窗口、力觉窗口时间偏移、2 维夹爪状态、12 维动作、任务说明、时间戳和三路相机数据引用或图像数组。
-- **FR-005**: 12 轴状态 MUST 使用固定语义顺序：左臂 X/Y/Z/Roll/Pitch/Yaw 后接右臂 X/Y/Z/Roll/Pitch/Yaw。
-- **FR-006**: 采集数据中的平移状态 MUST 使用微米，旋转状态 MUST 使用 0.001 度；前端复核显示中的旋转值 MUST 转回度。
+- **FR-004**: 每个采集帧 MUST 包含 14 维状态、14 维动作、12 轴原始脉冲、双路 6 维力觉、双路力觉时间窗口、力觉窗口时间偏移、任务说明、时间戳和三路相机数据引用或图像数组。
+- **FR-005**: 14 维状态 MUST 使用固定语义顺序：左臂 X/Y/Z/Roll/Pitch/Yaw/夹爪实际开口 后接右臂 X/Y/Z/Roll/Pitch/Yaw/夹爪实际开口。
+- **FR-006**: 采集数据中的平移状态 MUST 使用微米，旋转状态 MUST 使用 0.001 度，夹爪开口和夹爪目标 MUST 使用毫米；前端复核显示中的旋转值 MUST 转回度。
 - **FR-007**: 力觉数据 MUST 使用 N 和 Nm，不得在后端持久化 mN 或 mNm 显示单位。
 - **FR-008**: 系统 MUST 在保存 episode 后返回质量信息，至少包含帧数、时长、late frames、三路相机掉帧、左右最大力值和 warning 列表。
 - **FR-009**: 系统 MUST 支持保存、重录、跳过复位和结束会话四个录制流程动作，并保持与前端录制状态机一致。
@@ -130,7 +130,7 @@
 - **FR-028**: 系统 MUST 明确区分传感器物理能力分辨率、实际采集分辨率、预览分辨率和数据集保存分辨率。
 - **FR-029**: 系统 MUST 支持双 Nano-17 力觉数据，默认硬件事实为左侧 Dev5/ai0:5、右侧 Dev3/ai0:5、200 Hz 起步采样、Fx/Fy/Fz/Mx/My/Mz 顺序。
 - **FR-030**: 系统 MUST 根据力觉采样率和录制帧率为每个录制帧保存一段力觉窗口；当显式配置窗口样本数时，必须使用配置值并限制在可复核范围内。
-- **FR-031**: 夹爪状态 MUST 以左右开口值进入采集帧；当夹爪数据不可用时，系统必须保留占位值并在质量或日志中暴露来源风险。
+- **FR-031**: 从手夹爪实际开口 MUST 进入 `observation.state` 的左右夹爪维度；夹爪控制目标 MUST 进入 `action` 的左右夹爪目标维度；当夹爪数据不可用时，系统必须保留占位值并在质量或日志中暴露来源风险。
 
 #### E. 数据集复核、格式与文件安全
 
@@ -146,21 +146,46 @@
 - **FR-041**: 系统 MUST 防止数据集删除、episode 文件删除或临时文件清理越过配置的数据集根目录。
 - **FR-042**: 系统 MUST 支持真实硬件缺失时的 Mock HAL/Mock camera 验证路径，且该路径能生成可复核的最小 episode。
 
+#### F. 多源数据时间对齐
+
+当前差距：历史 `_collect_frame()` 路径按顺序读取 HAL、力觉窗口和相机数据；只有三路相机截图内部并行。仅凭这种顺序采集不能证明 30 Hz 录制和 HAL/相机 skew 阈值，必须把多源采集约束为同一 tick 并发启动并按来源设置 timeout。
+
+- **FR-043**: 系统 MUST 以录制主轴驱动 episode 采集；默认主轴为 30 Hz monotonic tick，每个 tick 都必须拥有稳定的帧序号、目标时间和实际采集时间。
+- **FR-044**: 系统 MUST 将 HAL motion state、动作、夹爪、力觉窗口和三路相机数据对齐到同一个录制 tick；任何数据源不得仅凭写入顺序被视为已对齐。
+- **FR-045**: HAL motion state 与录制 tick 的时间偏差 SHOULD 不超过 10 ms；当任意 HAL 样本偏差超过 20 ms 时，系统 MUST 在该 episode 质量信息中记录 warning。
+- **FR-046**: 每路相机帧与录制 tick 的时间偏差 SHOULD 不超过 16.7 ms；当相机帧偏差超过 33.3 ms、无可用帧或重复使用过期帧时，系统 MUST 将该帧标记为 late 或 drop，并按相机分别计数。
+- **FR-047**: 力觉窗口 MUST 覆盖当前录制 tick 前最近一帧周期；在 30 Hz 默认录制下，该窗口必须覆盖 tick 前约 33.3 ms 的最近高频样本，并保留每个窗口样本相对于当前 tick 的时间偏移。
+- **FR-048**: episode 质量报告 MUST 包含多源对齐指标，至少包括 max skew、avg skew、jitter、late frames 和 drop counts，并按 HAL、相机、力觉、夹爪等来源区分可定位的异常。
+- **FR-049**: 当同一关键数据源连续 3 帧无法对齐时，系统 MUST 将 episode 标记为 warning；当连续 10 帧无法对齐或关键源整段不可用时，系统 MUST 将 episode 标记为 invalid 或不可作为高质量样本。
+- **FR-050**: 系统 MUST 在同一录制 tick 内并发启动 HAL motion state、力觉窗口、夹爪缓存、Omega 状态和三路相机采集，并对每个来源设置 per-source timeout；任何来源超时或失败时，系统 MUST 记录该来源的 warning、drop 或 stale 信息，并不得阻塞其他来源写入当前帧。
+- **FR-050A**: 仅三路相机内部并行或按写入顺序汇总不得被视为满足多源时间对齐要求；系统 MUST 基于各来源采样时间、完成时间和 timeout 结果判断该帧是否满足对齐契约。
+
+#### G. LeRobot v3 数据结构标准
+
+- 数据的结构在满足硬件的前提下应与标准的 LeRobotDataset v3.0 保持一致
+- **FR-051**: 标准数据集 metadata MUST 声明 `codebase_version` 为 `v3.0`、`robot_type` 为 `dual_arm_micro_assembly`，默认 `fps` 为 30。
+- **FR-052**: 标准 `features.observation.state` MUST 为 `float32`、shape `[14]`，名称顺序必须为 `left_x_um`、`left_y_um`、`left_z_um`、`left_roll_mdeg`、`left_pitch_mdeg`、`left_yaw_mdeg`、`left_gripper_gap_mm`、`right_x_um`、`right_y_um`、`right_z_um`、`right_roll_mdeg`、`right_pitch_mdeg`、`right_yaw_mdeg`、`right_gripper_gap_mm`。
+- **FR-053**: 标准 `features.action` MUST 为 `float32`、shape `[14]`，名称顺序必须为 `left_dx_um`、`left_dy_um`、`left_dz_um`、`left_droll_mdeg`、`left_dpitch_mdeg`、`left_dyaw_mdeg`、`left_gripper_target_mm`、`right_dx_um`、`right_dy_um`、`right_dz_um`、`right_droll_mdeg`、`right_dpitch_mdeg`、`right_dyaw_mdeg`、`right_gripper_target_mm`。
+- **FR-054**: 标准 `features.observation.pulses` MUST 为 `float32`、shape `[12]`，名称顺序必须为左右臂 X/Y/Z/Roll/Pitch/Yaw 的原始脉冲字段，且不得包含夹爪维度。
+- **FR-055**: 标准 `features.observation.force_left` 和 `features.observation.force_right` MUST 为 `float32`、shape `[6]`，名称顺序必须为 `fx`、`fy`、`fz`、`mx`、`my`、`mz`。
+- **FR-056**: 标准三路相机 feature MUST 为 `observation.images.global`、`observation.images.wrist_left`、`observation.images.wrist_right`，dtype 必须为 `video`，shape 必须为 `[480, 640, 3]`，names 必须为 `height`、`width`、`channels`。
+- **FR-057**: `observation.gripper` 不得作为标准训练主字段替代 14 维 `observation.state` 中的夹爪维度；如需保留旧字段，只能作为兼容、调试或迁移用途，并且不得改变标准 features 的 shape 和字段顺序。
+
 ### AppStation 宪章要求 *(后端/HAL/硬件/数据功能 mandatory)*
 
 - **AC-001**：受影响的前端契约包括 `/api/record/session/create`、`/api/record/episode/save`、`/api/record/episode/discard`、`/api/record/session/finish`、`/api/record/reset/skip`、`/api/record/status`、`/api/datasets`、`/api/datasets/{dataset_id}`、`/api/datasets/{dataset_id}/episodes/{episode_id}`、`/api/datasets/{dataset_id}/file`、`/api/datasets/{dataset_id}/frame_image`、HAL 代理状态入口，以及 `/ws` 中的 recording、episodeCount、frameCount、jointPositions、forceLeft、forceRight、gripperPositions、cameras、HAL 健康和主手状态。兼容规则是：现有录制和数据集页面无需改变用户流程即可使用完善后的数据收集能力。
 - **AC-002**：录制状态机、数据集索引、力觉窗口、相机截图汇聚、LeRobot/fallback 写入和复核数据读取属于 Python Backend；LTDMC 运动控制、Omega.7 SDK 读取、语义轴到物理轴映射、脉冲到 UI 位置换算、急停和 jog 限制属于 C++ HAL；前端只消费状态和发起用户命令；WSL2 PolicyServer 不属于本功能范围。
 - **AC-003**：本功能不新增任意自动运动能力，但采集期间必须尊重急停、watchdog、力觉安全、HAL 健康、轴 enabled 状态和主手连接状态；采集不得屏蔽已有急停，真实硬件异常必须通过日志和质量指标暴露。
-- **AC-004**：数据形状为 12 轴状态、12 轴脉冲、12 维动作、双路 6 维力觉、双路力觉窗口、2 维夹爪、三路相机、HAL health、motion enabled/estop 和 Omega.7 双主手状态。平移单位为微米，旋转存储单位为 0.001 度，前端显示为度，力/力矩为 N/Nm。持久化配置字段包含数据集根目录、录制帧率、相机分辨率、力觉采样率、力觉窗口样本数、HAL 地址、工作原点、软限位和主手 openId。
+- **AC-004**：标准数据形状为 14 维 `observation.state`、14 维 `action`、12 维 `observation.pulses`、双路 6 维力觉和三路视频相机；其中夹爪实际开口进入 `observation.state` 的第 7/14 维，夹爪目标进入 `action` 的第 7/14 维。AppStation 质量扩展仍可记录双路力觉窗口、HAL health、motion enabled/estop、Omega.7 双主手状态和对齐指标，但不得改变标准 features 的字段顺序。平移单位为微米，旋转存储单位为 0.001 度，夹爪单位为毫米，前端显示旋转为度，力/力矩为 N/Nm。持久化配置字段包含数据集根目录、录制帧率、相机分辨率、力觉采样率、力觉窗口样本数、HAL 地址、工作原点、软限位和主手 openId。时间对齐契约必须记录录制 tick、各源时间偏差、late/drop 计数和质量报告中的 max skew、avg skew、jitter。
 - **AC-005**：核心契约验收可使用 HAL 骨架、Mock HAL 或 Mock camera；真实硬件验收必须覆盖 HAL health、motion state、Omega.7 state、三相机截图、NI-DAQmx 力觉采样和 episode 质量报告。
 
 ### Key Entities *(include if feature involves data)*
 
 - **录制会话**：一次数据采集活动，包含会话标识、数据集名称、任务说明、当前 episode 序号、采样参数、活动状态和数据格式。
 - **Episode**：一次可复核的采集样本，包含帧数、时长、任务、状态、质量指标、数据路径或原生索引范围、删除标记和 warning。
-- **采集帧**：episode 内的单帧记录，包含时间戳、双臂状态、脉冲、动作、力觉、夹爪和相机数据。
+- **采集帧**：episode 内的单帧记录，包含时间戳、14 维双臂状态、14 维动作、12 轴脉冲、双路力觉和三路相机数据；夹爪实际开口属于状态维度，夹爪目标属于动作维度。
 - **数据集**：本地可管理的数据集合，包含显示名称、稳定标识、格式、帧率、状态、更新时间、episode 列表和统计摘要。
-- **质量报告**：保存 episode 后生成的复核信息，包含帧数、掉帧、late frames、最大力觉、时长、warning 和是否建议保留。
+- **质量报告**：保存 episode 后生成的复核信息，包含帧数、掉帧、late frames、最大力觉、时长、warning、是否建议保留，以及各采集源的 max skew、avg skew、jitter 和 drop counts。
 - **硬件采集源**：为采集帧提供数据的 HAL、相机、力觉、夹爪和遥操作源；每个源可能处于真实、Mock、降级或不可用状态。
 - **HAL 健康状态**：真实硬件边界的可用性摘要，包含 LTDMC 可用性、Omega.7 可用性、版本、运行时长和错误信息。
 - **HAL 运动状态**：由 HAL 输出的 12 轴实时状态，包含语义轴 UI 位置、原始脉冲、enabled、moving 和 estop_active。
@@ -181,6 +206,8 @@
 - **SC-009**: 真实硬件采集前，现场工程师能在 5 秒内判断 LTDMC、Omega.7、estop 和 12 轴 enabled 状态是否允许高可信采集。
 - **SC-010**: 抽检任意 10 帧真实硬件采集数据，12 轴 UI 位置和原始脉冲都能追溯到同一 HAL motion state 语义顺序。
 - **SC-011**: 当 HAL vendor SDK 不可用、LTDMC 未初始化或仅一台 Omega.7 连接时，100% 的相关 episode 质量信息包含明确 warning。
+- **SC-012**: 在 30 Hz 目标采样下抽检任意 10 条真实硬件 episode，100% 的质量报告都包含 max skew、avg skew、jitter、late frames 和 drop counts；HAL 偏差超过 20 ms 或相机偏差超过 33.3 ms 的帧必须被标记为 warning、late 或 drop。
+- **SC-013**: 抽检任意 10 个新保存的数据集 metadata，100% 的标准 features 都与 LeRobot v3.0 契约一致：`observation.state` 和 `action` 为 14 维，`observation.pulses` 为 12 维，双路力觉为 6 维，三路相机为 `[480, 640, 3]` 视频字段。
 
 ## Assumptions
 
@@ -189,6 +216,9 @@
 - 本地数据集根目录由 settings 配置，默认可在当前工作站持久化；网络上传或远端 Hub 推送不是默认成功路径。
 - 真实硬件采集优先使用 HAL 即时状态、OpenCV/DirectShow 三路相机和 NI-DAQmx 力觉；硬件缺失时使用 Mock 或 fallback 路径完成契约验证。
 - 数据收集时的动作向量来自最近遥操作动作；若最近 1 秒内无动作，则记录零动作向量。
+- 标准训练数据结构以 LeRobot v3.0 metadata 为准；额外的力觉窗口、HAL health、主手状态和对齐指标属于 AppStation 质量扩展，不得改变标准 features 的字段名、shape 和顺序。
+- 多源数据对齐以 30 Hz 录制主轴为默认验收基线；当项目配置使用非 30 Hz 录制帧率时，质量报告仍需记录实际 tick 周期和各源相对偏差。
+- 连续无法对齐的默认判定为：同一关键数据源连续 3 帧触发 warning，连续 10 帧或整段不可用触发 invalid 或不可作为高质量样本。
 - 本功能不改变已有安全策略，只要求采集流程不得绕过或隐藏安全状态。
 - HAL 当前可在无 vendor SDK 时作为确定性骨架构建，但骨架只用于契约验证；真实硬件验收必须使用已加载 LTDMC 与 Force Dimension SDK 的 HalServer。
 - HAL 内部接口运行在本机硬件边界内；前端和数据集 spec 只依赖其外部健康、运动和主手状态语义，不依赖 HAL 内部代码结构。
