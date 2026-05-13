@@ -395,7 +395,7 @@ def test_record_session_writes_lerobot_fallback_dataset(tmp_path: Path, monkeypa
         assert start_response.status_code == 200
         assert start_response.json()["data"]["recording"] is True
         assert start_response.json()["data"]["forceSampleHz"] == 4000
-        assert start_response.json()["data"]["forceWindowSamples"] == 134
+        assert "forceWindowSamples" not in start_response.json()["data"]
         time.sleep(0.2)
 
         save_response = client.post("/api/record/episode/save")
@@ -492,7 +492,7 @@ def test_record_session_writes_native_lerobot_dataset_when_available(tmp_path: P
         )
         assert start_response.status_code == 200
         assert start_response.json()["data"]["format"] == "lerobot-v3-native"
-        assert start_response.json()["data"]["forceWindowSamples"] == 34
+        assert "forceWindowSamples" not in start_response.json()["data"]
         time.sleep(0.2)
 
         save_response = client.post("/api/record/episode/save")
