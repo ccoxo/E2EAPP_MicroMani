@@ -18,8 +18,42 @@ DEFAULT_MOTION_PROFILE: dict[str, Any] = {
     },
 }
 
-ICF_TELEOP_STRATEGY_VERSION = "icf_omega7_20260513"
+ICF_TELEOP_STRATEGY_VERSION = "icf_omega7_qserialtest_limits_20260513"
 ICF_WORK_ORIGIN_VERSION = "icf_work_origin_20260513"
+
+ICF_CAMERA_DEFAULTS: dict[str, Any] = {
+    "global": "AR0234 / index 1",
+    "globalIdentity": "USB\\VID_1D6B&PID_0102&MI_00\\6&1E9A8698&0&0000",
+    "wristLeft": "IMX258 / index 2",
+    "wristLeftIdentity": "USB\\VID_0EDC&PID_3080&MI_00\\7&38B4EA25&0&0000",
+    "wristRight": "IMX258 / index 0",
+    "wristRightIdentity": "USB\\VID_0EDC&PID_3080&MI_00\\6&1BBFDB86&0&0000",
+    "previewResolution": "640x480",
+    "globalResolution": "640x480",
+    "wristLeftResolution": "640x480",
+    "wristRightResolution": "640x480",
+    "fps": 30,
+    "tuning": {
+        "global": {
+            "autoExposure": False,
+            "exposure": -5.5,
+            "gain": 0.0,
+            "autoWhiteBalance": False,
+        },
+        "wrist_left": {
+            "autoExposure": False,
+            "exposure": -6.0,
+            "gain": 0.0,
+            "autoWhiteBalance": False,
+        },
+        "wrist_right": {
+            "autoExposure": False,
+            "exposure": -6.0,
+            "gain": 0.0,
+            "autoWhiteBalance": False,
+        },
+    },
+}
 
 DEFAULT_SOFT_LIMITS: dict[str, Any] = {
     "x": {"min": -40000000, "max": 40000000},
@@ -30,15 +64,19 @@ DEFAULT_SOFT_LIMITS: dict[str, Any] = {
     "yaw": {"min": -60000, "max": 60000},
 }
 
+ICF_TELEOP_SOFT_LIMIT_MIN = [-200000000.0] * 6
+ICF_TELEOP_SOFT_LIMIT_MAX = [200000000.0] * 6
+
 ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "strategyVersion": ICF_TELEOP_STRATEGY_VERSION,
     "swapHands": True,
+    "stabilityMode": "free",
     "leftTranslationScale": 0.30,
     "rightTranslationScale": 0.30,
-    "leftRotationScale": 0.15,
-    "rightRotationScale": 0.15,
-    "leftAxisOutputScale": [0.20, 0.20, 1.00, 1.00, 1.00, 0.25],
-    "rightAxisOutputScale": [0.40, 0.20, 1.00, 1.00, 1.00, 0.25],
+    "leftRotationScale": 0.10,
+    "rightRotationScale": 0.05,
+    "leftAxisOutputScale": [0.20, 0.20, 1.00, 1.00, 0.50, 0.10],
+    "rightAxisOutputScale": [0.20, 0.20, 1.00, 1.00, 0.50, 0.10],
     "translationDeadzone": 0.00002,
     "rotationDeadzone": 0.05,
     "incrementalTranslationMinEffectiveDelta": 0.00005,
@@ -47,14 +85,18 @@ ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "rotationStepLimitPulse": 1250,
     "translationStepUm": 5000.0,
     "rotationStepDeg": 0.2,
-    "translationStartVelocityUmS": 400.0,
-    "translationMaxVelocityUmS": 5000.0,
+    "translationStartVelocityUmS": 300.0,
+    "translationMaxVelocityUmS": 4000.0,
     "rotationStartVelocityDegS": 0.25,
     "rotationMaxVelocityDegS": 3.0,
     "motionProfileAccSec": 0.05,
     "motionProfileDecSec": 0.05,
     "leftEnabledAxes": [True, True, True, True, True, True],
     "rightEnabledAxes": [True, True, True, True, True, True],
+    "leftSoftLimitMin": list(ICF_TELEOP_SOFT_LIMIT_MIN),
+    "leftSoftLimitMax": list(ICF_TELEOP_SOFT_LIMIT_MAX),
+    "rightSoftLimitMin": list(ICF_TELEOP_SOFT_LIMIT_MIN),
+    "rightSoftLimitMax": list(ICF_TELEOP_SOFT_LIMIT_MAX),
 }
 
 ICF_WORK_ORIGIN_DEFAULTS: dict[str, Any] = {
@@ -78,19 +120,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ltdmcLibPath": "F:/E2EAPP_MicroMani/hal/vendor/leishine/lib/x64/LTDMC.lib",
         "dhdDllPath": "F:/E2EAPP_MicroMani/hal/vendor/force_dimension/bin/dhd64.dll",
     },
-    "cameras": {
-        "global": "AR0234 / index 2",
-        "globalIdentity": "USB\\VID_1D6B&PID_0102&MI_00\\7&235CBC02&0&0000",
-        "wristLeft": "IMX258 / index 1",
-        "wristLeftIdentity": "USB\\VID_0EDC&PID_3080&MI_00\\7&38B4EA25&0&0000",
-        "wristRight": "IMX258 / index 0",
-        "wristRightIdentity": "USB\\VID_0EDC&PID_3080&MI_00\\6&1BBFDB86&0&0000",
-        "previewResolution": "640x480",
-        "globalResolution": "640x480",
-        "wristLeftResolution": "640x480",
-        "wristRightResolution": "640x480",
-        "fps": 30,
-    },
+    "cameras": deepcopy(ICF_CAMERA_DEFAULTS),
     "force": {
         "leftIp": "Dev5/ai0:5",
         "rightIp": "Dev3/ai0:5",
@@ -208,7 +238,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "rightForceFeedback": False,
         **deepcopy(ICF_TELEOP_DEFAULTS),
         "requireClutch": False,
-        "stabilityMode": "track",
+        "stabilityMode": "free",
         "tcpFallbackPort": 12345,
         "gripperTeleop": {
             "enabled": False,

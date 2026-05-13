@@ -34,7 +34,7 @@ function CameraSlot({ kind, camera, resolution }: CameraSlotProps) {
 
   return (
     <div className={`record-camera-slot record-camera-${kind}`}>
-      {liveImageEnabled ? (
+      {liveImageEnabled && snapshotUrl ? (
         <img
           className="record-camera-image"
           data-testid={`record-camera-image-${kind}`}
@@ -47,7 +47,7 @@ function CameraSlot({ kind, camera, resolution }: CameraSlotProps) {
         <div className={`record-camera-placeholder record-camera-placeholder-${kind}`}>
           <div className="record-camera-placeholder-copy">
             <div>{spec.model}</div>
-            <small>{camera ? '模拟预览' : '无信号'}</small>
+            <small>{camera ? '等待画面' : '无信号'}</small>
           </div>
         </div>
       )}

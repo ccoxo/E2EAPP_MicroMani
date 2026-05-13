@@ -3,8 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from backend.core.defaults import default_config
-from backend.drivers.force_nidaq import NidaqForceDriver
-from backend.drivers.force_nidaq import ForceProbeResult
+from backend.drivers.force_nidaq import ForceProbeResult, NidaqForceDriver
 
 
 def test_force_driver_applies_reference_calibration_fallback() -> None:

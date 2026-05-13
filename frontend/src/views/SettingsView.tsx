@@ -33,7 +33,9 @@ import {
   clearMotionOrigin,
   disableMotionSide,
   enableMotionSide,
+  applyCameraTuning,
   homeMotionSide,
+  reconnectCamera,
   reconnectHal,
   setTeleopGravityCompensation,
   tareForceSensor,
@@ -43,6 +45,7 @@ import {
   fetchGripperTeleopStatus,
   mockMode,
 } from '../api'
+import { refreshCameraStream } from '../hooks/useLiveCameraSnapshot'
 import {
   armHardwareSpecs,
   axisHardwareSpecs,
@@ -58,6 +61,7 @@ import type {
   ArmMotionProfile,
   ArmSoftLimitConfig,
   CameraTelemetry,
+  CameraTuningProfile,
   ConnectionState,
   LogEntry,
   ManualControlAction,
@@ -74,6 +78,26 @@ type CameraKey = keyof typeof cameraHardwareSpecs
 
 const sideOrder: RobotSide[] = ['left', 'right']
 const cameraOrder: CameraKey[] = ['global', 'wrist_left', 'wrist_right']
+const defaultCameraTuning: Record<CameraKey, CameraTuningProfile> = {
+  global: {
+    autoExposure: false,
+    exposure: -5.5,
+    gain: 0,
+    autoWhiteBalance: false,
+  },
+  wrist_left: {
+    autoExposure: false,
+    exposure: -6,
+    gain: 0,
+    autoWhiteBalance: false,
+  },
+  wrist_right: {
+    autoExposure: false,
+    exposure: -6,
+    gain: 0,
+    autoWhiteBalance: false,
+  },
+}
 const previewResolutionOptions = [
   { value: '640x480', label: '640x480（推荐）' },
   { value: '320x240', label: '320x240（低负载）' },
@@ -555,8 +579,10 @@ function MotionCard({
   const [optimisticEnabled, setOptimisticEnabled] = useState<boolean | null>(null)
   useEffect(() => {
     if (optimisticEnabled !== null && motionEnabled !== null && motionEnabled !== undefined) {
-      setOptimisticEnabled(null)
+      const timer = window.setTimeout(() => setOptimisticEnabled(null), 0)
+      return () => window.clearTimeout(timer)
     }
+    return undefined
   }, [motionEnabled, optimisticEnabled])
   const effectiveEnabled = optimisticEnabled ?? motionEnabled ?? null
   const knownAxisEnabled = motionAxisEnabled?.filter((value) => value !== null && value !== undefined) ?? []
@@ -769,12 +795,14 @@ function CameraCard({
   config,
   updateConfig,
   focusHash,
+  injectLog,
 }: {
   cameraKey: CameraKey
   camera?: CameraTelemetry
   config: AppConfig
   updateConfig: (patch: Partial<AppConfig>) => void
   focusHash: string
+  injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
 }) {
   const spec = cameraHardwareSpecs[cameraKey]
   const id = cameraKey === 'global' ? 'camera-global' : cameraKey === 'wrist_left' ? 'camera-left' : 'camera-right'
@@ -782,7 +810,78 @@ function CameraCard({
   const resolutionField =
     cameraKey === 'global' ? 'globalResolution' : cameraKey === 'wrist_left' ? 'wristLeftResolution' : 'wristRightResolution'
   const previewResolution = config.cameras[resolutionField] ?? config.cameras.previewResolution
-  const state = camera?.health ?? 'pending'
+  const telemetryState = camera?.health ?? 'pending'
+  const [previewHealth, setPreviewHealth] = useState<ConnectionState>('checking')
+  const state: ConnectionState = !camera
+    ? 'pending'
+    : telemetryState === 'error' || previewHealth === 'error'
+      ? 'error'
+      : telemetryState === 'pending'
+        ? 'pending'
+        : previewHealth === 'checking' || previewHealth === 'pending'
+          ? 'checking'
+          : telemetryState === 'warn'
+            ? 'warn'
+            : 'ok'
+  const tuning = config.cameras.tuning?.[cameraKey] ?? defaultCameraTuning[cameraKey]
+  const isWristCamera = cameraKey !== 'global'
+  const [pendingCameraAction, setPendingCameraAction] = useState<'apply' | 'reconnect' | null>(null)
+  const sanitizeTuning = (next: CameraTuningProfile): CameraTuningProfile => {
+    const exposure = Math.min(0, Math.max(-13, Number(next.exposure)))
+    const wristExposure = isWristCamera ? Math.min(exposure, -5) : exposure
+    const gain = Math.min(64, Math.max(0, Number(next.gain)))
+    return {
+      autoExposure: isWristCamera ? false : Boolean(next.autoExposure),
+      exposure: Number.isFinite(wristExposure) ? wristExposure : defaultCameraTuning[cameraKey].exposure,
+      gain: Number.isFinite(gain) ? gain : defaultCameraTuning[cameraKey].gain,
+      autoWhiteBalance: Boolean(next.autoWhiteBalance),
+    }
+  }
+  const updateTuning = (patch: Partial<CameraTuningProfile>) => {
+    const nextTuning = sanitizeTuning({ ...tuning, ...patch })
+    updateConfig({
+      cameras: {
+        ...config.cameras,
+        tuning: {
+          ...(config.cameras.tuning ?? defaultCameraTuning),
+          [cameraKey]: nextTuning,
+        },
+      },
+    })
+  }
+  const handleApplyTuning = async () => {
+    setPendingCameraAction('apply')
+    try {
+      await applyCameraTuning(cameraKey, {
+        ...config,
+        cameras: {
+          ...config.cameras,
+          tuning: {
+            ...(config.cameras.tuning ?? defaultCameraTuning),
+            [cameraKey]: sanitizeTuning(tuning),
+          },
+        },
+      })
+      refreshCameraStream(cameraKey)
+      commandLog(injectLog, '[CAMERA]', `${spec.label} camera tuning applied`)
+    } catch (error) {
+      injectLog('ERROR', `${spec.label} camera tuning failed: ${commandErrorMessage(error)}`, '[CAMERA]')
+    } finally {
+      setPendingCameraAction(null)
+    }
+  }
+  const handleReconnect = async () => {
+    setPendingCameraAction('reconnect')
+    try {
+      await reconnectCamera(cameraKey)
+      refreshCameraStream(cameraKey)
+      commandLog(injectLog, '[CAMERA]', `${spec.label} camera reconnect requested`)
+    } catch (error) {
+      injectLog('ERROR', `${spec.label} camera reconnect failed: ${commandErrorMessage(error)}`, '[CAMERA]')
+    } finally {
+      setPendingCameraAction(null)
+    }
+  }
 
   return (
     <HardwareConfigCard
@@ -790,11 +889,21 @@ function CameraCard({
       focusHash={focusHash}
       icon={<Camera size={20} />}
       title={`${spec.label} · ${spec.model}`}
-      subtitle={`${spec.rawResolution} @ ${spec.fps}Hz · ${spec.lerobotKey}`}
+      subtitle={`${previewResolution} @ ${config.cameras.fps}Hz · ${spec.lerobotKey}`}
       state={state}
-      badges={<Tag color="processing">{spec.rawResolution}</Tag>}
+      badges={<Tag color={stateTone(state)}>{previewResolution}</Tag>}
+      actions={
+        <Space wrap>
+          <Button icon={<Save size={15} />} loading={pendingCameraAction === 'apply'} onClick={() => void handleApplyTuning()}>
+            应用参数
+          </Button>
+          <Button icon={<RefreshCw size={15} />} loading={pendingCameraAction === 'reconnect'} onClick={() => void handleReconnect()}>
+            重连预览
+          </Button>
+        </Space>
+      }
     >
-      {camera && <CameraPreview camera={camera} compact />}
+      {camera && <CameraPreview camera={camera} compact resolution={previewResolution} onPreviewHealthChange={setPreviewHealth} />}
       <div className="hardware-metric-grid camera-metric-grid">
         <MetricBox label="FPS" value={`${(camera?.fps ?? 0).toFixed(1)} / ${spec.fps}`} />
         <MetricBox label="Frame age" value={`${(camera?.frameAgeMs ?? 0).toFixed(0)} ms`} />
@@ -813,7 +922,41 @@ function CameraCard({
         </Form.Item>
         <Form.Item label="相机采集目标 FPS" tooltip="后端相机预览流的目标帧率；数据保存频率在数据存储里的录制 FPS 单独设置。"><InputNumber min={1} max={60} value={config.cameras.fps} onChange={(value) => updateConfig({ cameras: { ...config.cameras, fps: Number(value ?? 30) } })} /></Form.Item>
         <Form.Item label="曝光 / 增益">
-          <Slider range min={0} max={100} defaultValue={[42, 55]} />
+          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+            <Switch
+              checked={Boolean(tuning.autoExposure)}
+              disabled={isWristCamera}
+              checkedChildren="Auto"
+              unCheckedChildren="Manual"
+              onChange={(checked) => updateTuning({ autoExposure: checked })}
+            />
+            <Space size={8} wrap>
+              <Typography.Text type="secondary">Exposure</Typography.Text>
+              <InputNumber
+                min={-13}
+                max={isWristCamera ? -5 : 0}
+                step={0.5}
+                value={tuning.exposure}
+                onChange={(value) => updateTuning({ exposure: Number(value ?? defaultCameraTuning[cameraKey].exposure) })}
+              />
+            </Space>
+            <Space size={8} wrap>
+              <Typography.Text type="secondary">Gain</Typography.Text>
+              <InputNumber
+                min={0}
+                max={64}
+                step={1}
+                value={tuning.gain}
+                onChange={(value) => updateTuning({ gain: Number(value ?? 0) })}
+              />
+            </Space>
+            <Switch
+              checked={Boolean(tuning.autoWhiteBalance)}
+              checkedChildren="Auto WB"
+              unCheckedChildren="Manual WB"
+              onChange={(checked) => updateTuning({ autoWhiteBalance: checked })}
+            />
+          </Space>
         </Form.Item>
       </Form>
     </HardwareConfigCard>
@@ -1383,9 +1526,6 @@ function TeleopHandCard({
         <Form.Item label="OpenID">
           <InputNumber min={0} value={openId} onChange={(value) => setOpenId(Number(value ?? sideSpec.omegaDeviceId))} />
         </Form.Item>
-        <Form.Item label="数据轮询周期 ms">
-          <InputNumber min={1} value={config.teleop.inputIntervalMs} onChange={(value) => updateTeleop({ inputIntervalMs: Number(value ?? 10) })} />
-        </Form.Item>
         <Form.Item label="命令更新周期 ms">
           <InputNumber min={1} value={config.teleop.commandIntervalMs} onChange={(value) => updateTeleop({ commandIntervalMs: Number(value ?? 10) })} />
         </Form.Item>
@@ -1409,9 +1549,7 @@ function TeleopHandCard({
           <Select
             value={config.teleop.stabilityMode}
             options={[
-              { value: 'track', label: '跟踪 Track' },
-              { value: 'hold', label: '保持 Hold' },
-              { value: 'free', label: '自由 Free' },
+              { value: 'free', label: 'Off / Free' },
             ]}
             onChange={(value) => updateTeleop({ stabilityMode: value })}
           />
@@ -1442,8 +1580,8 @@ function TeleopHandCard({
         </Form.Item>
         <Form.Item label="Translation speed um/s">
           <Space.Compact>
-            <InputNumber min={0} value={config.teleop.translationStartVelocityUmS} onChange={(value) => updateTeleop({ translationStartVelocityUmS: Number(value ?? 400) })} />
-            <InputNumber min={1} value={config.teleop.translationMaxVelocityUmS} onChange={(value) => updateTeleop({ translationMaxVelocityUmS: Number(value ?? 5000) })} />
+            <InputNumber min={0} value={config.teleop.translationStartVelocityUmS} onChange={(value) => updateTeleop({ translationStartVelocityUmS: Number(value ?? 300) })} />
+            <InputNumber min={1} value={config.teleop.translationMaxVelocityUmS} onChange={(value) => updateTeleop({ translationMaxVelocityUmS: Number(value ?? 4000) })} />
           </Space.Compact>
         </Form.Item>
         <Form.Item label="Rotation speed deg/s">
@@ -1567,8 +1705,10 @@ function ManualArmControl({
   const [optimisticEnabled, setOptimisticEnabled] = useState<boolean | null>(null)
   useEffect(() => {
     if (optimisticEnabled !== null && motionEnabled !== null && motionEnabled !== undefined) {
-      setOptimisticEnabled(null)
+      const timer = window.setTimeout(() => setOptimisticEnabled(null), 0)
+      return () => window.clearTimeout(timer)
     }
+    return undefined
   }, [motionEnabled, optimisticEnabled])
   const effectiveMotionEnabled = optimisticEnabled ?? motionEnabled ?? null
   const selectedAxisEnabled = motionAxisEnabled?.[axisIndex] ?? effectiveMotionEnabled
@@ -2110,6 +2250,7 @@ export function SettingsView() {
                       config={config}
                       updateConfig={updateConfig}
                       focusHash={focusHash}
+                      injectLog={injectLog}
                     />
                   ))}
                   {sideOrder.map((side) => (

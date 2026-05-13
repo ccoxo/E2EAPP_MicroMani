@@ -34,14 +34,17 @@ def test_hal_teleop_target_update_uses_absolute_target_mode() -> None:
     assert "axis busy before teleop target" not in source
 
 
-def test_hal_teleop_soft_limit_allows_recovery_toward_valid_range() -> None:
+def test_hal_teleop_soft_limit_clips_to_payload_range() -> None:
     source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
     normalized = " ".join(source.split())
+    teleop_body = source.split("void LTDMCDriver::updateTeleopTargetUi(", 1)[1].split(
+        "void LTDMCDriver::stopTeleopSide", 1
+    )[0]
 
-    assert "bool teleopTargetAllowedByLimit(double baseUi, double targetUi, const AxisLimit& limit)" in normalized
-    assert "return targetUi > baseUi && targetUi < limit.min;" in normalized
-    assert "return targetUi < baseUi && targetUi > limit.max;" in normalized
-    assert "!teleopTargetAllowedByLimit(baseUi, targetUi, limit)" in normalized
+    assert "double clipTeleopTargetToLimit(double targetUi, const AxisLimit& limit)" in normalized
+    assert "return std::clamp(targetUi, limit.min, limit.max);" in normalized
+    assert "clipTeleopTargetToLimit(unclippedTargetUi, limit)" in normalized
+    assert "teleop target exceeds soft limit" not in teleop_body
     assert "teleopDefaultLimit" not in source
     assert "+/-7.5" not in source
 
@@ -87,3 +90,22 @@ def test_hal_launch_promotes_latest_built_binary() -> None:
     assert "LastWriteTimeUtc" in start_hal
     assert "Copy-Item -LiteralPath $halNextExe -Destination $halExe -Force" in start_hal
     assert 'copy /Y "HalServer.next.exe" "HalServer.exe"' in build_hal
+
+
+def test_hal_stage_axis_configuration_matches_icf_card_counts() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
+    normalized = " ".join(source.split())
+
+    assert "int stageAxisCount(appstation::hal::Side side)" in normalized
+    assert "return side == appstation::hal::Side::Left ? 6 : 9;" in normalized
+    assert "axisNoInt < stageAxisCount(side)" in normalized
+
+
+def test_hal_stage_axis_and_direction_signs_match_icf_mapping() -> None:
+    source = (REPO_ROOT / "hal" / "include" / "HalTypes.h").read_text(encoding="utf-8")
+    normalized = " ".join(source.split())
+
+    assert "kLeftPhysicalAxis{0, 1, 3, 5, 4, 2}" in normalized
+    assert "kRightPhysicalAxis{2, 0, 5, 8, 1, 7}" in normalized
+    assert "kLeftPulsePerUnit{-5000.0, -10000.0, -10000.0, 1666.666667, 2500.0, 3333.333333}" in normalized
+    assert "-5000.0, 10000.0, -10000.0, 1666.666667, -2500.0, -3333.333333" in normalized

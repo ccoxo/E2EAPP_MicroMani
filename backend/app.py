@@ -26,12 +26,12 @@ from backend.core.schemas import (
 from backend.hal_client.client import HalClient, RealHalClient, TestHalClient
 from backend.services.command_service import CommandService
 from backend.services.dataset_recorder import DatasetRecorderService
+from backend.services.gripper_tele_service import GripperTeleService
+from backend.services.gripper_worker_service import GripperWorkerService
 from backend.services.hardware_service import HardwareService
 from backend.services.policy_service import PolicyService
 from backend.services.stability_monitor import StabilityMonitorService
 from backend.services.telemetry_hub import TelemetryHub
-from backend.services.gripper_tele_service import GripperTeleService
-from backend.services.gripper_worker_service import GripperWorkerService
 from backend.services.teleop_mapping import TeleopMappingService
 
 
@@ -645,6 +645,25 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         logs.info("[CAMERA]", f"{camera} reconnect requested: {probe.message}")
         return envelope({"camera": camera, "ok": probe.ok, "message": probe.message})
 
+    @app.post("/api/cameras/{camera}/tuning/apply")
+    async def camera_tuning_apply(camera: str, config: AppConfig | None = None) -> ApiEnvelope:
+        if camera not in {"global", "wrist_left", "wrist_right"}:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "BAD_CAMERA", "message": "camera must be global, wrist_left, or wrist_right"},
+            )
+        active = (
+            settings.save_config(config.model_dump(mode="json"), emit_log=False)
+            if config is not None
+            else settings.get_config()
+        )
+        try:
+            result = await asyncio.to_thread(hardware.cameras.apply_tuning, active, camera)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail={"code": "CAMERA_UNAVAILABLE", "message": str(exc)}) from exc
+        logs.info("[CAMERA]", f"{camera} tuning applied: {result['profile']}")
+        return envelope(result)
+
     @app.get("/api/cameras/{camera}/snapshot")
     async def camera_snapshot(camera: str) -> Response:
         if camera not in {"global", "wrist_left", "wrist_right"}:
@@ -668,10 +687,17 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
         async def frames():
             period = 1.0 / 30.0
+            last_sequence = -1
             while True:
                 started = time.monotonic()
                 try:
-                    jpeg = await asyncio.to_thread(hardware.cameras.snapshot, settings.get_config(), camera)
+                    last_sequence, jpeg = await asyncio.to_thread(
+                        hardware.cameras.wait_for_frame,
+                        settings.get_config(),
+                        camera,
+                        last_sequence,
+                        2.0,
+                    )
                     yield (
                         b"--frame\r\n"
                         b"Content-Type: image/jpeg\r\n"

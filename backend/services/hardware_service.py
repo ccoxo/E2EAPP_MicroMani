@@ -14,7 +14,7 @@ class HardwareService:
     def __init__(self, settings: SettingsService, logs: LogService) -> None:
         self.settings = settings
         self.logs = logs
-        self.cameras = OpenCVCameraDriver()
+        self.cameras = OpenCVCameraDriver(logs)
         self.force = NidaqForceDriver()
         self.gripper = Rs485GripperDriver()
         self.pico = PicoAdbDriver()

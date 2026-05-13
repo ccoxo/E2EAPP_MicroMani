@@ -29,20 +29,26 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     config = default_config()
     teleop = config["teleop"]
 
-    assert teleop["strategyVersion"] == "icf_omega7_20260513"
+    assert teleop["strategyVersion"] == "icf_omega7_qserialtest_limits_20260513"
     assert teleop["swapHands"] is True
+    assert teleop["stabilityMode"] == "free"
     assert teleop["leftTranslationScale"] == 0.30
     assert teleop["rightTranslationScale"] == 0.30
-    assert teleop["leftRotationScale"] == 0.15
-    assert teleop["rightRotationScale"] == 0.15
-    assert teleop["leftAxisOutputScale"] == [0.20, 0.20, 1.0, 1.0, 1.0, 0.25]
-    assert teleop["rightAxisOutputScale"] == [0.40, 0.20, 1.0, 1.0, 1.0, 0.25]
+    assert teleop["leftRotationScale"] == 0.10
+    assert teleop["rightRotationScale"] == 0.05
+    assert teleop["leftAxisOutputScale"] == [0.20, 0.20, 1.0, 1.0, 0.5, 0.10]
+    assert teleop["rightAxisOutputScale"] == [0.20, 0.20, 1.0, 1.0, 0.5, 0.10]
     assert teleop["translationStepLimitPulse"] == 4000
     assert teleop["rotationStepLimitPulse"] == 1250
-    assert teleop["translationMaxVelocityUmS"] == 5000.0
+    assert teleop["translationStartVelocityUmS"] == 300.0
+    assert teleop["translationMaxVelocityUmS"] == 4000.0
     assert teleop["rotationMaxVelocityDegS"] == 3.0
     assert teleop["leftEnabledAxes"] == [True] * 6
     assert teleop["rightEnabledAxes"] == [True] * 6
+    assert teleop["leftSoftLimitMin"] == [-200000000.0] * 6
+    assert teleop["leftSoftLimitMax"] == [200000000.0] * 6
+    assert teleop["rightSoftLimitMin"] == [-200000000.0] * 6
+    assert teleop["rightSoftLimitMax"] == [200000000.0] * 6
 
 
 def test_work_origin_defaults_match_icf_reference_position() -> None:
@@ -90,6 +96,9 @@ def test_pico_script_defaults_point_to_reference_tools() -> None:
 def test_storage_defaults_separate_recording_fps_from_camera_preview() -> None:
     config = default_config()
 
+    assert config["cameras"]["global"] == "AR0234 / index 1"
+    assert config["cameras"]["wristLeft"] == "IMX258 / index 2"
+    assert config["cameras"]["wristRight"] == "IMX258 / index 0"
     assert config["cameras"]["previewResolution"] == "640x480"
     assert config["cameras"]["fps"] == 30
     assert config["storage"]["recordFps"] == 30

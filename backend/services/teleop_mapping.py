@@ -6,7 +6,7 @@ import time
 from typing import Any, Literal
 
 from backend.core.config import SettingsService
-from backend.core.defaults import DEFAULT_SOFT_LIMITS, ICF_TELEOP_DEFAULTS
+from backend.core.defaults import ICF_TELEOP_DEFAULTS
 from backend.core.logging import LogService, now_ms
 from backend.hal_client.client import HalClient
 
@@ -16,7 +16,6 @@ SideName = Literal["left", "right"]
 AXES: tuple[AxisName, AxisName, AxisName, AxisName, AxisName, AxisName] = ("X", "Y", "Z", "Roll", "Pitch", "Yaw")
 DEFAULT_TRANSLATION_STEP_UM = 5000.0
 DEFAULT_ROTATION_STEP_DEG = 0.2
-SOFT_LIMIT_KEYS = ("x", "y", "z", "roll", "pitch", "yaw")
 DEFAULT_AXIS_OUTPUT_SCALE = [1.0] * 6
 DEFAULT_ENABLED_AXES = [True] * 6
 
@@ -230,8 +229,10 @@ class TeleopMappingService:
         config: dict[str, Any],
     ) -> list[float]:
         teleop = config.get("teleop", {})
-        translation_scale = float(teleop.get(f"{side}TranslationScale", 0.2))
-        rotation_scale = float(teleop.get(f"{side}RotationScale", 0.18))
+        translation_key = f"{side}TranslationScale"
+        rotation_key = f"{side}RotationScale"
+        translation_scale = float(teleop.get(translation_key, ICF_TELEOP_DEFAULTS[translation_key]))
+        rotation_scale = float(teleop.get(rotation_key, ICF_TELEOP_DEFAULTS[rotation_key]))
         axis_scale = self._axis_output_scale(side, config)
         translation_deadzone_m = float(teleop.get("translationDeadzone", 0.00002))
         rotation_deadzone_deg = float(teleop.get("rotationDeadzone", 0.05))
@@ -295,10 +296,10 @@ class TeleopMappingService:
         return max(1.0, float(config.get("teleop", {}).get("rotationStepLimitPulse", 1250.0)))
 
     def _translation_start_velocity_um_s(self, config: dict[str, Any]) -> float:
-        return max(0.0, float(config.get("teleop", {}).get("translationStartVelocityUmS", 400.0)))
+        return max(0.0, float(config.get("teleop", {}).get("translationStartVelocityUmS", 300.0)))
 
     def _translation_max_velocity_um_s(self, config: dict[str, Any]) -> float:
-        return max(1.0, float(config.get("teleop", {}).get("translationMaxVelocityUmS", 5000.0)))
+        return max(1.0, float(config.get("teleop", {}).get("translationMaxVelocityUmS", 4000.0)))
 
     def _rotation_start_velocity_deg_s(self, config: dict[str, Any]) -> float:
         return max(0.0, float(config.get("teleop", {}).get("rotationStartVelocityDegS", 0.25)))
@@ -340,30 +341,28 @@ class TeleopMappingService:
         return [bool(value) for value in raw]
 
     def _soft_limit_arrays(self, side: SideName, config: dict[str, Any]) -> tuple[list[float], list[float]]:
-        motion = config.get("motion", {})
-        raw_limits = (
-            motion.get(f"{side}SoftLimits", DEFAULT_SOFT_LIMITS)
-            if isinstance(motion, dict)
-            else DEFAULT_SOFT_LIMITS
-        )
-        mins: list[float] = []
-        maxes: list[float] = []
-        for key in SOFT_LIMIT_KEYS:
-            axis_limit = raw_limits.get(key, {}) if isinstance(raw_limits, dict) else {}
-            default_axis_limit = DEFAULT_SOFT_LIMITS[key]
-            min_value = (
-                axis_limit.get("min", default_axis_limit["min"])
-                if isinstance(axis_limit, dict)
-                else default_axis_limit["min"]
-            )
-            max_value = (
-                axis_limit.get("max", default_axis_limit["max"])
-                if isinstance(axis_limit, dict)
-                else default_axis_limit["max"]
-            )
-            mins.append(float(min_value))
-            maxes.append(float(max_value))
+        teleop = config.get("teleop", {})
+        min_key = f"{side}SoftLimitMin"
+        max_key = f"{side}SoftLimitMax"
+        default_mins = [float(value) for value in ICF_TELEOP_DEFAULTS[min_key]]
+        default_maxes = [float(value) for value in ICF_TELEOP_DEFAULTS[max_key]]
+        if not isinstance(teleop, dict):
+            return default_mins, default_maxes
+        mins = self._coerce_teleop_soft_limit_array(teleop.get(min_key))
+        maxes = self._coerce_teleop_soft_limit_array(teleop.get(max_key))
+        if mins is None or maxes is None:
+            return default_mins, default_maxes
+        if any(min_value >= max_value for min_value, max_value in zip(mins, maxes, strict=True)):
+            return default_mins, default_maxes
         return mins, maxes
+
+    def _coerce_teleop_soft_limit_array(self, raw: Any) -> list[float] | None:
+        if not isinstance(raw, list) or len(raw) != 6:
+            return None
+        try:
+            return [float(value) for value in raw]
+        except (TypeError, ValueError):
+            return None
 
     def _reset_all_tracking(self) -> None:
         self._references.clear()

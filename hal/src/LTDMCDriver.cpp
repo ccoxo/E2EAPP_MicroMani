@@ -91,17 +91,12 @@ unsigned short cardForSide(appstation::hal::Side side) {
   return side == appstation::hal::Side::Left ? static_cast<unsigned short>(1) : static_cast<unsigned short>(0);
 }
 
-bool teleopTargetAllowedByLimit(double baseUi, double targetUi, const AxisLimit& limit) {
-  if (targetUi >= limit.min && targetUi <= limit.max) {
-    return true;
-  }
-  if (baseUi < limit.min) {
-    return targetUi > baseUi && targetUi < limit.min;
-  }
-  if (baseUi > limit.max) {
-    return targetUi < baseUi && targetUi > limit.max;
-  }
-  return false;
+int stageAxisCount(appstation::hal::Side side) {
+  return side == appstation::hal::Side::Left ? 6 : 9;
+}
+
+double clipTeleopTargetToLimit(double targetUi, const AxisLimit& limit) {
+  return std::clamp(targetUi, limit.min, limit.max);
 }
 
 double velocityToPulsePerSec(Side side, SemanticAxis axis, double velocityUiPerSec) {
@@ -245,9 +240,10 @@ void LTDMCDriver::emergencyStop() {
   ensureInitialized();
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   if (dmcStop) {
-    for (unsigned short card : {static_cast<unsigned short>(0), static_cast<unsigned short>(1)}) {
-      for (unsigned short axis = 0; axis < 12; ++axis) {
-        dmcStop(card, axis, 0);
+    for (const auto side : {Side::Left, Side::Right}) {
+      const auto card = cardForSide(side);
+      for (int axisNo = 0; axisNo < stageAxisCount(side); ++axisNo) {
+        dmcStop(card, static_cast<unsigned short>(axisNo), 0);
       }
     }
   }
@@ -566,13 +562,11 @@ void LTDMCDriver::updateTeleopTargetUi(
     const bool moving = false;
 #endif
     const auto basePulse = teleopTargetActive_[index] ? teleopTargetPulse_[index] : pulse_[index];
-    const auto targetPulse = basePulse + static_cast<double>(deltaPulse);
-    const auto baseUi = pulseToUi(basePulse, side, axis);
-    const auto targetUi = pulseToUi(targetPulse, side, axis);
     const auto limit = limits[axisIndex];
-    if (!teleopTargetAllowedByLimit(baseUi, targetUi, limit)) {
-      throw std::runtime_error("teleop target exceeds soft limit");
-    }
+    const auto unclippedTargetPulse = basePulse + static_cast<double>(deltaPulse);
+    const auto unclippedTargetUi = pulseToUi(unclippedTargetPulse, side, axis);
+    const auto targetUi = clipTeleopTargetToLimit(unclippedTargetUi, limit);
+    const auto targetPulse = uiToPulse(targetUi, side, axis);
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
     if (!moving) {
       applyMotionProfile(card, axisNo, startVelocityPulse, maxVelocityPulse, tacc, tdec, deltaPulse);
@@ -631,9 +625,8 @@ void LTDMCDriver::configureStageAxes(Side side) {
     throw std::runtime_error("required LTDMC homing configuration exports missing");
   }
   const auto card = cardForSide(side);
-  for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-    const auto axis = static_cast<SemanticAxis>(axisIndex);
-    const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
+  for (int axisNoInt = 0; axisNoInt < stageAxisCount(side); ++axisNoInt) {
+    const auto axisNo = static_cast<unsigned short>(axisNoInt);
     const auto retPulse = dmcSetPulseOutmode(card, axisNo, 5);
     if (retPulse != 0) {
       throw std::runtime_error(dmcAxisFailureMessage("dmc_set_pulse_outmode", retPulse, card, axisNo));

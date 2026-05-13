@@ -47,6 +47,11 @@ def _clear_camera_identities(config: dict) -> None:
         config["cameras"][key] = ""
 
 
+def _avoid_camera_index_conflicts(config: dict) -> None:
+    config["cameras"]["wristLeft"] = "IMX258 / index 1"
+    config["cameras"]["wristRight"] = "IMX258 / index 2"
+
+
 def test_recording_api_contract_examples_cover_required_routes() -> None:
     assert set(RECORDING_SAVE_CONTRACT_EXAMPLE) == {"episode", "status"}
     assert "recording" in RECORDING_SAVE_CONTRACT_EXAMPLE["status"]
@@ -734,6 +739,7 @@ def test_camera_snapshot_endpoint_returns_jpeg(tmp_path: Path, monkeypatch: Monk
     client = TestClient(create_app(tmp_path))
     config = client.get("/api/settings").json()
     _clear_camera_identities(config)
+    _avoid_camera_index_conflicts(config)
     config["cameras"]["global"] = "Global UVC / index 0"
     assert client.put("/api/settings", json=config).status_code == 200
 
@@ -798,6 +804,7 @@ def test_camera_driver_falls_back_when_first_windows_backend_fails(tmp_path: Pat
     client = TestClient(create_app(tmp_path))
     config = client.get("/api/settings").json()
     _clear_camera_identities(config)
+    _avoid_camera_index_conflicts(config)
     config["cameras"]["global"] = "Global UVC / index 0"
     assert client.put("/api/settings", json=config).status_code == 200
 
@@ -948,6 +955,8 @@ def test_camera_identity_overrides_stale_index(monkeypatch: MonkeyPatch) -> None
     config = default_config()
     config["cameras"]["global"] = "AR0234 / index 0"
     config["cameras"]["globalIdentity"] = "USB\\VID_1D6B&PID_0102&MI_00\\7&235CBC02&0&0000"
+    config["cameras"]["wristLeft"] = "IMX258 / index 1"
+    config["cameras"]["wristLeftIdentity"] = ""
     driver = OpenCVCameraDriver()
 
     monkeypatch.setattr(
@@ -972,12 +981,46 @@ def test_camera_identity_overrides_stale_index(monkeypatch: MonkeyPatch) -> None
     assert resolved["global"] == 2
 
 
+def test_camera_identities_lock_all_role_indices(monkeypatch: MonkeyPatch) -> None:
+    config = default_config()
+    config["cameras"]["global"] = "AR0234 / index 2"
+    config["cameras"]["wristLeft"] = "IMX258 / index 0"
+    config["cameras"]["wristRight"] = "IMX258 / index 1"
+    driver = OpenCVCameraDriver()
+
+    monkeypatch.setattr(
+        driver,
+        "_camera_identities_by_index",
+        lambda: {
+            0: {
+                "name": "WN Camera",
+                "devicePath": "\\\\?\\usb#vid_0edc&pid_3080&mi_00#6&1bbfdb86&0&0000#{guid}\\global",
+                "displayName": "@device:pnp:right",
+            },
+            1: {
+                "name": "UVC Camera",
+                "devicePath": "\\\\?\\usb#vid_1d6b&pid_0102&mi_00#6&1e9a8698&0&0000#{guid}\\global",
+                "displayName": "@device:pnp:global",
+            },
+            2: {
+                "name": "WN Camera",
+                "devicePath": "\\\\?\\usb#vid_0edc&pid_3080&mi_00#7&38b4ea25&0&0000#{guid}\\global",
+                "displayName": "@device:pnp:left",
+            },
+        },
+    )
+
+    resolved = driver._resolved_indices(object(), config, 30)
+
+    assert resolved == {"global": 1, "wrist_left": 2, "wrist_right": 0}
+
+
 def test_default_camera_mapping_matches_deployment_hardware() -> None:
     config = default_config()
 
-    assert config["cameras"]["global"] == "AR0234 / index 2"
-    assert config["cameras"]["globalIdentity"] == "USB\\VID_1D6B&PID_0102&MI_00\\7&235CBC02&0&0000"
-    assert config["cameras"]["wristLeft"] == "IMX258 / index 1"
+    assert config["cameras"]["global"] == "AR0234 / index 1"
+    assert config["cameras"]["globalIdentity"] == "USB\\VID_1D6B&PID_0102&MI_00\\6&1E9A8698&0&0000"
+    assert config["cameras"]["wristLeft"] == "IMX258 / index 2"
     assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0EDC&PID_3080&MI_00\\7&38B4EA25&0&0000"
     assert config["cameras"]["wristRight"] == "IMX258 / index 0"
     assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0EDC&PID_3080&MI_00\\6&1BBFDB86&0&0000"
@@ -985,6 +1028,71 @@ def test_default_camera_mapping_matches_deployment_hardware() -> None:
     assert config["cameras"]["globalResolution"] == "640x480"
     assert config["cameras"]["wristLeftResolution"] == "640x480"
     assert config["cameras"]["wristRightResolution"] == "640x480"
+    assert config["cameras"]["tuning"]["global"]["exposure"] == -5.5
+    assert config["cameras"]["tuning"]["wrist_left"]["exposure"] == -6.0
+    assert config["cameras"]["tuning"]["wrist_right"]["exposure"] == -6.0
+
+
+def test_camera_tuning_clamps_wrist_profile() -> None:
+    driver = OpenCVCameraDriver()
+    config = default_config()
+    config["cameras"]["tuning"]["wrist_left"] = {
+        "autoExposure": True,
+        "exposure": -3.0,
+        "gain": 72.0,
+        "autoWhiteBalance": True,
+    }
+
+    profile = driver._camera_tuning(config, "wrist_left")  # noqa: SLF001
+
+    assert profile == {
+        "autoExposure": False,
+        "exposure": -5.0,
+        "gain": 64.0,
+        "autoWhiteBalance": True,
+    }
+
+
+def test_camera_tuning_apply_endpoint_saves_config(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path))
+    calls: list[tuple[str, float]] = []
+
+    def fake_apply(config: dict, camera: str) -> dict[str, object]:
+        calls.append((camera, float(config["cameras"]["tuning"][camera]["exposure"])))
+        return {
+            "camera": camera,
+            "index": 1,
+            "profile": config["cameras"]["tuning"][camera],
+            "actual": {"exposure": -6.5},
+        }
+
+    client.app.state.hardware.cameras.apply_tuning = fake_apply
+    config = client.get("/api/settings").json()
+    config["cameras"]["tuning"]["global"]["exposure"] = -6.5
+
+    response = client.post("/api/cameras/global/tuning/apply", json=config)
+
+    assert response.status_code == 200
+    assert calls == [("global", -6.5)]
+    assert response.json()["data"]["profile"]["exposure"] == -6.5
+    assert client.get("/api/settings").json()["cameras"]["tuning"]["global"]["exposure"] == -6.5
+
+
+def test_camera_wait_for_frame_returns_cached_encoded_jpeg(monkeypatch: MonkeyPatch) -> None:
+    driver = OpenCVCameraDriver()
+    config = default_config()
+    _clear_camera_identities(config)
+    driver._latest_sequences[0] = 4  # noqa: SLF001
+    driver._latest_jpegs[0] = b"\xff\xd8cached\xff\xd9"  # noqa: SLF001
+
+    monkeypatch.setattr("backend.drivers.camera_opencv.import_module", lambda name: object())
+    monkeypatch.setattr(driver, "_resolved_indices", lambda cv2, cfg, fps: {"global": 0})
+    monkeypatch.setattr(driver, "_get_capture", lambda *args, **kwargs: object())
+
+    sequence, jpeg = driver.wait_for_frame(config, "global", last_sequence=3, timeout=0.01)
+
+    assert sequence == 4
+    assert jpeg == b"\xff\xd8cached\xff\xd9"
 
 
 def test_camera_reconnect_releases_selected_capture(monkeypatch: MonkeyPatch) -> None:

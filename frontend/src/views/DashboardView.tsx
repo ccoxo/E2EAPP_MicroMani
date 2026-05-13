@@ -5,6 +5,7 @@ import { useNavigate } from 'react-router-dom'
 import { CameraPreview } from '../components/CameraPreview'
 import { AxisGroupChart, ForceChart } from '../components/Charts'
 import { MetricPill } from '../components/MetricPill'
+import { armHardwareSpecs } from '../data'
 import { useTelemetryStore } from '../stores/telemetry'
 import type { CameraTelemetry, ConnectionState, DiagnosticItem, TelemetryFrame, TelemetrySample } from '../types'
 
@@ -189,10 +190,11 @@ function ArmHardwarePanel({
 }) {
   const navigate = useNavigate()
   const isLeft = side === 'left'
+  const sideSpec = armHardwareSpecs[side]
   const label = isLeft ? '左机械臂' : '右机械臂'
-  const cardNo = isLeft ? 'Card 1' : 'Card 0'
-  const axisOrder = isLeft ? '0 / 1 / 3 / 5 / 4 / 2' : '2 / 0 / 5 / 8 / 1 / 7'
-  const axisOffset = isLeft ? 0 : 6
+  const cardNo = `Card ${sideSpec.cardNo}`
+  const axisOrder = sideSpec.axisOrder.join(' / ')
+  const axisOffset = sideSpec.stateOffset
   const wristCamera = cameraByKey(frame.cameras, isLeft ? 'wrist_left' : 'wrist_right')
   const forceValues = isLeft ? frame.forceLeft : frame.forceRight
   const forceState = diagnosticState(diagnostics, isLeft ? 'ati-left' : 'ati-right')

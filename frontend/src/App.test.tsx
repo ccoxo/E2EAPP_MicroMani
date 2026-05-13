@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
+import { defaultConfig } from './data'
 import { chartHistoryIntervalMs, uiFrameIntervalMs, useTelemetryStore } from './stores/telemetry'
 import type { TelemetryFrame } from './types'
 
@@ -172,8 +173,7 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getByText('右臂运动控制卡 · Card 0')).toBeInTheDocument()
     expect(screen.getByText('0,1,3,5,4,2')).toBeInTheDocument()
     expect(screen.getByText('2,0,5,8,1,7')).toBeInTheDocument()
-    expect(screen.getAllByText(/1920x1080/).length).toBeGreaterThan(0)
-    expect(screen.getAllByText(/1920x1080/).length).toBeGreaterThan(1)
+    expect(screen.getAllByText(/640x480/).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/mN·m/).length).toBeGreaterThan(0)
     expect(screen.getByDisplayValue('COM8')).toBeInTheDocument()
     expect(screen.getByDisplayValue('COM9')).toBeInTheDocument()
@@ -193,7 +193,18 @@ describe('AppStation M0 frontend', () => {
     expect(screen.queryByText('目标 FPS')).not.toBeInTheDocument()
     expect(screen.queryByText('HAL API 已验证')).not.toBeInTheDocument()
     const globalCameraCard = document.querySelector<HTMLElement>('#camera-global')
+    const leftCameraCard = document.querySelector<HTMLElement>('#camera-left')
+    const rightCameraCard = document.querySelector<HTMLElement>('#camera-right')
     expect(globalCameraCard).toBeTruthy()
+    expect(leftCameraCard).toBeTruthy()
+    expect(rightCameraCard).toBeTruthy()
+    for (const card of [globalCameraCard, leftCameraCard, rightCameraCard]) {
+      expect(card!.textContent).toContain('640x480')
+      expect(card!.textContent).toContain('应用参数')
+      expect(card!.textContent).toContain('重连预览')
+      expect(card!.textContent).toContain('Exposure')
+      expect(card!.textContent).toContain('Gain')
+    }
     expect(within(globalCameraCard!).queryByRole('button', { name: '枚举' })).not.toBeInTheDocument()
     expect(within(globalCameraCard!).queryByRole('button', { name: '重连' })).not.toBeInTheDocument()
     expect(screen.getByText('选择硬件快照')).toBeInTheDocument()
@@ -205,8 +216,13 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getAllByText('连接主手').length).toBeGreaterThan(0)
     expect(screen.getAllByText('平移比例').length).toBeGreaterThan(0)
     expect(screen.getAllByText('旋转比例').length).toBeGreaterThan(0)
+    expect(screen.queryByText('数据轮询周期 ms')).not.toBeInTheDocument()
+    expect(screen.getAllByText('命令更新周期 ms').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Off / Free').length).toBeGreaterThan(0)
+    expect(defaultConfig.teleop.stabilityMode).toBe('free')
+    expect(defaultConfig.teleop.leftSoftLimitMin).toEqual([-200000000, -200000000, -200000000, -200000000, -200000000, -200000000])
     expect(screen.queryByText(/OpenXR/)).not.toBeInTheDocument()
-  })
+  }, 10000)
 
   it('only keeps camera grid overlays on the global preview', () => {
     render(<App />)

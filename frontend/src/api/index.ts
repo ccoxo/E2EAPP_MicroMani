@@ -200,6 +200,9 @@ export const enumerateCamera = (camera: CameraTelemetry['key']) =>
 export const reconnectCamera = (camera: CameraTelemetry['key']) =>
   postCommand(`/cameras/${camera}/reconnect`)
 
+export const applyCameraTuning = (camera: CameraTelemetry['key'], config?: AppConfig) =>
+  postCommand(`/cameras/${camera}/tuning/apply`, config)
+
 export async function manualAxisMove(
   side: ManualControlSide,
   axis: ManualControlAxis,

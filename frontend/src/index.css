@@ -1469,6 +1469,25 @@ select {
   gap: 4px;
 }
 
+.camera-meta-grid {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.camera-meta-grid .metric-pill,
+.camera-meta-grid .ant-tag {
+  margin-inline-end: 0;
+  white-space: nowrap;
+}
+
+.camera-resolution-tag,
+.camera-age-tag {
+  min-width: max-content;
+}
+
 .metric-pill {
   display: inline-flex;
   align-items: center;

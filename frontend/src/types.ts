@@ -51,6 +51,13 @@ export interface CameraTelemetry {
   health: ConnectionState
 }
 
+export interface CameraTuningProfile {
+  autoExposure: boolean
+  exposure: number
+  gain: number
+  autoWhiteBalance: boolean
+}
+
 export interface Omega7Telemetry {
   side: 'left' | 'right'
   connected: boolean
@@ -313,13 +320,17 @@ export interface AppConfig {
   }
   cameras: {
     global: string
+    globalIdentity?: string
     wristLeft: string
+    wristLeftIdentity?: string
     wristRight: string
+    wristRightIdentity?: string
     previewResolution: string
     globalResolution?: string
     wristLeftResolution?: string
     wristRightResolution?: string
     fps: number
+    tuning: Record<CameraTelemetry['key'], CameraTuningProfile>
   }
   force: {
     leftIp: string
@@ -452,6 +463,10 @@ export interface AppConfig {
     motionProfileDecSec: number
     leftEnabledAxes: boolean[]
     rightEnabledAxes: boolean[]
+    leftSoftLimitMin: number[]
+    leftSoftLimitMax: number[]
+    rightSoftLimitMin: number[]
+    rightSoftLimitMax: number[]
     requireClutch: boolean
     stabilityMode: Omega7StabilityMode
     tcpFallbackPort: number

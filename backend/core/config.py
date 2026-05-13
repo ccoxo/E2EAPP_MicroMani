@@ -7,6 +7,7 @@ from typing import Any, cast
 
 from backend.core.defaults import (
     DEFAULT_SOFT_LIMITS,
+    ICF_CAMERA_DEFAULTS,
     ICF_TELEOP_DEFAULTS,
     ICF_TELEOP_STRATEGY_VERSION,
     ICF_WORK_ORIGIN_DEFAULTS,
@@ -209,6 +210,37 @@ class SettingsService:
             safety = config.get("safety", {})
             if isinstance(safety, dict):
                 safety["yawSoftLimitDeg"] = DEFAULT_SOFT_LIMITS["yaw"]["max"]
+        if isinstance(teleop, dict):
+            try:
+                has_legacy_icf_translation_speed = (
+                    float(teleop.get("translationStartVelocityUmS", 0.0)) == 400.0
+                    and float(teleop.get("translationMaxVelocityUmS", 0.0)) == 5000.0
+                )
+            except (TypeError, ValueError):
+                has_legacy_icf_translation_speed = False
+            if has_legacy_icf_translation_speed:
+                teleop["translationStartVelocityUmS"] = ICF_TELEOP_DEFAULTS["translationStartVelocityUmS"]
+                teleop["translationMaxVelocityUmS"] = ICF_TELEOP_DEFAULTS["translationMaxVelocityUmS"]
+        cameras = config.get("cameras", {})
+        if isinstance(cameras, dict):
+            has_legacy_reversed_wrist_cameras = (
+                cameras.get("global") == "AR0234 / index 2"
+                and cameras.get("wristLeft") == "IMX258 / index 1"
+                and cameras.get("wristRight") == "IMX258 / index 0"
+            )
+            has_legacy_cyclic_camera_roles = (
+                cameras.get("global") == "AR0234 / index 2"
+                and cameras.get("wristLeft") == "IMX258 / index 0"
+                and cameras.get("wristRight") == "IMX258 / index 1"
+            )
+            if (
+                has_legacy_reversed_wrist_cameras
+                or has_legacy_cyclic_camera_roles
+            ):
+                for key, value in ICF_CAMERA_DEFAULTS.items():
+                    if key == "tuning":
+                        continue
+                    cameras[key] = json.loads(json.dumps(value))
         motion = config.get("motion", {})
         if isinstance(motion, dict) and not has_current_work_origin_strategy:
             origin = motion.get("origin", {})

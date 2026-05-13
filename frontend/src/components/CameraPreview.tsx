@@ -1,4 +1,5 @@
-import { Space, Tag, Typography } from 'antd'
+import { useEffect } from 'react'
+import { Tag, Typography } from 'antd'
 import { Camera, Clock3 } from 'lucide-react'
 import { useLiveCameraSnapshot } from '../hooks/useLiveCameraSnapshot'
 import type { CameraTelemetry } from '../types'
@@ -9,7 +10,9 @@ interface CameraPreviewProps {
   compact?: boolean
   showGrid?: boolean
   showReticle?: boolean
+  resolution?: string
   onClick?: () => void
+  onPreviewHealthChange?: (health: CameraTelemetry['health']) => void
 }
 
 const cameraResolution: Record<CameraTelemetry['key'], string> = {
@@ -18,11 +21,24 @@ const cameraResolution: Record<CameraTelemetry['key'], string> = {
   wrist_right: '640x480',
 }
 
-export function CameraPreview({ camera, compact, showGrid, showReticle, onClick }: CameraPreviewProps) {
+export function CameraPreview({
+  camera,
+  compact,
+  showGrid,
+  showReticle,
+  resolution,
+  onClick,
+  onPreviewHealthChange,
+}: CameraPreviewProps) {
   const skewState = Math.abs(camera.timestampSkewMs) > 16 ? 'warn' : 'ok'
-  const { liveImageEnabled, snapshotUrl, handleLoad, handleError } = useLiveCameraSnapshot(camera.key, camera.health)
+  const { liveImageEnabled, previewHealth, snapshotUrl, handleLoad, handleError } = useLiveCameraSnapshot(camera.key, camera.health)
   const gridVisible = showGrid ?? camera.key === 'global'
   const reticleVisible = showReticle ?? camera.key === 'global'
+  const displayResolution = resolution ?? cameraResolution[camera.key]
+
+  useEffect(() => {
+    onPreviewHealthChange?.(previewHealth)
+  }, [onPreviewHealthChange, previewHealth])
 
   return (
     <section
@@ -36,8 +52,8 @@ export function CameraPreview({ camera, compact, showGrid, showReticle, onClick 
       role={onClick ? 'button' : undefined}
       tabIndex={onClick ? 0 : undefined}
     >
-      <div className={`camera-frame camera-frame-${camera.key} ${liveImageEnabled ? 'camera-frame-live' : ''}`}>
-        {liveImageEnabled && (
+      <div className={`camera-frame camera-frame-${camera.key} ${liveImageEnabled && snapshotUrl ? 'camera-frame-live' : ''}`}>
+        {liveImageEnabled && snapshotUrl && (
           <img
             className="camera-image"
             data-testid={`camera-image-${camera.key}`}
@@ -47,10 +63,10 @@ export function CameraPreview({ camera, compact, showGrid, showReticle, onClick 
             onError={handleError}
           />
         )}
-        {!liveImageEnabled && (
+        {(!liveImageEnabled || !snapshotUrl) && (
           <div className="camera-placeholder">
             <Camera size={24} />
-            <span>无信号</span>
+            <span>No signal</span>
           </div>
         )}
         {gridVisible && <div className="camera-grid" />}
@@ -61,15 +77,15 @@ export function CameraPreview({ camera, compact, showGrid, showReticle, onClick 
         </div>
       </div>
       <div className="camera-meta">
-        <Space size={6} wrap>
-          <MetricPill state={camera.health} label={`${camera.fps.toFixed(1)} FPS`} />
-          <MetricPill state={skewState} label={`${camera.timestampSkewMs.toFixed(1)} ms`} tip="相对主时钟偏差" />
-          <Tag>{cameraResolution[camera.key]}</Tag>
-          <Tag className="compact-tag" icon={<Clock3 size={13} />}>
+        <div className="camera-meta-grid">
+          <MetricPill state={previewHealth} label={`${camera.fps.toFixed(1)} FPS`} />
+          <MetricPill state={skewState} label={`${camera.timestampSkewMs.toFixed(1)} ms`} tip="Clock skew" />
+          <Tag className="camera-resolution-tag">{displayResolution}</Tag>
+          <Tag className="compact-tag camera-age-tag" icon={<Clock3 size={13} />}>
             age {Math.max(0, camera.frameAgeMs).toFixed(0)} ms
           </Tag>
-        </Space>
-        {!compact && <Typography.Text type="secondary">完整画面按原始比例显示，原始帧由后端写入 LeRobotDataset。</Typography.Text>}
+        </div>
+        {!compact && <Typography.Text type="secondary">Preview frames keep the original aspect ratio.</Typography.Text>}
       </div>
     </section>
   )
