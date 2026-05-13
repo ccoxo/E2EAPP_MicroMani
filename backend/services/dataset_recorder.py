@@ -114,6 +114,8 @@ SOURCE_WARNING_SKEW_MS: dict[str, float] = {
 }
 SOURCE_DROP_SKEW_MS: dict[str, float] = {source: 35.0 for source in CAMERA_SOURCE_KEYS.values()}
 RING_BUFFER_RETENTION_S = 3.0
+WRITE_QUEUE_MAX_FRAMES = 120
+IMAGE_QUEUE_MAX_ITEMS = WRITE_QUEUE_MAX_FRAMES * len(CAMERA_KEYS)
 PLACEHOLDER_JPEG_BYTES = base64.b64decode(
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////"
     "////////////////////////////2wBDAf//////////////////////////////////////////////////////////"
@@ -148,6 +150,23 @@ class TimedSample:
 SourceSample = TimedSample
 
 
+@dataclass(frozen=True)
+class PendingFrame:
+    # 写盘队列只传不可变帧快照，避免 episode 切换后旧帧写入新文件。
+    episode_index: int
+    frame_index: int
+    timestamp: float
+    frame: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PendingImage:
+    # 图片写盘独立排队，低维记录先留在内存中，episode 保存时再批量写 JSONL。
+    path: Path
+    data: bytes
+
+
+# 存放采样数据的缓存区，按 source 分类，支持按时间查找最近样本和插值样本。
 class TimedRingBuffer:
     def __init__(self, *, retention_s: float = RING_BUFFER_RETENTION_S, maxlen: int = 300) -> None:
         self.retention_s = max(float(retention_s), 0.1)
@@ -256,7 +275,14 @@ class DatasetRecorderService:
         self.teleop = teleop
         self._lock = asyncio.Lock()
         self._loop_task: asyncio.Task[None] | None = None
+        self._writer_task: asyncio.Task[None] | None = None
+        self._image_writer_task: asyncio.Task[None] | None = None
         self._sampler_tasks: dict[str, asyncio.Task[None]] = {}
+        self._write_queue: asyncio.Queue[PendingFrame | None] = asyncio.Queue(maxsize=WRITE_QUEUE_MAX_FRAMES)
+        self._image_queue: asyncio.Queue[PendingImage | None] = asyncio.Queue(maxsize=IMAGE_QUEUE_MAX_ITEMS)
+        self._write_enqueue_pending = 0
+        self._write_enqueue_idle = asyncio.Event()
+        self._write_enqueue_idle.set()
         self._session_active = False
         self._recording = False
         self._session_id = ""
@@ -269,6 +295,7 @@ class DatasetRecorderService:
         self._episode_start_monotonic_s = 0.0
         self._session_started_at = 0.0
         self._episode_frames = 0
+        self._queued_episode_frames = 0
         self._episode_late_frames = 0
         self._camera_drops = {key: 0 for key in CAMERA_KEYS}
         self._tick_target_monotonic_s = 0.0
@@ -285,6 +312,7 @@ class DatasetRecorderService:
         self._max_force_left = 0.0
         self._max_force_right = 0.0
         self._writer: TextIO | None = None
+        self._episode_records: list[dict[str, Any]] = []
         self._native_dataset: Any | None = None
         self._native_error = ""
         self._native_use_videos = False
@@ -294,8 +322,7 @@ class DatasetRecorderService:
         self._last_camera_cache_used: dict[str, bool] = {key: False for key in CAMERA_KEYS}
         self._record_fps_hz = 30
         self._force_sample_hz = 200.0
-        self._force_window_samples_per_frame = 7
-        self._sample_buffers: dict[str, TimedRingBuffer] = self._new_sample_buffers({})
+        self._sample_buffers: dict[str, TimedRingBuffer] = self._new_sample_buffers({}) # 存放次采样数据的缓存区
         self._current_data_path: Path | None = None
         self._current_episode_paths: list[Path] = []
         self._last_saved_episode: dict[str, Any] | None = None
@@ -313,7 +340,6 @@ class DatasetRecorderService:
             self._last_saved_episode = None
             self._record_fps_hz = self._record_fps_from_config(config)
             self._force_sample_hz = self._force_sample_hz_from_config(config)
-            self._force_window_samples_per_frame = self._force_window_samples_from_config(config)
             dataset_root = self._dataset_root(config)
             dataset_root.mkdir(parents=True, exist_ok=True)
             self._dataset_dir = dataset_root / self._dataset_id
@@ -331,7 +357,13 @@ class DatasetRecorderService:
             self._episode_index = self._next_episode_index(self._dataset_dir)
             self._session_started_at = time.monotonic()
             self._session_active = True
+            self._write_queue = asyncio.Queue(maxsize=WRITE_QUEUE_MAX_FRAMES)
+            self._image_queue = asyncio.Queue(maxsize=IMAGE_QUEUE_MAX_ITEMS)
+            self._write_enqueue_pending = 0
+            self._write_enqueue_idle.set()
             self._begin_episode_locked()
+            self._image_writer_task = asyncio.create_task(self._image_writer_loop(), name="dataset-image-writer")
+            self._writer_task = asyncio.create_task(self._writer_loop(), name="dataset-writer")
             self._start_sampler_tasks_locked()
             self._loop_task = asyncio.create_task(self._record_loop(), name="dataset-recorder")
             self.telemetry.episode_count = self._episode_index
@@ -348,10 +380,12 @@ class DatasetRecorderService:
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
-            episode = self._finalize_episode_locked(status="review", deleted=False)
-            self._last_saved_episode = episode
             self._recording = False
             self.telemetry.recording = False
+        await self._drain_recording_queues()
+        async with self._lock:
+            episode = self._finalize_episode_locked(status="review", deleted=False)
+            self._last_saved_episode = episode
             self.telemetry.episode_count = self._episode_index + 1
         await self.teleop.stop("recording")
         self.logs.info("[LEROBOT]", f"record episode saved: {episode['id']}")
@@ -362,7 +396,14 @@ class DatasetRecorderService:
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
-            if self._recording:
+            was_recording = self._recording
+            if was_recording:
+                self._recording = False
+                self.telemetry.recording = False
+        if was_recording:
+            await self._drain_recording_queues()
+        async with self._lock:
+            if was_recording:
                 self._close_writer_locked()
                 self._discard_current_episode_files_locked()
             elif self._last_saved_episode is not None:
@@ -383,6 +424,16 @@ class DatasetRecorderService:
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
+            was_recording = self._recording
+            if was_recording:
+                self._recording = False
+                self.telemetry.recording = False
+        if was_recording:
+            await self._drain_recording_queues()
+        async with self._lock:
+            if was_recording:
+                self._close_writer_locked()
+                self._discard_current_episode_files_locked()
             self._last_saved_episode = None
             self._begin_episode_locked()
             self.telemetry.recording = True
@@ -394,7 +445,14 @@ class DatasetRecorderService:
     async def finish_session(self) -> dict[str, Any]:
         """结束录制会话，清理未保存帧并关闭 native 数据集资源。"""
         async with self._lock:
-            if self._session_active and self._recording:
+            was_recording = self._session_active and self._recording
+            if was_recording:
+                self._recording = False
+                self.telemetry.recording = False
+        if was_recording:
+            await self._drain_recording_queues()
+        async with self._lock:
+            if was_recording:
                 self._close_writer_locked()
                 self._discard_current_episode_files_locked()
             self._recording = False
@@ -412,6 +470,8 @@ class DatasetRecorderService:
                 pass
         self._loop_task = None
         await self._stop_sampler_tasks()
+        await self._stop_writer_task()
+        await self._stop_image_writer_task()
         self._finalize_native_dataset()
         self.logs.info("[LEROBOT]", "record session finished")
         return self.status()
@@ -427,12 +487,11 @@ class DatasetRecorderService:
             "active": self._session_active,
             "recording": self._recording,
             "episodeIndex": self._episode_index,
-            "frameCount": self._episode_frames,
+            "frameCount": max(self._queued_episode_frames, self._episode_frames),
             "lateFrames": self._episode_late_frames,
             "elapsedS": round(elapsed, 3),
             "fps": self._record_fps_hz,
             "forceSampleHz": self._force_sample_hz,
-            "forceWindowSamples": self._force_window_samples_per_frame,
             "datasetRoot": str(self._dataset_root(self.settings.get_config())),
             "format": "lerobot-v3-native" if self._native_dataset is not None else "lerobot-compatible-jsonl-fallback",
             "nativeError": self._native_error,
@@ -792,11 +851,16 @@ class DatasetRecorderService:
         if not bool(episode.get("native", False)):
             data_path = str(episode.get("dataPath", ""))
             frame_count = max(1, int(episode.get("frames", 1)))
-            for sample in self._episode_samples(dataset_dir, dataset_id, episode, max_samples=frame_count):
-                if int(sample.get("frame", -1)) == frame:
-                    image = sample.get("images", {}).get(camera) if isinstance(sample.get("images"), dict) else None
-                    if isinstance(image, str) and "?path=" in image:
-                        return self.resolve_file(dataset_id, image.split("?path=", 1)[1]).read_bytes()
+            feature_key = CAMERA_FEATURE_KEYS[camera]
+            for item in self._fallback_frame_records(dataset_dir, data_path):
+                if int(item.get("frame_index", -1)) != frame:
+                    continue
+                raw_path = item.get(feature_key)
+                if isinstance(raw_path, str):
+                    path = self.resolve_file(dataset_id, raw_path)
+                    if path.suffix.lower() == ".mp4":
+                        return self._decode_video_frame_to_jpeg(path, frame)
+                    return path.read_bytes()
             raise FileNotFoundError(data_path)
         imports = self._native_imports()
         if imports is None:
@@ -810,6 +874,7 @@ class DatasetRecorderService:
         image = item.get(CAMERA_FEATURE_KEYS[camera])
         return self._encode_rgb_tensor_to_jpeg(image, np)
 
+    # 初始化采样缓存区
     def _new_sample_buffers(self, config: dict[str, Any]) -> dict[str, TimedRingBuffer]:
         return {
             source: TimedRingBuffer(
@@ -836,6 +901,66 @@ class DatasetRecorderService:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._sampler_tasks = {}
 
+    async def _drain_recording_queues(self) -> None:
+        # 先等锁外待入队帧完成，再等待帧队列和图片队列，避免保存时漏掉最后一帧。
+        await self._write_enqueue_idle.wait()
+        await self._write_queue.join()
+        await self._image_queue.join()
+
+    async def _stop_writer_task(self) -> None:
+        # 停止 writer 前必须先排空队列，保证 metadata 的帧数和磁盘内容一致。
+        await self._write_enqueue_idle.wait()
+        await self._write_queue.join()
+        task = self._writer_task
+        if task is None:
+            return
+        if not task.done():
+            await self._write_queue.put(None)
+            await task
+        self._writer_task = None
+
+    async def _stop_image_writer_task(self) -> None:
+        await self._image_queue.join()
+        task = self._image_writer_task
+        if task is None:
+            return
+        if not task.done():
+            await self._image_queue.put(None)
+            await task
+        self._image_writer_task = None
+
+    async def _writer_loop(self) -> None:
+        # 单消费者串行整理帧，天然保持 frame_index/timestamp 顺序。
+        while True:
+            pending = await self._write_queue.get()
+            try:
+                if pending is None:
+                    return
+                image_jobs: list[PendingImage] = []
+                async with self._lock:
+                    image_jobs = self._write_frame_locked(pending.frame)
+                for image in image_jobs:
+                    await self._image_queue.put(image)
+            except Exception as exc:  # noqa: BLE001
+                self.logs.error("[LEROBOT]", f"writer recovered: {exc}")
+            finally:
+                self._write_queue.task_done()
+
+    async def _image_writer_loop(self) -> None:
+        # 图片写盘单独消费，避免慢磁盘阻塞低维记录缓冲。
+        while True:
+            pending = await self._image_queue.get()
+            try:
+                if pending is None:
+                    return
+                pending.path.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(pending.path.write_bytes, pending.data)
+            except Exception as exc:  # noqa: BLE001
+                self.logs.error("[LEROBOT]", f"image writer recovered: {exc}")
+            finally:
+                self._image_queue.task_done()
+
+    # 各个硬件的录制循环
     async def _sample_source_loop(self, source: str) -> None:
         next_sample_s = time.monotonic()
         while self._session_active:
@@ -854,6 +979,7 @@ class DatasetRecorderService:
                 self.logs.warning("[LEROBOT]", f"{source} sampler recovered: {exc}")
                 await asyncio.sleep(0.1)
 
+    # 采样具体的硬件
     async def _sample_source_once(self, source: str, config: dict[str, Any]) -> TimedSample:
         target_s = time.monotonic()
         if source == "hal":
@@ -879,7 +1005,7 @@ class DatasetRecorderService:
             return SourceSample("force", target_s, value, True, "", target_monotonic_s=target_s)
         return await self._timed_source(
             "force",
-            asyncio.to_thread(self.hardware.force.sample_window, config, 1),
+            asyncio.to_thread(self.hardware.force.sample, config),
             target_s,
             record_quality=False,
         )
@@ -981,15 +1107,18 @@ class DatasetRecorderService:
 
     async def _record_loop(self) -> None:
         # 录制循环按目标 FPS 调度；慢帧只记质量指标，不中断本轮采集。
-        # Hardware samples are produced by source samplers; this loop only aligns and writes frames.
+        # 硬件采样由后台 sampler 产生；本循环只做时间对齐、组帧和入队。
         while self._session_active:
             try:
-                if not self._recording:
+                async with self._lock:
+                    recording = self._recording
+                    frame_index = self._queued_episode_frames
+                    episode_index = self._episode_index
+                    episode_start = self._episode_start_monotonic_s or time.monotonic()
+                    period_s = 1.0 / max(1, self._record_fps_hz)
+                if not recording:
                     await asyncio.sleep(0.05)
                     continue
-                period_s = 1.0 / max(1, self._record_fps_hz)
-                frame_index = self._episode_frames
-                episode_start = self._episode_start_monotonic_s or time.monotonic()
                 target_tick = episode_start + frame_index * period_s
                 now = time.monotonic()
                 if now < target_tick:
@@ -1000,12 +1129,42 @@ class DatasetRecorderService:
                         self._episode_late_frames += 1
                 capture_tick = now
                 frame = await self._collect_frame(target_tick, frame_index=frame_index)
+                pending = PendingFrame(
+                    episode_index=episode_index,
+                    frame_index=frame_index,
+                    timestamp=float(frame["timestamp"]),
+                    frame=frame,
+                )
+                queued = False
                 async with self._lock:
+                    if (
+                        not self._recording
+                        or self._episode_index != episode_index
+                        or frame_index != self._queued_episode_frames
+                    ):
+                        continue
                     self._tick_target_monotonic_s = target_tick
                     self._tick_capture_monotonic_s = capture_tick
                     self._tick_skews_ms.append((capture_tick - target_tick) * 1000.0)
-                    self._write_frame_locked(frame)
-                next_target = (self._episode_start_monotonic_s or episode_start) + self._episode_frames * period_s
+                    self._queued_episode_frames = frame_index + 1
+                    self.telemetry.frame_count = max(self.telemetry.frame_count, self._queued_episode_frames)
+                    try:
+                        self._write_queue.put_nowait(pending)
+                        queued = True
+                    except asyncio.QueueFull:
+                        self._write_enqueue_pending += 1
+                        self._write_enqueue_idle.clear()
+                        pass
+                if not queued:
+                    # 队列满时在锁外等待，避免写盘反压阻塞保存、丢弃或结束操作。
+                    try:
+                        await self._write_queue.put(pending)
+                    finally:
+                        async with self._lock:
+                            self._write_enqueue_pending = max(0, self._write_enqueue_pending - 1)
+                            if self._write_enqueue_pending == 0:
+                                self._write_enqueue_idle.set()
+                next_target = episode_start + (frame_index + 1) * period_s
                 await asyncio.sleep(max(0.0, next_target - time.monotonic()))
             except asyncio.CancelledError:
                 raise
@@ -1068,24 +1227,6 @@ class DatasetRecorderService:
             "action": action,
             "images": image_payload,
         }
-
-    async def _force_window_sample(self, config: dict[str, Any]) -> Any | None:
-        # mock 模式直接使用遥测缓存；真机模式才进入 NI-DAQmx 窗口读取。
-        if not self._real_hardware_mode(config):
-            return None
-        # 录制线程只读取驱动缓存，避免 NI-DAQmx 同步采样拖慢 30Hz 主循环。
-        latest_window = getattr(self.hardware.force, "latest_window", None)
-        if callable(latest_window):
-            return await asyncio.to_thread(
-                latest_window,
-                config,
-                self._force_window_samples_per_frame,
-            )
-        return await asyncio.to_thread(
-            self.hardware.force.sample_window,
-            config,
-            self._force_window_samples_per_frame,
-        )
 
     async def _cached_source(
         self,
@@ -1310,22 +1451,21 @@ class DatasetRecorderService:
             paths[CAMERA_FEATURE_KEYS[key]] = relative.as_posix()
         return paths
 
-    def _write_frame_locked(self, frame: dict[str, Any]) -> None:
-        if not self._recording:
-            return
+    def _write_frame_locked(self, frame: dict[str, Any]) -> list[PendingImage]:
+        if int(frame.get("episode_index", self._episode_index)) != self._episode_index:
+            return []
         if self._native_dataset is not None:
             self._write_native_frame_locked(frame)
-            return
-        if self._writer is None:
-            return
+            return []
         state = frame["observation.state"]
         pulses = frame["observation.pulses"]
         force_left = frame["observation.force_left"]
         force_right = frame["observation.force_right"]
-        image_paths = self._write_fallback_camera_images_locked(frame.get("images", {}))
+        frame_index = int(frame.get("frame_index", self._episode_frames))
+        image_paths, image_jobs = self._fallback_camera_image_jobs_locked(frame.get("images", {}), frame_index)
         record = {
             "episode_index": frame.get("episode_index", self._episode_index),
-            "frame_index": frame.get("frame_index", self._episode_frames),
+            "frame_index": frame_index,
             "timestamp": frame["timestamp"],
             "observation.state": state,
             "observation.pulses": pulses,
@@ -1334,15 +1474,21 @@ class DatasetRecorderService:
             "action": frame["action"],
             **image_paths,
         }
-        self._writer.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-        self._writer.flush()
+        self._episode_records.append(record)
         self._episode_frames += 1
-        self.telemetry.frame_count = self._episode_frames
+        self.telemetry.frame_count = max(self._queued_episode_frames, self._episode_frames)
         self._max_force_left = max(self._max_force_left, self._force_norm(force_left))
         self._max_force_right = max(self._max_force_right, self._force_norm(force_right))
+        return image_jobs
 
-    def _write_fallback_camera_images_locked(self, images: object) -> dict[str, str]:
+    def _fallback_camera_image_jobs_locked(
+        self,
+        images: object,
+        frame_index: int,
+    ) -> tuple[dict[str, str], list[PendingImage]]:
+        # 图片路径使用帧自身索引，避免写盘跳帧时路径和 JSON record 错位。
         paths: dict[str, str] = {}
+        jobs: list[PendingImage] = []
         image_payload = images if isinstance(images, dict) else {}
         for _camera, feature_key in CAMERA_FEATURE_KEYS.items():
             raw = image_payload.get(feature_key)
@@ -1355,14 +1501,13 @@ class DatasetRecorderService:
                 / "chunk-000"
                 / feature_key
                 / f"episode_{self._episode_index:06d}"
-                / f"frame_{self._episode_frames:06d}.jpg"
+                / f"frame_{frame_index:06d}.jpg"
             )
             target = self._require_dataset_dir() / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
             self._current_episode_paths.append(target)
+            jobs.append(PendingImage(target, data))
             paths[feature_key] = relative.as_posix()
-        return paths
+        return paths, jobs
 
     def _write_native_frame_locked(self, frame: dict[str, Any]) -> None:
         if self._native_dataset is None:
@@ -1384,7 +1529,7 @@ class DatasetRecorderService:
                 native_frame[feature_key] = image
         self._native_dataset.add_frame(native_frame)
         self._episode_frames += 1
-        self.telemetry.frame_count = self._episode_frames
+        self.telemetry.frame_count = max(self._queued_episode_frames, self._episode_frames)
         self._max_force_left = max(self._max_force_left, self._force_norm(frame["observation.force_left"]))
         self._max_force_right = max(self._max_force_right, self._force_norm(frame["observation.force_right"]))
 
@@ -1433,6 +1578,7 @@ class DatasetRecorderService:
         self._episode_started_at = time.monotonic()
         self._episode_start_monotonic_s = self._episode_started_at
         self._episode_frames = 0
+        self._queued_episode_frames = 0
         self._episode_late_frames = 0
         self._camera_drops = {key: 0 for key in CAMERA_KEYS}
         self._tick_target_monotonic_s = 0.0
@@ -1451,6 +1597,7 @@ class DatasetRecorderService:
         self._max_force_left = 0.0
         self._max_force_right = 0.0
         self._current_episode_paths = []
+        self._episode_records = []
         if self._native_dataset is not None:
             self._native_dataset_from_index = self._native_total_frames()
             self._current_data_path = None
@@ -1459,10 +1606,78 @@ class DatasetRecorderService:
         data_path = Path("data") / "chunk-000" / f"episode_{self._episode_index:06d}.jsonl"
         absolute_data_path = dataset_dir / data_path
         absolute_data_path.parent.mkdir(parents=True, exist_ok=True)
-        self._writer = absolute_data_path.open("w", encoding="utf-8")
+        self._writer = None
         self._current_data_path = absolute_data_path
-        self._current_episode_paths.append(absolute_data_path)
         self._recording = True
+
+    def _flush_fallback_records_locked(self) -> None:
+        # 低维 JSONL 在 episode 保存时批量写入，减少录制过程中的小写入和 flush 抖动。
+        if self._current_data_path is None:
+            return
+        self._current_data_path.parent.mkdir(parents=True, exist_ok=True)
+        content = "".join(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            for record in self._episode_records
+        )
+        self._current_data_path.write_text(content, encoding="utf-8")
+        self._current_episode_paths.append(self._current_data_path)
+
+    def _encode_fallback_videos_locked(self) -> None:
+        # 保存 episode 时把 fallback JPG 序列合成为 MP4；失败时保留 JPG 路径供复核兜底。
+        if not self._episode_records:
+            return
+        try:
+            cv2 = importlib.import_module("cv2")
+        except Exception as exc:  # noqa: BLE001
+            self._source_warnings.append(f"fallback video encode skipped: {exc}")
+            return
+        dataset_dir = self._require_dataset_dir()
+        records = sorted(self._episode_records, key=lambda item: int(item.get("frame_index", 0)))
+        for _camera, feature_key in CAMERA_FEATURE_KEYS.items():
+            image_paths = [record.get(feature_key) for record in records]
+            if not all(isinstance(path, str) and path.lower().endswith(".jpg") for path in image_paths):
+                continue
+            absolute_images = [dataset_dir / str(path) for path in image_paths]
+            if not absolute_images or not all(path.exists() for path in absolute_images):
+                continue
+            relative_video = (
+                Path("videos")
+                / "chunk-000"
+                / feature_key
+                / f"episode_{self._episode_index:06d}.mp4"
+            )
+            video_path = dataset_dir / relative_video
+            if self._encode_jpegs_to_mp4(cv2, absolute_images, video_path):
+                for record in records:
+                    record[feature_key] = relative_video.as_posix()
+                self._current_episode_paths.append(video_path)
+                for image_path in absolute_images:
+                    self._safe_unlink(dataset_dir.resolve(), image_path)
+            else:
+                self._safe_unlink(dataset_dir.resolve(), video_path)
+
+    def _encode_jpegs_to_mp4(self, cv2: Any, images: list[Path], video_path: Path) -> bool:
+        # OpenCV 编码器在不同 Windows 环境可用性不同，因此失败只降级为保留 JPG 序列。
+        first = cv2.imread(str(images[0]))
+        if first is None:
+            return False
+        height, width = first.shape[:2]
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(video_path), fourcc, float(max(1, self._record_fps_hz)), (width, height))
+        if not writer.isOpened():
+            return False
+        try:
+            for image_path in images:
+                frame = cv2.imread(str(image_path))
+                if frame is None:
+                    return False
+                if frame.shape[:2] != (height, width):
+                    frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+                writer.write(frame)
+        finally:
+            writer.release()
+        return video_path.exists() and video_path.stat().st_size > 0
 
     def _finalize_episode_locked(self, *, status: str, deleted: bool) -> dict[str, Any]:
         dataset_dir = self._require_dataset_dir()
@@ -1472,6 +1687,9 @@ class DatasetRecorderService:
         native = self._native_dataset is not None
         if native:
             self._save_native_episode_locked()
+        elif not deleted:
+            self._encode_fallback_videos_locked()
+            self._flush_fallback_records_locked()
         episode_id = f"episode_{self._episode_index:06d}"
         skew = self._skew_stats()
         source_skew = self._source_skew_stats()
@@ -1626,7 +1844,6 @@ class DatasetRecorderService:
             "recording": {
                 "fps": self._record_fps_hz,
                 "forceSampleHz": self._force_sample_hz,
-                "forceWindowSamples": self._force_window_samples_per_frame,
                 "alignment": (
                     "asynchronous source samplers write monotonic ring buffers; "
                     "record frames use nearest samples at episode_start + frame_index / fps"
@@ -1654,7 +1871,7 @@ class DatasetRecorderService:
                 "dtype": "video",
                 "shape": [height, width, 3],
                 "names": ["height", "width", "channels"],
-                "encoding": "jpeg_sequence",
+                "encoding": "mp4",
             }
         return {
             "observation.state": {"dtype": "float32", "shape": [14], "names": list(STATE_FEATURE_NAMES)},
@@ -2009,18 +2226,6 @@ class DatasetRecorderService:
             raw = 200.0
         return min(max(raw, 1.0), 10000.0)
 
-    def _force_window_samples_from_config(self, config: dict[str, Any]) -> int:
-        force_config = config.get("force", {})
-        try:
-            override = int(force_config.get("recordWindowSamples", 0))
-        except (TypeError, ValueError):
-            override = 0
-        if override > 0:
-            return min(max(override, 1), 512)
-        sample_hz = self._force_sample_hz_from_config(config)
-        fps = self._record_fps_from_config(config)
-        return min(max(int(math.ceil(sample_hz / max(1, fps))), 1), 512)
-
     def _sync_recording_shape_from_native_info(self, dataset_dir: Path) -> None:
         info = self._read_json(dataset_dir / "meta" / "info.json")
         try:
@@ -2152,6 +2357,16 @@ class DatasetRecorderService:
         if native_episode or native_dataset:
             return self._native_episode_samples(dataset_dir, dataset_id, episode, max_samples)
         data_path = str(episode.get("dataPath", ""))
+        records = self._fallback_frame_records(dataset_dir, data_path)
+        if not records:
+            return []
+        stride = max(1, len(records) // max_samples)
+        samples: list[dict[str, Any]] = []
+        for item in records[::stride]:
+            samples.append(self._fallback_sample_for_api(dataset_id, episode, item, len(samples)))
+        return samples
+
+    def _fallback_frame_records(self, dataset_dir: Path, data_path: str) -> list[dict[str, Any]]:
         if not data_path:
             return []
         path = dataset_dir / data_path
@@ -2161,46 +2376,69 @@ class DatasetRecorderService:
             lines = path.read_text(encoding="utf-8").splitlines()
         except OSError:
             return []
-        stride = max(1, len(lines) // max_samples)
-        samples: list[dict[str, Any]] = []
-        for line in lines[::stride]:
+        records: list[dict[str, Any]] = []
+        for line in lines:
             try:
                 item = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            state_raw = item.get("observation.state")
-            if isinstance(state_raw, list) and len(state_raw) >= 14:
-                state = self._lerobot14_to_ui_motion_state([float(value) for value in state_raw])
-            elif isinstance(state_raw, list):
-                state = lerobot_to_ui_state([float(value) for value in state_raw])
-            else:
-                state = [0.0] * 12
-            pulses_raw = item.get("observation.pulses")
-            pulses = [float(value) for value in pulses_raw] if isinstance(pulses_raw, list) else [0.0] * 12
-            images_raw = item.get("images")
-            images: dict[str, str] = {}
-            if isinstance(images_raw, dict):
-                for key, feature_key in CAMERA_FEATURE_KEYS.items():
-                    raw_path = images_raw.get(feature_key)
-                    if isinstance(raw_path, str):
-                        images[key] = f"/api/datasets/{dataset_id}/file?path={raw_path}"
+            if isinstance(item, dict):
+                records.append(item)
+        return records
+
+    def _fallback_sample_for_api(
+        self,
+        dataset_id: str,
+        episode: dict[str, Any],
+        item: dict[str, Any],
+        fallback_frame: int,
+    ) -> dict[str, Any]:
+        state_raw = item.get("observation.state")
+        if isinstance(state_raw, list) and len(state_raw) >= 14:
+            state = self._lerobot14_to_ui_motion_state([float(value) for value in state_raw])
+        elif isinstance(state_raw, list):
+            state = lerobot_to_ui_state([float(value) for value in state_raw])
+        else:
+            state = [0.0] * 12
+        pulses_raw = item.get("observation.pulses")
+        pulses = [float(value) for value in pulses_raw] if isinstance(pulses_raw, list) else [0.0] * 12
+        frame = int(item.get("frame_index", fallback_frame))
+        images_raw = item.get("images")
+        images: dict[str, str] = {}
+        if isinstance(images_raw, dict):
             for key, feature_key in CAMERA_FEATURE_KEYS.items():
-                raw_path = item.get(feature_key)
+                raw_path = images_raw.get(feature_key)
                 if isinstance(raw_path, str):
-                    images[key] = f"/api/datasets/{dataset_id}/file?path={raw_path}"
-            samples.append(
-                {
-                    "frame": int(item.get("frame_index", len(samples))),
-                    "leftJoints": state[:6],
-                    "rightJoints": state[6:12],
-                    "leftPulses": pulses[:6],
-                    "rightPulses": pulses[6:12],
-                    "forceLeft": item.get("observation.force_left", [0.0] * 6),
-                    "forceRight": item.get("observation.force_right", [0.0] * 6),
-                    "images": images,
-                }
+                    images[key] = self._fallback_image_url(dataset_id, str(episode.get("id", "")), key, frame, raw_path)
+        for key, feature_key in CAMERA_FEATURE_KEYS.items():
+            raw_path = item.get(feature_key)
+            if isinstance(raw_path, str):
+                images[key] = self._fallback_image_url(dataset_id, str(episode.get("id", "")), key, frame, raw_path)
+        return {
+            "frame": frame,
+            "leftJoints": state[:6],
+            "rightJoints": state[6:12],
+            "leftPulses": pulses[:6],
+            "rightPulses": pulses[6:12],
+            "forceLeft": item.get("observation.force_left", [0.0] * 6),
+            "forceRight": item.get("observation.force_right", [0.0] * 6),
+            "images": images,
+        }
+
+    def _fallback_image_url(
+        self,
+        dataset_id: str,
+        episode_id: str,
+        camera: str,
+        frame: int,
+        relative_path: str,
+    ) -> str:
+        if relative_path.lower().endswith(".mp4"):
+            return (
+                f"/api/datasets/{dataset_id}/frame_image"
+                f"?episode_id={episode_id}&camera={camera}&frame={frame}"
             )
-        return samples
+        return f"/api/datasets/{dataset_id}/file?path={relative_path}"
 
     def _native_episode_samples(
         self,
@@ -2406,6 +2644,24 @@ class DatasetRecorderService:
         if not ok:
             raise FileNotFoundError("image")
         return bytes(buffer)
+
+    def _decode_video_frame_to_jpeg(self, path: Path, frame_index: int) -> bytes:
+        # fallback MP4 复核时按 frame_index 解码单帧，保持前端仍然拿到 JPEG。
+        cv2 = importlib.import_module("cv2")
+        capture = cv2.VideoCapture(str(path))
+        try:
+            if not capture.isOpened():
+                raise FileNotFoundError(str(path))
+            capture.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame_index)))
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                raise FileNotFoundError(f"{path}:{frame_index}")
+            ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+            if not ok:
+                raise FileNotFoundError("image")
+            return bytes(buffer)
+        finally:
+            capture.release()
 
     def _episode_quality(self, episode: dict[str, Any]) -> int:
         late = int(episode.get("lateFrames", 0))

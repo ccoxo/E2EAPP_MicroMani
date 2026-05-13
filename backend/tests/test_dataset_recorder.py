@@ -334,19 +334,19 @@ def test_dataset_recorder_falls_back_when_native_lerobot_unavailable(monkeypatch
     assert recorder._native_preflight() == "lerobot[dataset] is not installed in backend runtime"
 
 
-def test_dataset_recorder_uses_nonblocking_force_latest_window(monkeypatch) -> None:
+def test_dataset_recorder_samples_current_force_without_window(monkeypatch) -> None:
     class FakeForce:
         def __init__(self) -> None:
-            self.latest_calls = 0
             self.sample_calls = 0
+            self.window_calls = 0
 
-        def latest_window(self, _config: dict[str, object], samples: int) -> object:
-            self.latest_calls += 1
-            return {"samples": samples}
+        def sample(self, _config: dict[str, object]) -> object:
+            self.sample_calls += 1
+            return {"ok": True, "left": [1.0] * 6, "right": [2.0] * 6}
 
         def sample_window(self, _config: dict[str, object], _samples: int) -> object:
-            self.sample_calls += 1
-            return {}
+            self.window_calls += 1
+            return {"ok": True, "left": [0.0] * 6, "right": [0.0] * 6}
 
     class FakeHardware:
         def __init__(self) -> None:
@@ -354,14 +354,13 @@ def test_dataset_recorder_uses_nonblocking_force_latest_window(monkeypatch) -> N
 
     recorder = object.__new__(DatasetRecorderService)
     recorder.hardware = FakeHardware()
-    recorder._force_window_samples_per_frame = 5
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
 
-    result = asyncio.run(recorder._force_window_sample({"hal": {"mode": "real"}}))
+    result = asyncio.run(recorder._sample_force_source({"hal": {"mode": "real"}}, 1.0))
 
-    assert result == {"samples": 5}
-    assert recorder.hardware.force.latest_calls == 1
-    assert recorder.hardware.force.sample_calls == 0
+    assert result.value == {"ok": True, "left": [1.0] * 6, "right": [2.0] * 6}
+    assert recorder.hardware.force.sample_calls == 1
+    assert recorder.hardware.force.window_calls == 0
 
 
 def test_dataset_recorder_composes_14d_state_and_absolute_action() -> None:

@@ -36,3 +36,5 @@
 - HAL 相关条目按“硬件边界、运动状态、主手状态、安全门禁、采集可信度”组织，便于后续 `/speckit-plan` 直接拆分设计与任务。
 - 已补充 `F. 多源数据时间对齐`，明确 30 Hz monotonic tick、HAL/相机对齐阈值和力觉窗口覆盖范围。
 - 已补充 `G. LeRobot v3 数据结构标准`，明确 LeRobot 单臂示例仅作格式示范；本项目只保留双臂每个轴、夹爪、12 轴脉冲、双路力传感器、三路相机和 LeRobot 必要索引字段。旧 `observation.gripper` 仅可作为兼容或调试字段。
+- 已补充 `H. 采集与写盘解耦`，明确 30 Hz 采集主循环不得被图片/记录写盘和 flush 阻塞；待写入帧必须有稳定 frame_index，单 writer 串行消费，有界队列满时阻塞且记录 `writerBackpressureFrames`，保存 episode 前必须等待已排队帧全部落盘。
+- 本次更新后重新检查：无 `[NEEDS CLARIFICATION]` marker，新增 requirements 和 success criteria 均可通过写盘慢速、队列满、保存前仍有积压三类场景验证。

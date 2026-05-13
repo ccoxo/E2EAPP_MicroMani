@@ -13,7 +13,7 @@
 
 **Why this priority**: 这是数据收集功能的核心价值；没有稳定、完整、可复核的 episode，就无法进行后续数据集管理、模型推理或微调。
 
-**Independent Test**: 使用 Mock HAL/Mock camera 或真实硬件完成一次短采集，保存 episode 后检查该 episode 有帧数、任务描述、14 维状态、14 维动作、12 轴脉冲、双路 6 维力觉、力觉时间窗口和三路相机数据；当某路相机当前帧不可用时，该路图像使用最近一次有效缓存帧。
+**Independent Test**: 使用 Mock HAL/Mock camera 或真实硬件完成一次短采集，保存 episode 后检查该 episode 有帧数、任务描述、14 维状态、14 维动作、12 轴脉冲、双路 6 维力觉、力觉时间窗口和三路相机数据；当某路相机当前帧不可用时，该路图像使用最近一次有效缓存帧；当写盘变慢时，采集主循环仍按目标 tick 产生稳定递增的帧序号，并在保存前等待所有已排队帧完成持久化。
 
 **Acceptance Scenarios**:
 
@@ -70,6 +70,10 @@
 - HAL motion state 中某个轴 enabled 为 false 或 moving 状态异常：系统必须保留对应采集帧的状态值，便于排查。
 - Omega.7 读取失败、按钮状态缺失或夹爪开口不可用：系统必须继续保存可用采集数据，并把主手状态标记为不可完全可信。
 - 手动 jog 或回工作原点操作与采集同时发生：采集数据必须保留动作和运动状态变化。
+- 写盘耗时超过单个 30 Hz 采集周期：系统必须让采集主循环继续按目标 tick 排队帧，写盘延迟不得直接变成采集 tick 抖动。
+- 待写入队列达到容量上限：系统必须阻塞新的帧入队而不是丢弃帧，并记录 writer 背压帧数用于复核。
+- 操作员保存 episode 时仍存在已排队未写入帧：系统必须先等待这些帧全部写入，再生成 episode 元数据和保存结果。
+- 写入端消费速度慢于采集速度：系统必须保持帧序号和时间戳顺序，不得因为已写入帧数落后而重复分配同一个帧序号。
 
 ## Requirements *(mandatory)*
 
@@ -154,6 +158,18 @@
 - **FR-057**: LeRobot 自动帧索引字段 `timestamp`、`frame_index`、`episode_index`、`index` 和 `task_index` 可作为标准数据集索引字段存在，但不得被当作机器人观测、动作、力觉或相机硬件语义字段。
 - **FR-058**: `observation.gripper` 不得作为标准训练主字段替代 14 维 `observation.state` 中的夹爪维度；如需保留旧字段，只能作为兼容、调试或迁移用途，并且不得改变标准 features 的 shape 和字段顺序。
 
+#### H. 采集与写盘解耦
+
+当前差距：历史录制路径在采集循环内完成组帧、三路图片写入、记录写入、刷新和帧数更新；写盘抖动会直接阻塞 30 Hz 主循环，并放大 lateFrames。保存 episode 前也必须明确区分“已排队帧”和“已写入帧”，否则写入端慢于采集端时可能产生重复 frame_index 或不一致 metadata。
+
+- **FR-059**: 系统 MUST 将 30 Hz 采集主循环与磁盘持久化解耦；采集主循环完成组帧后必须把待写入帧交给写入队列，不得在同一 tick 内同步等待图片写入、记录写入或 flush。
+- **FR-060**: 每个待写入帧 MUST 包含 episode 序号、稳定递增的 frame_index、采集 timestamp 和完整帧数据；frame_index 必须由采集主循环分配，且不得依赖写入端已完成帧数。
+- **FR-061**: 系统 MUST 为每个活动录制会话只运行一个写入消费者，并按 frame_index 顺序串行写入待写入帧，避免原生数据集写入和 fallback 文件写入并发破坏顺序。
+- **FR-062**: 写入队列 MUST 设置容量上限，默认上限为 120 个待写入帧；队列满时系统 MUST 阻塞新的帧入队而不是丢帧，并记录 `writerBackpressureFrames`。
+- **FR-063**: 系统 MUST 分别维护已排队帧数和已写入帧数；实时录制进度可展示已排队帧数，保存结果和 episode metadata 必须使用已写入帧数。
+- **FR-064**: 操作员保存 episode 时，系统 MUST 先停止继续排队新帧，再等待写入队列中的当前 episode 帧全部完成，之后才能生成 episode metadata、返回保存结果或允许下一条 episode 开始。
+- **FR-065**: 写入端 MUST 在单个待写入帧失败时保留可诊断错误信息，并确保队列任务状态被正确结算，避免保存流程永久等待。
+
 ### AppStation 宪章要求 *(后端/HAL/硬件/数据功能 mandatory)*
 
 - **AC-001**：受影响的前端契约包括 `/api/record/session/create`、`/api/record/episode/save`、`/api/record/episode/discard`、`/api/record/session/finish`、`/api/record/reset/skip`、`/api/record/status`、`/api/datasets`、`/api/datasets/{dataset_id}`、`/api/datasets/{dataset_id}/episodes/{episode_id}`、`/api/datasets/{dataset_id}/file`、`/api/datasets/{dataset_id}/frame_image`，以及 `/ws` 中的 recording、episodeCount、frameCount、jointPositions、forceLeft、forceRight、gripperPositions 和 cameras。兼容规则是：现有录制和数据集页面无需改变用户流程即可使用完善后的数据收集能力。
@@ -171,6 +187,8 @@
 - **硬件采集源**：为采集帧提供数据的 HAL、相机、力觉、夹爪和遥操作源；每个源可能处于真实、Mock、降级或不可用状态。
 - **HAL 运动状态**：由 HAL 输出的 12 轴实时状态，包含语义轴 UI 位置、原始脉冲、enabled、moving 和 estop_active。
 - **Omega.7 主手状态**：左右主手输入来源，包含连接、openId、deviceId、序列号、位姿、按钮、夹爪开口、读取状态和错误信息。
+- **待写入帧**：采集主循环生成但尚未完成持久化的帧，包含 episode 序号、frame_index、timestamp 和完整帧数据。
+- **写入队列状态**：录制期间用于复核写盘健康度的状态，包含队列容量、当前积压、已排队帧数、已写入帧数和 writer 背压帧数。
 
 ## Success Criteria *(mandatory)*
 
@@ -188,6 +206,8 @@
 - **SC-010**: 抽检任意 10 帧真实硬件采集数据，12 轴 UI 位置和原始脉冲都能追溯到同一 HAL motion state 语义顺序。
 - **SC-011**: 在 30 Hz 目标采样下抽检任意 10 条真实硬件 episode，100% 的标准数据集 metadata 只包含必要训练字段和 LeRobot 索引字段。
 - **SC-013**: 抽检任意 10 个新保存的数据集 metadata，100% 的标准 features 都与 LeRobot v3.0 契约一致：`observation.state` 和 `action` 为 14 维，`observation.pulses` 为 12 维，双路力觉为 6 维，三路相机为 `[480, 640, 3]` 视频字段且包含必要 video info；LeRobot 索引字段仅用于 timestamp/frame/episode/task 索引，不混入硬件语义维度。
+- **SC-014**: 在模拟每帧写入耗时超过 33 ms 的条件下，一条 20 秒 episode 保存后不得出现重复 frame_index，metadata 帧数必须与实际写入帧数一致。
+- **SC-015**: 在写入队列达到容量上限的测试中，系统必须记录 writer 背压帧数，且保存后的 episode 不得因为背压丢失已排队帧。
 
 ## Assumptions
 
@@ -198,6 +218,8 @@
 - 数据收集时的动作向量来自最近遥操作动作；若最近 1 秒内无动作，则记录零动作向量。
 - 标准训练数据结构以 LeRobot v3.0 metadata 为准；主手状态和对齐指标默认不进入标准数据集 schema。
 - 多源数据对齐以 30 Hz 录制主轴为默认验收基线。
+- 写入队列默认容量为 120 帧，约等于 30 Hz 采集下 4 秒积压；该上限用于防止磁盘异常变慢时内存无界增长。
+- 写盘背压场景优先保持数据完整性，因此默认阻塞入队而不是丢帧；后续如需“低延迟优先”策略应另行明确。
 - 本功能不改变已有安全策略，只要求采集流程不得绕过或隐藏安全状态。
 - HAL 当前可在无 vendor SDK 时作为确定性骨架构建，但骨架只用于契约验证；真实硬件验收必须使用已加载 LTDMC 与 Force Dimension SDK 的 HalServer。
 - HAL 内部接口运行在本机硬件边界内；前端和数据集 spec 只依赖其外部运动和主手状态语义，不依赖 HAL 内部代码结构。
