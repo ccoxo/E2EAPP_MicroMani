@@ -49,6 +49,7 @@ import {
   cameraHardwareSpecs,
   forceChannels,
   nano17Spec,
+  semanticAxes,
   type RobotSide,
 } from '../data'
 import { useTelemetryStore } from '../stores/telemetry'
@@ -1282,6 +1283,18 @@ function TeleopHandCard({
   const setRotationScale = (value: number) => updateTeleop(side === 'left' ? { leftRotationScale: value } : { rightRotationScale: value })
   const setGravityCompensation = (value: boolean) => updateTeleop(side === 'left' ? { leftGravityCompensation: value } : { rightGravityCompensation: value })
   const setForceFeedback = (value: boolean) => updateTeleop(side === 'left' ? { leftForceFeedback: value } : { rightForceFeedback: value })
+  const axisOutputScale = side === 'left' ? config.teleop.leftAxisOutputScale : config.teleop.rightAxisOutputScale
+  const enabledAxes = side === 'left' ? config.teleop.leftEnabledAxes : config.teleop.rightEnabledAxes
+  const setAxisOutputScale = (axisIndex: number, value: number) => {
+    const next = [...axisOutputScale]
+    next[axisIndex] = value
+    updateTeleop(side === 'left' ? { leftAxisOutputScale: next } : { rightAxisOutputScale: next })
+  }
+  const setEnabledAxis = (axisIndex: number, value: boolean) => {
+    const next = [...enabledAxes]
+    next[axisIndex] = value
+    updateTeleop(side === 'left' ? { leftEnabledAxes: next } : { rightEnabledAxes: next })
+  }
   const pose = logicalConnected ? (handState?.pose ?? [0, 0, 0, 0, 0, 0]) : [0, 0, 0, 0, 0, 0]
   const positionMm = pose.slice(0, 3).map((value) => value * 1000)
   const rotationDeg = pose.slice(3, 6)
@@ -1376,6 +1389,22 @@ function TeleopHandCard({
         <Form.Item label="命令更新周期 ms">
           <InputNumber min={1} value={config.teleop.commandIntervalMs} onChange={(value) => updateTeleop({ commandIntervalMs: Number(value ?? 10) })} />
         </Form.Item>
+        <Form.Item label="平移单步上限 um">
+          <InputNumber
+            min={1}
+            step={100}
+            value={config.teleop.translationStepUm}
+            onChange={(value) => updateTeleop({ translationStepUm: Number(value ?? 5000) })}
+          />
+        </Form.Item>
+        <Form.Item label="旋转单步上限 °">
+          <InputNumber
+            min={0.001}
+            step={0.01}
+            value={config.teleop.rotationStepDeg}
+            onChange={(value) => updateTeleop({ rotationStepDeg: Number(value ?? 0.2) })}
+          />
+        </Form.Item>
         <Form.Item label="稳定模式">
           <Select
             value={config.teleop.stabilityMode}
@@ -1393,14 +1422,57 @@ function TeleopHandCard({
         <Form.Item label="旋转比例">
           <InputNumber min={0} step={0.01} value={rotationScale} onChange={(value) => setRotationScale(Number(value ?? 0.18))} />
         </Form.Item>
+        <Form.Item label="Translation step pulse">
+          <InputNumber min={1} step={100} value={config.teleop.translationStepLimitPulse} onChange={(value) => updateTeleop({ translationStepLimitPulse: Number(value ?? 4000) })} />
+        </Form.Item>
+        <Form.Item label="Rotation step pulse">
+          <InputNumber min={1} step={50} value={config.teleop.rotationStepLimitPulse} onChange={(value) => updateTeleop({ rotationStepLimitPulse: Number(value ?? 1250) })} />
+        </Form.Item>
         <Form.Item label="平移死区">
           <InputNumber min={0} step={0.00001} value={config.teleop.translationDeadzone} onChange={(value) => updateTeleop({ translationDeadzone: Number(value ?? 0) })} />
         </Form.Item>
         <Form.Item label="旋转死区 °">
           <InputNumber min={0} step={0.01} value={config.teleop.rotationDeadzone} onChange={(value) => updateTeleop({ rotationDeadzone: Number(value ?? 0.08) })} />
         </Form.Item>
+        <Form.Item label="Translation min delta">
+          <InputNumber min={0} step={0.00001} value={config.teleop.incrementalTranslationMinEffectiveDelta} onChange={(value) => updateTeleop({ incrementalTranslationMinEffectiveDelta: Number(value ?? 0.00005) })} />
+        </Form.Item>
+        <Form.Item label="Reverse deadzone">
+          <InputNumber min={0} step={0.00001} value={config.teleop.incrementalTranslationReverseDeadzone} onChange={(value) => updateTeleop({ incrementalTranslationReverseDeadzone: Number(value ?? 0.0001) })} />
+        </Form.Item>
+        <Form.Item label="Translation speed um/s">
+          <Space.Compact>
+            <InputNumber min={0} value={config.teleop.translationStartVelocityUmS} onChange={(value) => updateTeleop({ translationStartVelocityUmS: Number(value ?? 400) })} />
+            <InputNumber min={1} value={config.teleop.translationMaxVelocityUmS} onChange={(value) => updateTeleop({ translationMaxVelocityUmS: Number(value ?? 5000) })} />
+          </Space.Compact>
+        </Form.Item>
+        <Form.Item label="Rotation speed deg/s">
+          <Space.Compact>
+            <InputNumber min={0} step={0.05} value={config.teleop.rotationStartVelocityDegS} onChange={(value) => updateTeleop({ rotationStartVelocityDegS: Number(value ?? 0.25) })} />
+            <InputNumber min={1} step={0.1} value={config.teleop.rotationMaxVelocityDegS} onChange={(value) => updateTeleop({ rotationMaxVelocityDegS: Number(value ?? 3) })} />
+          </Space.Compact>
+        </Form.Item>
+        <Form.Item label="Profile acc/dec s">
+          <Space.Compact>
+            <InputNumber min={0.001} step={0.01} value={config.teleop.motionProfileAccSec} onChange={(value) => updateTeleop({ motionProfileAccSec: Number(value ?? 0.05) })} />
+            <InputNumber min={0.001} step={0.01} value={config.teleop.motionProfileDecSec} onChange={(value) => updateTeleop({ motionProfileDecSec: Number(value ?? 0.05) })} />
+          </Space.Compact>
+        </Form.Item>
       </Form>
       <div className="teleop-switch-row">
+        {semanticAxes.map((axis, axisIndex) => (
+          <span key={axis}>
+            <small>{axis}</small>
+            <InputNumber min={0} step={0.05} value={axisOutputScale[axisIndex] ?? 1} onChange={(value) => setAxisOutputScale(axisIndex, Number(value ?? 1))} />
+            <Switch checked={enabledAxes[axisIndex] ?? true} checkedChildren="On" unCheckedChildren="Off" onChange={(value) => setEnabledAxis(axisIndex, value)} />
+          </span>
+        ))}
+      </div>
+      <div className="teleop-switch-row">
+        <span>
+          <small>Swap hands</small>
+          <Switch checked={config.teleop.swapHands} checkedChildren="On" unCheckedChildren="Off" onChange={(value) => updateTeleop({ swapHands: value })} />
+        </span>
         <span>
           <small>重力补偿</small>
           <Switch checked={gravityCompensation} checkedChildren="开" unCheckedChildren="关" onChange={setGravityEnabled} />

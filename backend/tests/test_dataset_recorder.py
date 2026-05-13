@@ -4,7 +4,7 @@ import asyncio
 import time
 from pathlib import Path
 
-from backend.services.dataset_recorder import DatasetRecorderService
+from backend.services.dataset_recorder import DatasetRecorderService, TimedRingBuffer, TimedSample
 
 EXPECTED_V3_FEATURES = {
     "observation.state": {
@@ -170,14 +170,26 @@ def test_dataset_recorder_fallback_features_follow_v3_contract() -> None:
     assert "observation.gripper" not in features
 
 
-def test_dataset_recorder_collect_frame_uses_parallel_sources() -> None:
+def test_timed_ring_buffer_nearest_respects_skew_and_prunes() -> None:
+    buffer = TimedRingBuffer(retention_s=1.0, maxlen=3)
+    buffer.append(TimedSample("hal", 10.0, {"value": 10}))
+    buffer.append(TimedSample("hal", 10.5, {"value": 11}))
+    buffer.append(TimedSample("hal", 11.4, {"value": 12}))
+    buffer.append(TimedSample("hal", 12.0, {"value": 13}))
+
+    assert len(buffer) == 2
+    assert buffer.nearest(11.95, 0.1).value == {"value": 13}
+    assert buffer.nearest(11.0, 0.1) is None
+
+
+def test_dataset_recorder_collect_frame_uses_timed_buffers() -> None:
     source = (Path(__file__).resolve().parents[1] / "services" / "dataset_recorder.py").read_text(encoding="utf-8")
 
-    assert "await asyncio.gather(" in source
-    assert 'self._timed_source("hal", self.hal.motion_state()' in source
-    assert 'self._timed_source("force", self._force_window_sample(config)' in source
-    assert 'self._timed_source("camera", self._capture_cameras(config)' in source
-    assert 'self._timed_source("omega", self.hal.omega_state()' in source
+    assert "class TimedRingBuffer" in source
+    assert "self._start_sampler_tasks_locked()" in source
+    assert 'self._aligned_sample("hal", target_monotonic_s)' in source
+    assert 'self._aligned_sample("force", target_monotonic_s)' in source
+    assert "CAMERA_SOURCE_KEYS" in source
 
 
 def test_dataset_recorder_timed_source_records_timeout_drop() -> None:
@@ -200,7 +212,13 @@ def test_dataset_recorder_timed_source_records_timeout_drop() -> None:
     assert recorder._source_fail_streaks["hal"] == 1
 
 
-def test_dataset_recorder_gripper_source_uses_worker_sample_timestamp() -> None:
+def test_dataset_recorder_source_timestamp_uses_host_receive_time() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+
+    assert recorder._source_sample_monotonic({"received_monotonic_ms": 1, "monotonic_s": 2.0}, 42.0) == 42.0
+
+
+def test_dataset_recorder_gripper_source_uses_host_receive_timestamp() -> None:
     class FakeTelemetry:
         def __init__(self) -> None:
             self.gripper_positions = [-1.0, -1.0]
@@ -243,11 +261,13 @@ def test_dataset_recorder_gripper_source_uses_worker_sample_timestamp() -> None:
     recorder._source_warnings = []
     config = {"hal": {"mode": "real"}, "gripper": {"sampleHz": 30, "sampleStaleMs": 500}}
 
-    sample = asyncio.run(recorder._gripper_source(config, time.monotonic()))
+    before = time.monotonic()
+    sample = asyncio.run(recorder._gripper_source(config, before))
+    after = time.monotonic()
 
     assert sample.ok is True
     assert sample.value == [4.0, 5.0]
-    assert sample.monotonic_s == recorder.telemetry._last_gripper_sample_at
+    assert before <= sample.monotonic_s <= after
 
 
 def test_dataset_recorder_uses_cached_camera_frame_on_snapshot_failure(tmp_path: Path, monkeypatch) -> None:

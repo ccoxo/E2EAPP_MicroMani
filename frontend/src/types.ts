@@ -347,6 +347,7 @@ export interface AppConfig {
     jogStepDeg: number
     yawSoftLimitDeg: number
     positionSource: 'dmc_get_position' | 'dmc_get_encoder'
+    workOriginStrategyVersion: string
     origin: MotionOriginConfig
     homeOnStartup: MotionStartupHomeConfig
     leftProfile: ArmMotionProfile
@@ -427,12 +428,30 @@ export interface AppConfig {
     rightGravityCompensation: boolean
     leftForceFeedback: boolean
     rightForceFeedback: boolean
+    strategyVersion: string
+    swapHands: boolean
     leftTranslationScale: number
     rightTranslationScale: number
     leftRotationScale: number
     rightRotationScale: number
+    leftAxisOutputScale: number[]
+    rightAxisOutputScale: number[]
+    translationStepUm: number
+    rotationStepDeg: number
+    translationStepLimitPulse: number
+    rotationStepLimitPulse: number
     translationDeadzone: number
     rotationDeadzone: number
+    incrementalTranslationMinEffectiveDelta: number
+    incrementalTranslationReverseDeadzone: number
+    translationStartVelocityUmS: number
+    translationMaxVelocityUmS: number
+    rotationStartVelocityDegS: number
+    rotationMaxVelocityDegS: number
+    motionProfileAccSec: number
+    motionProfileDecSec: number
+    leftEnabledAxes: boolean[]
+    rightEnabledAxes: boolean[]
     requireClutch: boolean
     stabilityMode: Omega7StabilityMode
     tcpFallbackPort: number

@@ -34,7 +34,11 @@ link /nologo /OUT:"HalServer.next.exe" ^
   ws2_32.lib ^
   || goto :err
 
-echo Build succeeded: %BUILD%\HalServer.next.exe
+for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set BUILD_STAMP=%%I
+if exist "HalServer.exe" copy /Y "HalServer.exe" "HalServer.backup-%BUILD_STAMP%.exe" >nul || goto :err
+copy /Y "HalServer.next.exe" "HalServer.exe" >nul || goto :err
+
+echo Build succeeded: %BUILD%\HalServer.exe
 popd
 exit /b 0
 

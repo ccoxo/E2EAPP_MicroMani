@@ -251,6 +251,17 @@ def test_motion_origin_capture_clear_and_per_side_config(tmp_path: Path, monkeyp
 def test_home_all_requires_and_sends_captured_work_origin(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     client = TestClient(create_app(tmp_path))
+    settings = client.app.state.settings
+    config = settings.get_config()
+    config["motion"]["origin"] = {
+        "valid": False,
+        "leftValid": False,
+        "rightValid": False,
+        "leftPulse": [0.0] * 6,
+        "rightPulse": [0.0] * 6,
+        "updatedAt": 0,
+    }
+    settings.save_config(config, emit_log=False)
 
     missing_response = client.post("/api/motion/home_all")
     assert missing_response.status_code == 503

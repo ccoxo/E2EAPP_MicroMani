@@ -18,13 +18,52 @@ DEFAULT_MOTION_PROFILE: dict[str, Any] = {
     },
 }
 
+ICF_TELEOP_STRATEGY_VERSION = "icf_omega7_20260513"
+ICF_WORK_ORIGIN_VERSION = "icf_work_origin_20260513"
+
 DEFAULT_SOFT_LIMITS: dict[str, Any] = {
-    "x": {"min": -25000, "max": 25000},
-    "y": {"min": -37500, "max": 37500},
-    "z": {"min": -37500, "max": 37500},
-    "roll": {"min": -180, "max": 180},
-    "pitch": {"min": -70, "max": 70},
-    "yaw": {"min": -7.5, "max": 7.5},
+    "x": {"min": -40000000, "max": 40000000},
+    "y": {"min": -20000000, "max": 20000000},
+    "z": {"min": -20000000, "max": 20000000},
+    "roll": {"min": -120000, "max": 120000},
+    "pitch": {"min": -80000, "max": 80000},
+    "yaw": {"min": -60000, "max": 60000},
+}
+
+ICF_TELEOP_DEFAULTS: dict[str, Any] = {
+    "strategyVersion": ICF_TELEOP_STRATEGY_VERSION,
+    "swapHands": True,
+    "leftTranslationScale": 0.30,
+    "rightTranslationScale": 0.30,
+    "leftRotationScale": 0.15,
+    "rightRotationScale": 0.15,
+    "leftAxisOutputScale": [0.20, 0.20, 1.00, 1.00, 1.00, 0.25],
+    "rightAxisOutputScale": [0.40, 0.20, 1.00, 1.00, 1.00, 0.25],
+    "translationDeadzone": 0.00002,
+    "rotationDeadzone": 0.05,
+    "incrementalTranslationMinEffectiveDelta": 0.00005,
+    "incrementalTranslationReverseDeadzone": 0.00010,
+    "translationStepLimitPulse": 4000,
+    "rotationStepLimitPulse": 1250,
+    "translationStepUm": 5000.0,
+    "rotationStepDeg": 0.2,
+    "translationStartVelocityUmS": 400.0,
+    "translationMaxVelocityUmS": 5000.0,
+    "rotationStartVelocityDegS": 0.25,
+    "rotationMaxVelocityDegS": 3.0,
+    "motionProfileAccSec": 0.05,
+    "motionProfileDecSec": 0.05,
+    "leftEnabledAxes": [True, True, True, True, True, True],
+    "rightEnabledAxes": [True, True, True, True, True, True],
+}
+
+ICF_WORK_ORIGIN_DEFAULTS: dict[str, Any] = {
+    "valid": True,
+    "leftValid": True,
+    "rightValid": True,
+    "leftPulse": [100000.0, 0.0, -35179.0, 64833.0, 64839.0, -2947.0],
+    "rightPulse": [-233.0, -19221.0, 593101.0, 4427.0, -81110.0, -180.0],
+    "updatedAt": 1778586070000,
 }
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -76,16 +115,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "motionThreadHz": 1000,
         "jogStepUm": 50,
         "jogStepDeg": 0.05,
-        "yawSoftLimitDeg": 7.5,
+        "yawSoftLimitDeg": 60000,
         "positionSource": "dmc_get_position",
-        "origin": {
-            "valid": False,
-            "leftValid": False,
-            "rightValid": False,
-            "leftPulse": [0.0] * 6,
-            "rightPulse": [0.0] * 6,
-            "updatedAt": 0,
-        },
+        "workOriginStrategyVersion": ICF_WORK_ORIGIN_VERSION,
+        "origin": deepcopy(ICF_WORK_ORIGIN_DEFAULTS),
         "homeOnStartup": {
             "enabled": False,
             "mode": "work_origin",
@@ -126,7 +159,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "fzStopN": 5,
         "momentWarnNm": 0.02,
         "momentStopNm": 0.04,
-        "yawSoftLimitDeg": 7.5,
+        "yawSoftLimitDeg": 60000,
         "watchdogMs": 50,
     },
     "zmq": {
@@ -173,12 +206,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "rightGravityCompensation": True,
         "leftForceFeedback": False,
         "rightForceFeedback": False,
-        "leftTranslationScale": 0.24,
-        "rightTranslationScale": 0.3,
-        "leftRotationScale": 0.18,
-        "rightRotationScale": 0.18,
-        "translationDeadzone": 0.00002,
-        "rotationDeadzone": 0.08,
+        **deepcopy(ICF_TELEOP_DEFAULTS),
         "requireClutch": False,
         "stabilityMode": "track",
         "tcpFallbackPort": 12345,

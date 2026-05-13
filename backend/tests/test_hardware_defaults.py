@@ -25,6 +25,38 @@ def test_motion_translation_profile_uses_um_units() -> None:
     assert "maxAcceleration" not in translation
 
 
+def test_omega7_teleop_defaults_match_icf_strategy() -> None:
+    config = default_config()
+    teleop = config["teleop"]
+
+    assert teleop["strategyVersion"] == "icf_omega7_20260513"
+    assert teleop["swapHands"] is True
+    assert teleop["leftTranslationScale"] == 0.30
+    assert teleop["rightTranslationScale"] == 0.30
+    assert teleop["leftRotationScale"] == 0.15
+    assert teleop["rightRotationScale"] == 0.15
+    assert teleop["leftAxisOutputScale"] == [0.20, 0.20, 1.0, 1.0, 1.0, 0.25]
+    assert teleop["rightAxisOutputScale"] == [0.40, 0.20, 1.0, 1.0, 1.0, 0.25]
+    assert teleop["translationStepLimitPulse"] == 4000
+    assert teleop["rotationStepLimitPulse"] == 1250
+    assert teleop["translationMaxVelocityUmS"] == 5000.0
+    assert teleop["rotationMaxVelocityDegS"] == 3.0
+    assert teleop["leftEnabledAxes"] == [True] * 6
+    assert teleop["rightEnabledAxes"] == [True] * 6
+
+
+def test_work_origin_defaults_match_icf_reference_position() -> None:
+    config = default_config()
+    origin = config["motion"]["origin"]
+
+    assert config["motion"]["workOriginStrategyVersion"] == "icf_work_origin_20260513"
+    assert origin["valid"] is True
+    assert origin["leftValid"] is True
+    assert origin["rightValid"] is True
+    assert origin["leftPulse"] == [100000.0, 0.0, -35179.0, 64833.0, 64839.0, -2947.0]
+    assert origin["rightPulse"] == [-233.0, -19221.0, 593101.0, 4427.0, -81110.0, -180.0]
+
+
 def test_force_defaults_match_nidaq_reference_project() -> None:
     config = default_config()
 

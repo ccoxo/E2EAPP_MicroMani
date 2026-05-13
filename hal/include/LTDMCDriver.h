@@ -32,6 +32,11 @@ class LTDMCDriver {
   void updateTeleopTargetUi(
       Side side,
       const std::array<double, 6>& deltaUi,
+      double translationStepPulse,
+      double rotationStepPulse,
+      const std::array<bool, 6>& enabledAxes,
+      bool syncZeroDeltaTarget,
+      const std::array<AxisLimit, 6>& limits,
       double translationVelocityUiPerSec,
       double rotationVelocityUiPerSec,
       double translationStartVelocityUiPerSec = 0.0,

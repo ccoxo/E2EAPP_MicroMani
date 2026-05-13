@@ -259,6 +259,29 @@ double jsonNumberValue(const std::string& body, const std::string& key, double f
   return end == start ? fallback : value;
 }
 
+bool jsonBoolValue(const std::string& body, const std::string& key, bool fallback) {
+  const auto marker = std::string("\"") + key + "\"";
+  auto pos = body.find(marker);
+  if (pos == std::string::npos) {
+    return fallback;
+  }
+  pos = body.find(':', pos + marker.size());
+  if (pos == std::string::npos) {
+    return fallback;
+  }
+  ++pos;
+  while (pos < body.size() && std::isspace(static_cast<unsigned char>(body[pos]))) {
+    ++pos;
+  }
+  if (body.compare(pos, 4, "true") == 0) {
+    return true;
+  }
+  if (body.compare(pos, 5, "false") == 0) {
+    return false;
+  }
+  return fallback;
+}
+
 bool jsonNumberArrayValue(const std::string& body, const std::string& key, size_t index, double* out) {
   const auto marker = std::string("\"") + key + "\"";
   auto pos = body.find(marker);
@@ -296,6 +319,48 @@ bool jsonNumberArrayValue(const std::string& body, const std::string& key, size_
   return false;
 }
 
+bool jsonBoolArrayValue(const std::string& body, const std::string& key, size_t index, bool* out) {
+  const auto marker = std::string("\"") + key + "\"";
+  auto pos = body.find(marker);
+  if (pos == std::string::npos) {
+    return false;
+  }
+  pos = body.find('[', pos + marker.size());
+  if (pos == std::string::npos) {
+    return false;
+  }
+  ++pos;
+  for (size_t current = 0; current <= index; ++current) {
+    while (pos < body.size() && std::isspace(static_cast<unsigned char>(body[pos]))) {
+      ++pos;
+    }
+    bool value = true;
+    size_t valueLength = 0;
+    if (body.compare(pos, 4, "true") == 0) {
+      value = true;
+      valueLength = 4;
+    } else if (body.compare(pos, 5, "false") == 0) {
+      value = false;
+      valueLength = 5;
+    } else {
+      return false;
+    }
+    if (current == index) {
+      *out = value;
+      return true;
+    }
+    pos += valueLength;
+    while (pos < body.size() && std::isspace(static_cast<unsigned char>(body[pos]))) {
+      ++pos;
+    }
+    if (pos >= body.size() || body[pos] != ',') {
+      return false;
+    }
+    ++pos;
+  }
+  return false;
+}
+
 std::array<double, 12> jsonWorkOriginPulse(const std::string& body) {
   std::array<double, 12> pulses{};
   for (size_t i = 0; i < 6; ++i) {
@@ -307,6 +372,31 @@ std::array<double, 12> jsonWorkOriginPulse(const std::string& body) {
     }
   }
   return pulses;
+}
+
+std::array<appstation::hal::AxisLimit, 6> jsonTeleopSoftLimits(const std::string& body) {
+  std::array<appstation::hal::AxisLimit, 6> limits{};
+  for (size_t i = 0; i < limits.size(); ++i) {
+    if (!jsonNumberArrayValue(body, "softLimitMin", i, &limits[i].min)
+        || !jsonNumberArrayValue(body, "softLimitMax", i, &limits[i].max)) {
+      throw std::runtime_error("teleop_target_update requires softLimitMin[6] and softLimitMax[6]");
+    }
+    if (limits[i].min >= limits[i].max) {
+      throw std::runtime_error("teleop_target_update soft limit min must be less than max");
+    }
+  }
+  return limits;
+}
+
+std::array<bool, 6> jsonTeleopEnabledAxes(const std::string& body) {
+  std::array<bool, 6> enabled{true, true, true, true, true, true};
+  for (size_t i = 0; i < enabled.size(); ++i) {
+    bool value = true;
+    if (jsonBoolArrayValue(body, "enabledAxes", i, &value)) {
+      enabled[i] = value;
+    }
+  }
+  return enabled;
 }
 
 appstation::hal::Side parseSide(const std::string& value) {
@@ -330,6 +420,25 @@ appstation::hal::SemanticAxis parseAxis(const std::string& value) {
   if (value == "Pitch") return SemanticAxis::Pitch;
   if (value == "Yaw") return SemanticAxis::Yaw;
   throw std::runtime_error("unknown axis");
+}
+
+int envIntValue(const char* key, int fallback) {
+  const char* raw = std::getenv(key);
+  if (!raw || !*raw) {
+    return fallback;
+  }
+  char* end = nullptr;
+  const auto value = std::strtol(raw, &end, 10);
+  return end == raw ? fallback : static_cast<int>(value);
+}
+
+bool envBoolValue(const char* key, bool fallback) {
+  const char* raw = std::getenv(key);
+  if (!raw || !*raw) {
+    return fallback;
+  }
+  const auto value = lowercase(raw);
+  return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
 std::string httpResponse(int code, const std::string& body, bool keepAlive) {
@@ -430,6 +539,11 @@ void serveConnection(
         motion.updateTeleopTargetUi(
             side,
             deltas,
+            jsonNumberValue(bodyText, "translationStepLimitPulse", 0.0),
+            jsonNumberValue(bodyText, "rotationStepLimitPulse", 0.0),
+            jsonTeleopEnabledAxes(bodyText),
+            jsonBoolValue(bodyText, "syncZeroDeltaTarget", false),
+            jsonTeleopSoftLimits(bodyText),
             jsonNumberValue(bodyText, "translationVelocityUiPerSec", 0.0),
             jsonNumberValue(bodyText, "rotationVelocityUiPerSec", 0.0),
             jsonNumberValue(bodyText, "translationStartVelocityUiPerSec", 0.0),
@@ -472,7 +586,10 @@ int main() {
   LTDMCDriver motion;
   Omega7Driver omega;
   const bool motionOk = motion.initialize();
-  omega.initialize(0, 1);
+  const int leftOpenId = envIntValue("APPSTATION_OMEGA7_LEFT_OPEN_ID", 0);
+  const int rightOpenId = envIntValue("APPSTATION_OMEGA7_RIGHT_OPEN_ID", 1);
+  const bool swapHands = envBoolValue("APPSTATION_OMEGA7_SWAP_HANDS", true);
+  omega.initialize(leftOpenId, rightOpenId, swapHands);
 
   MotionControlThread motionThread(motion);
   if (motionOk) {

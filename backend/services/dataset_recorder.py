@@ -9,8 +9,11 @@ import os
 import re
 import shutil
 import time
-from dataclasses import dataclass
+from bisect import bisect_left
+from collections import deque
+from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, TextIO
 
 from backend.core.config import SettingsService
@@ -82,16 +85,35 @@ ACTION_FEATURE_NAMES: tuple[str, ...] = (
 )
 FORCE_FEATURE_NAMES: tuple[str, ...] = ("fx", "fy", "fz", "mx", "my", "mz")
 GRIPPER_FEATURE_NAMES: tuple[str, str] = ("left_gap_mm", "right_gap_mm")
-SOURCE_KEYS: tuple[str, ...] = ("hal", "camera", "force", "gripper", "omega")
+CAMERA_SOURCE_KEYS: dict[str, str] = {key: f"camera_{key}" for key in CAMERA_KEYS}
+CAMERA_KEY_BY_SOURCE: dict[str, str] = {source: key for key, source in CAMERA_SOURCE_KEYS.items()}
+SOURCE_KEYS: tuple[str, ...] = (
+    "hal",
+    "force",
+    "gripper",
+    *CAMERA_SOURCE_KEYS.values(),
+    "omega",
+)
 SOURCE_TIMEOUT_S: dict[str, float] = {
     "hal": 0.020,
     "camera": 0.0333,
     "force": 0.020,
     "omega": 0.020,
+    **{source: 0.035 for source in CAMERA_SOURCE_KEYS.values()},
 }
 # timeout 用 drop 边界，warning 用更严格的 skew 边界；这样慢但成功的源也会进入质量报告。
-SOURCE_WARNING_SKEW_MS: dict[str, float] = {"hal": 20.0, "camera": 16.7, "gripper": 33.4}
-SOURCE_DROP_SKEW_MS: dict[str, float] = {"camera": 33.3}
+SOURCE_MAX_SKEW_S: dict[str, float] = {
+    "hal": 0.020,
+    "force": 0.010,
+    "gripper": 0.050,
+    "omega": 0.020,
+    **{source: 0.035 for source in CAMERA_SOURCE_KEYS.values()},
+}
+SOURCE_WARNING_SKEW_MS: dict[str, float] = {
+    source: max_skew_s * 1000.0 for source, max_skew_s in SOURCE_MAX_SKEW_S.items()
+}
+SOURCE_DROP_SKEW_MS: dict[str, float] = {source: 35.0 for source in CAMERA_SOURCE_KEYS.values()}
+RING_BUFFER_RETENTION_S = 3.0
 PLACEHOLDER_JPEG_BYTES = base64.b64decode(
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////"
     "////////////////////////////2wBDAf//////////////////////////////////////////////////////////"
@@ -107,11 +129,11 @@ PLACEHOLDER_JPEG_BYTES = base64.b64decode(
 
 
 @dataclass(frozen=True)
-class SourceSample:
+class TimedSample:
     # 记录每个硬件源相对同一录制 tick 的时序，用于质量统计而不写入训练帧。
     source: str
-    value: Any
     monotonic_s: float
+    value: Any
     ok: bool = True
     message: str = ""
     target_monotonic_s: float = 0.0
@@ -121,6 +143,91 @@ class SourceSample:
     timed_out: bool = False
     stale: bool = False
     cache_used: bool = False
+
+
+SourceSample = TimedSample
+
+
+class TimedRingBuffer:
+    def __init__(self, *, retention_s: float = RING_BUFFER_RETENTION_S, maxlen: int = 300) -> None:
+        self.retention_s = max(float(retention_s), 0.1)
+        self.maxlen = max(int(maxlen), 1)
+        self._samples: deque[TimedSample] = deque()
+
+    def append(self, sample: TimedSample) -> None:
+        if not self._samples or sample.monotonic_s >= self._samples[-1].monotonic_s:
+            self._samples.append(sample)
+        else:
+            samples = list(self._samples)
+            index = bisect_left([item.monotonic_s for item in samples], sample.monotonic_s)
+            samples.insert(index, sample)
+            self._samples = deque(samples)
+        latest_s = max(item.monotonic_s for item in self._samples)
+        self.prune(latest_s - self.retention_s)
+        while len(self._samples) > self.maxlen:
+            self._samples.popleft()
+
+    def nearest(self, target_s: float, max_skew_s: float) -> TimedSample | None:
+        if not self._samples:
+            return None
+        samples = list(self._samples)
+        times = [sample.monotonic_s for sample in samples]
+        index = bisect_left(times, target_s)
+        candidates = []
+        if index < len(samples):
+            candidates.append(samples[index])
+        if index > 0:
+            candidates.append(samples[index - 1])
+        if not candidates:
+            return None
+        nearest = min(candidates, key=lambda sample: abs(sample.monotonic_s - target_s))
+        return nearest if abs(nearest.monotonic_s - target_s) <= max_skew_s else None
+
+    def interpolate(self, target_s: float, max_gap_s: float) -> TimedSample | None:
+        if not self._samples:
+            return None
+        samples = list(self._samples)
+        times = [sample.monotonic_s for sample in samples]
+        index = bisect_left(times, target_s)
+        if index <= 0 or index >= len(samples):
+            return self.nearest(target_s, max_gap_s)
+        before = samples[index - 1]
+        after = samples[index]
+        gap_s = after.monotonic_s - before.monotonic_s
+        if gap_s <= 0 or gap_s > max_gap_s:
+            return None
+        if not (
+            isinstance(before.value, list)
+            and isinstance(after.value, list)
+            and len(before.value) == len(after.value)
+        ):
+            return self.nearest(target_s, max_gap_s)
+        try:
+            ratio = (target_s - before.monotonic_s) / gap_s
+            value = [
+                float(left) + (float(right) - float(left)) * ratio
+                for left, right in zip(before.value, after.value, strict=True)
+            ]
+        except (TypeError, ValueError):
+            return self.nearest(target_s, max_gap_s)
+        return TimedSample(
+            before.source,
+            target_s,
+            value,
+            before.ok and after.ok,
+            "interpolated",
+            target_monotonic_s=target_s,
+        )
+
+    def prune(self, before_s: float) -> None:
+        while self._samples and self._samples[0].monotonic_s < before_s:
+            self._samples.popleft()
+
+    def clear(self) -> None:
+        self._samples.clear()
+
+    def __len__(self) -> int:
+        return len(self._samples)
 
 
 class DatasetRecorderService:
@@ -149,6 +256,7 @@ class DatasetRecorderService:
         self.teleop = teleop
         self._lock = asyncio.Lock()
         self._loop_task: asyncio.Task[None] | None = None
+        self._sampler_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_active = False
         self._recording = False
         self._session_id = ""
@@ -158,6 +266,7 @@ class DatasetRecorderService:
         self._dataset_dir: Path | None = None
         self._episode_index = 0
         self._episode_started_at = 0.0
+        self._episode_start_monotonic_s = 0.0
         self._session_started_at = 0.0
         self._episode_frames = 0
         self._episode_late_frames = 0
@@ -166,6 +275,8 @@ class DatasetRecorderService:
         self._tick_capture_monotonic_s = 0.0
         self._tick_skews_ms: list[float] = []
         self._drop_counts: dict[str, int] = {key: 0 for key in (*CAMERA_KEYS, *SOURCE_KEYS)}
+        self._stale_counts: dict[str, int] = {key: 0 for key in SOURCE_KEYS}
+        self._cache_counts: dict[str, int] = {key: 0 for key in SOURCE_KEYS}
         self._late_source_frames: dict[str, int] = {}
         self._source_skews_ms: dict[str, list[float]] = {key: [] for key in SOURCE_KEYS}
         self._source_elapsed_ms: dict[str, list[float]] = {key: [] for key in SOURCE_KEYS}
@@ -184,6 +295,7 @@ class DatasetRecorderService:
         self._record_fps_hz = 30
         self._force_sample_hz = 200.0
         self._force_window_samples_per_frame = 7
+        self._sample_buffers: dict[str, TimedRingBuffer] = self._new_sample_buffers({})
         self._current_data_path: Path | None = None
         self._current_episode_paths: list[Path] = []
         self._last_saved_episode: dict[str, Any] | None = None
@@ -219,8 +331,9 @@ class DatasetRecorderService:
             self._episode_index = self._next_episode_index(self._dataset_dir)
             self._session_started_at = time.monotonic()
             self._session_active = True
-            self._loop_task = asyncio.create_task(self._record_loop(), name="dataset-recorder")
             self._begin_episode_locked()
+            self._start_sampler_tasks_locked()
+            self._loop_task = asyncio.create_task(self._record_loop(), name="dataset-recorder")
             self.telemetry.episode_count = self._episode_index
             self.telemetry.frame_count = 0
             self.telemetry.recording = True
@@ -298,6 +411,7 @@ class DatasetRecorderService:
             except asyncio.CancelledError:
                 pass
         self._loop_task = None
+        await self._stop_sampler_tasks()
         self._finalize_native_dataset()
         self.logs.info("[LEROBOT]", "record session finished")
         return self.status()
@@ -357,7 +471,7 @@ class DatasetRecorderService:
                     "format": str(
                         app_info.get("format")
                         or info.get("format")
-                        or ("lerobot-v3-native" if native_format else "unknown")
+                        or ("lerobot-v3-native" if native_format else "lerobot-v3-jsonl-fallback")
                     ),
                     "episodes": [
                         self._episode_for_api(dataset_dir, dataset_dir.name, episode) for episode in visible_episodes
@@ -696,63 +810,226 @@ class DatasetRecorderService:
         image = item.get(CAMERA_FEATURE_KEYS[camera])
         return self._encode_rgb_tensor_to_jpeg(image, np)
 
-    async def _record_loop(self) -> None:
-        # 录制循环按目标 FPS 调度；慢帧只记质量指标，不中断本轮采集。
-        period_s = 1.0 / max(1, self._record_fps_hz)  # 录制主轴周期：1 / fps。
-        # 下一帧的开始时间
-        next_tick = time.monotonic()
-        # 录制循环
+    def _new_sample_buffers(self, config: dict[str, Any]) -> dict[str, TimedRingBuffer]:
+        return {
+            source: TimedRingBuffer(
+                retention_s=RING_BUFFER_RETENTION_S,
+                maxlen=max(8, int(self._source_sample_rate_hz(source, config) * RING_BUFFER_RETENTION_S) + 4),
+            )
+            for source in SOURCE_KEYS
+        }
+
+    def _start_sampler_tasks_locked(self) -> None:
+        for source in SOURCE_KEYS:
+            task = self._sampler_tasks.get(source)
+            if task is None or task.done():
+                self._sampler_tasks[source] = asyncio.create_task(
+                    self._sample_source_loop(source),
+                    name=f"dataset-sampler-{source}",
+                )
+
+    async def _stop_sampler_tasks(self) -> None:
+        tasks = [task for task in self._sampler_tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._sampler_tasks = {}
+
+    async def _sample_source_loop(self, source: str) -> None:
+        next_sample_s = time.monotonic()
         while self._session_active:
             try:
-                # 复位时不刷刷新 下一帧开始时间
+                config = self.settings.get_config()
+                sample = await self._sample_source_once(source, config)
+                self._sample_buffers.setdefault(source, TimedRingBuffer()).append(sample)
+                period_s = 1.0 / self._source_sample_rate_hz(source, config)
+                scheduled_s = next_sample_s + period_s
+                now = time.monotonic()
+                next_sample_s = scheduled_s if scheduled_s > now else now + period_s
+                await asyncio.sleep(max(0.0, next_sample_s - time.monotonic()))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.logs.warning("[LEROBOT]", f"{source} sampler recovered: {exc}")
+                await asyncio.sleep(0.1)
+
+    async def _sample_source_once(self, source: str, config: dict[str, Any]) -> TimedSample:
+        target_s = time.monotonic()
+        if source == "hal":
+            return await self._timed_source("hal", self.hal.motion_state(), target_s, record_quality=False)
+        if source == "omega":
+            return await self._timed_source("omega", self.hal.omega_state(), target_s, record_quality=False)
+        if source == "force":
+            return await self._sample_force_source(config, target_s)
+        if source == "gripper":
+            return await self._gripper_source(config, target_s, record_quality=False)
+        camera = CAMERA_KEY_BY_SOURCE.get(source)
+        if camera is not None:
+            return await self._sample_camera_source(config, camera, target_s)
+        return self._fallback_sample(source, target_s, f"{source} unsupported")
+
+    async def _sample_force_source(self, config: dict[str, Any], target_s: float) -> TimedSample:
+        if not self._real_hardware_mode(config):
+            value = SimpleNamespace(
+                ok=True,
+                left=list(self.telemetry.force_left),
+                right=list(self.telemetry.force_right),
+            )
+            return SourceSample("force", target_s, value, True, "", target_monotonic_s=target_s)
+        return await self._timed_source(
+            "force",
+            asyncio.to_thread(self.hardware.force.sample_window, config, 1),
+            target_s,
+            record_quality=False,
+        )
+
+    async def _sample_camera_source(self, config: dict[str, Any], camera: str, target_s: float) -> TimedSample:
+        source = CAMERA_SOURCE_KEYS[camera]
+        feature_key = CAMERA_FEATURE_KEYS[camera]
+        started = time.monotonic()
+        if not self._real_hardware_mode(config):
+            value = self._camera_placeholder_value(feature_key)
+            finished = time.monotonic()
+            return SourceSample(
+                source,
+                finished,
+                value,
+                True,
+                "",
+                target_monotonic_s=target_s,
+                started_monotonic_s=started,
+                finished_monotonic_s=finished,
+                elapsed_ms=(finished - started) * 1000.0,
+            )
+        try:
+            jpeg = await asyncio.to_thread(self.hardware.cameras.snapshot, config, camera)
+            value = self._decode_jpeg_to_rgb(jpeg, config, camera) if self._native_dataset is not None else jpeg
+            if self._native_dataset is not None:
+                self._last_native_camera_frames[feature_key] = value
+            else:
+                self._last_camera_frames[camera] = jpeg
+            ok = True
+            message = ""
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            message = f"{source} cache used: {exc}"
+            value = self._last_camera_value(camera, feature_key)
+        finished = time.monotonic()
+        return SourceSample(
+            source,
+            finished,
+            value,
+            ok,
+            message,
+            target_monotonic_s=target_s,
+            started_monotonic_s=started,
+            finished_monotonic_s=finished,
+            elapsed_ms=(finished - started) * 1000.0,
+            timed_out=(finished - started) > self._source_timeout_s(source),
+            stale=not ok,
+            cache_used=not ok,
+        )
+
+    def _aligned_sample(self, source: str, target_s: float) -> TimedSample:
+        buffer = self._sample_buffers.get(source)
+        max_skew_s = SOURCE_MAX_SKEW_S.get(source, 0.020)
+        sample = buffer.nearest(target_s, max_skew_s) if buffer is not None else None
+        if sample is None and buffer is not None:
+            sample = buffer.nearest(target_s, math.inf)
+            if sample is not None:
+                sample = replace(
+                    sample,
+                    target_monotonic_s=target_s,
+                    stale=True,
+                    cache_used=sample.cache_used or source in CAMERA_KEY_BY_SOURCE,
+                    message=sample.message or f"{source} stale",
+                )
+        if sample is None:
+            sample = self._fallback_sample(source, target_s, f"{source} missing")
+        elif sample.value is None:
+            fallback = self._fallback_sample(source, target_s, sample.message or f"{source} missing")
+            sample = replace(sample, value=fallback.value, stale=True)
+        self._record_source_quality(sample, target_s, sample.elapsed_ms)
+        return sample
+
+    def _fallback_sample(self, source: str, target_s: float, message: str) -> TimedSample:
+        value: Any = None
+        if source == "hal":
+            value = {"positions": list(self.telemetry.motion_positions), "pulses": [0.0] * 12}
+        elif source == "force":
+            value = SimpleNamespace(
+                ok=True,
+                left=list(self.telemetry.force_left),
+                right=list(self.telemetry.force_right),
+            )
+        elif source == "gripper":
+            value = list(self.telemetry.gripper_positions)
+        elif source in CAMERA_KEY_BY_SOURCE:
+            camera = CAMERA_KEY_BY_SOURCE[source]
+            value = self._last_camera_value(camera, CAMERA_FEATURE_KEYS[camera])
+        return SourceSample(
+            source,
+            target_s,
+            value,
+            False,
+            message,
+            target_monotonic_s=target_s,
+            stale=True,
+            cache_used=source in CAMERA_KEY_BY_SOURCE,
+        )
+
+    async def _record_loop(self) -> None:
+        # 录制循环按目标 FPS 调度；慢帧只记质量指标，不中断本轮采集。
+        # Hardware samples are produced by source samplers; this loop only aligns and writes frames.
+        while self._session_active:
+            try:
                 if not self._recording:
                     await asyncio.sleep(0.05)
-                    next_tick = time.monotonic()
                     continue
+                period_s = 1.0 / max(1, self._record_fps_hz)
+                frame_index = self._episode_frames
+                episode_start = self._episode_start_monotonic_s or time.monotonic()
+                target_tick = episode_start + frame_index * period_s
                 now = time.monotonic()
-                # 检查帧时间是否慢
-                if now > next_tick + period_s:
+                if now < target_tick:
+                    await asyncio.sleep(target_tick - now)
+                    now = time.monotonic()
+                if now > target_tick + period_s:
                     async with self._lock:
                         self._episode_late_frames += 1
-                # 记录当前 tick 的实际采集时间，用于 episode 质量统计。
-                target_tick = next_tick
-                capture_tick = time.monotonic()
-                frame = await self._collect_frame(target_tick)
+                capture_tick = now
+                frame = await self._collect_frame(target_tick, frame_index=frame_index)
                 async with self._lock:
                     self._tick_target_monotonic_s = target_tick
                     self._tick_capture_monotonic_s = capture_tick
                     self._tick_skews_ms.append((capture_tick - target_tick) * 1000.0)
                     self._write_frame_locked(frame)
-                next_tick += period_s
-                await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
+                next_target = (self._episode_start_monotonic_s or episode_start) + self._episode_frames * period_s
+                await asyncio.sleep(max(0.0, next_target - time.monotonic()))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 self.logs.error("[LEROBOT]", f"record loop recovered: {exc}")
                 await asyncio.sleep(0.2)
 
-    async def _collect_frame(self, target_monotonic_s: float | None = None) -> dict[str, Any]:
+    async def _collect_frame(
+        self,
+        target_monotonic_s: float | None = None,
+        *,
+        frame_index: int | None = None,
+    ) -> dict[str, Any]:
         config = self.settings.get_config()
         target_monotonic_s = target_monotonic_s if target_monotonic_s is not None else time.monotonic()
+        frame_index = self._episode_frames if frame_index is None else frame_index
         motion_positions = list(self.telemetry.motion_positions)
         motion_pulses = [0.0] * 12
         force_left = list(self.telemetry.force_left)
         force_right = list(self.telemetry.force_right)
-        # 同一个 tick 内并发启动主要硬件源，避免 HAL、力觉和相机串行耗时累加。
-        # 单个源超时或失败只降级该源，不能阻塞其他源写入当前帧。
-        (
-            hal_sample,
-            force_sample,
-            camera_sample,
-            gripper_sample,
-            omega_sample,
-        ) = await asyncio.gather(
-            self._timed_source("hal", self.hal.motion_state(), target_monotonic_s),
-            self._timed_source("force", self._force_window_sample(config), target_monotonic_s),
-            self._timed_source("camera", self._capture_cameras(config), target_monotonic_s),
-            self._gripper_source(config, target_monotonic_s),
-            self._timed_source("omega", self.hal.omega_state(), target_monotonic_s),
-        )
+        hal_sample = self._aligned_sample("hal", target_monotonic_s)
+        force_sample = self._aligned_sample("force", target_monotonic_s)
+        gripper_sample = self._aligned_sample("gripper", target_monotonic_s)
+        self._aligned_sample("omega", target_monotonic_s)
         motion_state = hal_sample.value if hal_sample.ok and isinstance(hal_sample.value, dict) else {}
         raw_positions = motion_state.get("positions") if isinstance(motion_state, dict) else None
         if isinstance(raw_positions, list) and len(raw_positions) == 12:
@@ -761,21 +1038,29 @@ class DatasetRecorderService:
         if isinstance(raw_pulses, list) and len(raw_pulses) == 12:
             motion_pulses = [float(value) for value in raw_pulses]
         motion_positions = self._recording_motion_positions(config, motion_positions, motion_pulses)
-        force_result = force_sample.value
-        if force_sample.ok and getattr(force_result, "ok", False):
-            force_left = [float(value) for value in force_result.left]
-            force_right = [float(value) for value in force_result.right]
+        force_values = self._force_values_from_sample(force_sample.value)
+        if force_values is not None:
+            force_left, force_right = force_values
         gripper_positions = (
             list(gripper_sample.value)
-            if gripper_sample.ok and isinstance(gripper_sample.value, list)
+            if isinstance(gripper_sample.value, list)
             else list(self.telemetry.gripper_positions)
         )
         observation_state = self._compose_observation_state(motion_positions, gripper_positions)
-        image_payload = camera_sample.value if camera_sample.ok and isinstance(camera_sample.value, dict) else {}
+        image_payload: dict[str, Any] = {}
+        for camera, source in CAMERA_SOURCE_KEYS.items():
+            feature_key = CAMERA_FEATURE_KEYS[camera]
+            camera_sample = self._aligned_sample(source, target_monotonic_s)
+            image_payload[feature_key] = (
+                camera_sample.value
+                if camera_sample.value is not None
+                else self._camera_placeholder_value(feature_key)
+            )
         action = self._latest_action_vector(observation_state, config)
-        # 训练帧只保留 LeRobot v3 标准字段；调试用 appstation/force-window 字段避免进入数据集。
         return {
-            "timestamp": self._episode_frames / max(1, self._record_fps_hz),
+            "timestamp": frame_index / max(1, self._record_fps_hz),
+            "frame_index": frame_index,
+            "episode_index": self._episode_index,
             "observation.state": observation_state,
             "observation.pulses": motion_pulses,
             "observation.force_left": force_left,
@@ -802,26 +1087,45 @@ class DatasetRecorderService:
             self._force_window_samples_per_frame,
         )
 
-    async def _cached_source(self, source: str, value: Any, target_monotonic_s: float) -> SourceSample:
+    async def _cached_source(
+        self,
+        source: str,
+        value: Any,
+        target_monotonic_s: float,
+        *,
+        record_quality: bool = True,
+    ) -> SourceSample:
         # 缓存型源本身不阻塞，但仍记录采样时间，便于质量报告统一处理。
         now = time.monotonic()
         sample = SourceSample(
             source,
-            value,
             now,
+            value,
             True,
             "",
             target_monotonic_s=target_monotonic_s,
             started_monotonic_s=now,
             finished_monotonic_s=now,
         )
-        self._record_source_quality(sample, target_monotonic_s, 0.0)
+        if record_quality:
+            self._record_source_quality(sample, target_monotonic_s, 0.0)
         return sample
 
-    async def _gripper_source(self, config: dict[str, Any], target_monotonic_s: float) -> SourceSample:
+    async def _gripper_source(
+        self,
+        config: dict[str, Any],
+        target_monotonic_s: float,
+        *,
+        record_quality: bool = True,
+    ) -> SourceSample:
         # 夹爪位置由 telemetry/worker 后台刷新；录制帧只读取缓存并检查是否过期。
         if not self._real_hardware_mode(config):
-            return await self._cached_source("gripper", list(self.telemetry.gripper_positions), target_monotonic_s)
+            return await self._cached_source(
+                "gripper",
+                list(self.telemetry.gripper_positions),
+                target_monotonic_s,
+                record_quality=record_quality,
+            )
         await self._refresh_gripper_cache(config)
         stale_after_s = self._positive_ratio(config.get("gripper", {}).get("sampleStaleMs"), 2500.0) / 1000.0
         stale_after_s = max(0.5, stale_after_s)
@@ -829,18 +1133,20 @@ class DatasetRecorderService:
         age_s = time.monotonic() - last_sample_at if last_sample_at > 0 else math.inf
         ok = age_s <= stale_after_s
         message = "" if ok else f"gripper stale: {round(age_s, 3)}s"
+        finished = time.monotonic()
         sample = SourceSample(
             "gripper",
+            finished,
             list(self.telemetry.gripper_positions),
-            last_sample_at if last_sample_at > 0 else time.monotonic(),
             ok,
             message,
             target_monotonic_s=target_monotonic_s,
             started_monotonic_s=target_monotonic_s,
-            finished_monotonic_s=time.monotonic(),
+            finished_monotonic_s=finished,
             stale=not ok,
         )
-        self._record_source_quality(sample, target_monotonic_s, 0.0)
+        if record_quality:
+            self._record_source_quality(sample, target_monotonic_s, 0.0)
         return sample
 
     async def _refresh_gripper_cache(self, config: dict[str, Any]) -> None:
@@ -849,7 +1155,14 @@ class DatasetRecorderService:
             # 录制循环主动刷新 worker 缓存，避免依赖 WebSocket 帧驱动夹爪采样。
             await asyncio.to_thread(refresh_gripper, config, time.monotonic())
 
-    async def _timed_source(self, source: str, awaitable: Any, target_monotonic_s: float) -> SourceSample:
+    async def _timed_source(
+        self,
+        source: str,
+        awaitable: Any,
+        target_monotonic_s: float,
+        *,
+        record_quality: bool = True,
+    ) -> SourceSample:
         # 单源超时只影响该源质量标记，不能拖慢同一 tick 的其他硬件源。
         started = time.monotonic()
         try:
@@ -857,7 +1170,7 @@ class DatasetRecorderService:
             ok = True
             message = ""
             timed_out = False
-        except asyncio.TimeoutError:
+        except TimeoutError:
             value = None
             ok = False
             message = f"{source} timeout"
@@ -871,8 +1184,8 @@ class DatasetRecorderService:
         elapsed_ms = (finished - started) * 1000.0
         sample = SourceSample(
             source,
-            value,
             self._source_sample_monotonic(value, finished),
+            value,
             ok,
             message,
             target_monotonic_s=target_monotonic_s,
@@ -883,21 +1196,43 @@ class DatasetRecorderService:
             stale=not ok,
             cache_used=source == "camera" and any(self._last_camera_cache_used.values()),
         )
-        self._record_source_quality(sample, target_monotonic_s, elapsed_ms)
+        if record_quality:
+            self._record_source_quality(sample, target_monotonic_s, elapsed_ms)
         return sample
 
     def _source_timeout_s(self, source: str) -> float:
         return SOURCE_TIMEOUT_S.get(source, 0.020)
 
+    def _source_sample_rate_hz(self, source: str, config: dict[str, Any]) -> float:
+        if source == "force":
+            return min(max(self._force_sample_hz_from_config(config), 1.0), 200.0)
+        if source == "gripper":
+            return min(max(self._positive_ratio(config.get("gripper", {}).get("sampleHz"), 30.0), 1.0), 60.0)
+        if source in CAMERA_KEY_BY_SOURCE:
+            return min(max(self._positive_ratio(config.get("cameras", {}).get("fps"), self._record_fps_hz), 1.0), 60.0)
+        return min(max(float(self._record_fps_from_config(config)), 1.0), 60.0)
+
+    def _force_values_from_sample(self, value: Any) -> tuple[list[float], list[float]] | None:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            left = value.get("left")
+            right = value.get("right")
+            ok = bool(value.get("ok", left is not None and right is not None))
+        else:
+            left = getattr(value, "left", None)
+            right = getattr(value, "right", None)
+            ok = bool(getattr(value, "ok", left is not None and right is not None))
+        if not ok or not isinstance(left, list) or not isinstance(right, list):
+            return None
+        return (
+            [float(item) for item in (left + [0.0] * 6)[:6]],
+            [float(item) for item in (right + [0.0] * 6)[:6]],
+        )
+
     def _source_sample_monotonic(self, value: Any, fallback_monotonic_s: float) -> float:
-        # HAL/Omega 会携带后端接收时的 monotonic 时间；其他源退回完成时间。
-        if not isinstance(value, dict):
-            return fallback_monotonic_s
-        raw = value.get("received_monotonic_ms")
-        try:
-            return float(raw) / 1000.0
-        except (TypeError, ValueError):
-            return fallback_monotonic_s
+        _ = value
+        return fallback_monotonic_s
 
     def _record_source_quality(self, sample: SourceSample, target_monotonic_s: float, elapsed_ms: float) -> None:
         # 所有源使用同一套质量统计：skew、耗时、drop、连续失败和 warning。
@@ -907,8 +1242,21 @@ class DatasetRecorderService:
         self._source_elapsed_ms.setdefault(sample.source, []).append(elapsed_ms)
         warning_threshold = SOURCE_WARNING_SKEW_MS.get(sample.source)
         if warning_threshold is not None and abs_skew_ms > warning_threshold:
-            self._late_source_frames[sample.source] = self._late_source_frames.get(sample.source, 0) + 1
+            late_source_frames = getattr(self, "_late_source_frames", {})
+            late_source_frames[sample.source] = late_source_frames.get(sample.source, 0) + 1
+            self._late_source_frames = late_source_frames
             self._source_warnings.append(f"{sample.source} skew {round(abs_skew_ms, 3)}ms")
+        if sample.stale:
+            stale_counts = getattr(self, "_stale_counts", {})
+            stale_counts[sample.source] = stale_counts.get(sample.source, 0) + 1
+            self._stale_counts = stale_counts
+        if sample.cache_used:
+            cache_counts = getattr(self, "_cache_counts", {})
+            cache_counts[sample.source] = cache_counts.get(sample.source, 0) + 1
+            self._cache_counts = cache_counts
+            camera = CAMERA_KEY_BY_SOURCE.get(sample.source)
+            if camera is not None:
+                self._camera_drops[camera] = self._camera_drops.get(camera, 0) + 1
         drop_threshold = SOURCE_DROP_SKEW_MS.get(sample.source)
         if sample.ok and drop_threshold is not None and abs_skew_ms > drop_threshold:
             self._drop_counts[sample.source] = self._drop_counts.get(sample.source, 0) + 1
@@ -974,19 +1322,17 @@ class DatasetRecorderService:
         pulses = frame["observation.pulses"]
         force_left = frame["observation.force_left"]
         force_right = frame["observation.force_right"]
+        image_paths = self._write_fallback_camera_images_locked(frame.get("images", {}))
         record = {
-            "index": self._episode_frames,
-            "episode_index": self._episode_index,
-            "frame_index": self._episode_frames,
+            "episode_index": frame.get("episode_index", self._episode_index),
+            "frame_index": frame.get("frame_index", self._episode_frames),
             "timestamp": frame["timestamp"],
-            "task": self._task,
             "observation.state": state,
             "observation.pulses": pulses,
             "observation.force_left": force_left,
             "observation.force_right": force_right,
             "action": frame["action"],
-            "next.done": False,
-            "images": frame["images"],
+            **image_paths,
         }
         self._writer.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
         self._writer.flush()
@@ -994,6 +1340,29 @@ class DatasetRecorderService:
         self.telemetry.frame_count = self._episode_frames
         self._max_force_left = max(self._max_force_left, self._force_norm(force_left))
         self._max_force_right = max(self._max_force_right, self._force_norm(force_right))
+
+    def _write_fallback_camera_images_locked(self, images: object) -> dict[str, str]:
+        paths: dict[str, str] = {}
+        image_payload = images if isinstance(images, dict) else {}
+        for _camera, feature_key in CAMERA_FEATURE_KEYS.items():
+            raw = image_payload.get(feature_key)
+            if isinstance(raw, str):
+                paths[feature_key] = raw
+                continue
+            data = raw if isinstance(raw, bytes) else self._placeholder_camera_jpeg()
+            relative = (
+                Path("videos")
+                / "chunk-000"
+                / feature_key
+                / f"episode_{self._episode_index:06d}"
+                / f"frame_{self._episode_frames:06d}.jpg"
+            )
+            target = self._require_dataset_dir() / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            self._current_episode_paths.append(target)
+            paths[feature_key] = relative.as_posix()
+        return paths
 
     def _write_native_frame_locked(self, frame: dict[str, Any]) -> None:
         if self._native_dataset is None:
@@ -1062,6 +1431,7 @@ class DatasetRecorderService:
         self._close_writer_locked()
         # 每个 episode 独立统计质量指标，保存/丢弃时可以精确回滚。
         self._episode_started_at = time.monotonic()
+        self._episode_start_monotonic_s = self._episode_started_at
         self._episode_frames = 0
         self._episode_late_frames = 0
         self._camera_drops = {key: 0 for key in CAMERA_KEYS}
@@ -1069,10 +1439,13 @@ class DatasetRecorderService:
         self._tick_capture_monotonic_s = 0.0
         self._tick_skews_ms = []
         self._drop_counts = {key: 0 for key in (*CAMERA_KEYS, *SOURCE_KEYS)}
+        self._stale_counts = {key: 0 for key in SOURCE_KEYS}
+        self._cache_counts = {key: 0 for key in SOURCE_KEYS}
         self._late_source_frames = {}
         self._source_skews_ms = {key: [] for key in SOURCE_KEYS}
         self._source_elapsed_ms = {key: [] for key in SOURCE_KEYS}
         self._source_fail_streaks = {key: 0 for key in SOURCE_KEYS}
+        self._sample_buffers = self._new_sample_buffers(self.settings.get_config())
         self._source_warnings = []
         self._last_camera_cache_used = {key: False for key in CAMERA_KEYS}
         self._max_force_left = 0.0
@@ -1121,6 +1494,8 @@ class DatasetRecorderService:
             "lateFrames": self._episode_late_frames,
             "cameraDrops": dict(self._camera_drops),
             "dropCounts": dict(self._drop_counts),
+            "staleCounts": dict(self._stale_counts),
+            "cacheCounts": dict(self._cache_counts),
             "maxSkewMs": skew["maxSkewMs"],
             "avgSkewMs": skew["avgSkewMs"],
             "jitterMs": skew["jitterMs"],
@@ -1138,11 +1513,9 @@ class DatasetRecorderService:
         info_path = dataset_dir / "meta" / "info.json"
         info = self._read_json(info_path)
         if info:
-            info["updatedAt"] = now_ms()
             if native:
+                info["updatedAt"] = now_ms()
                 self._write_appstation_info(dataset_dir, self.settings.get_config())
-            else:
-                self._write_json(info_path, info)
         self._episode_index += 1
         return episode
 
@@ -1255,8 +1628,8 @@ class DatasetRecorderService:
                 "forceSampleHz": self._force_sample_hz,
                 "forceWindowSamples": self._force_window_samples_per_frame,
                 "alignment": (
-                    "state/images/scalar force are sampled once per frame; "
-                    "force windows preserve high-rate samples"
+                    "asynchronous source samplers write monotonic ring buffers; "
+                    "record frames use nearest samples at episode_start + frame_index / fps"
                 ),
             },
             "createdAt": int(info.get("createdAt", now_ms())) if info else now_ms(),
@@ -1605,6 +1978,16 @@ class DatasetRecorderService:
             pass
         return PLACEHOLDER_JPEG_BYTES
 
+    def _camera_placeholder_value(self, feature_key: str) -> Any:
+        if self._native_dataset is not None:
+            return self._synthetic_camera_frame(feature_key)
+        return self._placeholder_camera_jpeg()
+
+    def _last_camera_value(self, camera: str, feature_key: str) -> Any:
+        if self._native_dataset is not None:
+            return self._last_native_camera_frames.get(feature_key) or self._synthetic_camera_frame(feature_key)
+        return self._last_camera_frames.get(camera) or self._placeholder_camera_jpeg()
+
     def _np_float32(self, values: object) -> Any:
         imports = self._native_imports()
         if imports is None:
@@ -1687,6 +2070,10 @@ class DatasetRecorderService:
             "samples": samples,
             "lateFrames": int(episode.get("lateFrames", 0)),
             "cameraDrops": episode.get("cameraDrops", {}),
+            "dropCounts": episode.get("dropCounts", {}),
+            "staleCounts": episode.get("staleCounts", {}),
+            "cacheCounts": episode.get("cacheCounts", {}),
+            "sourceMaxSkewMs": episode.get("sourceMaxSkewMs", {}),
             "maxForceLeft": float(episode.get("maxForceLeft", 0.0)),
             "maxForceRight": float(episode.get("maxForceRight", 0.0)),
             "features": features,
@@ -1797,6 +2184,10 @@ class DatasetRecorderService:
                     raw_path = images_raw.get(feature_key)
                     if isinstance(raw_path, str):
                         images[key] = f"/api/datasets/{dataset_id}/file?path={raw_path}"
+            for key, feature_key in CAMERA_FEATURE_KEYS.items():
+                raw_path = item.get(feature_key)
+                if isinstance(raw_path, str):
+                    images[key] = f"/api/datasets/{dataset_id}/file?path={raw_path}"
             samples.append(
                 {
                     "frame": int(item.get("frame_index", len(samples))),
@@ -1916,6 +2307,8 @@ class DatasetRecorderService:
                         "lateFrames": 0,
                         "cameraDrops": {key: 0 for key in CAMERA_KEYS},
                         "dropCounts": {key: 0 for key in (*CAMERA_KEYS, *SOURCE_KEYS)},
+                        "staleCounts": {key: 0 for key in SOURCE_KEYS},
+                        "cacheCounts": {key: 0 for key in SOURCE_KEYS},
                         "maxSkewMs": 0.0,
                         "avgSkewMs": 0.0,
                         "jitterMs": 0.0,
@@ -2028,6 +2421,12 @@ class DatasetRecorderService:
         if skew["maxSkewMs"] > 20.0:
             warnings.append(f"max skew: {skew['maxSkewMs']}ms")
         warnings.extend(dict.fromkeys(self._source_warnings))
+        for source, count in self._stale_counts.items():
+            if count:
+                warnings.append(f"{source} stale: {count}")
+        for source, count in self._cache_counts.items():
+            if count:
+                warnings.append(f"{source} cache used: {count}")
         for key, count in self._camera_drops.items():
             if count:
                 warnings.append(f"{key} camera drops: {count}")

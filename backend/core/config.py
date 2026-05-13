@@ -5,7 +5,14 @@ import re
 from pathlib import Path
 from typing import Any, cast
 
-from backend.core.defaults import default_config
+from backend.core.defaults import (
+    DEFAULT_SOFT_LIMITS,
+    ICF_TELEOP_DEFAULTS,
+    ICF_TELEOP_STRATEGY_VERSION,
+    ICF_WORK_ORIGIN_DEFAULTS,
+    ICF_WORK_ORIGIN_VERSION,
+    default_config,
+)
 from backend.core.logging import LogService, now_ms
 from backend.core.schemas import (
     AppConfig,
@@ -32,7 +39,21 @@ class SettingsService:
     def get_config(self) -> dict[str, Any]:
         try:
             data = json.loads(self.config_path.read_text(encoding="utf-8"))
-            merged = self._migrate_config(self._merge_defaults(data))
+            raw_teleop = data.get("teleop", {}) if isinstance(data, dict) else {}
+            raw_motion = data.get("motion", {}) if isinstance(data, dict) else {}
+            has_current_teleop_strategy = (
+                isinstance(raw_teleop, dict)
+                and raw_teleop.get("strategyVersion") == ICF_TELEOP_STRATEGY_VERSION
+            )
+            has_current_work_origin_strategy = (
+                isinstance(raw_motion, dict)
+                and raw_motion.get("workOriginStrategyVersion") == ICF_WORK_ORIGIN_VERSION
+            )
+            merged = self._migrate_config(
+                self._merge_defaults(data),
+                has_current_teleop_strategy,
+                has_current_work_origin_strategy,
+            )
             validated = AppConfig.model_validate(merged).model_dump(mode="json")
             if merged != data:
                 self.save_config(validated, emit_log=False)
@@ -52,9 +73,6 @@ class SettingsService:
 
     def apply_config(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
         active = self.save_config(config) if config is not None else self.get_config()
-        yaw_limit = float(active["motion"]["yawSoftLimitDeg"])
-        if yaw_limit > 7.5:
-            raise ValueError("yawSoftLimitDeg must be <= 7.5 degrees")
         self.logs.info("[HAL]", "settings applied to backend runtime config")
         return active
 
@@ -173,8 +191,31 @@ class SettingsService:
 
         return cast(dict[str, Any], merge(default_config(), data))
 
-    def _migrate_config(self, config: dict[str, Any]) -> dict[str, Any]:
+    def _migrate_config(
+        self,
+        config: dict[str, Any],
+        has_current_teleop_strategy: bool,
+        has_current_work_origin_strategy: bool,
+    ) -> dict[str, Any]:
         teleop = config.get("teleop", {})
+        if isinstance(teleop, dict) and not has_current_teleop_strategy:
+            for key, value in ICF_TELEOP_DEFAULTS.items():
+                teleop[key] = json.loads(json.dumps(value))
+            motion = config.get("motion", {})
+            if isinstance(motion, dict):
+                motion["leftSoftLimits"] = json.loads(json.dumps(DEFAULT_SOFT_LIMITS))
+                motion["rightSoftLimits"] = json.loads(json.dumps(DEFAULT_SOFT_LIMITS))
+                motion["yawSoftLimitDeg"] = DEFAULT_SOFT_LIMITS["yaw"]["max"]
+            safety = config.get("safety", {})
+            if isinstance(safety, dict):
+                safety["yawSoftLimitDeg"] = DEFAULT_SOFT_LIMITS["yaw"]["max"]
+        motion = config.get("motion", {})
+        if isinstance(motion, dict) and not has_current_work_origin_strategy:
+            origin = motion.get("origin", {})
+            origin_valid = isinstance(origin, dict) and bool(origin.get("valid", False))
+            if not origin_valid:
+                motion["origin"] = json.loads(json.dumps(ICF_WORK_ORIGIN_DEFAULTS))
+            motion["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
         gripper_teleop = teleop.get("gripperTeleop", {})
         if isinstance(gripper_teleop, dict):
             default_thresholds = (

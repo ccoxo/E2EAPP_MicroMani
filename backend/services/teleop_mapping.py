@@ -6,6 +6,7 @@ import time
 from typing import Any, Literal
 
 from backend.core.config import SettingsService
+from backend.core.defaults import DEFAULT_SOFT_LIMITS, ICF_TELEOP_DEFAULTS
 from backend.core.logging import LogService, now_ms
 from backend.hal_client.client import HalClient
 
@@ -13,10 +14,11 @@ AxisName = Literal["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
 SideName = Literal["left", "right"]
 
 AXES: tuple[AxisName, AxisName, AxisName, AxisName, AxisName, AxisName] = ("X", "Y", "Z", "Roll", "Pitch", "Yaw")
-TRANSLATION_STEP_UM = 200.0
-ROTATION_STEP_DEG = 0.2
-TRANSLATION_VELOCITY_UM_S = 1000.0
-ROTATION_VELOCITY_DEG_S = 1.0
+DEFAULT_TRANSLATION_STEP_UM = 5000.0
+DEFAULT_ROTATION_STEP_DEG = 0.2
+SOFT_LIMIT_KEYS = ("x", "y", "z", "roll", "pitch", "yaw")
+DEFAULT_AXIS_OUTPUT_SCALE = [1.0] * 6
+DEFAULT_ENABLED_AXES = [True] * 6
 
 
 class TeleopMappingService:
@@ -29,6 +31,8 @@ class TeleopMappingService:
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
         self._references: dict[str, list[float]] = {}
+        self._translation_carry: dict[SideName, list[float]] = {}
+        self._translation_direction: dict[SideName, list[int]] = {}
         self._active_sides: set[SideName] = set()
         self._last_action: dict[str, Any] | None = None
         self._last_error = ""
@@ -43,6 +47,8 @@ class TeleopMappingService:
         if self._armed_at_ms is None:
             self._armed_at_ms = now_ms()
             self._references.clear()
+            self._translation_carry.clear()
+            self._translation_direction.clear()
             self._active_sides.clear()
         if mode != "real":
             self._last_action = None
@@ -52,19 +58,24 @@ class TeleopMappingService:
             return self.status()
         self._stop_event = asyncio.Event()
         self._task = asyncio.create_task(self._run_loop(), name="teleop-mapping")
+        translation_step = self._translation_step_um(config)
+        rotation_step = self._rotation_step_deg(config)
         self.logs.warning(
             "[HAL]",
-            "teleop mapper armed for recording; clutch button required, max step 200um / 0.2deg",
+            (
+                "teleop mapper armed for recording; clutch button required, "
+                f"max step {translation_step:g}um / {rotation_step:g}deg"
+            ),
         )
         return self.status()
 
     async def stop(self, source: str = "recording") -> dict[str, Any]:
         self._arm_sources.discard(source)
         if self._arm_sources:
-            self._references.clear()
+            self._reset_all_tracking()
             return self.status()
         self._armed_at_ms = None
-        self._references.clear()
+        self._reset_all_tracking()
         stop_event = self._stop_event
         task = self._task
         if stop_event is not None:
@@ -84,6 +95,7 @@ class TeleopMappingService:
 
     def status(self) -> dict[str, Any]:
         running = self._task is not None and not self._task.done()
+        config = self.settings.get_config() if self.settings is not None else {}
         return {
             "armed": self._armed_at_ms is not None,
             "running": running,
@@ -92,16 +104,16 @@ class TeleopMappingService:
             "lastAction": self._last_action,
             "lastError": self._last_error,
             "limits": {
-                "translationStepUm": TRANSLATION_STEP_UM,
-                "rotationStepDeg": ROTATION_STEP_DEG,
-                "translationVelocityUmS": TRANSLATION_VELOCITY_UM_S,
-                "rotationVelocityDegS": ROTATION_VELOCITY_DEG_S,
+                "translationStepUm": self._translation_step_um(config),
+                "rotationStepDeg": self._rotation_step_deg(config),
+                "translationStepLimitPulse": self._translation_step_limit_pulse(config),
+                "rotationStepLimitPulse": self._rotation_step_limit_pulse(config),
+                "translationVelocityUmS": self._translation_max_velocity_um_s(config),
+                "rotationVelocityDegS": self._rotation_max_velocity_deg_s(config),
             },
         }
 
     async def _run_loop(self) -> None:
-        teleop = self.settings.get_config().get("teleop", {})
-        period_s = float(teleop.get("commandIntervalMs", 10)) / 1000.0
         while self._stop_event is not None and not self._stop_event.is_set():
             started = time.monotonic()
             try:
@@ -116,19 +128,20 @@ class TeleopMappingService:
                     self._last_error = message
                     self._last_error_at = now
             elapsed = time.monotonic() - started
+            period_s = self._command_interval_s(self.settings.get_config())
             await asyncio.sleep(max(0.001, period_s - elapsed))
 
     async def _step(self) -> None:
         config = self.settings.get_config()
         health = await self.hal.health()
         if not health.connected or not health.ltdmc_ok or not health.omega7_ok:
-            self._references.clear()
+            self._reset_all_tracking()
             await self._stop_all_active_sides()
             return
         omega = await self.hal.omega_state()
         raw_hands = omega.get("hands")
         if not isinstance(raw_hands, list):
-            self._references.clear()
+            self._reset_all_tracking()
             await self._stop_all_active_sides()
             return
         for side in ("left", "right"):
@@ -158,7 +171,7 @@ class TeleopMappingService:
             and pose is not None
         )
         if not active or pose is None:
-            self._references.pop(side, None)
+            self._reset_side_tracking(side)
             await self._stop_side_if_active(side)
             return
         reference = self._references.get(side)
@@ -166,20 +179,33 @@ class TeleopMappingService:
             self._references[side] = pose
             return
         deltas = self._deltas_from_delta(side, pose, reference, config)
-        if deltas is None:
-            return
+        sync_zero_delta_target = True
+        soft_limit_min, soft_limit_max = self._soft_limit_arrays(side, config)
         payload = {
             "side": side,
             "deltas": {axis: deltas[idx] for idx, axis in enumerate(AXES)},
-            "translationVelocityUiPerSec": TRANSLATION_VELOCITY_UM_S,
-            "rotationVelocityUiPerSec": ROTATION_VELOCITY_DEG_S,
-            "translationStartVelocityUiPerSec": TRANSLATION_VELOCITY_UM_S * 0.2,
-            "rotationStartVelocityUiPerSec": ROTATION_VELOCITY_DEG_S * 0.2,
-            "accTimeSec": 0.05,
-            "decTimeSec": 0.05,
+            "translationStepUm": self._translation_step_um(config),
+            "rotationStepDeg": self._rotation_step_deg(config),
+            "translationStepLimitPulse": self._translation_step_limit_pulse(config),
+            "rotationStepLimitPulse": self._rotation_step_limit_pulse(config),
+            "enabledAxes": self._enabled_axes(side, config),
+            "syncZeroDeltaTarget": sync_zero_delta_target,
+            "softLimitMin": soft_limit_min,
+            "softLimitMax": soft_limit_max,
+            "translationVelocityUiPerSec": self._translation_max_velocity_um_s(config),
+            "rotationVelocityUiPerSec": self._rotation_max_velocity_deg_s(config),
+            "translationStartVelocityUiPerSec": self._translation_start_velocity_um_s(config),
+            "rotationStartVelocityUiPerSec": self._rotation_start_velocity_deg_s(config),
+            "accTimeSec": self._motion_profile_acc_sec(config),
+            "decTimeSec": self._motion_profile_dec_sec(config),
         }
-        await self.hal.command("motion.teleop_target_update", payload)
         self._active_sides.add(side)
+        try:
+            await self.hal.command("motion.teleop_target_update", payload)
+        except Exception:
+            self._reset_side_tracking(side)
+            await self._stop_side_if_active(side)
+            raise
         self._references[side] = pose
         dominant_index = max(range(len(deltas)), key=lambda idx: abs(deltas[idx]))
         delta_vector = [0.0] * 12
@@ -202,28 +228,152 @@ class TeleopMappingService:
         pose: list[float],
         reference: list[float],
         config: dict[str, Any],
-    ) -> list[float] | None:
+    ) -> list[float]:
         teleop = config.get("teleop", {})
         translation_scale = float(teleop.get(f"{side}TranslationScale", 0.2))
         rotation_scale = float(teleop.get(f"{side}RotationScale", 0.18))
-        translation_deadzone_um = float(teleop.get("translationDeadzone", 0.00002)) * 1_000_000.0
-        rotation_deadzone_deg = float(teleop.get("rotationDeadzone", 0.08))
+        axis_scale = self._axis_output_scale(side, config)
+        translation_deadzone_m = float(teleop.get("translationDeadzone", 0.00002))
+        rotation_deadzone_deg = float(teleop.get("rotationDeadzone", 0.05))
         deltas = [0.0] * 6
         for idx in range(6):
             raw_delta = pose[idx] - reference[idx]
             if idx < 3:
-                value = raw_delta * 1_000_000.0 * translation_scale
-                if abs(value) <= translation_deadzone_um * translation_scale:
+                filtered = self._filter_incremental_translation(side, idx, raw_delta, translation_deadzone_m, config)
+                if filtered == 0.0:
                     continue
-                deltas[idx] = min(abs(value), TRANSLATION_STEP_UM) * (1 if value > 0 else -1)
+                deltas[idx] = filtered * 1_000_000.0 * translation_scale * axis_scale[idx]
             else:
-                value = raw_delta * rotation_scale
-                if abs(value) <= rotation_deadzone_deg * rotation_scale:
+                if abs(raw_delta) < rotation_deadzone_deg:
                     continue
-                deltas[idx] = min(abs(value), ROTATION_STEP_DEG) * (1 if value > 0 else -1)
-        if not any(delta != 0.0 for delta in deltas):
-            return None
+                deltas[idx] = raw_delta * rotation_scale * axis_scale[idx]
         return deltas
+
+    def _filter_incremental_translation(
+        self,
+        side: SideName,
+        axis_index: int,
+        raw_delta: float,
+        deadzone_m: float,
+        config: dict[str, Any],
+    ) -> float:
+        if abs(raw_delta) < deadzone_m:
+            return 0.0
+        carry = self._translation_carry.setdefault(side, [0.0, 0.0, 0.0])
+        direction = self._translation_direction.setdefault(side, [0, 0, 0])
+        carry[axis_index] += raw_delta
+        carry_sign = 1 if carry[axis_index] > 1e-12 else -1 if carry[axis_index] < -1e-12 else 0
+        if carry_sign == 0:
+            carry[axis_index] = 0.0
+            return 0.0
+        reversing = direction[axis_index] != 0 and carry_sign != direction[axis_index]
+        threshold = (
+            self._incremental_translation_reverse_deadzone(config)
+            if reversing
+            else self._incremental_translation_min_effective_delta(config)
+        )
+        if abs(carry[axis_index]) < threshold:
+            return 0.0
+        output = carry[axis_index]
+        carry[axis_index] = 0.0
+        direction[axis_index] = carry_sign
+        return output
+
+    def _command_interval_s(self, config: dict[str, Any]) -> float:
+        return max(1.0, float(config.get("teleop", {}).get("commandIntervalMs", 10))) / 1000.0
+
+    def _translation_step_um(self, config: dict[str, Any]) -> float:
+        return max(0.0, float(config.get("teleop", {}).get("translationStepUm", DEFAULT_TRANSLATION_STEP_UM)))
+
+    def _rotation_step_deg(self, config: dict[str, Any]) -> float:
+        return max(0.0, float(config.get("teleop", {}).get("rotationStepDeg", DEFAULT_ROTATION_STEP_DEG)))
+
+    def _translation_step_limit_pulse(self, config: dict[str, Any]) -> float:
+        return max(1.0, float(config.get("teleop", {}).get("translationStepLimitPulse", 4000.0)))
+
+    def _rotation_step_limit_pulse(self, config: dict[str, Any]) -> float:
+        return max(1.0, float(config.get("teleop", {}).get("rotationStepLimitPulse", 1250.0)))
+
+    def _translation_start_velocity_um_s(self, config: dict[str, Any]) -> float:
+        return max(0.0, float(config.get("teleop", {}).get("translationStartVelocityUmS", 400.0)))
+
+    def _translation_max_velocity_um_s(self, config: dict[str, Any]) -> float:
+        return max(1.0, float(config.get("teleop", {}).get("translationMaxVelocityUmS", 5000.0)))
+
+    def _rotation_start_velocity_deg_s(self, config: dict[str, Any]) -> float:
+        return max(0.0, float(config.get("teleop", {}).get("rotationStartVelocityDegS", 0.25)))
+
+    def _rotation_max_velocity_deg_s(self, config: dict[str, Any]) -> float:
+        return max(1.0, float(config.get("teleop", {}).get("rotationMaxVelocityDegS", 3.0)))
+
+    def _motion_profile_acc_sec(self, config: dict[str, Any]) -> float:
+        return max(0.001, float(config.get("teleop", {}).get("motionProfileAccSec", 0.05)))
+
+    def _motion_profile_dec_sec(self, config: dict[str, Any]) -> float:
+        return max(0.001, float(config.get("teleop", {}).get("motionProfileDecSec", 0.05)))
+
+    def _incremental_translation_min_effective_delta(self, config: dict[str, Any]) -> float:
+        teleop = config.get("teleop", {})
+        return max(
+            float(teleop.get("translationDeadzone", 0.00002)),
+            float(teleop.get("incrementalTranslationMinEffectiveDelta", 0.00005)),
+        )
+
+    def _incremental_translation_reverse_deadzone(self, config: dict[str, Any]) -> float:
+        return max(
+            self._incremental_translation_min_effective_delta(config),
+            float(config.get("teleop", {}).get("incrementalTranslationReverseDeadzone", 0.00010)),
+        )
+
+    def _axis_output_scale(self, side: SideName, config: dict[str, Any]) -> list[float]:
+        key = f"{side}AxisOutputScale"
+        raw = config.get("teleop", {}).get(key, ICF_TELEOP_DEFAULTS.get(key, DEFAULT_AXIS_OUTPUT_SCALE))
+        if not isinstance(raw, list) or len(raw) != 6:
+            raw = ICF_TELEOP_DEFAULTS.get(key, DEFAULT_AXIS_OUTPUT_SCALE)
+        return [float(value) for value in raw]
+
+    def _enabled_axes(self, side: SideName, config: dict[str, Any]) -> list[bool]:
+        key = f"{side}EnabledAxes"
+        raw = config.get("teleop", {}).get(key, DEFAULT_ENABLED_AXES)
+        if not isinstance(raw, list) or len(raw) != 6:
+            raw = DEFAULT_ENABLED_AXES
+        return [bool(value) for value in raw]
+
+    def _soft_limit_arrays(self, side: SideName, config: dict[str, Any]) -> tuple[list[float], list[float]]:
+        motion = config.get("motion", {})
+        raw_limits = (
+            motion.get(f"{side}SoftLimits", DEFAULT_SOFT_LIMITS)
+            if isinstance(motion, dict)
+            else DEFAULT_SOFT_LIMITS
+        )
+        mins: list[float] = []
+        maxes: list[float] = []
+        for key in SOFT_LIMIT_KEYS:
+            axis_limit = raw_limits.get(key, {}) if isinstance(raw_limits, dict) else {}
+            default_axis_limit = DEFAULT_SOFT_LIMITS[key]
+            min_value = (
+                axis_limit.get("min", default_axis_limit["min"])
+                if isinstance(axis_limit, dict)
+                else default_axis_limit["min"]
+            )
+            max_value = (
+                axis_limit.get("max", default_axis_limit["max"])
+                if isinstance(axis_limit, dict)
+                else default_axis_limit["max"]
+            )
+            mins.append(float(min_value))
+            maxes.append(float(max_value))
+        return mins, maxes
+
+    def _reset_all_tracking(self) -> None:
+        self._references.clear()
+        self._translation_carry.clear()
+        self._translation_direction.clear()
+
+    def _reset_side_tracking(self, side: SideName) -> None:
+        self._references.pop(side, None)
+        self._translation_carry.pop(side, None)
+        self._translation_direction.pop(side, None)
 
     async def _stop_all_active_sides(self) -> None:
         for side in tuple(self._active_sides):

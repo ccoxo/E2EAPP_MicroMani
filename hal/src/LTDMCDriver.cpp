@@ -91,27 +91,31 @@ unsigned short cardForSide(appstation::hal::Side side) {
   return side == appstation::hal::Side::Left ? static_cast<unsigned short>(1) : static_cast<unsigned short>(0);
 }
 
-AxisLimit teleopDefaultLimit(SemanticAxis axis) {
-  switch (axis) {
-    case SemanticAxis::X:
-      return {-25000.0, 25000.0};
-    case SemanticAxis::Y:
-    case SemanticAxis::Z:
-      return {-37500.0, 37500.0};
-    case SemanticAxis::Roll:
-      return {-180.0, 180.0};
-    case SemanticAxis::Pitch:
-      return {-70.0, 70.0};
-    case SemanticAxis::Yaw:
-      return {-7.5, 7.5};
+bool teleopTargetAllowedByLimit(double baseUi, double targetUi, const AxisLimit& limit) {
+  if (targetUi >= limit.min && targetUi <= limit.max) {
+    return true;
   }
-  return {0.0, 0.0};
+  if (baseUi < limit.min) {
+    return targetUi > baseUi && targetUi < limit.min;
+  }
+  if (baseUi > limit.max) {
+    return targetUi < baseUi && targetUi > limit.max;
+  }
+  return false;
 }
 
 double velocityToPulsePerSec(Side side, SemanticAxis axis, double velocityUiPerSec) {
   const auto pulseScale = std::abs(pulsePerUnit(side, axis));
   const auto velocityScale = isRotation(axis) ? pulseScale : pulseScale / 1000.0;
   return (std::max)(1.0, velocityUiPerSec * velocityScale);
+}
+
+long clampPulseStep(long deltaPulse, double stepLimitPulse) {
+  const auto limit = static_cast<long>(std::llround(stepLimitPulse));
+  if (limit <= 0 || std::abs(deltaPulse) <= limit) {
+    return deltaPulse;
+  }
+  return deltaPulse > 0 ? limit : -limit;
 }
 
 #ifdef _WIN32
@@ -133,6 +137,12 @@ void applyMotionProfile(
   if (dmcSetSProfile) {
     dmcSetSProfile(card, axisNo, 0, 0.0);
   }
+}
+
+void updateTeleopTargetBestEffort(unsigned short card, unsigned short axisNo, long targetPulse) {
+  // Match ICF teleop: target refresh return codes must not break the 10 ms command loop.
+  const auto retUpdate = dmcUpdateTargetPosition(card, axisNo, targetPulse, 1);
+  (void)retUpdate;
 }
 #endif
 }  // namespace
@@ -483,6 +493,11 @@ void LTDMCDriver::moveRelativeUi(
 void LTDMCDriver::updateTeleopTargetUi(
     Side side,
     const std::array<double, 6>& deltaUi,
+    double translationStepPulse,
+    double rotationStepPulse,
+    const std::array<bool, 6>& enabledAxes,
+    bool syncZeroDeltaTarget,
+    const std::array<AxisLimit, 6>& limits,
     double translationVelocityUiPerSec,
     double rotationVelocityUiPerSec,
     double translationStartVelocityUiPerSec,
@@ -494,43 +509,46 @@ void LTDMCDriver::updateTeleopTargetUi(
   if (translationVelocityUiPerSec <= 0 || rotationVelocityUiPerSec <= 0) {
     throw std::runtime_error("teleop velocity must be positive");
   }
+  if (translationStepPulse <= 0 || rotationStepPulse <= 0) {
+    throw std::runtime_error("teleop pulse step limit must be positive");
+  }
   const double tacc = accTimeSec > 0 ? accTimeSec : 0.05;
   const double tdec = decTimeSec > 0 ? decTimeSec : 0.05;
   const auto card = cardForSide(side);
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
-  if (!dmcSetProfile || !dmcPMove || !dmcCheckDone || !dmcUpdateTargetPosition) {
-    throw std::runtime_error("required LTDMC teleop exports missing: set_profile/pmove/check_done/update_target_position");
+  if (!dmcSetProfile || !dmcCheckDone || !dmcUpdateTargetPosition) {
+    throw std::runtime_error("required LTDMC teleop exports missing: set_profile/check_done/update_target_position");
   }
 #endif
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     const auto axis = static_cast<SemanticAxis>(axisIndex);
     const auto delta = deltaUi[axisIndex];
     const auto rotation = isRotation(axis);
-    const auto maxStep = rotation ? 0.2 : 200.0;
-    if (std::abs(delta) > maxStep) {
-      throw std::runtime_error(rotation ? "teleop rotation delta exceeds 0.2 degree"
-                                        : "teleop translation delta exceeds 200 um");
-    }
-    const auto deltaPulse = static_cast<long>(std::llround(uiToPulse(delta, side, axis)));
-    if (deltaPulse == 0) {
+    const auto index = stateIndex(side, axis);
+    if (!enabledAxes[axisIndex]) {
+      teleopTargetActive_[index] = false;
       continue;
     }
-    const auto index = stateIndex(side, axis);
+    const auto stepLimitPulse = rotation ? rotationStepPulse : translationStepPulse;
+    const auto requestedDeltaPulse = static_cast<long>(std::llround(uiToPulse(delta, side, axis)));
+    const auto deltaPulse = clampPulseStep(requestedDeltaPulse, stepLimitPulse);
+    const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
+    if (deltaPulse == 0) {
+      if (syncZeroDeltaTarget) {
+#if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
+        if (dmcGetPosition) {
+          pulse_[index] = static_cast<double>(dmcGetPosition(card, axisNo));
+        }
+        const auto updateTargetPulse = static_cast<long>(std::llround(pulse_[index]));
+        updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse);
+#endif
+        teleopTargetPulse_[index] = pulse_[index];
+        teleopTargetActive_[index] = true;
+      }
+      continue;
+    }
     if (!enabled_[index]) {
       throw std::runtime_error("teleop axis is not servo-enabled");
-    }
-    const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
-#if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
-    if (!teleopTargetActive_[index] && dmcGetPosition) {
-      pulse_[index] = static_cast<double>(dmcGetPosition(card, axisNo));
-    }
-#endif
-    const auto basePulse = teleopTargetActive_[index] ? teleopTargetPulse_[index] : pulse_[index];
-    const auto targetPulse = basePulse + static_cast<double>(deltaPulse);
-    const auto targetUi = pulseToUi(targetPulse, side, axis);
-    const auto limit = teleopDefaultLimit(axis);
-    if (targetUi < limit.min || targetUi > limit.max) {
-      throw std::runtime_error("teleop target exceeds soft limit");
     }
     const auto maxVelocityUiPerSec = rotation ? rotationVelocityUiPerSec : translationVelocityUiPerSec;
     const auto requestedStartVelocity =
@@ -541,26 +559,30 @@ void LTDMCDriver::updateTeleopTargetUi(
                                    : (std::max)(1.0, maxVelocityPulse * 0.2);
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
     const bool moving = dmcCheckDone(card, axisNo) == 0;
-    if (moving && !teleopTargetActive_[index]) {
-      throw std::runtime_error(dmcAxisFailureMessage("axis busy before teleop target", -1, card, axisNo));
+    if (!teleopTargetActive_[index] && dmcGetPosition) {
+      pulse_[index] = static_cast<double>(dmcGetPosition(card, axisNo));
     }
-    if (moving) {
-      const auto updateTargetPulse = static_cast<long>(std::llround(targetPulse));
-      const auto retUpdate = dmcUpdateTargetPosition(card, axisNo, updateTargetPulse, 1);
-      if (retUpdate != 0) {
-        throw std::runtime_error(
-            dmcFailureMessage("dmc_update_target_position", retUpdate, card, axisNo, updateTargetPulse));
-      }
-    } else {
+#else
+    const bool moving = false;
+#endif
+    const auto basePulse = teleopTargetActive_[index] ? teleopTargetPulse_[index] : pulse_[index];
+    const auto targetPulse = basePulse + static_cast<double>(deltaPulse);
+    const auto baseUi = pulseToUi(basePulse, side, axis);
+    const auto targetUi = pulseToUi(targetPulse, side, axis);
+    const auto limit = limits[axisIndex];
+    if (!teleopTargetAllowedByLimit(baseUi, targetUi, limit)) {
+      throw std::runtime_error("teleop target exceeds soft limit");
+    }
+#if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
+    if (!moving) {
       applyMotionProfile(card, axisNo, startVelocityPulse, maxVelocityPulse, tacc, tdec, deltaPulse);
-      const auto retMove = dmcPMove(card, axisNo, deltaPulse, 0);
-      if (retMove != 0) {
-        throw std::runtime_error(dmcFailureMessage("dmc_pmove", retMove, card, axisNo, deltaPulse));
-      }
     }
+    const auto updateTargetPulse = static_cast<long>(std::llround(targetPulse));
+    updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse);
 #else
     (void)card;
     (void)axisNo;
+    (void)moving;
     (void)maxVelocityPulse;
     (void)startVelocityPulse;
     (void)tacc;
@@ -586,6 +608,13 @@ void LTDMCDriver::stopTeleopSide(Side side) {
       const auto retStop = dmcStop(card, axisNo, 0);
       if (retStop != 0) {
         throw std::runtime_error(dmcAxisFailureMessage("dmc_stop", retStop, card, axisNo));
+      }
+      if (dmcGetPosition) {
+        pulse_[index] = static_cast<double>(dmcGetPosition(card, axisNo));
+      }
+      if (dmcUpdateTargetPosition) {
+        const auto currentPulse = static_cast<long>(std::llround(pulse_[index]));
+        updateTeleopTargetBestEffort(card, axisNo, currentPulse);
       }
     }
 #else
@@ -639,11 +668,6 @@ void LTDMCDriver::checkLimits(
   for (int i = 0; i < 12; ++i) {
     if (targetUi[i] < limits[i].min || targetUi[i] > limits[i].max) {
       throw std::runtime_error("motion target exceeds soft limit");
-    }
-  }
-  for (const int yawIndex : {5, 11}) {
-    if (std::abs(targetUi[yawIndex]) > 7.5) {
-      throw std::runtime_error("yaw target exceeds +/-7.5 degree safety limit");
     }
   }
 }

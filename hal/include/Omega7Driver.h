@@ -28,7 +28,7 @@ struct Omega7State {
 
 class Omega7Driver {
  public:
-  bool initialize(int leftOpenId, int rightOpenId);
+  bool initialize(int leftOpenId, int rightOpenId, bool swapHands);
   bool ok() const;
   std::string lastError() const;
   std::array<Omega7State, 2> readState();

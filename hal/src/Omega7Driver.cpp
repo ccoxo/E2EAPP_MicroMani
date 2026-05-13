@@ -6,6 +6,8 @@
 
 #include <chrono>
 #include <sstream>
+#include <utility>
+#include <vector>
 
 namespace appstation::hal {
 
@@ -53,7 +55,7 @@ std::string sdkError() {
 #endif
 }  // namespace
 
-bool Omega7Driver::initialize(int leftOpenId, int rightOpenId) {
+bool Omega7Driver::initialize(int leftOpenId, int rightOpenId, bool swapHands) {
   std::scoped_lock lock(mutex_);
   // initialize 可能被重复调用；先清空旧状态，后续任一步失败都保持未初始化。
   initialized_ = false;
@@ -100,11 +102,9 @@ bool Omega7Driver::initialize(int leftOpenId, int rightOpenId) {
     return false;
   }
 
-  int openedCount = 0;
+  std::vector<Omega7State> openedDevices;
   std::ostringstream warnings;
-  // slot 0/1 对应本系统里的 left/right 主手槽位；requestedOpenId 是
-  // Force Dimension SDK 的 open id，不一定等于最终返回的 deviceId。
-  auto openDevice = [&](size_t slot, int requestedOpenId, const char* label) {
+  auto openDevice = [&](int requestedOpenId, const char* label) {
     if (requestedOpenId < 0) {
       return;
     }
@@ -115,7 +115,7 @@ bool Omega7Driver::initialize(int leftOpenId, int rightOpenId) {
       warnings << label << " openId=" << requestedOpenId << " failed: " << sdkError() << "; ";
       return;
     }
-    auto& item = state_[slot];
+    Omega7State item{};
     item.connected = true;
     item.openId = requestedOpenId;
     item.deviceId = deviceId;
@@ -135,17 +135,59 @@ bool Omega7Driver::initialize(int leftOpenId, int rightOpenId) {
       item.leftHanded = dhdIsLeftHanded(static_cast<char>(deviceId));
       item.handednessKnown = true;
     }
-    openedCount += 1;
+    openedDevices.push_back(item);
   };
 
-  // 先打开左主手；只有确实枚举到多台设备且 openId 不重复时才尝试右主手。
-  openDevice(0, leftOpenId, "left");
+  openDevice(leftOpenId, "left");
   if (deviceCount > 1 && rightOpenId != leftOpenId) {
-    openDevice(1, rightOpenId, "right");
+    openDevice(rightOpenId, "right");
+  }
+
+  auto takeDeviceByHandedness = [&](bool wantLeftHanded) {
+    for (auto it = openedDevices.begin(); it != openedDevices.end(); ++it) {
+      if (it->handednessKnown && it->leftHanded == wantLeftHanded) {
+        const auto item = *it;
+        openedDevices.erase(it);
+        return item;
+      }
+    }
+    return Omega7State{};
+  };
+
+  auto takeDeviceByOpenId = [&](int openId) {
+    for (auto it = openedDevices.begin(); it != openedDevices.end(); ++it) {
+      if (it->openId == openId) {
+        const auto item = *it;
+        openedDevices.erase(it);
+        return item;
+      }
+    }
+    return Omega7State{};
+  };
+
+  state_[0] = takeDeviceByHandedness(true);
+  state_[1] = takeDeviceByHandedness(false);
+  if (!state_[0].connected) {
+    state_[0] = takeDeviceByOpenId(leftOpenId);
+  }
+  if (!state_[1].connected) {
+    state_[1] = takeDeviceByOpenId(rightOpenId);
+  }
+  if (!state_[0].connected && !openedDevices.empty()) {
+    state_[0] = openedDevices.front();
+    openedDevices.erase(openedDevices.begin());
+  }
+  if (!state_[1].connected && !openedDevices.empty()) {
+    state_[1] = openedDevices.front();
+    openedDevices.erase(openedDevices.begin());
+  }
+  if (swapHands) {
+    std::swap(state_[0], state_[1]);
   }
 
   // 至少打开一台主手就认为 Omega7Driver 可用。只打开一台时保留 warning，
   // 让 /health 能提示“部分连接”而不是直接判整个模块不可用。
+  const int openedCount = (state_[0].connected ? 1 : 0) + (state_[1].connected ? 1 : 0);
   initialized_ = openedCount > 0;
   if (!initialized_) {
     std::ostringstream error;
