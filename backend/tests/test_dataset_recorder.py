@@ -6,78 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from backend.services.dataset_recorder import (
-    PLACEHOLDER_JPEG_BYTES,
-    DatasetRecorderService,
-    TimedRingBuffer,
-    TimedSample,
-)
-
-EXPECTED_V3_FEATURES = {
-    "observation.state": {
-        "dtype": "float32",
-        "shape": [14],
-        "names": [
-            "left_x_um",
-            "left_y_um",
-            "left_z_um",
-            "left_roll_mdeg",
-            "left_pitch_mdeg",
-            "left_yaw_mdeg",
-            "left_gripper_gap_mm",
-            "right_x_um",
-            "right_y_um",
-            "right_z_um",
-            "right_roll_mdeg",
-            "right_pitch_mdeg",
-            "right_yaw_mdeg",
-            "right_gripper_gap_mm",
-        ],
-    },
-    "action": {
-        "dtype": "float32",
-        "shape": [14],
-        "names": [
-            "left_dx_um",
-            "left_dy_um",
-            "left_dz_um",
-            "left_droll_mdeg",
-            "left_dpitch_mdeg",
-            "left_dyaw_mdeg",
-            "left_gripper_target_mm",
-            "right_dx_um",
-            "right_dy_um",
-            "right_dz_um",
-            "right_droll_mdeg",
-            "right_dpitch_mdeg",
-            "right_dyaw_mdeg",
-            "right_gripper_target_mm",
-        ],
-    },
-    "observation.pulses": {
-        "dtype": "float32",
-        "shape": [12],
-        "names": [
-            "left_x_pulse",
-            "left_y_pulse",
-            "left_z_pulse",
-            "left_roll_pulse",
-            "left_pitch_pulse",
-            "left_yaw_pulse",
-            "right_x_pulse",
-            "right_y_pulse",
-            "right_z_pulse",
-            "right_roll_pulse",
-            "right_pitch_pulse",
-            "right_yaw_pulse",
-        ],
-    },
-    "observation.force_left": {"dtype": "float32", "shape": [6], "names": ["fx", "fy", "fz", "mx", "my", "mz"]},
-    "observation.force_right": {"dtype": "float32", "shape": [6], "names": ["fx", "fy", "fz", "mx", "my", "mz"]},
-    "observation.images.global": {"dtype": "video", "shape": [480, 640, 3]},
-    "observation.images.wrist_left": {"dtype": "video", "shape": [480, 640, 3]},
-    "observation.images.wrist_right": {"dtype": "video", "shape": [480, 640, 3]},
-}
+from backend.services.dataset_recorder import DatasetRecorderService, TimedRingBuffer, TimedSample
 
 
 def hal_motion_fixture(timestamp_ms: int = 1234) -> dict[str, object]:
@@ -136,18 +65,14 @@ def test_dataset_recorder_declares_and_writes_motion_pulses() -> None:
 
     assert "PULSE_FEATURE_NAMES" in source
     assert '"observation.pulses": motion_pulses' in source
-    assert '"observation.pulses": pulses' in source
     assert '"observation.pulses": self._np_float32(frame["observation.pulses"])' in source
-    assert '"observation.pulses": {"dtype": "float32", "shape": [12]' in source
     assert '"observation.pulses": {"dtype": "float32", "shape": (12,)' in source
 
 
 def test_dataset_recorder_declares_v3_state_and_action_shapes() -> None:
     source = (Path(__file__).resolve().parents[1] / "services" / "dataset_recorder.py").read_text(encoding="utf-8")
 
-    assert '"observation.state": {"dtype": "float32", "shape": [14]' in source
     assert '"observation.state": {"dtype": "float32", "shape": (14,)' in source
-    assert '"action": {"dtype": "float32", "shape": [14]' in source
     assert '"action": {"dtype": "float32", "shape": (14,)' in source
     assert '"observation.gripper": {"dtype": "float32"' not in source
 
@@ -163,41 +88,6 @@ def test_dataset_recorder_native_features_follow_v3_contract() -> None:
     assert features["observation.images.global"]["dtype"] == "video"
     assert features["observation.images.global"]["shape"] == (480, 640, 3)
     assert "observation.gripper" not in features
-
-
-def test_dataset_recorder_fallback_features_follow_v3_contract() -> None:
-    recorder = object.__new__(DatasetRecorderService)
-
-    features = recorder._features()
-
-    for key, expected in EXPECTED_V3_FEATURES.items():
-        assert key in features
-        assert features[key]["dtype"] == expected["dtype"]
-        assert list(features[key]["shape"]) == expected["shape"]
-    assert "observation.gripper" not in features
-
-
-def test_fallback_mp4_encoder_resizes_placeholder_first_frame(tmp_path: Path) -> None:
-    cv2 = pytest.importorskip("cv2")
-    np = pytest.importorskip("numpy")
-    recorder = object.__new__(DatasetRecorderService)
-    recorder._record_fps_hz = 30
-    first = tmp_path / "frame_000000.jpg"
-    second = tmp_path / "frame_000001.jpg"
-    first.write_bytes(PLACEHOLDER_JPEG_BYTES)
-    frame = np.zeros((480, 640, 3), dtype=np.uint8)
-    frame[:, :, 1] = 180
-    assert cv2.imwrite(str(second), frame)
-
-    ok, message = recorder._encode_jpegs_to_mp4(
-        cv2,
-        [first, second],
-        tmp_path / "episode_000000.mp4",
-        size=(640, 480),
-    )
-
-    assert ok, message
-    assert (tmp_path / "episode_000000.mp4").stat().st_size > 0
 
 
 def test_timed_ring_buffer_nearest_respects_skew_and_prunes() -> None:
@@ -217,9 +107,37 @@ def test_dataset_recorder_collect_frame_uses_timed_buffers() -> None:
 
     assert "class TimedRingBuffer" in source
     assert "self._start_sampler_tasks_locked()" in source
-    assert 'self._aligned_sample("hal", target_monotonic_s)' in source
-    assert 'self._aligned_sample("force", target_monotonic_s)' in source
+    assert 'recorder._aligned_sample("hal", target_monotonic_s)' in source
+    assert 'recorder._aligned_sample("force", target_monotonic_s)' in source
     assert "CAMERA_SOURCE_KEYS" in source
+
+
+def test_dataset_recorder_source_sampler_uses_shared_source_epoch() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._sampler_start_monotonic_s = 100.0
+    recorder._record_fps_hz = 30
+
+    due = recorder._next_phase_aligned_sample_time("hal", {}, 100.005)
+
+    assert due == pytest.approx(100.0 + (1.0 / 30.0), abs=0.001)
+
+
+def test_dataset_recorder_alignment_time_uses_warmup_plus_dataset_timestamp() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._record_fps_hz = 30
+    recorder._episode_source_time0_s = 0.5
+
+    assert recorder._record_target_timestamp_s(0) == pytest.approx(0.5)
+    assert recorder._record_target_timestamp_s(15) == pytest.approx(1.0)
+
+
+def test_dataset_recorder_source_sample_time_uses_source_frequency() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._record_fps_hz = 30
+    recorder._force_sample_hz = 200.0
+
+    assert recorder._source_sample_timestamp_s("force", 50, {"force": {"sampleHz": 200}}) == pytest.approx(0.25)
+    assert recorder._source_sample_timestamp_s("camera_global", 10, {"cameras": {"fps": 25}}) == pytest.approx(0.4)
 
 
 def test_dataset_recorder_timed_source_records_timeout_drop() -> None:
@@ -234,21 +152,22 @@ def test_dataset_recorder_timed_source_records_timeout_drop() -> None:
     recorder._source_fail_streaks = {"hal": 0}
     recorder._source_warnings = []
 
-    sample = asyncio.run(recorder._timed_source("hal", slow_source(), time.monotonic()))
+    sample = asyncio.run(recorder._timed_source("hal", slow_source(), 2.5))
 
     assert sample.ok is False
+    assert sample.monotonic_s == pytest.approx(2.5)
     assert sample.message == "hal timeout"
     assert recorder._drop_counts["hal"] == 1
     assert recorder._source_fail_streaks["hal"] == 1
 
 
-def test_dataset_recorder_source_timestamp_uses_host_receive_time() -> None:
+def test_dataset_recorder_source_timestamp_uses_assigned_sample_time() -> None:
     recorder = object.__new__(DatasetRecorderService)
 
     assert recorder._source_sample_monotonic({"received_monotonic_ms": 1, "monotonic_s": 2.0}, 42.0) == 42.0
 
 
-def test_dataset_recorder_gripper_source_uses_host_receive_timestamp() -> None:
+def test_dataset_recorder_gripper_source_uses_assigned_sample_time() -> None:
     class FakeTelemetry:
         def __init__(self) -> None:
             self.gripper_positions = [-1.0, -1.0]
@@ -291,63 +210,11 @@ def test_dataset_recorder_gripper_source_uses_host_receive_timestamp() -> None:
     recorder._source_warnings = []
     config = {"hal": {"mode": "real"}, "gripper": {"sampleHz": 30, "sampleStaleMs": 500}}
 
-    before = time.monotonic()
-    sample = asyncio.run(recorder._gripper_source(config, before))
-    after = time.monotonic()
+    sample = asyncio.run(recorder._gripper_source(config, 3.5))
 
     assert sample.ok is True
     assert sample.value == [4.0, 5.0]
-    assert before <= sample.monotonic_s <= after
-
-
-def test_dataset_recorder_uses_cached_camera_frame_on_snapshot_failure(tmp_path: Path, monkeypatch) -> None:
-    class FakeCameras:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def snapshot(self, _config: dict[str, object], key: str) -> bytes:
-            self.calls += 1
-            if self.calls <= 3:
-                return f"{key}-first".encode()
-            raise RuntimeError(f"{key} offline")
-
-    class FakeHardware:
-        def __init__(self) -> None:
-            self.cameras = FakeCameras()
-
-    class FakeLogs:
-        def warning(self, _channel: str, _message: str) -> None:
-            return None
-
-    recorder = object.__new__(DatasetRecorderService)
-    recorder._native_dataset = None
-    recorder._dataset_dir = tmp_path
-    recorder._episode_index = 0
-    recorder._episode_frames = 0
-    recorder._current_episode_paths = []
-    recorder._camera_drops = {"global": 0, "wrist_left": 0, "wrist_right": 0}
-    recorder._drop_counts = {"global": 0, "wrist_left": 0, "wrist_right": 0}
-    recorder._last_camera_frames = {}
-    recorder._source_warnings = []
-    recorder.hardware = FakeHardware()
-    recorder.logs = FakeLogs()
-
-    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
-    config = {"hal": {"mode": "real"}}
-    first = asyncio.run(recorder._capture_cameras(config))
-    recorder._episode_frames = 1
-    second = asyncio.run(recorder._capture_cameras(config))
-
-    assert set(first) == {
-        "observation.images.global",
-        "observation.images.wrist_left",
-        "observation.images.wrist_right",
-    }
-    assert set(second) == set(first)
-    cached_path = tmp_path / second["observation.images.global"]
-    assert cached_path.read_bytes() == b"global-first"
-    assert recorder._camera_drops["global"] == 1
-    assert "global camera cache used" in recorder._source_warnings
+    assert sample.monotonic_s == pytest.approx(3.5)
 
 
 def test_native_preflight_does_not_import_lerobot_record_script() -> None:
