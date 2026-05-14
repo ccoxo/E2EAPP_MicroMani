@@ -26,7 +26,7 @@ from backend.services.teleop_mapping import TeleopMappingService
 
 SAFE_ID = re.compile(r"[^A-Za-z0-9_.-]+")
 CAMERA_KEYS: tuple[str, str, str] = ("global", "wrist_left", "wrist_right")
-# 这些 feature 名称需要和 LeRobot 数据集字段保持稳定，前后端按它们读取图像。
+# 这些 feature 名称需要和 LeRobot 数据集字段保持稳定,前后端按它们读取图像.
 CAMERA_FEATURE_KEYS: dict[str, str] = {
     "global": "observation.images.global",
     "wrist_left": "observation.images.wrist_left",
@@ -101,7 +101,7 @@ SOURCE_TIMEOUT_S: dict[str, float] = {
     "omega": 0.020,
     **{source: 0.035 for source in CAMERA_SOURCE_KEYS.values()},
 }
-# timeout 用 drop 边界，warning 用更严格的 skew 边界；这样慢但成功的源也会进入质量报告。
+# timeout 用 drop 边界,warning 用更严格的 skew 边界;这样慢但成功的源也会进入质量报告.
 SOURCE_MAX_SKEW_S: dict[str, float] = {
     "hal": 0.020,
     "force": 0.010,
@@ -136,7 +136,7 @@ class DatasetSaveError(RuntimeError):
 
 @dataclass(frozen=True)
 class TimedSample:
-    # 记录每个硬件源相对同一录制 tick 的时序，用于质量统计而不写入训练帧。
+    # 记录每个硬件源相对同一录制 tick 的时序,用于质量统计而不写入训练帧.
     source: str
     monotonic_s: float
     value: Any
@@ -156,7 +156,7 @@ SourceSample = TimedSample
 
 @dataclass(frozen=True)
 class PendingFrame:
-    # 写盘队列只传不可变帧快照，避免 episode 切换后旧帧写入新文件。
+    # 写盘队列只传不可变帧快照,避免 episode 切换后旧帧写入新文件.
     episode_index: int
     frame_index: int
     timestamp: float
@@ -165,19 +165,21 @@ class PendingFrame:
 
 @dataclass(frozen=True)
 class PendingImage:
-    # 图片写盘独立排队，低维记录先留在内存中，episode 保存时再批量写 JSONL。
+    # 图片写盘独立排队,低维记录先留在内存中,episode 保存时再批量写 JSONL.
     path: Path
     data: bytes
 
 
-# 存放采样数据的缓存区，按 source 分类，支持按时间查找最近样本和插值样本。
+# 存放采样数据的缓存区,按 source 分类,支持按时间查找最近样本和插值样本.
 class TimedRingBuffer:
     def __init__(self, *, retention_s: float = RING_BUFFER_RETENTION_S, maxlen: int = 300) -> None:
+        """功能:初始化时间采样缓存的容量和保留窗口."""
         self.retention_s = max(float(retention_s), 0.1)
         self.maxlen = max(int(maxlen), 1)
         self._samples: deque[TimedSample] = deque()
 
     def append(self, sample: TimedSample) -> None:
+        """功能:按单调时间追加采样,并清理过期或超量数据."""
         if not self._samples or sample.monotonic_s >= self._samples[-1].monotonic_s:
             self._samples.append(sample)
         else:
@@ -191,6 +193,7 @@ class TimedRingBuffer:
             self._samples.popleft()
 
     def nearest(self, target_s: float, max_skew_s: float) -> TimedSample | None:
+        """功能:查找目标时间附近且偏差合法的采样."""
         if not self._samples:
             return None
         samples = list(self._samples)
@@ -207,6 +210,7 @@ class TimedRingBuffer:
         return nearest if abs(nearest.monotonic_s - target_s) <= max_skew_s else None
 
     def interpolate(self, target_s: float, max_gap_s: float) -> TimedSample | None:
+        """功能:在相邻数值采样之间插值,不安全时退回最近采样."""
         if not self._samples:
             return None
         samples = list(self._samples)
@@ -243,23 +247,25 @@ class TimedRingBuffer:
         )
 
     def prune(self, before_s: float) -> None:
+        """功能:删除早于指定时间的历史采样."""
         while self._samples and self._samples[0].monotonic_s < before_s:
             self._samples.popleft()
 
     def clear(self) -> None:
+        """功能:清空缓存中的全部采样."""
         self._samples.clear()
 
     def __len__(self) -> int:
+        """功能:返回当前缓存中的采样数量."""
         return len(self._samples)
 
 
 class DatasetRecorderService:
     """Recorder using the app hardware services with a native LeRobot path.
 
-    If `lerobot[dataset]` is installed, frames are written through
-    `LeRobotDataset.create/resume/add_frame/save_episode`. If it is not
-    available, the service keeps the previous JSONL/JPEG fallback so the app can
-    still record and review data without changing the rest of the UI.
+    Frames are written through `LeRobotDataset.create/resume/add_frame/save_episode`.
+    AppStation owns hardware collection, time alignment, quality stats and UI
+    metadata. LeRobot owns dataset layout, frame persistence and standard metadata.
     """
 
     def __init__(
@@ -271,6 +277,7 @@ class DatasetRecorderService:
         logs: LogService,
         teleop: TeleopMappingService,
     ) -> None:
+        """功能:初始化数据集录制服务的依赖,状态,队列和缓存."""
         self.settings = settings
         self.hardware = hardware
         self.hal = hal
@@ -332,7 +339,7 @@ class DatasetRecorderService:
         self._last_saved_episode: dict[str, Any] | None = None
 
     async def start_session(self, dataset_name: str, task: str) -> dict[str, Any]:
-        """创建录制会话并初始化 native/fallback 数据集写入路径。"""
+        """功能:创建录制会话,初始化 native 写入路径并启动采样任务."""
         async with self._lock:
             if self._session_active:
                 raise RuntimeError("record session already active")
@@ -353,11 +360,9 @@ class DatasetRecorderService:
             self._last_native_camera_frames = {}
             self._last_camera_cache_used = {key: False for key in CAMERA_KEYS}
             native_started = self._try_begin_native_dataset_locked(config)
-            if native_started:
-                self._write_appstation_info(self._require_dataset_dir(), config)
-            else:
-                self._dataset_dir.mkdir(parents=True, exist_ok=True)
-                self._write_info(self._dataset_dir, config)
+            if not native_started:
+                raise RuntimeError(self._native_required_message())
+            self._write_appstation_info(self._require_dataset_dir(), config)
             self._episode_index = self._next_episode_index(self._dataset_dir)
             self._session_started_at = time.monotonic()
             self._session_active = True
@@ -380,7 +385,7 @@ class DatasetRecorderService:
         return self.status()
 
     async def save_episode(self) -> dict[str, Any]:
-        """保存当前 episode，返回 episode 摘要和最新录制状态。"""
+        """功能:停止当前 episode 采集,等待已排队数据落盘并返回保存结果."""
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
@@ -396,7 +401,7 @@ class DatasetRecorderService:
         return {"episode": episode, "status": self.status()}
 
     async def discard_episode(self) -> dict[str, Any]:
-        """丢弃当前或最近保存的 episode，并立即开始同序号重录。"""
+        """功能:丢弃当前或最近保存的 episode,并用相同序号重新录制."""
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
@@ -424,7 +429,7 @@ class DatasetRecorderService:
         return self.status()
 
     async def skip_reset(self) -> dict[str, Any]:
-        """跳过复位确认并开始下一条 episode 录制。"""
+        """功能:跳过复位确认,清理未保存数据并开始下一条 episode."""
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
@@ -447,7 +452,7 @@ class DatasetRecorderService:
         return self.status()
 
     async def finish_session(self) -> dict[str, Any]:
-        """结束录制会话，清理未保存帧并关闭 native 数据集资源。"""
+        """功能:结束录制会话,停止后台任务并释放 native 数据集资源."""
         async with self._lock:
             was_recording = self._session_active and self._recording
             if was_recording:
@@ -481,7 +486,7 @@ class DatasetRecorderService:
         return self.status()
 
     def status(self) -> dict[str, Any]:
-        """返回当前录制会话、帧计数、频率和数据集路径状态。"""
+        """功能:返回当前录制会话的状态,帧计数,写入格式和 native 错误."""
         elapsed = time.monotonic() - self._episode_started_at if self._recording else 0.0
         return {
             "session": self._session_id,
@@ -497,13 +502,13 @@ class DatasetRecorderService:
             "fps": self._record_fps_hz,
             "forceSampleHz": self._force_sample_hz,
             "datasetRoot": str(self._dataset_root(self.settings.get_config())),
-            "format": "lerobot-v3-native" if self._native_dataset is not None else "lerobot-compatible-jsonl-fallback",
+            "format": "lerobot-v3-native" if self._native_dataset is not None else "lerobot-v3-native-required",
             "nativeError": self._native_error,
             "teleop": self.teleop.status(),
         }
 
     def list_datasets(self) -> list[dict[str, Any]]:
-        """列出本地数据集，并附带可见 episode 的复核摘要。"""
+        """功能:扫描本地数据集目录,汇总可见 episode 和展示信息."""
         root = self._dataset_root(self.settings.get_config())
         if not root.exists():
             return []
@@ -534,7 +539,7 @@ class DatasetRecorderService:
                     "format": str(
                         app_info.get("format")
                         or info.get("format")
-                        or ("lerobot-v3-native" if native_format else "lerobot-v3-jsonl-fallback")
+                        or ("lerobot-v3-native" if native_format else "lerobot-v3-native-required")
                     ),
                     "episodes": [
                         self._episode_for_api(dataset_dir, dataset_dir.name, episode) for episode in visible_episodes
@@ -544,7 +549,7 @@ class DatasetRecorderService:
         return sorted(datasets, key=lambda item: int(item.get("updatedAt", 0)), reverse=True)
 
     def create_dataset(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """按请求名称创建空数据集，优先生成 LeRobot v3 native metadata。"""
+        """功能:创建空数据集目录,并写入 native metadata."""
         config = self.settings.get_config()
         name = str(payload.get("name") or f"dataset_{now_ms()}").strip()
         dataset_id = self._safe_id(name)
@@ -559,13 +564,18 @@ class DatasetRecorderService:
             self._dataset_name = name
             dataset_dir.mkdir(parents=True, exist_ok=True)
             if not self._create_native_dataset_metadata(dataset_dir, config):
-                self._write_info(dataset_dir, config)
+                try:
+                    if dataset_dir.exists() and not any(dataset_dir.iterdir()):
+                        dataset_dir.rmdir()
+                except OSError:
+                    pass
+                raise RuntimeError(self._native_required_message())
         finally:
             self._dataset_name = previous_name
         return {"dataset": self._episode_dataset_stub(dataset_dir)}
 
     def update_dataset(self, dataset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """更新数据集展示名称并保留原有 metadata 和 episode 索引。"""
+        """功能:更新数据集展示名称和时间戳,保留已有录制数据."""
         dataset_dir = self._dataset_path(dataset_id)
         info_path = dataset_dir / "meta" / "info.json"
         info = self._read_json(info_path)
@@ -590,7 +600,7 @@ class DatasetRecorderService:
         return {"dataset": self._episode_dataset_stub(dataset_dir)}
 
     def delete_dataset(self, dataset_id: str) -> dict[str, Any]:
-        """删除指定本地数据集，并拒绝越过配置的数据集根目录。"""
+        """功能:删除指定数据集目录,并阻止越过配置根目录."""
         dataset_dir = self._dataset_path(dataset_id)
         root = self._dataset_root(self.settings.get_config()).resolve()
         target = dataset_dir.resolve()
@@ -604,7 +614,7 @@ class DatasetRecorderService:
         return {"deleted": dataset_id}
 
     def save_review(self, dataset_id: str) -> dict[str, Any]:
-        """保存复核结果时间戳，保持 native 和 fallback metadata 兼容。"""
+        """功能:保存数据集复核时间戳,兼容 native 和 fallback metadata."""
         dataset_dir = self._dataset_path(dataset_id)
         info_path = dataset_dir / "meta" / "info.json"
         info = self._read_json(info_path)
@@ -624,14 +634,14 @@ class DatasetRecorderService:
         return {"saved": dataset_id, "updatedAt": info["updatedAt"]}
 
     def export_dataset(self, dataset_id: str) -> dict[str, Any]:
-        """返回本地导出状态；Hub 推送未启用时只确认数据集已就绪。"""
+        """功能:返回本地数据集的导出路径,状态和格式."""
         dataset_dir = self._dataset_path(dataset_id)
         if not (dataset_dir / "meta" / "info.json").exists():
             raise FileNotFoundError(dataset_id)
         config = self.settings.get_config()
         push_enabled = bool(config.get("storage", {}).get("pushToHub", False))
         info = self._read_json(dataset_dir / "meta" / "info.json")
-        fmt = "lerobot-v3-native" if self._is_native_dataset_info(info) else "lerobot-compatible-jsonl-fallback"
+        fmt = "lerobot-v3-native" if self._is_native_dataset_info(info) else "lerobot-v3-native-required"
         return {
             "dataset": dataset_id,
             "pushToHub": push_enabled,
@@ -641,7 +651,7 @@ class DatasetRecorderService:
         }
 
     def dataset_stats(self, dataset_id: str) -> dict[str, Any]:
-        """汇总可见 episode 的帧数、时长、状态和力觉质量指标。"""
+        """功能:统计数据集的可见 episode,帧数,时长,质量和 feature 摘要."""
         dataset_dir = self._dataset_path(dataset_id)
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
@@ -678,7 +688,7 @@ class DatasetRecorderService:
         }
 
     def episode_detail(self, dataset_id: str, episode_id: str) -> dict[str, Any]:
-        """读取单条 episode 详情，包含 feature shape、样本和相机分辨率来源。"""
+        """功能:读取单条 episode 的详情,feature 定义和抽样帧."""
         dataset_dir = self._dataset_path(dataset_id)
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
@@ -696,7 +706,7 @@ class DatasetRecorderService:
         return {"episode": self._episode_for_api(dataset_dir, dataset_id, episode)}
 
     def split_dataset(self, dataset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """基于可见 episode 生成 train/val/test 本地划分文件。"""
+        """功能:按请求比例生成并保存 train/val/test 数据划分."""
         dataset_dir = self._dataset_path(dataset_id)
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
@@ -723,7 +733,7 @@ class DatasetRecorderService:
         return payload_out
 
     def clean_dataset(self, dataset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """按帧数和迟帧比例检查可见 episode，并可选择标记为 invalid。"""
+        """功能:根据质量阈值生成清理报告,并可选标记低质量 episode."""
         dataset_dir = self._dataset_path(dataset_id)
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
@@ -762,7 +772,7 @@ class DatasetRecorderService:
         return report
 
     def push_dataset(self, dataset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """在启用 Hub 推送时上传数据集；默认 dry-run 只返回本地就绪状态。"""
+        """功能:返回数据集推送请求的结果,保留远端仓库接入边界."""
         dataset_dir = self._dataset_path(dataset_id)
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
@@ -790,7 +800,7 @@ class DatasetRecorderService:
         return {"dataset": dataset_id, "repoId": repo_id, "pushed": True, "dryRun": False}
 
     def update_episode(self, dataset_id: str, episode_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """更新 episode 名称或复核状态，供前端复核页直接调用。"""
+        """功能:更新指定 episode 的状态,名称或删除标记."""
         dataset_dir = self._dataset_path(dataset_id)
         episodes = self._read_episodes(dataset_dir)
         updated = False
@@ -812,7 +822,7 @@ class DatasetRecorderService:
         return {"episode": episode_id}
 
     def delete_episode(self, dataset_id: str, episode_id: str) -> dict[str, Any]:
-        """软删除 episode 并标记 invalid，避免继续作为可用训练样本展示。"""
+        """功能:将指定 episode 标记为删除或移除 fallback 记录."""
         dataset_dir = self._dataset_path(dataset_id)
         episodes = self._read_episodes(dataset_dir)
         updated = False
@@ -829,7 +839,7 @@ class DatasetRecorderService:
         return {"deleted": episode_id}
 
     def resolve_file(self, dataset_id: str, relative_path: str) -> Path:
-        """解析数据集内部文件路径，并阻止路径逃逸到数据集根目录之外。"""
+        """功能:解析数据集内部相对文件路径,并防止路径越界."""
         dataset_dir = self._dataset_path(dataset_id)
         target = (dataset_dir / relative_path).resolve()
         root = dataset_dir.resolve()
@@ -842,7 +852,7 @@ class DatasetRecorderService:
         return target
 
     def resolve_frame_image(self, dataset_id: str, episode_id: str, camera: str, frame: int) -> bytes:
-        """读取 fallback 或 native episode 的指定相机帧并返回 JPEG 字节。"""
+        """功能:按 episode,相机和帧号返回预览 JPEG,兼容 fallback 和 native."""
         if camera not in CAMERA_FEATURE_KEYS:
             raise FileNotFoundError(camera)
         dataset_dir = self._dataset_path(dataset_id)
@@ -879,6 +889,7 @@ class DatasetRecorderService:
 
     # 初始化采样缓存区
     def _new_sample_buffers(self, config: dict[str, Any]) -> dict[str, TimedRingBuffer]:
+        """功能:处理录制服务的内部辅助逻辑(_new_sample_buffers)."""
         return {
             source: TimedRingBuffer(
                 retention_s=RING_BUFFER_RETENTION_S,
@@ -888,6 +899,7 @@ class DatasetRecorderService:
         }
 
     def _start_sampler_tasks_locked(self) -> None:
+        """功能:处理录制服务的内部辅助逻辑(_start_sampler_tasks_locked)."""
         for source in SOURCE_KEYS:
             task = self._sampler_tasks.get(source)
             if task is None or task.done():
@@ -897,6 +909,7 @@ class DatasetRecorderService:
                 )
 
     async def _stop_sampler_tasks(self) -> None:
+        """功能:处理录制服务的内部辅助逻辑(_stop_sampler_tasks)."""
         tasks = [task for task in self._sampler_tasks.values() if not task.done()]
         for task in tasks:
             task.cancel()
@@ -905,13 +918,15 @@ class DatasetRecorderService:
         self._sampler_tasks = {}
 
     async def _drain_recording_queues(self) -> None:
-        # 先等锁外待入队帧完成，再等待帧队列和图片队列，避免保存时漏掉最后一帧。
+        # 先等锁外待入队帧完成,再等待帧队列和图片队列,避免保存时漏掉最后一帧.
+        """功能:处理录制服务的内部辅助逻辑(_drain_recording_queues)."""
         await self._write_enqueue_idle.wait()
         await self._write_queue.join()
         await self._image_queue.join()
 
     async def _stop_writer_task(self) -> None:
-        # 停止 writer 前必须先排空队列，保证 metadata 的帧数和磁盘内容一致。
+        # 停止 writer 前必须先排空队列,保证 metadata 的帧数和磁盘内容一致.
+        """功能:处理录制服务的内部辅助逻辑(_stop_writer_task)."""
         await self._write_enqueue_idle.wait()
         await self._write_queue.join()
         task = self._writer_task
@@ -923,6 +938,7 @@ class DatasetRecorderService:
         self._writer_task = None
 
     async def _stop_image_writer_task(self) -> None:
+        """功能:处理录制服务的内部辅助逻辑(_stop_image_writer_task)."""
         await self._image_queue.join()
         task = self._image_writer_task
         if task is None:
@@ -933,7 +949,8 @@ class DatasetRecorderService:
         self._image_writer_task = None
 
     async def _writer_loop(self) -> None:
-        # 单消费者串行整理帧，天然保持 frame_index/timestamp 顺序。
+        # 单消费者串行整理帧,天然保持 frame_index/timestamp 顺序.
+        """功能:写入或生成数据集持久化内容(_writer_loop)."""
         while True:
             pending = await self._write_queue.get()
             try:
@@ -950,7 +967,8 @@ class DatasetRecorderService:
                 self._write_queue.task_done()
 
     async def _image_writer_loop(self) -> None:
-        # 图片写盘单独消费，避免慢磁盘阻塞低维记录缓冲。
+        # 图片写盘单独消费,避免慢磁盘阻塞低维记录缓冲.
+        """功能:处理录制服务的内部辅助逻辑(_image_writer_loop)."""
         while True:
             pending = await self._image_queue.get()
             try:
@@ -965,6 +983,7 @@ class DatasetRecorderService:
 
     # 各个硬件的录制循环
     async def _sample_source_loop(self, source: str) -> None:
+        """功能:执行硬件来源采样或采样数据转换(_sample_source_loop)."""
         next_sample_s = time.monotonic()
         while self._session_active:
             try:
@@ -984,6 +1003,7 @@ class DatasetRecorderService:
 
     # 采样具体的硬件
     async def _sample_source_once(self, source: str, config: dict[str, Any]) -> TimedSample:
+        """功能:执行硬件来源采样或采样数据转换(_sample_source_once)."""
         target_s = time.monotonic()
         if source == "hal":
             return await self._timed_source("hal", self.hal.motion_state(), target_s, record_quality=False)
@@ -999,6 +1019,7 @@ class DatasetRecorderService:
         return self._fallback_sample(source, target_s, f"{source} unsupported")
 
     async def _sample_force_source(self, config: dict[str, Any], target_s: float) -> TimedSample:
+        """功能:执行硬件来源采样或采样数据转换(_sample_force_source)."""
         if not self._real_hardware_mode(config):
             value = SimpleNamespace(
                 ok=True,
@@ -1014,6 +1035,7 @@ class DatasetRecorderService:
         )
 
     async def _sample_camera_source(self, config: dict[str, Any], camera: str, target_s: float) -> TimedSample:
+        """功能:执行硬件来源采样或采样数据转换(_sample_camera_source)."""
         source = CAMERA_SOURCE_KEYS[camera]
         feature_key = CAMERA_FEATURE_KEYS[camera]
         started = time.monotonic()
@@ -1061,6 +1083,7 @@ class DatasetRecorderService:
         )
 
     def _aligned_sample(self, source: str, target_s: float) -> TimedSample:
+        """功能:处理录制服务的内部辅助逻辑(_aligned_sample)."""
         buffer = self._sample_buffers.get(source)
         max_skew_s = SOURCE_MAX_SKEW_S.get(source, 0.020)
         sample = buffer.nearest(target_s, max_skew_s) if buffer is not None else None
@@ -1083,6 +1106,7 @@ class DatasetRecorderService:
         return sample
 
     def _fallback_sample(self, source: str, target_s: float, message: str) -> TimedSample:
+        """功能:处理 fallback JSONL/图片路径的记录和预览(_fallback_sample)."""
         value: Any = None
         if source == "hal":
             value = {"positions": list(self.telemetry.motion_positions), "pulses": [0.0] * 12}
@@ -1109,8 +1133,9 @@ class DatasetRecorderService:
         )
 
     async def _record_loop(self) -> None:
-        # 录制循环按目标 FPS 调度；慢帧只记质量指标，不中断本轮采集。
-        # 硬件采样由后台 sampler 产生；本循环只做时间对齐、组帧和入队。
+        # 录制循环按目标 FPS 调度;慢帧只记质量指标,不中断本轮采集.
+        # 硬件采样由后台 sampler 产生;本循环只做时间对齐,组帧和入队.
+        """功能:处理录制循环,帧对齐或动作向量(_record_loop)."""
         while self._session_active:
             try:
                 async with self._lock:
@@ -1159,7 +1184,7 @@ class DatasetRecorderService:
                         self._write_enqueue_idle.clear()
                         pass
                 if not queued:
-                    # 队列满时在锁外等待，避免写盘反压阻塞保存、丢弃或结束操作。
+                    # 队列满时在锁外等待,避免写盘反压阻塞保存,丢弃或结束操作.
                     try:
                         await self._write_queue.put(pending)
                     finally:
@@ -1181,6 +1206,7 @@ class DatasetRecorderService:
         *,
         frame_index: int | None = None,
     ) -> dict[str, Any]:
+        """功能:处理录制服务的内部辅助逻辑(_collect_frame)."""
         config = self.settings.get_config()
         target_monotonic_s = target_monotonic_s if target_monotonic_s is not None else time.monotonic()
         frame_index = self._episode_frames if frame_index is None else frame_index
@@ -1239,7 +1265,8 @@ class DatasetRecorderService:
         *,
         record_quality: bool = True,
     ) -> SourceSample:
-        # 缓存型源本身不阻塞，但仍记录采样时间，便于质量报告统一处理。
+        # 缓存型源本身不阻塞,但仍记录采样时间,便于质量报告统一处理.
+        """功能:处理录制服务的内部辅助逻辑(_cached_source)."""
         now = time.monotonic()
         sample = SourceSample(
             source,
@@ -1262,7 +1289,8 @@ class DatasetRecorderService:
         *,
         record_quality: bool = True,
     ) -> SourceSample:
-        # 夹爪位置由 telemetry/worker 后台刷新；录制帧只读取缓存并检查是否过期。
+        # 夹爪位置由 telemetry/worker 后台刷新;录制帧只读取缓存并检查是否过期.
+        """功能:处理录制服务的内部辅助逻辑(_gripper_source)."""
         if not self._real_hardware_mode(config):
             return await self._cached_source(
                 "gripper",
@@ -1294,9 +1322,10 @@ class DatasetRecorderService:
         return sample
 
     async def _refresh_gripper_cache(self, config: dict[str, Any]) -> None:
+        """功能:处理录制服务的内部辅助逻辑(_refresh_gripper_cache)."""
         refresh_gripper = getattr(self.telemetry, "refresh_gripper_positions", None)
         if callable(refresh_gripper):
-            # 录制循环主动刷新 worker 缓存，避免依赖 WebSocket 帧驱动夹爪采样。
+            # 录制循环主动刷新 worker 缓存,避免依赖 WebSocket 帧驱动夹爪采样.
             await asyncio.to_thread(refresh_gripper, config, time.monotonic())
 
     async def _timed_source(
@@ -1307,7 +1336,8 @@ class DatasetRecorderService:
         *,
         record_quality: bool = True,
     ) -> SourceSample:
-        # 单源超时只影响该源质量标记，不能拖慢同一 tick 的其他硬件源。
+        # 单源超时只影响该源质量标记,不能拖慢同一 tick 的其他硬件源.
+        """功能:处理录制服务的内部辅助逻辑(_timed_source)."""
         started = time.monotonic()
         try:
             value = await asyncio.wait_for(awaitable, timeout=self._source_timeout_s(source))
@@ -1345,9 +1375,11 @@ class DatasetRecorderService:
         return sample
 
     def _source_timeout_s(self, source: str) -> float:
+        """功能:统计或解析单个硬件来源的时序质量(_source_timeout_s)."""
         return SOURCE_TIMEOUT_S.get(source, 0.020)
 
     def _source_sample_rate_hz(self, source: str, config: dict[str, Any]) -> float:
+        """功能:统计或解析单个硬件来源的时序质量(_source_sample_rate_hz)."""
         if source == "force":
             return min(max(self._force_sample_hz_from_config(config), 1.0), 200.0)
         if source == "gripper":
@@ -1357,6 +1389,7 @@ class DatasetRecorderService:
         return min(max(float(self._record_fps_from_config(config)), 1.0), 60.0)
 
     def _force_values_from_sample(self, value: Any) -> tuple[list[float], list[float]] | None:
+        """功能:处理力觉数据的提取,配置或质量统计(_force_values_from_sample)."""
         if value is None:
             return None
         if isinstance(value, dict):
@@ -1375,11 +1408,13 @@ class DatasetRecorderService:
         )
 
     def _source_sample_monotonic(self, value: Any, fallback_monotonic_s: float) -> float:
+        """功能:统计或解析单个硬件来源的时序质量(_source_sample_monotonic)."""
         _ = value
         return fallback_monotonic_s
 
     def _record_source_quality(self, sample: SourceSample, target_monotonic_s: float, elapsed_ms: float) -> None:
-        # 所有源使用同一套质量统计：skew、耗时、drop、连续失败和 warning。
+        # 所有源使用同一套质量统计:skew,耗时,drop,连续失败和 warning.
+        """功能:处理录制循环,帧对齐或动作向量(_record_source_quality)."""
         skew_ms = (sample.monotonic_s - target_monotonic_s) * 1000.0
         abs_skew_ms = abs(skew_ms)
         self._source_skews_ms.setdefault(sample.source, []).append(skew_ms)
@@ -1416,6 +1451,7 @@ class DatasetRecorderService:
             self._source_warnings.append(f"{sample.source} consecutive failures: {streak}")
 
     async def _capture_cameras(self, config: dict[str, Any]) -> dict[str, Any]:
+        """功能:采集相机数据并处理缓存或占位兜底(_capture_cameras)."""
         self._last_camera_cache_used = {key: False for key in CAMERA_KEYS}
         if self._native_dataset is not None:
             return await self._capture_native_camera_arrays(config)
@@ -1424,7 +1460,7 @@ class DatasetRecorderService:
         if not self._real_hardware_mode(config):
             return {}
         paths: dict[str, str] = {}
-        # 三路相机并发截图，避免串行等待把录制循环拖慢。
+        # 三路相机并发截图,避免串行等待把录制循环拖慢.
         tasks = [
             asyncio.to_thread(self.hardware.cameras.snapshot, config, key)
             for key in CAMERA_KEYS
@@ -1455,6 +1491,7 @@ class DatasetRecorderService:
         return paths
 
     def _write_frame_locked(self, frame: dict[str, Any]) -> list[PendingImage]:
+        """功能:写入或生成数据集持久化内容(_write_frame_locked)."""
         if int(frame.get("episode_index", self._episode_index)) != self._episode_index:
             return []
         if self._native_dataset is not None:
@@ -1489,7 +1526,8 @@ class DatasetRecorderService:
         images: object,
         frame_index: int,
     ) -> tuple[dict[str, str], list[PendingImage]]:
-        # 图片路径使用帧自身索引，避免写盘跳帧时路径和 JSON record 错位。
+        # 图片路径使用帧自身索引,避免写盘跳帧时路径和 JSON record 错位.
+        """功能:处理 fallback JSONL/图片路径的记录和预览(_fallback_camera_image_jobs_locked)."""
         paths: dict[str, str] = {}
         jobs: list[PendingImage] = []
         image_payload = images if isinstance(images, dict) else {}
@@ -1513,6 +1551,7 @@ class DatasetRecorderService:
         return paths, jobs
 
     def _write_native_frame_locked(self, frame: dict[str, Any]) -> None:
+        """功能:写入或生成数据集持久化内容(_write_native_frame_locked)."""
         if self._native_dataset is None:
             return
         native_frame = {
@@ -1542,6 +1581,7 @@ class DatasetRecorderService:
         positions: list[float],
         pulses: list[float],
     ) -> list[float]:
+        """功能:处理录制循环,帧对齐或动作向量(_recording_motion_positions)."""
         origin = config.get("motion", {}).get("origin", {})
         if not isinstance(origin, dict) or len(pulses) != 12:
             return positions
@@ -1565,6 +1605,7 @@ class DatasetRecorderService:
         return next_positions
 
     def _origin_side_pulses(self, origin: dict[str, Any], side: str) -> list[float] | None:
+        """功能:处理录制服务的内部辅助逻辑(_origin_side_pulses)."""
         key = "leftPulse" if side == "left" else "rightPulse"
         raw = origin.get(key)
         if not isinstance(raw, list) or len(raw) < 6:
@@ -1575,9 +1616,10 @@ class DatasetRecorderService:
             return None
 
     def _begin_episode_locked(self) -> None:
+        """功能:处理录制服务的内部辅助逻辑(_begin_episode_locked)."""
         dataset_dir = self._require_dataset_dir()
         self._close_writer_locked()
-        # 每个 episode 独立统计质量指标，保存/丢弃时可以精确回滚。
+        # 每个 episode 独立统计质量指标,保存/丢弃时可以精确回滚.
         self._episode_started_at = time.monotonic()
         self._episode_start_monotonic_s = self._episode_started_at
         self._episode_frames = 0
@@ -1614,7 +1656,8 @@ class DatasetRecorderService:
         self._recording = True
 
     def _flush_fallback_records_locked(self) -> None:
-        # 低维 JSONL 在 episode 保存时批量写入，减少录制过程中的小写入和 flush 抖动。
+        # 低维 JSONL 在 episode 保存时批量写入,减少录制过程中的小写入和 flush 抖动.
+        """功能:处理录制服务的内部辅助逻辑(_flush_fallback_records_locked)."""
         if self._current_data_path is None:
             return
         self._current_data_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1626,7 +1669,7 @@ class DatasetRecorderService:
         self._current_episode_paths.append(self._current_data_path)
 
     def _encode_fallback_videos_locked(self) -> None:
-        # Fallback metadata declares MP4 video features, so saving must produce MP4s or fail clearly.
+        # Legacy fallback paths should fail clearly if an older internal path reaches them.
         if not self._episode_records:
             return
         try:
@@ -1746,6 +1789,7 @@ class DatasetRecorderService:
         return True, ""
 
     def _finalize_episode_locked(self, *, status: str, deleted: bool) -> dict[str, Any]:
+        """功能:处理录制服务的内部辅助逻辑(_finalize_episode_locked)."""
         dataset_dir = self._require_dataset_dir()
         data_path = self._current_data_path
         duration_s = max(0.0, time.monotonic() - self._episode_started_at)
@@ -1754,12 +1798,11 @@ class DatasetRecorderService:
         if native:
             self._save_native_episode_locked()
         elif not deleted:
-            self._encode_fallback_videos_locked()
-            self._flush_fallback_records_locked()
+            raise DatasetSaveError(self._native_required_message())
         episode_id = f"episode_{self._episode_index:06d}"
         skew = self._skew_stats()
         source_skew = self._source_skew_stats()
-        # 统一写入 AppStation 自己的 episode 索引，兼容原生 LeRobot 和 JSONL fallback。
+        # 统一写入 AppStation 自己的 episode 索引,兼容原生 LeRobot 和 JSONL fallback.
         episode = {
             "id": episode_id,
             "name": episode_id,
@@ -1804,6 +1847,7 @@ class DatasetRecorderService:
         return episode
 
     def _remove_saved_episode_locked(self, episode: dict[str, Any]) -> None:
+        """功能:处理录制服务的内部辅助逻辑(_remove_saved_episode_locked)."""
         dataset_dir = self._require_dataset_dir()
         episode_id = str(episode.get("id", ""))
         self._episode_index = int(episode.get("episodeIndex", self._episode_index))
@@ -1812,6 +1856,7 @@ class DatasetRecorderService:
         self._remove_episode_artifacts_locked(self._episode_index)
 
     def _mark_saved_episode_deleted_locked(self, episode: dict[str, Any]) -> None:
+        """功能:处理录制服务的内部辅助逻辑(_mark_saved_episode_deleted_locked)."""
         dataset_dir = self._require_dataset_dir()
         episode_id = str(episode.get("id", ""))
         episodes = self._read_episodes(dataset_dir)
@@ -1824,6 +1869,7 @@ class DatasetRecorderService:
         self._write_episodes(dataset_dir, episodes)
 
     def _remove_episode_artifacts_locked(self, episode_index: int) -> None:
+        """功能:处理录制服务的内部辅助逻辑(_remove_episode_artifacts_locked)."""
         dataset_dir = self._require_dataset_dir().resolve()
         data_path = dataset_dir / "data" / "chunk-000" / f"episode_{episode_index:06d}.jsonl"
         self._safe_unlink(dataset_dir, data_path)
@@ -1834,6 +1880,7 @@ class DatasetRecorderService:
             self._safe_rmtree(dataset_dir, image_dir)
 
     def _discard_current_episode_files_locked(self) -> None:
+        """功能:处理录制服务的内部辅助逻辑(_discard_current_episode_files_locked)."""
         if self._native_dataset is not None:
             try:
                 self._native_dataset.clear_episode_buffer()
@@ -1855,6 +1902,7 @@ class DatasetRecorderService:
         self._current_episode_paths = []
 
     def _safe_unlink(self, root: Path, path: Path) -> None:
+        """功能:执行受数据集根目录约束的安全文件操作(_safe_unlink)."""
         try:
             target = path.resolve()
             target.relative_to(root)
@@ -1867,6 +1915,7 @@ class DatasetRecorderService:
             pass
 
     def _safe_rmtree(self, root: Path, path: Path) -> None:
+        """功能:执行受数据集根目录约束的安全文件操作(_safe_rmtree)."""
         try:
             target = path.resolve()
             target.relative_to(root)
@@ -1879,6 +1928,7 @@ class DatasetRecorderService:
             pass
 
     def _close_writer_locked(self) -> None:
+        """功能:处理录制服务的内部辅助逻辑(_close_writer_locked)."""
         if self._writer is None:
             return
         try:
@@ -1887,8 +1937,9 @@ class DatasetRecorderService:
             self._writer = None
 
     def _write_info(self, dataset_dir: Path, config: dict[str, Any]) -> None:
+        """功能:写入或生成数据集持久化内容(_write_info)."""
         info_path = dataset_dir / "meta" / "info.json"
-        # fallback metadata 仅保留训练契约需要的核心字段，避免和 native metadata 语义混用。
+        # fallback metadata 仅保留训练契约需要的核心字段,避免和 native metadata 语义混用.
         payload = {
             "name": self._dataset_name,
             "codebase_version": "v3.0",
@@ -1899,6 +1950,7 @@ class DatasetRecorderService:
         self._write_json(info_path, payload)
 
     def _write_appstation_info(self, dataset_dir: Path, config: dict[str, Any]) -> None:
+        """功能:写入或生成数据集持久化内容(_write_appstation_info)."""
         path = dataset_dir / "meta" / "appstation_info.json"
         info = self._read_json(path)
         payload = {
@@ -1932,6 +1984,7 @@ class DatasetRecorderService:
         self._write_json(path, payload)
 
     def _features(self) -> dict[str, Any]:
+        """功能:处理录制服务的内部辅助逻辑(_features)."""
         image_features = {}
         for key in CAMERA_KEYS:
             width, height = CAMERA_CAPTURE_SIZES[key]
@@ -1951,7 +2004,9 @@ class DatasetRecorderService:
         }
 
     def _create_native_dataset_metadata(self, dataset_dir: Path, config: dict[str, Any]) -> bool:
+        """功能:处理录制服务的内部辅助逻辑(_create_native_dataset_metadata)."""
         if not self._native_recording_requested():
+            self._native_error = "native LeRobot disabled by APPSTATION_LEROBOT_NATIVE"
             return False
         preflight = self._native_preflight()
         if preflight:
@@ -1959,8 +2014,10 @@ class DatasetRecorderService:
             return False
         imports = self._native_imports()
         if imports is None:
+            self._native_error = "lerobot[dataset] is not installed in backend runtime"
             return False
         if dataset_dir.exists() and any(dataset_dir.iterdir()):
+            self._native_error = "dataset directory already contains files"
             return False
         LeRobotDataset, _np = imports
         repo_id = f"local/{dataset_dir.name}"
@@ -1990,7 +2047,8 @@ class DatasetRecorderService:
             self._native_use_videos = previous_use_videos
 
     def _try_begin_native_dataset_locked(self, config: dict[str, Any]) -> bool:
-        # 原生 LeRobot 可用时优先使用；失败时调用方会退回 JSONL/JPEG 兼容格式。
+        # 录制数据统一交给 LeRobot native dataset 维护;失败时调用方直接报错.
+        """功能:处理录制服务的内部辅助逻辑(_try_begin_native_dataset_locked)."""
         if not self._native_recording_requested():
             self._native_error = "native LeRobot disabled by APPSTATION_LEROBOT_NATIVE"
             return False
@@ -2011,7 +2069,7 @@ class DatasetRecorderService:
         try:
             if self._is_native_dataset_info(self._read_json(dataset_dir / "meta" / "info.json")):
                 if self._native_dataset_is_empty(dataset_dir):
-                    # 空的原生目录可能来自上次初始化失败，重建可以修复损坏的 meta。
+                    # 空的原生目录可能来自上次初始化失败,重建可以修复损坏的 meta.
                     app_info = self._read_json(dataset_dir / "meta" / "appstation_info.json")
                     shutil.rmtree(dataset_dir)
                     self._native_dataset = LeRobotDataset.create(
@@ -2028,7 +2086,7 @@ class DatasetRecorderService:
                     if app_info:
                         self._write_json(dataset_dir / "meta" / "appstation_info.json", app_info)
                 else:
-                    # 已有有效原生数据集时继续追加，保留历史 episode。
+                    # 已有有效原生数据集时继续追加,保留历史 episode.
                     self._native_dataset = LeRobotDataset.resume(
                         repo_id=repo_id,
                         root=dataset_dir,
@@ -2059,7 +2117,13 @@ class DatasetRecorderService:
             self._native_error = str(exc)
             return False
 
+    def _native_required_message(self) -> str:
+        """功能:生成 native LeRobot 必需但不可用时的错误信息."""
+        reason = self._native_error or "native LeRobot dataset initialization failed"
+        return f"native LeRobot dataset is required; {reason}"
+
     def _native_dataset_is_empty(self, dataset_dir: Path) -> bool:
+        """功能:处理 LeRobot native 数据集的创建,恢复,读取或写入(_native_dataset_is_empty)."""
         data_dir = dataset_dir / "data"
         episode_meta_dir = dataset_dir / "meta" / "episodes"
         return (
@@ -2069,7 +2133,8 @@ class DatasetRecorderService:
         )
 
     def _native_features(self, config: dict[str, Any]) -> dict[str, Any]:
-        # feature shape 是训练/回放的契约；这里集中生成，避免录制路径出现字段漂移。
+        # feature shape 是训练/回放的契约;这里集中生成,避免录制路径出现字段漂移.
+        """功能:处理 LeRobot native 数据集的创建,恢复,读取或写入(_native_features)."""
         image_dtype = "video" if self._native_use_videos else "image"
         features: dict[str, Any] = {
             "observation.state": {"dtype": "float32", "shape": (14,), "names": list(STATE_FEATURE_NAMES)},
@@ -2088,6 +2153,7 @@ class DatasetRecorderService:
         return features
 
     def _native_imports(self) -> tuple[Any, Any] | None:
+        """功能:处理 LeRobot native 数据集的创建,恢复,读取或写入(_native_imports)."""
         try:
             module = importlib.import_module("lerobot.datasets.lerobot_dataset")
             np = importlib.import_module("numpy")
@@ -2096,6 +2162,7 @@ class DatasetRecorderService:
         return module.LeRobotDataset, np
 
     def _native_preflight(self) -> str:
+        """功能:处理 LeRobot native 数据集的创建,恢复,读取或写入(_native_preflight)."""
         imports = self._native_imports()
         if imports is None:
             return "lerobot[dataset] is not installed in backend runtime"
@@ -2113,17 +2180,21 @@ class DatasetRecorderService:
         return ""
 
     def _native_recording_requested(self) -> bool:
+        """功能:处理 LeRobot native 数据集的创建,恢复,读取或写入(_native_recording_requested)."""
         value = os.environ.get("APPSTATION_LEROBOT_NATIVE", "auto").strip().lower()
         return value not in {"0", "false", "off", "no"}
 
     def _native_use_videos_requested(self) -> bool:
+        """功能:处理 LeRobot native 数据集的创建,恢复,读取或写入(_native_use_videos_requested)."""
         value = os.environ.get("APPSTATION_LEROBOT_USE_VIDEOS", "1").strip().lower()
         return value not in {"0", "false", "off", "no"}
 
     def _native_vcodec(self) -> str:
+        """功能:处理 LeRobot native 数据集的创建,恢复,读取或写入(_native_vcodec)."""
         return os.environ.get("APPSTATION_LEROBOT_VCODEC", "h264").strip() or "h264"
 
     def _native_total_frames(self) -> int:
+        """功能:处理 LeRobot native 数据集的创建,恢复,读取或写入(_native_total_frames)."""
         if self._native_dataset is None:
             return 0
         meta = getattr(self._native_dataset, "meta", None)
@@ -2138,6 +2209,7 @@ class DatasetRecorderService:
             return 0
 
     def _save_native_episode_locked(self) -> None:
+        """功能:处理录制服务的内部辅助逻辑(_save_native_episode_locked)."""
         if self._native_dataset is None:
             return
         try:
@@ -2149,6 +2221,7 @@ class DatasetRecorderService:
             raise RuntimeError(f"native LeRobot save_episode failed: {exc}") from exc
 
     def _resume_native_dataset_locked(self) -> Any:
+        """功能:处理录制服务的内部辅助逻辑(_resume_native_dataset_locked)."""
         imports = self._native_imports()
         if imports is None:
             raise RuntimeError("lerobot[dataset] is not installed in backend runtime")
@@ -2163,6 +2236,7 @@ class DatasetRecorderService:
         )
 
     def _finalize_native_dataset(self) -> None:
+        """功能:处理录制服务的内部辅助逻辑(_finalize_native_dataset)."""
         dataset = self._native_dataset
         self._native_dataset = None
         if dataset is None:
@@ -2173,9 +2247,11 @@ class DatasetRecorderService:
             self._native_error = str(exc)
 
     def _is_native_dataset_info(self, info: dict[str, Any]) -> bool:
+        """功能:处理录制服务的内部辅助逻辑(_is_native_dataset_info)."""
         return str(info.get("format", "")) == "lerobot-v3-native"
 
     async def _capture_native_camera_arrays(self, config: dict[str, Any]) -> dict[str, Any]:
+        """功能:采集相机数据并处理缓存或占位兜底(_capture_native_camera_arrays)."""
         self._last_camera_cache_used = {key: False for key in CAMERA_KEYS}
         real_mode = self._real_hardware_mode(config)
         if not real_mode:
@@ -2212,6 +2288,7 @@ class DatasetRecorderService:
         return images
 
     def _decode_jpeg_to_rgb(self, jpeg: bytes, config: dict[str, Any], camera: str = "global") -> Any:
+        """功能:将图像或视频数据解码为预览或写入需要的格式(_decode_jpeg_to_rgb)."""
         imports = self._native_imports()
         if imports is None:
             raise RuntimeError("native numpy import unavailable")
@@ -2228,6 +2305,7 @@ class DatasetRecorderService:
         return rgb
 
     def _synthetic_camera_frame(self, feature_key: str) -> Any:
+        """功能:处理录制服务的内部辅助逻辑(_synthetic_camera_frame)."""
         imports = self._native_imports()
         if imports is None:
             return None
@@ -2246,6 +2324,7 @@ class DatasetRecorderService:
         return frame
 
     def _placeholder_camera_jpeg(self) -> bytes:
+        """功能:处理录制服务的内部辅助逻辑(_placeholder_camera_jpeg)."""
         try:
             imports = self._native_imports()
             if imports is None:
@@ -2264,16 +2343,19 @@ class DatasetRecorderService:
         return PLACEHOLDER_JPEG_BYTES
 
     def _camera_placeholder_value(self, feature_key: str) -> Any:
+        """功能:解析相机配置,分辨率或占位数据(_camera_placeholder_value)."""
         if self._native_dataset is not None:
             return self._synthetic_camera_frame(feature_key)
         return self._placeholder_camera_jpeg()
 
     def _last_camera_value(self, camera: str, feature_key: str) -> Any:
+        """功能:处理录制服务的内部辅助逻辑(_last_camera_value)."""
         if self._native_dataset is not None:
             return self._last_native_camera_frames.get(feature_key) or self._synthetic_camera_frame(feature_key)
         return self._last_camera_frames.get(camera) or self._placeholder_camera_jpeg()
 
     def _np_float32(self, values: object) -> Any:
+        """功能:处理录制服务的内部辅助逻辑(_np_float32)."""
         imports = self._native_imports()
         if imports is None:
             return values
@@ -2281,6 +2363,7 @@ class DatasetRecorderService:
         return np.asarray(values, dtype=np.float32)
 
     def _record_fps_from_config(self, config: dict[str, Any]) -> int:
+        """功能:处理录制循环,帧对齐或动作向量(_record_fps_from_config)."""
         try:
             raw = float(config.get("storage", {}).get("recordFps") or config.get("cameras", {}).get("fps", 30))
         except (TypeError, ValueError):
@@ -2288,6 +2371,7 @@ class DatasetRecorderService:
         return int(min(max(round(raw), 1), 60))
 
     def _force_sample_hz_from_config(self, config: dict[str, Any]) -> float:
+        """功能:处理力觉数据的提取,配置或质量统计(_force_sample_hz_from_config)."""
         try:
             raw = float(config.get("force", {}).get("sampleHz", 200))
         except (TypeError, ValueError):
@@ -2295,6 +2379,7 @@ class DatasetRecorderService:
         return min(max(raw, 1.0), 10000.0)
 
     def _sync_recording_shape_from_native_info(self, dataset_dir: Path) -> None:
+        """功能:处理录制服务的内部辅助逻辑(_sync_recording_shape_from_native_info)."""
         info = self._read_json(dataset_dir / "meta" / "info.json")
         try:
             self._record_fps_hz = int(info.get("fps", self._record_fps_hz))
@@ -2302,6 +2387,7 @@ class DatasetRecorderService:
             pass
 
     def _camera_size(self, config: dict[str, Any], camera: str = "global") -> tuple[int, int]:
+        """功能:解析相机配置,分辨率或占位数据(_camera_size)."""
         cameras = config.get("cameras", {})
         key = f"{camera}Resolution"
         if camera == "wrist_left":
@@ -2325,6 +2411,7 @@ class DatasetRecorderService:
         return width, height
 
     def _episode_for_api(self, dataset_dir: Path, dataset_id: str, episode: dict[str, Any]) -> dict[str, Any]:
+        """功能:处理 episode 的统计,转换,读取或 API 展示(_episode_for_api)."""
         samples = self._episode_samples(dataset_dir, dataset_id, episode)
         quality = self._episode_quality(episode)
         features = self._feature_summary(dataset_dir)
@@ -2355,6 +2442,7 @@ class DatasetRecorderService:
         }
 
     def _feature_summary(self, dataset_dir: Path) -> dict[str, Any]:
+        """功能:处理录制服务的内部辅助逻辑(_feature_summary)."""
         info = self._read_json(dataset_dir / "meta" / "info.json")
         features = info.get("features", {})
         if not isinstance(features, dict):
@@ -2380,6 +2468,7 @@ class DatasetRecorderService:
         return summary
 
     def _camera_resolution_summary(self, dataset_dir: Path) -> dict[str, dict[str, str]]:
+        """功能:解析相机配置,分辨率或占位数据(_camera_resolution_summary)."""
         info = self._read_json(dataset_dir / "meta" / "info.json")
         app_info = self._read_json(dataset_dir / "meta" / "appstation_info.json")
         hardware = app_info.get("hardware") if app_info else info.get("hardware", {})
@@ -2391,6 +2480,7 @@ class DatasetRecorderService:
         return self._camera_resolution_summary_from_config({})
 
     def _camera_resolution_summary_from_config(self, config: dict[str, Any]) -> dict[str, dict[str, str]]:
+        """功能:解析相机配置,分辨率或占位数据(_camera_resolution_summary_from_config)."""
         cameras = config.get("cameras", {}) if isinstance(config.get("cameras"), dict) else {}
         preview = str(cameras.get("previewResolution", "native"))
         result: dict[str, dict[str, str]] = {}
@@ -2406,6 +2496,7 @@ class DatasetRecorderService:
         return result
 
     def _configured_camera_resolution(self, cameras: dict[str, Any], camera: str) -> str:
+        """功能:处理录制服务的内部辅助逻辑(_configured_camera_resolution)."""
         key = f"{camera}Resolution"
         if camera == "wrist_left":
             key = "wristLeftResolution"
@@ -2420,6 +2511,7 @@ class DatasetRecorderService:
         episode: dict[str, Any],
         max_samples: int = 300,
     ) -> list[dict[str, Any]]:
+        """功能:处理 episode 的统计,转换,读取或 API 展示(_episode_samples)."""
         native_episode = bool(episode.get("native", False))
         native_dataset = self._is_native_dataset_info(self._read_json(dataset_dir / "meta" / "info.json"))
         if native_episode or native_dataset:
@@ -2435,6 +2527,7 @@ class DatasetRecorderService:
         return samples
 
     def _fallback_frame_records(self, dataset_dir: Path, data_path: str) -> list[dict[str, Any]]:
+        """功能:处理 fallback JSONL/图片路径的记录和预览(_fallback_frame_records)."""
         if not data_path:
             return []
         path = dataset_dir / data_path
@@ -2461,6 +2554,7 @@ class DatasetRecorderService:
         item: dict[str, Any],
         fallback_frame: int,
     ) -> dict[str, Any]:
+        """功能:处理 fallback JSONL/图片路径的记录和预览(_fallback_sample_for_api)."""
         state_raw = item.get("observation.state")
         if isinstance(state_raw, list) and len(state_raw) >= 14:
             state = self._lerobot14_to_ui_motion_state([float(value) for value in state_raw])
@@ -2501,6 +2595,7 @@ class DatasetRecorderService:
         frame: int,
         relative_path: str,
     ) -> str:
+        """功能:处理 fallback JSONL/图片路径的记录和预览(_fallback_image_url)."""
         if relative_path.lower().endswith(".mp4"):
             return (
                 f"/api/datasets/{dataset_id}/frame_image"
@@ -2515,6 +2610,7 @@ class DatasetRecorderService:
         episode: dict[str, Any],
         max_samples: int,
     ) -> list[dict[str, Any]]:
+        """功能:处理 LeRobot native 数据集的创建,恢复,读取或写入(_native_episode_samples)."""
         imports = self._native_imports()
         if imports is None:
             return []
@@ -2563,6 +2659,7 @@ class DatasetRecorderService:
         return samples
 
     def _tensor_to_float_list(self, value: Any, *, expected: int) -> list[float]:
+        """功能:处理录制服务的内部辅助逻辑(_tensor_to_float_list)."""
         if value is None:
             return [0.0] * expected
         if hasattr(value, "detach"):
@@ -2575,6 +2672,7 @@ class DatasetRecorderService:
         return result + [0.0] * max(0, expected - len(result))
 
     def _native_episodes_from_meta(self, dataset_dir: Path, info: dict[str, Any]) -> list[dict[str, Any]]:
+        """功能:处理 LeRobot native 数据集的创建,恢复,读取或写入(_native_episodes_from_meta)."""
         if not self._is_native_dataset_info(info):
             return []
         try:
@@ -2629,12 +2727,14 @@ class DatasetRecorderService:
         return episodes
 
     def _visible_episodes_for_dataset(self, dataset_dir: Path, info: dict[str, Any]) -> list[dict[str, Any]]:
+        """功能:处理录制服务的内部辅助逻辑(_visible_episodes_for_dataset)."""
         episodes = self._read_episodes(dataset_dir)
         if not episodes and self._is_native_dataset_info(info):
             episodes = self._native_episodes_from_meta(dataset_dir, info)
         return [episode for episode in episodes if not bool(episode.get("deleted", False))]
 
     def _positive_ratio(self, value: Any, default: float) -> float:
+        """功能:处理录制服务的内部辅助逻辑(_positive_ratio)."""
         try:
             parsed = float(value)
         except (TypeError, ValueError):
@@ -2642,7 +2742,8 @@ class DatasetRecorderService:
         return max(parsed, 0.0)
 
     def _compose_observation_state(self, motion_positions: list[float], gripper_positions: list[Any]) -> list[float]:
-        # 将 12 维从臂位姿和 2 维从手夹爪开口合成为 LeRobot v3 的 14 维 state。
+        # 将 12 维从臂位姿和 2 维从手夹爪开口合成为 LeRobot v3 的 14 维 state.
+        """功能:处理录制服务的内部辅助逻辑(_compose_observation_state)."""
         motion = (list(motion_positions) + [0.0] * 12)[:12]
         gripper = [self._float_or_zero(value) for value in (list(gripper_positions) + [0.0, 0.0])[:2]]
         return [
@@ -2663,7 +2764,8 @@ class DatasetRecorderService:
         ]
 
     def _lerobot14_to_ui_motion_state(self, state: list[float]) -> list[float]:
-        # 回放/预览仍使用 12 维 UI 位姿，因此需要跳过 state 中的夹爪维度。
+        # 回放/预览仍使用 12 维 UI 位姿,因此需要跳过 state 中的夹爪维度.
+        """功能:处理录制服务的内部辅助逻辑(_lerobot14_to_ui_motion_state)."""
         values = (list(state) + [0.0] * 14)[:14]
         return [
             values[0],
@@ -2681,6 +2783,7 @@ class DatasetRecorderService:
         ]
 
     def _float_or_zero(self, value: Any) -> float:
+        """功能:处理录制服务的内部辅助逻辑(_float_or_zero)."""
         try:
             result = float(value)
         except (TypeError, ValueError):
@@ -2690,6 +2793,7 @@ class DatasetRecorderService:
         return result
 
     def _encode_rgb_tensor_to_jpeg(self, image: Any, np: Any) -> bytes:
+        """功能:将图像或视频数据编码为目标格式(_encode_rgb_tensor_to_jpeg)."""
         if image is None:
             raise FileNotFoundError("image")
         if hasattr(image, "detach"):
@@ -2714,7 +2818,8 @@ class DatasetRecorderService:
         return bytes(buffer)
 
     def _decode_video_frame_to_jpeg(self, path: Path, frame_index: int) -> bytes:
-        # fallback MP4 复核时按 frame_index 解码单帧，保持前端仍然拿到 JPEG。
+        # fallback MP4 复核时按 frame_index 解码单帧,保持前端仍然拿到 JPEG.
+        """功能:将图像或视频数据解码为预览或写入需要的格式(_decode_video_frame_to_jpeg)."""
         cv2 = importlib.import_module("cv2")
         capture = cv2.VideoCapture(str(path))
         try:
@@ -2732,12 +2837,14 @@ class DatasetRecorderService:
             capture.release()
 
     def _episode_quality(self, episode: dict[str, Any]) -> int:
+        """功能:处理 episode 的统计,转换,读取或 API 展示(_episode_quality)."""
         late = int(episode.get("lateFrames", 0))
         drops_raw = episode.get("cameraDrops", {})
         drops = sum(int(value) for value in drops_raw.values()) if isinstance(drops_raw, dict) else 0
         return max(40, min(99, 96 - late * 2 - drops * 3))
 
     def _quality_warnings(self) -> list[str]:
+        """功能:处理录制服务的内部辅助逻辑(_quality_warnings)."""
         warnings: list[str] = []
         if self._episode_late_frames:
             warnings.append(f"late frames: {self._episode_late_frames}")
@@ -2757,7 +2864,8 @@ class DatasetRecorderService:
         return warnings
 
     def _skew_stats(self) -> dict[str, float]:
-        # 当前阶段先统计录制 tick 与实际采集开始时间的偏差，后续再细化到每个硬件源。
+        # 当前阶段先统计录制 tick 与实际采集开始时间的偏差,后续再细化到每个硬件源.
+        """功能:处理录制服务的内部辅助逻辑(_skew_stats)."""
         values = [abs(value) for value in self._tick_skews_ms]
         if not values:
             return {"maxSkewMs": 0.0, "avgSkewMs": 0.0, "jitterMs": 0.0}
@@ -2773,6 +2881,7 @@ class DatasetRecorderService:
         }
 
     def _source_skew_stats(self) -> dict[str, dict[str, float]]:
+        """功能:统计或解析单个硬件来源的时序质量(_source_skew_stats)."""
         max_skew: dict[str, float] = {}
         avg_skew: dict[str, float] = {}
         jitter: dict[str, float] = {}
@@ -2794,7 +2903,8 @@ class DatasetRecorderService:
         observation_state: list[float] | None = None,
         config: dict[str, Any] | None = None,
     ) -> list[float]:
-        # action 记录从臂绝对目标：当前 observation.state 加主手增量，夹爪目标取配置值。
+        # action 记录从臂绝对目标:当前 observation.state 加主手增量,夹爪目标取配置值.
+        """功能:处理录制服务的内部辅助逻辑(_latest_action_vector)."""
         base = (list(observation_state) + [0.0] * 14)[:14] if observation_state is not None else [0.0] * 14
         config = config or {}
         vector = self._latest_action_delta_vector()
@@ -2806,6 +2916,7 @@ class DatasetRecorderService:
         return action
 
     def _latest_action_delta_vector(self) -> list[float]:
+        """功能:处理录制服务的内部辅助逻辑(_latest_action_delta_vector)."""
         vector = [0.0] * 14
         last_action = self.teleop.status().get("lastAction")
         if not isinstance(last_action, dict):
@@ -2833,7 +2944,8 @@ class DatasetRecorderService:
         return vector
 
     def _motion_delta_to_action_delta(self, delta_vector: list[Any]) -> list[float]:
-        # teleop delta 仍是 12 维位姿增量，这里插入左右夹爪槽位并把旋转从度转成 mdeg。
+        # teleop delta 仍是 12 维位姿增量,这里插入左右夹爪槽位并把旋转从度转成 mdeg.
+        """功能:处理录制服务的内部辅助逻辑(_motion_delta_to_action_delta)."""
         motion = [0.0] * 12
         for index, value in enumerate(delta_vector[:12]):
             try:
@@ -2858,19 +2970,23 @@ class DatasetRecorderService:
         ]
 
     def _dataset_root(self, config: dict[str, Any]) -> Path:
+        """功能:解析或构造数据集路径和摘要信息(_dataset_root)."""
         raw = str(config.get("storage", {}).get("datasetRoot", "~/.appstation/datasets"))
         return Path(raw).expanduser()
 
     def _dataset_path(self, dataset_id: str) -> Path:
+        """功能:解析或构造数据集路径和摘要信息(_dataset_path)."""
         root = self._dataset_root(self.settings.get_config())
         return root / self._safe_id(dataset_id)
 
     def _require_dataset_dir(self) -> Path:
+        """功能:处理录制服务的内部辅助逻辑(_require_dataset_dir)."""
         if self._dataset_dir is None:
             raise RuntimeError("record dataset is not initialized")
         return self._dataset_dir
 
     def _next_episode_index(self, dataset_dir: Path) -> int:
+        """功能:处理录制服务的内部辅助逻辑(_next_episode_index)."""
         episodes = self._read_episodes(dataset_dir)
         if not episodes:
             episodes = self._native_episodes_from_meta(dataset_dir, self._read_json(dataset_dir / "meta" / "info.json"))
@@ -2878,6 +2994,7 @@ class DatasetRecorderService:
         return max(indices, default=-1) + 1
 
     def _read_episodes(self, dataset_dir: Path) -> list[dict[str, Any]]:
+        """功能:读取本地 metadata 或记录文件(_read_episodes)."""
         path = dataset_dir / "meta" / "episodes.jsonl"
         if not path.exists():
             return []
@@ -2892,18 +3009,21 @@ class DatasetRecorderService:
         return episodes
 
     def _write_episodes(self, dataset_dir: Path, episodes: list[dict[str, Any]]) -> None:
+        """功能:写入或生成数据集持久化内容(_write_episodes)."""
         path = dataset_dir / "meta" / "episodes.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         content = "".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n" for item in episodes)
         path.write_text(content, encoding="utf-8")
 
     def _episode_dataset_stub(self, dataset_dir: Path) -> dict[str, Any]:
+        """功能:处理 episode 的统计,转换,读取或 API 展示(_episode_dataset_stub)."""
         info = self._read_json(dataset_dir / "meta" / "info.json")
         app_info = self._read_json(dataset_dir / "meta" / "appstation_info.json")
         name = app_info.get("name") or info.get("name") or dataset_dir.name
         return {"id": dataset_dir.name, "name": str(name)}
 
     def _read_json(self, path: Path) -> dict[str, Any]:
+        """功能:读取本地 metadata 或记录文件(_read_json)."""
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -2911,14 +3031,17 @@ class DatasetRecorderService:
         return data if isinstance(data, dict) else {}
 
     def _write_json(self, path: Path, data: dict[str, Any]) -> None:
+        """功能:写入或生成数据集持久化内容(_write_json)."""
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _safe_id(self, value: str) -> str:
+        """功能:执行受数据集根目录约束的安全文件操作(_safe_id)."""
         normalized = SAFE_ID.sub("_", value.strip()).strip("._-")
         return normalized[:80] or "dataset"
 
     def _relative_to_dataset(self, dataset_dir: Path, path: Path | None) -> str:
+        """功能:处理录制服务的内部辅助逻辑(_relative_to_dataset)."""
         if path is None:
             return ""
         try:
@@ -2927,10 +3050,12 @@ class DatasetRecorderService:
             return path.name
 
     def _real_hardware_mode(self, config: dict[str, Any]) -> bool:
+        """功能:处理录制服务的内部辅助逻辑(_real_hardware_mode)."""
         mode = os.environ.get("APPSTATION_HAL_MODE") or config.get("hal", {}).get("mode", "real")
         return str(mode).lower() == "real"
 
     def _force_norm(self, values: object) -> float:
+        """功能:处理力觉数据的提取,配置或质量统计(_force_norm)."""
         if not isinstance(values, list) or len(values) < 3:
             return 0.0
         return max(abs(float(values[0])), abs(float(values[1])), abs(float(values[2])))

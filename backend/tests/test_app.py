@@ -30,15 +30,18 @@ RECORDING_SAVE_CONTRACT_EXAMPLE = {
 }
 
 DATASET_LIST_CONTRACT_EXAMPLE = {
-    "format": "lerobot-v3-jsonl-fallback",
+    "format": "lerobot-v3-native",
     "fps": 30,
     "episodes": [],
 }
 
 
 def create_mock_record_client(tmp_path: Path, monkeypatch: MonkeyPatch) -> TestClient:
+    if importlib.util.find_spec("lerobot") is None:
+        pytest.skip("lerobot[dataset] is not installed in this backend environment")
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
-    monkeypatch.setenv("APPSTATION_LEROBOT_NATIVE", "0")
+    monkeypatch.setenv("APPSTATION_LEROBOT_NATIVE", "1")
+    monkeypatch.setenv("APPSTATION_LEROBOT_USE_VIDEOS", "0")
     return TestClient(create_app(tmp_path / "runtime"))
 
 
@@ -406,7 +409,7 @@ def test_teleop_logical_connect_disconnect_does_not_touch_motion(tmp_path: Path,
     assert command_response.status_code == 200
 
 
-def test_record_session_writes_lerobot_fallback_dataset(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_record_session_fails_when_native_lerobot_is_disabled(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     monkeypatch.setenv("APPSTATION_LEROBOT_NATIVE", "0")
     dataset_root = tmp_path / "datasets"
@@ -420,72 +423,11 @@ def test_record_session_writes_lerobot_fallback_dataset(tmp_path: Path, monkeypa
             "/api/record/session/create",
             json={"dataset_name": "unit_test_dataset", "task": "pytest capture"},
         )
-        assert start_response.status_code == 200
-        assert start_response.json()["data"]["recording"] is True
-        assert start_response.json()["data"]["forceSampleHz"] == 4000
-        assert "forceWindowSamples" not in start_response.json()["data"]
-        time.sleep(0.2)
-
-        save_response = client.post("/api/record/episode/save")
-        assert save_response.status_code == 200
-        episode = save_response.json()["data"]["episode"]
-        assert episode["frames"] > 0
-        assert "dropCounts" in episode
-        assert "maxSkewMs" in episode
-        assert "avgSkewMs" in episode
-        assert "jitterMs" in episode
-
-        datasets_response = client.get("/api/datasets")
-        assert datasets_response.status_code == 200
-        datasets = datasets_response.json()["data"]["datasets"]
-        dataset = next(item for item in datasets if item["id"] == "unit_test_dataset")
-        assert dataset["format"] == "lerobot-v3-jsonl-fallback"
-        assert dataset["episodes"][0]["samples"]
-        detail_response = client.get(f"/api/datasets/unit_test_dataset/episodes/{episode['id']}")
-        assert detail_response.status_code == 200
-        detail = detail_response.json()["data"]["episode"]
-        assert detail["features"]["observation.state"]["shape"] == [14]
-        assert detail["features"]["action"]["shape"] == [14]
-        assert detail["cameraResolutions"]["global"]["saved"] == "640x480"
-        assert detail["maxForceLeft"] >= 0
-        assert detail["samples"]
-
-        data_path = dataset_root / "unit_test_dataset" / episode["dataPath"]
-        assert data_path.exists()
-        info = json.loads((dataset_root / "unit_test_dataset" / "meta" / "info.json").read_text(encoding="utf-8"))
-        assert set(info) == {"name", "codebase_version", "robot_type", "fps", "features"}
-        first_line = data_path.read_text(encoding="utf-8").splitlines()[0]
-        frame = json.loads(first_line)
-        assert frame["timestamp"] == frame["frame_index"] / config["storage"]["recordFps"]
-        assert len(frame["observation.state"]) == 14
-        assert len(frame["observation.force_left"]) == 6
-        assert "observation.force_left_window" not in frame
-        assert "observation.force_right_window" not in frame
-        assert "observation.force_window_dt" not in frame
-        assert "appstation.observation.gripper" not in frame
-        assert "appstation.sources" not in frame
-        assert "appstation.omega" not in frame
-        assert "observation.gripper" not in frame
-        assert len(frame["action"]) == 14
-        for feature_key in (
-            "observation.images.global",
-            "observation.images.wrist_left",
-            "observation.images.wrist_right",
-        ):
-            assert frame[feature_key].endswith(".mp4")
-            assert (dataset_root / "unit_test_dataset" / frame[feature_key]).exists()
-            image_dir = (
-                dataset_root
-                / "unit_test_dataset"
-                / "videos"
-                / "chunk-000"
-                / feature_key
-                / episode["id"]
-            )
-            assert not image_dir.exists()
-
-        finish_response = client.post("/api/record/session/finish")
-        assert finish_response.status_code == 200
+        assert start_response.status_code == 503
+        detail = start_response.json()["detail"]
+        assert detail["code"] == "NATIVE_DATASET_UNAVAILABLE"
+        assert "native LeRobot dataset is required" in detail["message"]
+        assert not (dataset_root / "unit_test_dataset" / "meta" / "info.json").exists()
 
 
 def test_mock_hal_camera_end_to_end_record_save_list_review(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -596,7 +538,7 @@ def test_native_recording_resizes_camera_frames_to_feature_shape(tmp_path: Path,
     assert frame.dtype == np.uint8
 
 
-def test_dataset_review_and_export_endpoints(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_create_dataset_fails_when_native_lerobot_is_disabled(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     monkeypatch.setenv("APPSTATION_LEROBOT_NATIVE", "0")
     dataset_root = tmp_path / "datasets"
@@ -606,35 +548,11 @@ def test_dataset_review_and_export_endpoints(tmp_path: Path, monkeypatch: Monkey
     assert client.put("/api/settings", json=config).status_code == 200
 
     create_response = client.post("/api/datasets", json={"name": "review_dataset"})
-    assert create_response.status_code == 200
-    assert create_response.json()["data"]["dataset"]["id"] == "review_dataset"
-
-    save_response = client.post("/api/datasets/review_dataset/review/save")
-    assert save_response.status_code == 200
-    assert save_response.json()["data"]["saved"] == "review_dataset"
-
-    export_response = client.post("/api/datasets/review_dataset/export")
-    assert export_response.status_code == 200
-    assert export_response.json()["data"]["pushToHub"] is False
-
-    stats_response = client.get("/api/datasets/review_dataset/stats")
-    assert stats_response.status_code == 200
-    assert stats_response.json()["data"]["episodes"] == 0
-
-    split_response = client.post(
-        "/api/datasets/review_dataset/split",
-        json={"ratios": {"train": 0.7, "val": 0.2, "test": 0.1}},
-    )
-    assert split_response.status_code == 200
-    assert set(split_response.json()["data"]["splits"]) == {"train", "val", "test"}
-
-    clean_response = client.post("/api/datasets/review_dataset/clean", json={"apply": False, "minFrames": 2})
-    assert clean_response.status_code == 200
-    assert clean_response.json()["data"]["checked"] == 0
-
-    push_response = client.post("/api/datasets/review_dataset/push", json={"repoId": "local/test", "dryRun": True})
-    assert push_response.status_code == 200
-    assert push_response.json()["data"]["pushed"] is False
+    assert create_response.status_code == 503
+    detail = create_response.json()["detail"]
+    assert detail["code"] == "NATIVE_DATASET_UNAVAILABLE"
+    assert "native LeRobot dataset is required" in detail["message"]
+    assert not (dataset_root / "review_dataset" / "meta" / "info.json").exists()
 
 
 def test_dataset_episode_update_and_delete_hide_usable_sample(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

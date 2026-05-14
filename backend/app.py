@@ -802,6 +802,11 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         try:
             return envelope(await recorder.start_session(str(dataset_name), str(task)))
         except RuntimeError as exc:
+            if "native LeRobot dataset is required" in str(exc):
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "NATIVE_DATASET_UNAVAILABLE", "message": str(exc)},
+                ) from exc
             raise HTTPException(status_code=409, detail={"code": "RECORDING_BUSY", "message": str(exc)}) from exc
 
     @app.post("/api/record/episode/save")
@@ -841,7 +846,13 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/datasets")
     async def create_dataset(payload: dict[str, Any]) -> ApiEnvelope:
-        return envelope(recorder.create_dataset(payload))
+        try:
+            return envelope(recorder.create_dataset(payload))
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "NATIVE_DATASET_UNAVAILABLE", "message": str(exc)},
+            ) from exc
 
     @app.patch("/api/datasets/{dataset_id}")
     async def update_dataset(dataset_id: str, payload: dict[str, Any]) -> ApiEnvelope:
