@@ -14,7 +14,7 @@ from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from pathlib import Path
-from threading import Thread
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from typing import Any
 
@@ -118,8 +118,10 @@ SOURCE_DROP_SKEW_MS: dict[str, float] = {source: 35.0 for source in CAMERA_SOURC
 RING_BUFFER_RETENTION_S = 3.0
 WRITE_QUEUE_MAX_FRAMES = 120
 WRITE_QUEUE_PUT_TIMEOUT_S = 1.0
-SAMPLER_START_LEAD_S = 0.0
+SAMPLER_START_LEAD_S = 0.05
 RECORDER_HARDWARE_WARMUP_S = 0.5
+MAX_SAMPLE_JITTER_S = 0.10
+SAMPLE_LOOKBACK_WINDOW_S = 0.10
 
 
 class DatasetSaveError(RuntimeError):
@@ -340,26 +342,29 @@ class TimedRingBuffer:
         self.retention_s = max(float(retention_s), 0.1)
         self.maxlen = max(int(maxlen), 1)
         self._samples: deque[TimedSample] = deque()
+        self._lock = Lock()
 
     def append(self, sample: TimedSample) -> None:
         """处理录制服务逻辑：append。"""
-        if not self._samples or sample.monotonic_s >= self._samples[-1].monotonic_s:
-            self._samples.append(sample)
-        else:
-            samples = list(self._samples)
-            index = bisect_left([item.monotonic_s for item in samples], sample.monotonic_s)
-            samples.insert(index, sample)
-            self._samples = deque(samples)
-        latest_s = max(item.monotonic_s for item in self._samples)
-        self.prune(latest_s - self.retention_s)
-        while len(self._samples) > self.maxlen:
-            self._samples.popleft()
+        with self._lock:
+            if not self._samples or sample.monotonic_s >= self._samples[-1].monotonic_s:
+                self._samples.append(sample)
+            else:
+                samples = list(self._samples)
+                index = bisect_left([item.monotonic_s for item in samples], sample.monotonic_s)
+                samples.insert(index, sample)
+                self._samples = deque(samples)
+            latest_s = max(item.monotonic_s for item in self._samples)
+            self._prune_locked(latest_s - self.retention_s)
+            while len(self._samples) > self.maxlen:
+                self._samples.popleft()
 
     def nearest(self, target_s: float, max_skew_s: float) -> TimedSample | None:
         """处理录制服务逻辑：nearest。"""
-        if not self._samples:
-            return None
-        samples = list(self._samples)
+        with self._lock:
+            if not self._samples:
+                return None
+            samples = list(self._samples)
         times = [sample.monotonic_s for sample in samples]
         index = bisect_left(times, target_s)
         candidates = []
@@ -374,16 +379,22 @@ class TimedRingBuffer:
 
     def prune(self, before_s: float) -> None:
         """处理录制服务逻辑：prune。"""
+        with self._lock:
+            self._prune_locked(before_s)
+
+    def _prune_locked(self, before_s: float) -> None:
         while self._samples and self._samples[0].monotonic_s < before_s:
             self._samples.popleft()
 
     def clear(self) -> None:
         """处理录制服务逻辑：clear。"""
-        self._samples.clear()
+        with self._lock:
+            self._samples.clear()
 
     def __len__(self) -> int:
         """处理录制服务逻辑：__len__。"""
-        return len(self._samples)
+        with self._lock:
+            return len(self._samples)
 
 
 class DatasetRecorderService:
@@ -413,7 +424,8 @@ class DatasetRecorderService:
         self._lock = asyncio.Lock()
         self._loop_task: asyncio.Task[None] | None = None
         self._writer_thread: LeRobotWriterThread | None = None
-        self._sampler_tasks: dict[str, asyncio.Task[None]] = {}
+        self._sampler_threads: dict[str, Thread] = {}
+        self._sampler_stop_event = Event()
         self._write_queue: queue.Queue[PendingFrame | WriterCommand | None] = queue.Queue(
             maxsize=WRITE_QUEUE_MAX_FRAMES
         )
@@ -1024,13 +1036,29 @@ class DatasetRecorderService:
     # 内部说明。
     def _new_sample_buffers(self, config: dict[str, Any]) -> dict[str, TimedRingBuffer]:
         """处理录制服务逻辑：_new_sample_buffers。"""
+        retention_s = self._sample_buffer_retention_s(config)
         return {
             source: TimedRingBuffer(
-                retention_s=RING_BUFFER_RETENTION_S,
-                maxlen=max(8, int(self._source_sample_rate_hz(source, config) * RING_BUFFER_RETENTION_S) + 4),
+                retention_s=retention_s,
+                maxlen=max(8, int(self._source_sample_rate_hz(source, config) * retention_s) + 4),
             )
             for source in SOURCE_KEYS
         }
+
+    def _sample_buffer_retention_s(self, config: dict[str, Any]) -> float:
+        """Cover warmup, downstream delay, sampling jitter and assembler lookback."""
+        storage = config.get("storage", {}) if isinstance(config.get("storage"), dict) else {}
+        fps = max(1, self._record_fps_from_config(config))
+        consumer_delay_s = self._positive_ratio(
+            storage.get("maxConsumerLatencyS"),
+            WRITE_QUEUE_MAX_FRAMES / fps,
+        )
+        jitter_s = self._positive_ratio(storage.get("maxSampleJitterS"), MAX_SAMPLE_JITTER_S)
+        lookback_s = self._positive_ratio(storage.get("sampleLookbackWindowS"), SAMPLE_LOOKBACK_WINDOW_S)
+        return max(
+            RING_BUFFER_RETENTION_S,
+            RECORDER_HARDWARE_WARMUP_S + consumer_delay_s + jitter_s + lookback_s,
+        )
 
     def _native_writer_active(self) -> bool:
         """Return whether the native writer thread owns an open dataset."""
@@ -1104,22 +1132,25 @@ class DatasetRecorderService:
 
     def _start_sampler_tasks_locked(self) -> None:
         """处理录制服务逻辑：_start_sampler_tasks_locked。"""
+        self._sampler_stop_event.clear()
         for source in SOURCE_KEYS:
-            task = self._sampler_tasks.get(source)
-            if task is None or task.done():
-                self._sampler_tasks[source] = asyncio.create_task(
-                    self._sample_source_loop(source),
+            thread = self._sampler_threads.get(source)
+            if thread is None or not thread.is_alive():
+                self._sampler_threads[source] = Thread(
+                    target=self._sample_source_loop,
+                    args=(source,),
                     name=f"dataset-sampler-{source}",
+                    daemon=True,
                 )
+                self._sampler_threads[source].start()
 
     async def _stop_sampler_tasks(self) -> None:
         """处理录制服务逻辑：_stop_sampler_tasks。"""
-        tasks = [task for task in self._sampler_tasks.values() if not task.done()]
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._sampler_tasks = {}
+        self._sampler_stop_event.set()
+        threads = [thread for thread in self._sampler_threads.values() if thread.is_alive()]
+        for thread in threads:
+            await asyncio.to_thread(thread.join, 1.0)
+        self._sampler_threads = {}
 
     async def _drain_recording_queues(self) -> None:
         # 内部说明。
@@ -1139,16 +1170,16 @@ class DatasetRecorderService:
         await asyncio.to_thread(writer.join, 2.0)
         self._writer_thread = None
 
-    async def _sample_source_loop(self, source: str) -> None:
+    def _sample_source_loop(self, source: str) -> None:
         """Sample one hardware source on its own cadence."""
         epoch_s = 0.0
         sample_index = 0
-        while self._session_active:
+        while self._session_active and not self._sampler_stop_event.is_set():
             try:
                 config = self._recording_config()
                 start_s = self._sampler_start_monotonic_s
                 if start_s <= 0.0:
-                    await asyncio.sleep(0.01)
+                    self._sampler_stop_event.wait(0.01)
                     continue
                 if start_s != epoch_s:
                     epoch_s = start_s
@@ -1162,19 +1193,18 @@ class DatasetRecorderService:
                     sample_index = max(sample_index, int(math.floor((now - epoch_s) * rate_hz)))
                     next_sample_s = epoch_s + self._source_sample_timestamp_s(source, sample_index, config)
                 if now < next_sample_s:
-                    await asyncio.sleep(next_sample_s - now)
+                    if self._sampler_stop_event.wait(next_sample_s - now):
+                        return
                 target_s = self._source_sample_timestamp_s(source, sample_index, config)
-                sample = await self._sample_source_once(source, config, target_s)
+                sample = self._sample_source_once_sync(source, config, epoch_s + target_s)
                 if epoch_s != self._sampler_start_monotonic_s:
                     continue
                 self._sample_buffers.setdefault(source, TimedRingBuffer()).append(sample)
                 sample_index += 1
                 self._source_sample_indices[source] = sample_index
-            except asyncio.CancelledError:
-                raise
             except Exception as exc:  # noqa: BLE001
                 self.logs.warning("[LEROBOT]", f"{source} sampler recovered: {exc}")
-                await asyncio.sleep(0.1)
+                self._sampler_stop_event.wait(0.1)
 
     def _next_phase_aligned_sample_time(self, source: str, config: dict[str, Any], now_s: float) -> float:
         """Return the next wall-clock sample time from the shared hardware epoch."""
@@ -1190,42 +1220,75 @@ class DatasetRecorderService:
         return max(0, int(sample_index)) / self._source_sample_rate_hz(source, config)
 
     def _record_target_timestamp_s(self, frame_index: int) -> float:
-        """Return the hardware-relative target timestamp for a recorder frame."""
-        return self._episode_source_time0_s + max(0, int(frame_index)) / max(1, self._record_fps_hz)
+        """Return the absolute monotonic target timestamp for a recorder frame."""
+        record_start_s = self._sampler_start_monotonic_s or self._episode_start_monotonic_s
+        return record_start_s + RECORDER_HARDWARE_WARMUP_S + max(0, int(frame_index)) / max(1, self._record_fps_hz)
 
     async def _sample_source_once(self, source: str, config: dict[str, Any], target_s: float) -> TimedSample:
-        """Sample a concrete hardware source for a preassigned relative timestamp."""
+        """Sample a concrete hardware source for a preassigned absolute timestamp."""
+        return await asyncio.to_thread(self._sample_source_once_sync, source, config, target_s)
+
+    def _sample_source_once_sync(self, source: str, config: dict[str, Any], target_s: float) -> TimedSample:
+        """Sample a concrete hardware source from its dedicated sampler thread."""
         if source == "hal":
-            return await self._timed_source("hal", self.hal.motion_state(), target_s, record_quality=False)
+            return asyncio.run(self._timed_source("hal", self.hal.motion_state(), target_s, record_quality=False))
         if source == "omega":
-            return await self._timed_source("omega", self.hal.omega_state(), target_s, record_quality=False)
+            return asyncio.run(self._timed_source("omega", self.hal.omega_state(), target_s, record_quality=False))
         if source == "force":
-            return await self._sample_force_source(config, target_s)
+            return self._sample_force_source_sync(config, target_s)
         if source == "gripper":
-            return await self._gripper_source(config, target_s, record_quality=False)
+            return self._gripper_source_sync(config, target_s, record_quality=False)
         camera = CAMERA_KEY_BY_SOURCE.get(source)
         if camera is not None:
-            return await self._sample_camera_source(config, camera, target_s)
+            return self._sample_camera_source_sync(config, camera, target_s)
         return self._fallback_sample(source, target_s, f"{source} unsupported")
 
     async def _sample_force_source(self, config: dict[str, Any], target_s: float) -> TimedSample:
         """处理录制服务逻辑：_sample_force_source。"""
+        return await asyncio.to_thread(self._sample_force_source_sync, config, target_s)
+
+    def _sample_force_source_sync(self, config: dict[str, Any], target_s: float) -> TimedSample:
+        """Read force data in the force sampler thread and timestamp it immediately."""
         if not self._real_hardware_mode(config):
+            sampled_at = time.monotonic()
             value = SimpleNamespace(
                 ok=True,
                 left=list(self.telemetry.force_left),
                 right=list(self.telemetry.force_right),
+                sample_monotonic_s=sampled_at,
             )
-            return SourceSample("force", target_s, value, True, "", target_monotonic_s=target_s)
-        return await self._timed_source(
+            return SourceSample("force", sampled_at, value, True, "", target_monotonic_s=target_s)
+        started = time.monotonic()
+        try:
+            value = self.hardware.force.sample(config)
+            ok = bool(getattr(value, "ok", True) if not isinstance(value, dict) else value.get("ok", True))
+            raw_message = getattr(value, "message", "") if not isinstance(value, dict) else value.get("message", "")
+            message = "" if ok else str(raw_message)
+        except Exception as exc:  # noqa: BLE001
+            value = None
+            ok = False
+            message = f"force failed: {exc}"
+        finished = time.monotonic()
+        sample_time = self._source_sample_monotonic(value, finished) if ok else target_s
+        return SourceSample(
             "force",
-            asyncio.to_thread(self.hardware.force.sample, config),
-            target_s,
-            record_quality=False,
+            sample_time,
+            value,
+            ok,
+            message,
+            target_monotonic_s=target_s,
+            started_monotonic_s=started,
+            finished_monotonic_s=finished,
+            elapsed_ms=(finished - started) * 1000.0,
+            stale=not ok,
         )
 
     async def _sample_camera_source(self, config: dict[str, Any], camera: str, target_s: float) -> TimedSample:
         """处理录制服务逻辑：_sample_camera_source。"""
+        return await asyncio.to_thread(self._sample_camera_source_sync, config, camera, target_s)
+
+    def _sample_camera_source_sync(self, config: dict[str, Any], camera: str, target_s: float) -> TimedSample:
+        """Read one camera source in its sampler thread and keep its last valid frame."""
         source = CAMERA_SOURCE_KEYS[camera]
         feature_key = CAMERA_FEATURE_KEYS[camera]
         started = time.monotonic()
@@ -1234,7 +1297,7 @@ class DatasetRecorderService:
             finished = time.monotonic()
             return SourceSample(
                 source,
-                target_s,
+                finished,
                 value,
                 True,
                 "",
@@ -1246,7 +1309,7 @@ class DatasetRecorderService:
         try:
             if not self._native_writer_active():
                 raise RuntimeError("native LeRobot writer is not open")
-            value = await asyncio.to_thread(self._camera_recording_frame, config, camera)
+            value, sampled_at = self._camera_recording_frame_with_time(config, camera)
             self._last_native_camera_frames[feature_key] = value
             ok = True
             message = ""
@@ -1254,10 +1317,12 @@ class DatasetRecorderService:
             ok = False
             message = f"{source} cache used: {exc}"
             value = self._last_camera_value(camera, feature_key)
+            sampled_at = None
         finished = time.monotonic()
+        sample_time = sampled_at if sampled_at is not None else finished
         return SourceSample(
             source,
-            target_s,
+            sample_time,
             value,
             ok,
             message,
@@ -1336,7 +1401,7 @@ class DatasetRecorderService:
                     await asyncio.sleep(0.05)
                     continue
                 target_tick = self._record_target_timestamp_s(frame_index)
-                scheduled_tick = record_start + frame_index * period_s
+                scheduled_tick = target_tick
                 now = time.monotonic()
                 if now < scheduled_tick:
                     await asyncio.sleep(scheduled_tick - now)
@@ -1442,14 +1507,37 @@ class DatasetRecorderService:
     ) -> SourceSample:
         # 夹爪位置由 telemetry/worker 后台刷新；录制帧只读取缓存并检查是否过期。
         """处理录制服务逻辑：_gripper_source。"""
+        return await asyncio.to_thread(
+            self._gripper_source_sync,
+            config,
+            target_monotonic_s,
+            record_quality=record_quality,
+        )
+
+    def _gripper_source_sync(
+        self,
+        config: dict[str, Any],
+        target_monotonic_s: float,
+        *,
+        record_quality: bool = True,
+    ) -> SourceSample:
+        """Read gripper cache in the gripper sampler thread."""
         if not self._real_hardware_mode(config):
-            return await self._cached_source(
+            sampled_at = time.monotonic()
+            sample = SourceSample(
                 "gripper",
+                sampled_at,
                 list(self.telemetry.gripper_positions),
-                target_monotonic_s,
-                record_quality=record_quality,
+                True,
+                "",
+                target_monotonic_s=target_monotonic_s,
+                started_monotonic_s=sampled_at,
+                finished_monotonic_s=sampled_at,
             )
-        await self._refresh_gripper_cache(config)
+            if record_quality:
+                self._record_source_quality(sample, target_monotonic_s, 0.0)
+            return sample
+        self._refresh_gripper_cache_sync(config)
         stale_after_s = self._positive_ratio(config.get("gripper", {}).get("sampleStaleMs"), 2500.0) / 1000.0
         stale_after_s = max(0.5, stale_after_s)
         last_sample_at = float(getattr(self.telemetry, "_last_gripper_sample_at", 0.0) or 0.0)
@@ -1457,14 +1545,15 @@ class DatasetRecorderService:
         ok = age_s <= stale_after_s
         message = "" if ok else f"gripper stale: {round(age_s, 3)}s"
         finished = time.monotonic()
+        sample_time = self._gripper_sample_monotonic(target_monotonic_s, finished)
         sample = SourceSample(
             "gripper",
-            target_monotonic_s,
+            sample_time,
             list(self.telemetry.gripper_positions),
             ok,
             message,
             target_monotonic_s=target_monotonic_s,
-            started_monotonic_s=target_monotonic_s,
+            started_monotonic_s=sample_time,
             finished_monotonic_s=finished,
             stale=not ok,
         )
@@ -1474,10 +1563,13 @@ class DatasetRecorderService:
 
     async def _refresh_gripper_cache(self, config: dict[str, Any]) -> None:
         """处理录制服务逻辑：_refresh_gripper_cache。"""
+        await asyncio.to_thread(self._refresh_gripper_cache_sync, config)
+
+    def _refresh_gripper_cache_sync(self, config: dict[str, Any]) -> None:
+        """Refresh gripper cache from a sampler thread."""
         refresh_gripper = getattr(self.telemetry, "refresh_gripper_positions", None)
         if callable(refresh_gripper):
-            # 录制循环主动刷新 worker 缓存，避免依赖 WebSocket 帧驱动夹爪采样。
-            await asyncio.to_thread(refresh_gripper, config, time.monotonic())
+            refresh_gripper(config, time.monotonic())
 
     async def _timed_source(
         self,
@@ -1507,9 +1599,10 @@ class DatasetRecorderService:
             timed_out = False
         finished = time.monotonic()
         elapsed_ms = (finished - started) * 1000.0
+        fallback_sample_time = finished if ok else target_monotonic_s
         sample = SourceSample(
             source,
-            self._source_sample_monotonic(value, target_monotonic_s),
+            self._source_sample_monotonic(value, fallback_sample_time),
             value,
             ok,
             message,
@@ -1560,8 +1653,63 @@ class DatasetRecorderService:
 
     def _source_sample_monotonic(self, value: Any, fallback_monotonic_s: float) -> float:
         """处理录制服务逻辑：_source_sample_monotonic。"""
-        _ = value
+        raw_relative = self._source_sample_relative_monotonic_s(value)
+        if raw_relative is not None:
+            return raw_relative
+        raw_s = self._source_sample_absolute_monotonic_s(value)
+        if raw_s is not None:
+            return raw_s
         return fallback_monotonic_s
+
+    def _source_sample_absolute_monotonic_s(self, value: Any) -> float | None:
+        """Return a driver's process-monotonic sample timestamp when present."""
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            candidates = (
+                (value.get("sample_monotonic_s"), 1.0),
+                (value.get("received_monotonic_ms"), 0.001),
+                (value.get("monotonicMs"), 0.001),
+            )
+        else:
+            candidates = (
+                (getattr(value, "sample_monotonic_s", None), 1.0),
+                (getattr(value, "received_monotonic_ms", None), 0.001),
+                (getattr(value, "monotonicMs", None), 0.001),
+            )
+        for raw, scale in candidates:
+            parsed = self._coerce_float(raw)
+            if parsed is not None and parsed > 0:
+                return parsed * scale
+        return None
+
+    def _source_sample_relative_monotonic_s(self, value: Any) -> float | None:
+        """Return an explicitly supplied monotonic sample timestamp if present."""
+        raw = value.get("monotonic_s") if isinstance(value, dict) else getattr(value, "monotonic_s", None)
+        parsed = self._coerce_float(raw)
+        return parsed if parsed is not None and parsed >= 0 else None
+
+    def _gripper_sample_monotonic(self, fallback_monotonic_s: float, fallback_absolute_s: float) -> float:
+        """Return the freshest gripper cache timestamp in host monotonic time."""
+        samples = getattr(self.telemetry, "gripper_samples", {}) or {}
+        latest_s: float | None = None
+        if isinstance(samples, dict):
+            for sample in samples.values():
+                raw = sample.get("monotonicMs") if isinstance(sample, dict) else None
+                parsed = self._coerce_float(raw)
+                if parsed is None or parsed <= 0:
+                    continue
+                absolute_s = parsed / 1000.0
+                latest_s = absolute_s if latest_s is None else max(latest_s, absolute_s)
+        if latest_s is not None:
+            return latest_s
+        return fallback_absolute_s if fallback_absolute_s > 0 else fallback_monotonic_s
+
+    def _coerce_float(self, value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _record_source_quality(self, sample: SourceSample, target_monotonic_s: float, elapsed_ms: float) -> None:
         # timeout 用 drop 边界，warning 用更严格的 skew 边界；这样慢但成功的源也会进入质量报告。
@@ -1785,8 +1933,8 @@ class DatasetRecorderService:
                 "fps": self._record_fps_hz,
                 "forceSampleHz": self._force_sample_hz,
                 "alignment": (
-                    "source samplers share a source_epoch and write sample_time = sample_index / source_hz; "
-                    "record frames align at warmup_s + frame_index / record_fps"
+                    "source samplers record host monotonic sample times; "
+                    "record frames align at sampler_start_s + warmup_s + frame_index / record_fps"
                 ),
             },
             "createdAt": int(info.get("createdAt", now_ms())) if info else now_ms(),
@@ -2027,11 +2175,26 @@ class DatasetRecorderService:
 
     def _camera_recording_frame(self, config: dict[str, Any], camera: str) -> Any:
         """Return an RGB camera frame for native recording without using preview JPEGs."""
+        frame, _sampled_at = self._camera_recording_frame_with_time(config, camera)
+        return frame
+
+    def _camera_recording_frame_with_time(self, config: dict[str, Any], camera: str) -> tuple[Any, float | None]:
+        """Return an RGB camera frame and the capture thread timestamp when available."""
+        raw_snapshot_with_time = getattr(self.hardware.cameras, "snapshot_frame_with_timestamp", None)
+        if callable(raw_snapshot_with_time):
+            snapshot = raw_snapshot_with_time(config, camera)
+            frame = getattr(snapshot, "frame", snapshot[0] if isinstance(snapshot, tuple) else snapshot)
+            sampled_at = getattr(
+                snapshot,
+                "monotonic_s",
+                snapshot[1] if isinstance(snapshot, tuple) and len(snapshot) > 1 else None,
+            )
+            return self._coerce_rgb_frame(frame, config, camera), self._coerce_float(sampled_at)
         raw_snapshot = getattr(self.hardware.cameras, "snapshot_frame", None)
         if callable(raw_snapshot):
-            return self._coerce_rgb_frame(raw_snapshot(config, camera), config, camera)
+            return self._coerce_rgb_frame(raw_snapshot(config, camera), config, camera), time.monotonic()
         jpeg = self.hardware.cameras.snapshot(config, camera)
-        return self._decode_jpeg_to_rgb(jpeg, config, camera)
+        return self._decode_jpeg_to_rgb(jpeg, config, camera), time.monotonic()
 
     def _decode_jpeg_to_rgb(self, jpeg: bytes, config: dict[str, Any], camera: str = "global") -> Any:
         """处理录制服务逻辑：_decode_jpeg_to_rgb。"""

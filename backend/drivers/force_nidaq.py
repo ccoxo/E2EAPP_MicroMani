@@ -44,6 +44,7 @@ class ForceProbeResult:
     sample_hz: float = 0.0
     sample_count: int = 0
     calibration: dict[str, Any] = field(default_factory=dict)
+    sample_monotonic_s: float = 0.0
 
 
 class _PersistentTask:
@@ -132,7 +133,13 @@ class NidaqForceDriver:
             nidaqmx = import_module("nidaqmx")
             constants = import_module("nidaqmx.constants")
         except Exception as exc:
-            return ForceProbeResult(False, f"NI-DAQmx Python import failed: {exc}", [0.0] * 6, [0.0] * 6)
+            return ForceProbeResult(
+                False,
+                f"NI-DAQmx Python import failed: {exc}",
+                [0.0] * 6,
+                [0.0] * 6,
+                sample_monotonic_s=time.monotonic(),
+            )
 
         errors: list[str] = []
         with self._sample_lock:
@@ -154,7 +161,13 @@ class NidaqForceDriver:
                     errors.append(f"{label} {channel}: {exc}")
                     persistent.close()
         if errors:
-            return ForceProbeResult(False, "; ".join(errors), [0.0] * 6, [0.0] * 6)
+            return ForceProbeResult(
+                False,
+                "; ".join(errors),
+                [0.0] * 6,
+                [0.0] * 6,
+                sample_monotonic_s=time.monotonic(),
+            )
         calibration = self.calibration_info(config)
         return ForceProbeResult(
             True,
@@ -162,6 +175,7 @@ class NidaqForceDriver:
             [0.0] * 6,
             [0.0] * 6,
             calibration=calibration,
+            sample_monotonic_s=time.monotonic(),
         )
 
     def sample(self, config: dict[str, Any]) -> ForceProbeResult:
@@ -175,7 +189,13 @@ class NidaqForceDriver:
                 nidaqmx = import_module("nidaqmx")
                 constants = import_module("nidaqmx.constants")
             except Exception as exc:
-                self._last_sample = ForceProbeResult(False, f"NI-DAQmx import failed: {exc}", [0.0] * 6, [0.0] * 6)
+                self._last_sample = ForceProbeResult(
+                    False,
+                    f"NI-DAQmx import failed: {exc}",
+                    [0.0] * 6,
+                    [0.0] * 6,
+                    sample_monotonic_s=time.monotonic(),
+                )
                 self._last_sample_at = now
                 return self._last_sample
             try:
@@ -205,8 +225,10 @@ class NidaqForceDriver:
                     f"NI-DAQmx force sample failed: {exc}",
                     [0.0] * 6,
                     [0.0] * 6,
+                    sample_monotonic_s=time.monotonic(),
                 )
             else:
+                sampled_at = time.monotonic()
                 sample_hz = self._sample_hz(config)
                 left = left_window[-1]
                 right = right_window[-1]
@@ -220,6 +242,7 @@ class NidaqForceDriver:
                     sample_hz,
                     1,
                     self.calibration_info(config),
+                    sampled_at,
                 )
             self._last_sample_at = now
             return self._last_sample
@@ -279,6 +302,7 @@ class NidaqForceDriver:
                     sample_hz,
                     sample_count,
                     self.calibration_info(config),
+                    time.monotonic(),
                 )
             self._last_sample_at = now
             return self._last_sample
@@ -309,6 +333,7 @@ class NidaqForceDriver:
             sample_hz,
             sample_count,
             latest.calibration,
+            latest.sample_monotonic_s,
         )
 
     def _fit_window(self, window: list[list[float]], latest: list[float], sample_count: int) -> list[list[float]]:
@@ -329,7 +354,13 @@ class NidaqForceDriver:
             nidaqmx = import_module("nidaqmx")
             constants = import_module("nidaqmx.constants")
         except Exception as exc:
-            return ForceProbeResult(False, f"NI-DAQmx import failed: {exc}", [0.0] * 6, [0.0] * 6)
+            return ForceProbeResult(
+                False,
+                f"NI-DAQmx import failed: {exc}",
+                [0.0] * 6,
+                [0.0] * 6,
+                sample_monotonic_s=time.monotonic(),
+            )
         with self._sample_lock:
             try:
                 left_raw = self._read_channel_window(
@@ -367,6 +398,7 @@ class NidaqForceDriver:
                     sample_hz=sample_hz,
                     sample_count=sample_count,
                     calibration=self.calibration_info(config),
+                    sample_monotonic_s=time.monotonic(),
                 )
         left = processed_left[-1]
         right = processed_right[-1]
@@ -380,6 +412,7 @@ class NidaqForceDriver:
             sample_hz,
             sample_count,
             self.calibration_info(config),
+            time.monotonic(),
         )
         self._last_sample_at = time.monotonic()
         return self._last_sample
