@@ -353,6 +353,43 @@ class OpenCVCameraDriver:
             event.clear()
         raise RuntimeError(f"{camera} index {index} frame read failed")
 
+    def snapshot_frame(self, config: dict[str, Any], camera: str) -> Any:
+        try:
+            cv2 = import_module("cv2")
+        except Exception as exc:
+            raise RuntimeError(f"OpenCV import failed: {exc}") from exc
+
+        fps_config = float(config["cameras"].get("fps", 30))
+        resolved = self._resolved_indices(cv2, config, fps_config)
+        if camera not in resolved:
+            raise RuntimeError(f"unknown camera: {camera}")
+        index = resolved[camera]
+        width, height = self._capture_size(config, camera)
+        with self._capture_lock:
+            capture = self._get_capture(cv2, index, width, height, fps_config, camera, config)
+            if capture is None:
+                raise RuntimeError(f"{camera} index {index} open failed")
+        deadline = time.monotonic() + CAMERA_FRAME_WAIT_SEC
+        while time.monotonic() < deadline:
+            frame_lock = self._frame_locks.get(index)
+            if frame_lock is not None:
+                with frame_lock:
+                    frame = self._latest_frames.get(index)
+                    if frame is not None and hasattr(frame, "copy"):
+                        frame = frame.copy()
+            else:
+                frame = None
+            if frame is not None:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                return rgb
+            event = self._frame_events.get(index)
+            if event is None:
+                time.sleep(0.01)
+                continue
+            event.wait(timeout=0.05)
+            event.clear()
+        raise RuntimeError(f"{camera} index {index} frame read failed")
+
     def wait_for_frame(
         self,
         config: dict[str, Any],
