@@ -4,7 +4,14 @@ import asyncio
 import time
 from pathlib import Path
 
-from backend.services.dataset_recorder import DatasetRecorderService, TimedRingBuffer, TimedSample
+import pytest
+
+from backend.services.dataset_recorder import (
+    PLACEHOLDER_JPEG_BYTES,
+    DatasetRecorderService,
+    TimedRingBuffer,
+    TimedSample,
+)
 
 EXPECTED_V3_FEATURES = {
     "observation.state": {
@@ -168,6 +175,29 @@ def test_dataset_recorder_fallback_features_follow_v3_contract() -> None:
         assert features[key]["dtype"] == expected["dtype"]
         assert list(features[key]["shape"]) == expected["shape"]
     assert "observation.gripper" not in features
+
+
+def test_fallback_mp4_encoder_resizes_placeholder_first_frame(tmp_path: Path) -> None:
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._record_fps_hz = 30
+    first = tmp_path / "frame_000000.jpg"
+    second = tmp_path / "frame_000001.jpg"
+    first.write_bytes(PLACEHOLDER_JPEG_BYTES)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    frame[:, :, 1] = 180
+    assert cv2.imwrite(str(second), frame)
+
+    ok, message = recorder._encode_jpegs_to_mp4(
+        cv2,
+        [first, second],
+        tmp_path / "episode_000000.mp4",
+        size=(640, 480),
+    )
+
+    assert ok, message
+    assert (tmp_path / "episode_000000.mp4").stat().st_size > 0
 
 
 def test_timed_ring_buffer_nearest_respects_skew_and_prunes() -> None:

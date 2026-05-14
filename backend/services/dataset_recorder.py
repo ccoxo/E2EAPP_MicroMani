@@ -130,6 +130,10 @@ PLACEHOLDER_JPEG_BYTES = base64.b64decode(
 )
 
 
+class DatasetSaveError(RuntimeError):
+    """Raised when an episode cannot be persisted in the declared dataset format."""
+
+
 @dataclass(frozen=True)
 class TimedSample:
     # 记录每个硬件源相对同一录制 tick 的时序，用于质量统计而不写入训练帧。
@@ -850,7 +854,6 @@ class DatasetRecorderService:
             raise FileNotFoundError(episode_id)
         if not bool(episode.get("native", False)):
             data_path = str(episode.get("dataPath", ""))
-            frame_count = max(1, int(episode.get("frames", 1)))
             feature_key = CAMERA_FEATURE_KEYS[camera]
             for item in self._fallback_frame_records(dataset_dir, data_path):
                 if int(item.get("frame_index", -1)) != frame:
@@ -1623,61 +1626,124 @@ class DatasetRecorderService:
         self._current_episode_paths.append(self._current_data_path)
 
     def _encode_fallback_videos_locked(self) -> None:
-        # 保存 episode 时把 fallback JPG 序列合成为 MP4；失败时保留 JPG 路径供复核兜底。
+        # Fallback metadata declares MP4 video features, so saving must produce MP4s or fail clearly.
         if not self._episode_records:
             return
         try:
             cv2 = importlib.import_module("cv2")
         except Exception as exc:  # noqa: BLE001
-            self._source_warnings.append(f"fallback video encode skipped: {exc}")
-            return
+            raise DatasetSaveError(f"fallback MP4 encode unavailable: {exc}") from exc
         dataset_dir = self._require_dataset_dir()
         records = sorted(self._episode_records, key=lambda item: int(item.get("frame_index", 0)))
-        for _camera, feature_key in CAMERA_FEATURE_KEYS.items():
-            image_paths = [record.get(feature_key) for record in records]
-            if not all(isinstance(path, str) and path.lower().endswith(".jpg") for path in image_paths):
-                continue
-            absolute_images = [dataset_dir / str(path) for path in image_paths]
-            if not absolute_images or not all(path.exists() for path in absolute_images):
-                continue
-            relative_video = (
-                Path("videos")
-                / "chunk-000"
-                / feature_key
-                / f"episode_{self._episode_index:06d}.mp4"
+        encoded: list[tuple[str, Path, Path, list[Path]]] = []
+        failures: list[str] = []
+        for camera, feature_key in CAMERA_FEATURE_KEYS.items():
+            try:
+                encoded.append(
+                    self._encode_fallback_camera_video(cv2, dataset_dir, records, camera, feature_key)
+                )
+            except DatasetSaveError as exc:
+                failures.append(str(exc))
+        if failures:
+            root = dataset_dir.resolve()
+            for _feature_key, _relative_video, video_path, _absolute_images in encoded:
+                self._safe_unlink(root, video_path)
+            raise DatasetSaveError("fallback MP4 encode failed: " + "; ".join(failures))
+        root = dataset_dir.resolve()
+        for feature_key, relative_video, video_path, absolute_images in encoded:
+            for record in records:
+                record[feature_key] = relative_video.as_posix()
+            self._current_episode_paths.append(video_path)
+            for image_path in absolute_images:
+                self._safe_unlink(root, image_path)
+            self._safe_rmtree(
+                root,
+                dataset_dir / "videos" / "chunk-000" / feature_key / f"episode_{self._episode_index:06d}",
             )
-            video_path = dataset_dir / relative_video
-            if self._encode_jpegs_to_mp4(cv2, absolute_images, video_path):
-                for record in records:
-                    record[feature_key] = relative_video.as_posix()
-                self._current_episode_paths.append(video_path)
-                for image_path in absolute_images:
-                    self._safe_unlink(dataset_dir.resolve(), image_path)
-            else:
-                self._safe_unlink(dataset_dir.resolve(), video_path)
 
-    def _encode_jpegs_to_mp4(self, cv2: Any, images: list[Path], video_path: Path) -> bool:
-        # OpenCV 编码器在不同 Windows 环境可用性不同，因此失败只降级为保留 JPG 序列。
-        first = cv2.imread(str(images[0]))
-        if first is None:
-            return False
-        height, width = first.shape[:2]
+    def _encode_fallback_camera_video(
+        self,
+        cv2: Any,
+        dataset_dir: Path,
+        records: list[dict[str, Any]],
+        camera: str,
+        feature_key: str,
+    ) -> tuple[str, Path, Path, list[Path]]:
+        image_paths = [record.get(feature_key) for record in records]
+        if not image_paths:
+            raise DatasetSaveError(f"{feature_key}: no frames to encode")
+        invalid_index = next(
+            (
+                index
+                for index, path in enumerate(image_paths)
+                if not isinstance(path, str) or not path.lower().endswith(".jpg")
+            ),
+            None,
+        )
+        if invalid_index is not None:
+            raise DatasetSaveError(f"{feature_key}: frame {invalid_index} does not reference a JPG")
+        absolute_images = [dataset_dir / str(path) for path in image_paths]
+        missing = next((path for path in absolute_images if not path.exists()), None)
+        if missing is not None:
+            raise DatasetSaveError(f"{feature_key}: missing frame {self._relative_to_dataset(dataset_dir, missing)}")
+        relative_video = (
+            Path("videos")
+            / "chunk-000"
+            / feature_key
+            / f"episode_{self._episode_index:06d}.mp4"
+        )
+        video_path = dataset_dir / relative_video
+        ok, message = self._encode_jpegs_to_mp4(
+            cv2,
+            absolute_images,
+            video_path,
+            size=CAMERA_CAPTURE_SIZES[camera],
+        )
+        if not ok:
+            self._safe_unlink(dataset_dir.resolve(), video_path)
+            raise DatasetSaveError(f"{feature_key}: {message}")
+        return feature_key, relative_video, video_path, absolute_images
+
+    def _encode_jpegs_to_mp4(
+        self,
+        cv2: Any,
+        images: list[Path],
+        video_path: Path,
+        *,
+        size: tuple[int, int],
+    ) -> tuple[bool, str]:
+        # Startup fallback frames can be 1x1 placeholders; encode to the declared camera size instead.
+        if not images:
+            return False, "no JPG frames"
+        width, height = size
+        if width <= 1 or height <= 1:
+            return False, f"invalid video size {width}x{height}"
         video_path.parent.mkdir(parents=True, exist_ok=True)
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(str(video_path), fourcc, float(max(1, self._record_fps_hz)), (width, height))
         if not writer.isOpened():
-            return False
+            return False, f"OpenCV VideoWriter could not open mp4v output at {width}x{height}"
+        frames_written = 0
         try:
             for image_path in images:
                 frame = cv2.imread(str(image_path))
                 if frame is None:
-                    return False
+                    return False, f"unreadable JPG frame {image_path.name}"
                 if frame.shape[:2] != (height, width):
-                    frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+                    frame = cv2.resize(
+                        frame,
+                        (width, height),
+                        interpolation=getattr(cv2, "INTER_AREA", 3),
+                    )
                 writer.write(frame)
+                frames_written += 1
         finally:
             writer.release()
-        return video_path.exists() and video_path.stat().st_size > 0
+        if frames_written != len(images):
+            return False, f"wrote {frames_written}/{len(images)} frames"
+        if not video_path.exists() or video_path.stat().st_size <= 0:
+            return False, "OpenCV did not create a non-empty MP4"
+        return True, ""
 
     def _finalize_episode_locked(self, *, status: str, deleted: bool) -> dict[str, Any]:
         dataset_dir = self._require_dataset_dir()
@@ -1762,6 +1828,8 @@ class DatasetRecorderService:
         data_path = dataset_dir / "data" / "chunk-000" / f"episode_{episode_index:06d}.jsonl"
         self._safe_unlink(dataset_dir, data_path)
         for feature_key in CAMERA_FEATURE_KEYS.values():
+            video_path = dataset_dir / "videos" / "chunk-000" / feature_key / f"episode_{episode_index:06d}.mp4"
+            self._safe_unlink(dataset_dir, video_path)
             image_dir = dataset_dir / "videos" / "chunk-000" / feature_key / f"episode_{episode_index:06d}"
             self._safe_rmtree(dataset_dir, image_dir)
 

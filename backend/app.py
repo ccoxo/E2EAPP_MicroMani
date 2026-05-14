@@ -25,7 +25,7 @@ from backend.core.schemas import (
 )
 from backend.hal_client.client import HalClient, RealHalClient, TestHalClient
 from backend.services.command_service import CommandService
-from backend.services.dataset_recorder import DatasetRecorderService
+from backend.services.dataset_recorder import DatasetRecorderService, DatasetSaveError
 from backend.services.gripper_tele_service import GripperTeleService
 from backend.services.gripper_worker_service import GripperWorkerService
 from backend.services.hardware_service import HardwareService
@@ -758,6 +758,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def save_episode() -> ApiEnvelope:
         try:
             return envelope(await recorder.save_episode())
+        except DatasetSaveError as exc:
+            raise HTTPException(status_code=500, detail={"code": "RECORDING_SAVE_FAILED", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail={"code": "RECORDING_NOT_ACTIVE", "message": str(exc)}) from exc
 

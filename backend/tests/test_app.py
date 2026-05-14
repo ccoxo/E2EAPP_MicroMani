@@ -444,6 +444,22 @@ def test_record_session_writes_lerobot_fallback_dataset(tmp_path: Path, monkeypa
         assert "appstation.omega" not in frame
         assert "observation.gripper" not in frame
         assert len(frame["action"]) == 14
+        for feature_key in (
+            "observation.images.global",
+            "observation.images.wrist_left",
+            "observation.images.wrist_right",
+        ):
+            assert frame[feature_key].endswith(".mp4")
+            assert (dataset_root / "unit_test_dataset" / frame[feature_key]).exists()
+            image_dir = (
+                dataset_root
+                / "unit_test_dataset"
+                / "videos"
+                / "chunk-000"
+                / feature_key
+                / episode["id"]
+            )
+            assert not image_dir.exists()
 
         finish_response = client.post("/api/record/session/finish")
         assert finish_response.status_code == 200
