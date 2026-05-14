@@ -14,7 +14,7 @@ from backend.app import create_app, relative_motion_positions
 from backend.core.defaults import default_config
 from backend.core.logging import LogService
 from backend.drivers.camera_opencv import OpenCVCameraDriver
-from backend.hal_client.client import RealHalClient, TestHalClient
+from backend.hal_client.client import HalHealth, RealHalClient, TestHalClient
 from backend.services.dataset_recorder import DatasetRecorderService
 
 RECORDING_SAVE_CONTRACT_EXAMPLE = {
@@ -174,6 +174,40 @@ def test_websocket_telemetry_compatibility_and_log_shape(tmp_path: Path, monkeyp
         assert key in frame
     assert log["type"] == "log"
     assert {"id", "ts", "channel", "level", "msg"}.issubset(log["data"])
+
+
+def test_websocket_marks_right_roll_enabled_feedback_unknown(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    class FakeHal:
+        async def health(self) -> HalHealth:
+            return HalHealth(
+                ltdmc_ok=True,
+                omega7_ok=False,
+                version="fake-hal",
+                uptime_s=1.0,
+                connected=True,
+                mode="real",
+            )
+
+        async def motion_state(self) -> dict:
+            return {
+                "positions": [0.0] * 12,
+                "pulses": [0.0] * 12,
+                "enabled": [True] * 6 + [False] * 6,
+                "estop_active": False,
+            }
+
+        async def command(self, name: str, payload: dict | None = None) -> dict:
+            return {"command": name, "payload": payload or {}}
+
+    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: FakeHal())
+    client = TestClient(create_app(tmp_path))
+
+    with client.websocket_connect("/ws") as websocket:
+        frame = websocket.receive_json()["data"]
+
+    assert frame["motionAxisEnabled"]["right"] == [False, False, False, None, False, False]
 
 
 def test_hardware_status_uses_gripper_workers_in_dual_mode(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

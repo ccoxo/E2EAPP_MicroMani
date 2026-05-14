@@ -681,13 +681,9 @@ bool LTDMCDriver::axisMotionEnabled(Side side, SemanticAxis axis) const {
   if (usesSevonPin(side, axis)) {
     return false;
   }
-  for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-    const auto candidate = static_cast<SemanticAxis>(axisIndex);
-    if (usesSevonPin(side, candidate) && enabled_[stateIndex(side, candidate)]) {
-      return true;
-    }
-  }
-  return false;
+  // Axis 8 (right Roll) has no readable SEVON pin, so a false cached flag
+  // means unknown rather than definitely disabled.
+  return true;
 }
 
 }  // namespace appstation::hal

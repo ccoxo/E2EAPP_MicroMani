@@ -126,6 +126,8 @@ def test_teleop_mapper_sends_continuous_six_axis_delta() -> None:
             0,
             0,
         ]
+        assert mapper.status()["actionHistory"][-1]["deltaVector"] == mapper.status()["lastAction"]["deltaVector"]
+        assert mapper.status()["actionHistory"][-1]["monotonic_s"] > 0
 
     asyncio.run(run())
 

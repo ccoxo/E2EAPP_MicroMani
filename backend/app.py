@@ -1033,8 +1033,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         if isinstance(raw_enabled, list) and len(raw_enabled) == 12:
                             left_axis_enabled = [bool(value) for value in raw_enabled[:6]]
                             right_axis_enabled: list[bool | None] = [bool(value) for value in raw_enabled[6:12]]
-                            if any(value is True for index, value in enumerate(right_axis_enabled) if index != 3):
-                                right_axis_enabled[3] = True if right_axis_enabled[3] is True else None
+                            # Right Roll is physical axis 8 and has no readable SEVON feedback.
+                            # Surface a false readback as unknown instead of a hard-disabled axis.
+                            if right_axis_enabled[3] is not True:
+                                right_axis_enabled[3] = None
                             motion_axis_enabled = {
                                 "left": left_axis_enabled,
                                 "right": right_axis_enabled,

@@ -120,6 +120,7 @@ def test_hal_skips_sevon_pin_for_right_roll_axis_eight() -> None:
         "if (!usesSevonPin(side, axis)) { enabled_[stateIndex(side, axis)] = enabled; "
         "++succeeded; continue; }"
     ) in normalized
+    assert "Axis 8 (right Roll) has no readable SEVON pin" in source
 
 
 def test_hal_stage_axis_and_direction_signs_match_icf_mapping() -> None:

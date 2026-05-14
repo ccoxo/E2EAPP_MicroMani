@@ -285,9 +285,9 @@ class CommandService:
         if isinstance(raw_enabled, list) and len(raw_enabled) == 12:
             axis_index = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"].index(axis)
             state_index = (0 if side == "left" else 6) + axis_index
-            axis_enabled = bool(raw_enabled[state_index])
-            if side == "right" and axis == "Roll" and self._side_has_readable_enabled_axis(raw_enabled[6:12]):
+            if self._axis_enabled_feedback_unreadable(side, axis):
                 return
+            axis_enabled = bool(raw_enabled[state_index])
         elif isinstance(raw_enabled, dict):
             value = raw_enabled.get(side)
             if isinstance(value, bool):
@@ -328,12 +328,12 @@ class CommandService:
 
     def _normalize_motion_axis_enabled(self, side: str, values: list[Any]) -> list[bool | None]:
         normalized: list[bool | None] = [bool(value) for value in values[:6]]
-        if side == "right" and len(normalized) >= 4 and self._side_has_readable_enabled_axis(normalized):
-            normalized[3] = True if normalized[3] is True else None
+        if side == "right" and len(normalized) >= 4 and normalized[3] is not True:
+            normalized[3] = None
         return normalized
 
-    def _side_has_readable_enabled_axis(self, values: list[Any]) -> bool:
-        return any(bool(value) for index, value in enumerate(values[:6]) if index != 3)
+    def _axis_enabled_feedback_unreadable(self, side: str, axis: str) -> bool:
+        return side == "right" and axis == "Roll"
 
     def _axis_profile(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> dict[str, float]:
         motion = config["motion"]

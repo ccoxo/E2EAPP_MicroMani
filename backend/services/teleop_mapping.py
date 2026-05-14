@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from collections import deque
 from typing import Any, Literal
 
 from backend.core.config import SettingsService
@@ -34,6 +35,7 @@ class TeleopMappingService:
         self._translation_direction: dict[SideName, list[int]] = {}
         self._active_sides: set[SideName] = set()
         self._last_action: dict[str, Any] | None = None
+        self._action_history: deque[dict[str, Any]] = deque(maxlen=1000)
         self._last_error = ""
         self._last_error_at = 0.0
         self._armed_at_ms: int | None = None
@@ -49,8 +51,10 @@ class TeleopMappingService:
             self._translation_carry.clear()
             self._translation_direction.clear()
             self._active_sides.clear()
+            self._action_history.clear()
         if mode != "real":
             self._last_action = None
+            self._action_history.clear()
             self.logs.info("[HAL]", "teleop mapper armed in test mode; no hardware motion will be sent")
             return self.status()
         if self._task is not None and not self._task.done():
@@ -101,6 +105,7 @@ class TeleopMappingService:
             "armedAt": self._armed_at_ms,
             "sources": sorted(self._arm_sources),
             "lastAction": self._last_action,
+            "actionHistory": list(self._action_history),
             "lastError": self._last_error,
             "limits": {
                 "translationStepUm": self._translation_step_um(config),
@@ -211,8 +216,11 @@ class TeleopMappingService:
         offset = 0 if side == "left" else 6
         for idx, delta in enumerate(deltas):
             delta_vector[offset + idx] = delta
-        self._last_action = {
+        action_monotonic_s = time.monotonic()
+        action = {
             "ts": now_ms(),
+            "monotonicMs": int(action_monotonic_s * 1000),
+            "monotonic_s": action_monotonic_s,
             "side": side,
             "axis": AXES[dominant_index],
             "delta": deltas[dominant_index],
@@ -220,6 +228,8 @@ class TeleopMappingService:
             "deltas": payload["deltas"],
             "deltaVector": delta_vector,
         }
+        self._last_action = action
+        self._action_history.append(action)
 
     def _deltas_from_delta(
         self,

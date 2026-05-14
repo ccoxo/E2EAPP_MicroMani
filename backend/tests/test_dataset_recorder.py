@@ -103,6 +103,15 @@ def test_timed_ring_buffer_nearest_respects_skew_and_prunes() -> None:
     assert buffer.nearest(11.0, 0.1) is None
 
 
+def test_timed_ring_buffer_reports_settled_sample() -> None:
+    buffer = TimedRingBuffer(retention_s=1.0, maxlen=4)
+    buffer.append(TimedSample("hal", 10.0, {"value": 10}))
+    buffer.append(TimedSample("hal", 10.5, {"value": 11}))
+
+    assert buffer.has_at_or_after(10.25) is True
+    assert buffer.has_at_or_after(10.75) is False
+
+
 def test_dataset_recorder_collect_frame_uses_timed_buffers() -> None:
     source = (Path(__file__).resolve().parents[1] / "services" / "dataset_recorder.py").read_text(encoding="utf-8")
 
@@ -120,9 +129,9 @@ def test_dataset_recorder_source_sampler_uses_shared_source_epoch() -> None:
     recorder._sampler_start_monotonic_s = 100.0
     recorder._record_fps_hz = 30
 
-    due = recorder._next_phase_aligned_sample_time("hal", {}, 100.005)
+    due = recorder._next_phase_aligned_sample_time("hal", {"motion": {"motionThreadHz": 1000}}, 100.005)
 
-    assert due == pytest.approx(100.0 + (1.0 / 30.0), abs=0.001)
+    assert due == pytest.approx(100.006, abs=0.001)
 
 
 def test_dataset_recorder_alignment_time_uses_warmup_plus_dataset_timestamp() -> None:
@@ -133,6 +142,30 @@ def test_dataset_recorder_alignment_time_uses_warmup_plus_dataset_timestamp() ->
 
     assert recorder._record_target_timestamp_s(0) == pytest.approx(100.5)
     assert recorder._record_target_timestamp_s(15) == pytest.approx(101.0)
+
+
+def test_dataset_recorder_frame_assembly_uses_default_alignment_delay() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+
+    assert recorder._alignment_delay_s({"storage": {}}) == pytest.approx(0.1)
+    assert recorder._frame_assembly_due_s(10.0, {"storage": {}}) == pytest.approx(10.1)
+
+
+def test_dataset_recorder_waits_for_critical_source_settle_until_timeout() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._sample_buffers = {"hal": TimedRingBuffer()}
+    recorder._source_warnings = []
+
+    missing = asyncio.run(
+        recorder._wait_for_critical_sources(
+            {"storage": {"settleTimeoutMs": 0}},
+            10.0,
+            sources=("hal",),
+        )
+    )
+
+    assert missing == {"hal"}
+    assert recorder._source_warnings == ["hal settle timeout"]
 
 
 def test_dataset_recorder_sample_buffer_covers_warmup_delay_jitter_and_lookback() -> None:
@@ -160,6 +193,12 @@ def test_dataset_recorder_source_sample_time_uses_source_frequency() -> None:
 
     assert recorder._source_sample_timestamp_s("force", 50, {"force": {"sampleHz": 200}}) == pytest.approx(0.25)
     assert recorder._source_sample_timestamp_s("camera_global", 10, {"cameras": {"fps": 25}}) == pytest.approx(0.4)
+    assert recorder._source_sample_timestamp_s("hal", 100, {"motion": {"motionThreadHz": 1000}}) == pytest.approx(0.1)
+    assert recorder._source_sample_timestamp_s(
+        "omega",
+        10,
+        {"teleop": {"omegaSampleHz": 100}},
+    ) == pytest.approx(0.1)
 
 
 def test_dataset_recorder_timed_source_records_timeout_drop() -> None:
@@ -330,6 +369,50 @@ def test_dataset_recorder_composes_14d_state_and_absolute_action() -> None:
         state,
         {"gripper": {"targetLeftMm": 6.0, "targetRightMm": 7.0}},
     ) == [11, 2, 3, 600.0, 200.0, 300.0, 6.0, -13, 8, 9, 400.0, 500.0, 500.0, 7.0]
+
+
+def test_dataset_recorder_action_vector_uses_last_action_before_target() -> None:
+    class FakeTeleop:
+        def status(self) -> dict[str, object]:
+            return {
+                "lastAction": {
+                    "ts": int(time.time() * 1000),
+                    "monotonic_s": 10.2,
+                    "deltaVector": [99.0] * 12,
+                },
+                "actionHistory": [
+                    {
+                        "ts": int(time.time() * 1000),
+                        "monotonic_s": 9.9,
+                        "deltaVector": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    },
+                    {
+                        "ts": int(time.time() * 1000),
+                        "monotonic_s": 10.2,
+                        "deltaVector": [99.0] * 12,
+                    },
+                ],
+            }
+
+    recorder = object.__new__(DatasetRecorderService)
+    recorder.teleop = FakeTeleop()
+
+    assert recorder._latest_action_vector([0.0] * 14, {}, 10.0) == [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
 
 
 def test_dataset_recorder_applies_work_origin_pulse_conversion() -> None:

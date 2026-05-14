@@ -116,12 +116,18 @@ SOURCE_WARNING_SKEW_MS: dict[str, float] = {
 }
 SOURCE_DROP_SKEW_MS: dict[str, float] = {source: 35.0 for source in CAMERA_SOURCE_KEYS.values()}
 RING_BUFFER_RETENTION_S = 3.0
-WRITE_QUEUE_MAX_FRAMES = 120
+WRITE_QUEUE_MAX_FRAMES = 1200
 WRITE_QUEUE_PUT_TIMEOUT_S = 1.0
 SAMPLER_START_LEAD_S = 0.05
 RECORDER_HARDWARE_WARMUP_S = 0.5
 MAX_SAMPLE_JITTER_S = 0.10
 SAMPLE_LOOKBACK_WINDOW_S = 0.10
+ALIGNMENT_DELAY_S = 0.100
+SETTLE_TIMEOUT_MS = 20.0
+ACTION_STALE_S = 1.0
+HAL_NATIVE_SAMPLE_HZ = 1000.0
+OMEGA_NATIVE_SAMPLE_HZ = 100.0
+CRITICAL_ALIGNMENT_SOURCE_KEYS: tuple[str, ...] = ("hal", "force", "gripper", "omega")
 
 
 class DatasetSaveError(RuntimeError):
@@ -331,7 +337,7 @@ class FrameAssembler:
             "observation.pulses": motion_pulses,
             "observation.force_left": force_left,
             "observation.force_right": force_right,
-            "action": recorder._latest_action_vector(observation_state, config),
+            "action": recorder._latest_action_vector(observation_state, config, target_monotonic_s),
             "images": image_payload,
         }
 
@@ -376,6 +382,11 @@ class TimedRingBuffer:
             return None
         nearest = min(candidates, key=lambda sample: abs(sample.monotonic_s - target_s))
         return nearest if abs(nearest.monotonic_s - target_s) <= max_skew_s else None
+
+    def has_at_or_after(self, target_s: float) -> bool:
+        """Return whether any buffered sample has reached the requested target time."""
+        with self._lock:
+            return bool(self._samples and self._samples[-1].monotonic_s >= target_s)
 
     def prune(self, before_s: float) -> None:
         """处理录制服务逻辑：prune。"""
@@ -1212,7 +1223,7 @@ class DatasetRecorderService:
         rate_hz = self._source_sample_rate_hz(source, config)
         if now_s < start_s:
             return start_s
-        next_index = int(math.floor((now_s - start_s) * rate_hz)) + 1
+        next_index = int(math.floor(((now_s - start_s) * rate_hz) + 1e-9)) + 1
         return start_s + self._source_sample_timestamp_s(source, next_index, config)
 
     def _source_sample_timestamp_s(self, source: str, sample_index: int, config: dict[str, Any]) -> float:
@@ -1223,6 +1234,54 @@ class DatasetRecorderService:
         """Return the absolute monotonic target timestamp for a recorder frame."""
         record_start_s = self._sampler_start_monotonic_s or self._episode_start_monotonic_s
         return record_start_s + RECORDER_HARDWARE_WARMUP_S + max(0, int(frame_index)) / max(1, self._record_fps_hz)
+
+    def _frame_assembly_due_s(self, target_monotonic_s: float, config: dict[str, Any]) -> float:
+        """Return when the recorder may assemble a target tick."""
+        return target_monotonic_s + self._alignment_delay_s(config)
+
+    def _alignment_delay_s(self, config: dict[str, Any]) -> float:
+        """Return the configured source-alignment delay in seconds."""
+        storage = config.get("storage", {}) if isinstance(config.get("storage"), dict) else {}
+        return self._positive_ratio(storage.get("alignmentDelayMs"), ALIGNMENT_DELAY_S * 1000.0) / 1000.0
+
+    def _settle_timeout_s(self, config: dict[str, Any]) -> float:
+        """Return how long frame assembly may wait for critical sources to pass target."""
+        storage = config.get("storage", {}) if isinstance(config.get("storage"), dict) else {}
+        return self._positive_ratio(storage.get("settleTimeoutMs"), SETTLE_TIMEOUT_MS) / 1000.0
+
+    async def _wait_for_critical_sources(
+        self,
+        config: dict[str, Any],
+        target_monotonic_s: float,
+        *,
+        sources: tuple[str, ...] = CRITICAL_ALIGNMENT_SOURCE_KEYS,
+    ) -> set[str]:
+        """Wait until critical source buffers contain at least one sample at/after target."""
+        missing = self._sources_missing_at_or_after(sources, target_monotonic_s)
+        timeout_s = self._settle_timeout_s(config)
+        if not missing or timeout_s <= 0:
+            for source in missing:
+                self._source_warnings.append(f"{source} settle timeout")
+            return missing
+        deadline_s = time.monotonic() + timeout_s
+        while missing:
+            remaining_s = deadline_s - time.monotonic()
+            if remaining_s <= 0:
+                break
+            await asyncio.sleep(min(0.002, remaining_s))
+            missing = self._sources_missing_at_or_after(sources, target_monotonic_s)
+        for source in missing:
+            self._source_warnings.append(f"{source} settle timeout")
+        return missing
+
+    def _sources_missing_at_or_after(self, sources: tuple[str, ...], target_monotonic_s: float) -> set[str]:
+        """Return source keys without a buffered sample at or after target."""
+        missing: set[str] = set()
+        for source in sources:
+            buffer = self._sample_buffers.get(source)
+            if buffer is None or not buffer.has_at_or_after(target_monotonic_s):
+                missing.add(source)
+        return missing
 
     async def _sample_source_once(self, source: str, config: dict[str, Any], target_s: float) -> TimedSample:
         """Sample a concrete hardware source for a preassigned absolute timestamp."""
@@ -1395,19 +1454,18 @@ class DatasetRecorderService:
                     recording = self._recording
                     frame_index = self._queued_episode_frames
                     episode_index = self._episode_index
-                    record_start = self._record_loop_start_monotonic_s or time.monotonic()
                     period_s = 1.0 / max(1, self._record_fps_hz)
+                    config = self._recording_config()
                 if not recording:
                     await asyncio.sleep(0.05)
                     continue
                 target_tick = self._record_target_timestamp_s(frame_index)
-                scheduled_tick = target_tick
+                scheduled_tick = self._frame_assembly_due_s(target_tick, config)
                 now = time.monotonic()
                 if now < scheduled_tick:
                     await asyncio.sleep(scheduled_tick - now)
-                    now = time.monotonic()
-                capture_tick = now
                 frame = await self._collect_frame(target_tick, frame_index=frame_index)
+                capture_tick = time.monotonic()
                 pending = PendingFrame(
                     episode_index=episode_index,
                     frame_index=frame_index,
@@ -1451,7 +1509,7 @@ class DatasetRecorderService:
                             self._write_enqueue_pending = max(0, self._write_enqueue_pending - 1)
                             if self._write_enqueue_pending == 0:
                                 self._write_enqueue_idle.set()
-                next_target = record_start + (frame_index + 1) * period_s
+                next_target = self._frame_assembly_due_s(self._record_target_timestamp_s(frame_index + 1), config)
                 await asyncio.sleep(max(0.0, next_target - time.monotonic()))
             except asyncio.CancelledError:
                 raise
@@ -1471,6 +1529,7 @@ class DatasetRecorderService:
         target_monotonic_s = (
             target_monotonic_s if target_monotonic_s is not None else self._record_target_timestamp_s(frame_index)
         )
+        await self._wait_for_critical_sources(config, target_monotonic_s)
         return self._frame_assembler.assemble(config, target_monotonic_s, frame_index)
 
     async def _cached_source(
@@ -1624,6 +1683,14 @@ class DatasetRecorderService:
 
     def _source_sample_rate_hz(self, source: str, config: dict[str, Any]) -> float:
         """处理录制服务逻辑：_source_sample_rate_hz。"""
+        if source == "hal":
+            motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+            return max(self._positive_ratio(motion.get("motionThreadHz"), HAL_NATIVE_SAMPLE_HZ), 1.0)
+        if source == "omega":
+            teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
+            interval_ms = self._positive_ratio(teleop.get("commandIntervalMs"), 0.0)
+            default_hz = 1000.0 / interval_ms if interval_ms > 0 else OMEGA_NATIVE_SAMPLE_HZ
+            return max(self._positive_ratio(teleop.get("omegaSampleHz"), default_hz), 1.0)
         if source == "force":
             return min(max(self._force_sample_hz_from_config(config), 1.0), 200.0)
         if source == "gripper":
@@ -1934,8 +2001,11 @@ class DatasetRecorderService:
                 "forceSampleHz": self._force_sample_hz,
                 "alignment": (
                     "source samplers record host monotonic sample times; "
-                    "record frames align at sampler_start_s + warmup_s + frame_index / record_fps"
+                    "record frames align at sampler_start_s + warmup_s + frame_index / record_fps; "
+                    "assembly waits alignment_delay_ms before settling critical source buffers"
                 ),
+                "alignmentDelayMs": round(self._alignment_delay_s(config) * 1000.0, 3),
+                "settleTimeoutMs": round(self._settle_timeout_s(config) * 1000.0, 3),
             },
             "createdAt": int(info.get("createdAt", now_ms())) if info else now_ms(),
             "updatedAt": now_ms(),
@@ -2779,12 +2849,13 @@ class DatasetRecorderService:
         self,
         observation_state: list[float] | None = None,
         config: dict[str, Any] | None = None,
+        target_monotonic_s: float | None = None,
     ) -> list[float]:
         # action 记录绝对目标：当前 observation.state 加主手增量，夹爪目标取配置值。
         """处理录制服务逻辑：_latest_action_vector。"""
         base = (list(observation_state) + [0.0] * 14)[:14] if observation_state is not None else [0.0] * 14
         config = config or {}
-        vector = self._latest_action_delta_vector()
+        vector = self._latest_action_delta_vector(target_monotonic_s)
         action = [base[index] + vector[index] for index in range(14)]
         gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
         if gripper:
@@ -2792,14 +2863,18 @@ class DatasetRecorderService:
             action[13] = self._float_or_zero(gripper.get("targetRightMm", base[13]))
         return action
 
-    def _latest_action_delta_vector(self) -> list[float]:
+    def _latest_action_delta_vector(self, target_monotonic_s: float | None = None) -> list[float]:
         """处理录制服务逻辑：_latest_action_delta_vector。"""
         vector = [0.0] * 14
-        last_action = self.teleop.status().get("lastAction")
+        last_action = self._teleop_action_for_target(target_monotonic_s)
         if not isinstance(last_action, dict):
             return vector
-        ts = int(last_action.get("ts", 0))
-        if now_ms() - ts > 1000:
+        action_monotonic_s = self._action_monotonic_s(last_action)
+        if target_monotonic_s is None:
+            ts = int(last_action.get("ts", 0))
+            if now_ms() - ts > int(ACTION_STALE_S * 1000):
+                return vector
+        elif action_monotonic_s is None or target_monotonic_s - action_monotonic_s > ACTION_STALE_S:
             return vector
         delta_vector = last_action.get("deltaVector")
         if isinstance(delta_vector, list):
@@ -2819,6 +2894,45 @@ class DatasetRecorderService:
         value = float(last_action.get("delta", 0.0))
         vector[state_index] = value * 1000.0 if axis_index >= 3 else value
         return vector
+
+    def _teleop_action_for_target(self, target_monotonic_s: float | None) -> dict[str, Any] | None:
+        """Return the latest action not newer than target_monotonic_s."""
+        status = self.teleop.status()
+        if target_monotonic_s is None:
+            last_action = status.get("lastAction")
+            return last_action if isinstance(last_action, dict) else None
+        best_action: dict[str, Any] | None = None
+        best_monotonic_s = -math.inf
+        history = status.get("actionHistory")
+        if isinstance(history, list):
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                monotonic_s = self._action_monotonic_s(item)
+                if monotonic_s is None or monotonic_s > target_monotonic_s or monotonic_s < best_monotonic_s:
+                    continue
+                best_action = item
+                best_monotonic_s = monotonic_s
+        if best_action is not None:
+            return best_action
+        last_action = status.get("lastAction")
+        if not isinstance(last_action, dict):
+            return None
+        monotonic_s = self._action_monotonic_s(last_action)
+        if monotonic_s is None or monotonic_s > target_monotonic_s:
+            return None
+        return last_action
+
+    def _action_monotonic_s(self, action: dict[str, Any]) -> float | None:
+        """Return a teleop action timestamp in host monotonic seconds."""
+        for raw, scale in (
+            (action.get("monotonic_s"), 1.0),
+            (action.get("monotonicMs"), 0.001),
+        ):
+            parsed = self._coerce_float(raw)
+            if parsed is not None and parsed >= 0:
+                return parsed * scale
+        return None
 
     def _motion_delta_to_action_delta(self, delta_vector: list[Any]) -> list[float]:
         # teleop delta 仍是 12 维位姿增量，这里插入左右夹爪槽位并把旋转从度转成 mdeg。
