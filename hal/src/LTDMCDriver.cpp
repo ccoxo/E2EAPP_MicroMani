@@ -95,6 +95,10 @@ int stageAxisCount(appstation::hal::Side side) {
   return side == appstation::hal::Side::Left ? 6 : 9;
 }
 
+bool usesSevonPin(appstation::hal::Side side, appstation::hal::SemanticAxis axis) {
+  return physicalAxis(side, axis) < 8;
+}
+
 double clipTeleopTargetToLimit(double targetUi, const AxisLimit& limit) {
   return std::clamp(targetUi, limit.min, limit.max);
 }
@@ -222,7 +226,7 @@ MotionState LTDMCDriver::readState() {
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
       const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
       pulse_[index] = static_cast<double>(dmcGetPosition(card, axisNo));
-      if (dmcReadSevonPin) {
+      if (dmcReadSevonPin && usesSevonPin(side, axis)) {
         enabled_[index] = dmcReadSevonPin(card, axisNo) > 0;
       }
       state.axes[index].moving = dmcCheckDone(card, axisNo) == 0;
@@ -277,6 +281,11 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled) {
       ++failed;
       continue;
     }
+    if (!usesSevonPin(side, axis)) {
+      enabled_[stateIndex(side, axis)] = enabled;
+      ++succeeded;
+      continue;
+    }
     const auto ret = dmcWriteSevonPin(card, axisNo, enabled ? 1 : 0);
     if (ret != 0) {
       if (failed > 0) {
@@ -299,7 +308,7 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled) {
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     teleopTargetActive_[stateIndex(side, static_cast<SemanticAxis>(axisIndex))] = false;
   }
-  if (succeeded == 0 && failed > 0) {
+  if (failed > 0) {
     throw std::runtime_error(failures.str());
   }
   std::ostringstream message;
@@ -433,7 +442,7 @@ void LTDMCDriver::moveRelativeUi(
   if (deltaPulse == 0) {
     throw std::runtime_error("jog delta rounds to zero pulses");
   }
-  if (!enabled_[index]) {
+  if (!axisMotionEnabled(side, axis)) {
     throw std::runtime_error("axis is not servo-enabled");
   }
   const auto card = side == Side::Left ? static_cast<unsigned short>(1) : static_cast<unsigned short>(0);
@@ -543,7 +552,7 @@ void LTDMCDriver::updateTeleopTargetUi(
       }
       continue;
     }
-    if (!enabled_[index]) {
+    if (!axisMotionEnabled(side, axis)) {
       throw std::runtime_error("teleop axis is not servo-enabled");
     }
     const auto maxVelocityUiPerSec = rotation ? rotationVelocityUiPerSec : translationVelocityUiPerSec;
@@ -663,6 +672,22 @@ void LTDMCDriver::checkLimits(
       throw std::runtime_error("motion target exceeds soft limit");
     }
   }
+}
+
+bool LTDMCDriver::axisMotionEnabled(Side side, SemanticAxis axis) const {
+  if (enabled_[stateIndex(side, axis)]) {
+    return true;
+  }
+  if (usesSevonPin(side, axis)) {
+    return false;
+  }
+  for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    const auto candidate = static_cast<SemanticAxis>(axisIndex);
+    if (usesSevonPin(side, candidate) && enabled_[stateIndex(side, candidate)]) {
+      return true;
+    }
+  }
+  return false;
 }
 
 }  // namespace appstation::hal

@@ -6,6 +6,7 @@ from typing import Any, cast
 from backend.core.config import SettingsService
 from backend.core.logging import LogService, now_ms
 from backend.core.schemas import GripperCommandRequest, ManualAxisMoveRequest, SettingsCommandRequest
+from backend.core.units import pulses_to_ui_state
 from backend.hal_client.client import HalClient
 from backend.services.hardware_service import HardwareService
 from backend.services.telemetry_hub import TelemetryHub
@@ -76,6 +77,13 @@ class CommandService:
         await self._refresh_motion_enabled(side)
         side_label = "left" if side == "left" else "right"
         self.logs.info("[HAL]", f"{side_label} motion axes disable requested")
+        return result
+
+    async def stop_motion_side(self, side: str) -> dict[str, object]:
+        self._validate_side(side)
+        result = await self.hal.command("motion.teleop_stop_side", {"side": side})
+        side_label = "left" if side == "left" else "right"
+        self.logs.warning("[HAL]", f"{side_label} motion stop requested")
         return result
 
     async def home_motion_side(self, side: str) -> dict[str, object]:
@@ -153,6 +161,7 @@ class CommandService:
         self._validate_manual_axis_safety(config, request)
         if self._real_hardware_mode(config):
             await self._validate_motion_axis_enabled(request.side, request.axis)
+            await self._validate_manual_axis_soft_limit(config, request)
             profile = self._axis_profile(config, request)
             hal_result = await self.hal.command(
                 "motion.manual_axis_move",
@@ -262,7 +271,7 @@ class CommandService:
         raw_enabled = state.get("enabled")
         if isinstance(raw_enabled, list) and len(raw_enabled) == 12:
             values = raw_enabled[:6] if side == "left" else raw_enabled[6:12]
-            self.telemetry.set_motion_axis_enabled(side, [bool(value) for value in values])
+            self.telemetry.set_motion_axis_enabled(side, self._normalize_motion_axis_enabled(side, values))
             return
         if isinstance(raw_enabled, dict):
             value = raw_enabled.get(side)
@@ -277,12 +286,54 @@ class CommandService:
             axis_index = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"].index(axis)
             state_index = (0 if side == "left" else 6) + axis_index
             axis_enabled = bool(raw_enabled[state_index])
+            if side == "right" and axis == "Roll" and self._side_has_readable_enabled_axis(raw_enabled[6:12]):
+                return
         elif isinstance(raw_enabled, dict):
             value = raw_enabled.get(side)
             if isinstance(value, bool):
                 axis_enabled = value
         if axis_enabled is not True:
             raise RuntimeError(f"{side} {axis} motion axis is disabled; enable the axis before manual jog")
+
+    async def _validate_manual_axis_soft_limit(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> None:
+        origin = self._normalized_motion_origin(config)
+        origin_valid = bool(origin["leftValid"] if request.side == "left" else origin["rightValid"])
+        if not origin_valid:
+            return
+        state = await self.hal.motion_state()
+        pulses = self._motion_state_pulses(state)
+        side_offset = 0 if request.side == "left" else 6
+        origin_pulses = cast(list[float], origin["leftPulse"] if request.side == "left" else origin["rightPulse"])
+        relative_pulses = list(pulses)
+        for index in range(6):
+            relative_pulses[side_offset + index] = float(pulses[side_offset + index]) - origin_pulses[index]
+        axis_order = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
+        axis_index = axis_order.index(request.axis)
+        state_index = side_offset + axis_index
+        current = pulses_to_ui_state(relative_pulses)[state_index]
+        target = current + request.step * request.direction
+        limit_key = request.axis.lower()
+        limits_key = "leftSoftLimits" if request.side == "left" else "rightSoftLimits"
+        limits = config["motion"][limits_key][limit_key]
+        min_limit = float(limits["min"])
+        max_limit = float(limits["max"])
+        if axis_index >= 3:
+            min_limit /= 1000.0
+            max_limit /= 1000.0
+        if target < min_limit or target > max_limit:
+            raise RuntimeError(
+                f"{request.side} {request.axis} target exceeds soft limit: "
+                f"{target:.3f} not in [{min_limit:.3f}, {max_limit:.3f}]"
+            )
+
+    def _normalize_motion_axis_enabled(self, side: str, values: list[Any]) -> list[bool | None]:
+        normalized: list[bool | None] = [bool(value) for value in values[:6]]
+        if side == "right" and len(normalized) >= 4 and self._side_has_readable_enabled_axis(normalized):
+            normalized[3] = True if normalized[3] is True else None
+        return normalized
+
+    def _side_has_readable_enabled_axis(self, values: list[Any]) -> bool:
+        return any(bool(value) for index, value in enumerate(values[:6]) if index != 3)
 
     def _axis_profile(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> dict[str, float]:
         motion = config["motion"]

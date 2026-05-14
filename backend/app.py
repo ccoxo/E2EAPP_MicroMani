@@ -23,6 +23,7 @@ from backend.core.schemas import (
     SnapshotCreateRequest,
     SnapshotScope,
 )
+from backend.core.units import pulses_to_ui_state
 from backend.hal_client.client import HalClient, RealHalClient, TestHalClient
 from backend.services.command_service import CommandService
 from backend.services.dataset_recorder import DatasetRecorderService, DatasetSaveError
@@ -71,6 +72,45 @@ def mask_omega_state_for_logical_connection(state: dict[str, Any], config: dict[
         next_hands.append(hand)
     masked["hands"] = next_hands
     return masked
+
+
+def origin_side_pulses(origin: dict[str, Any], side: str) -> list[float] | None:
+    key = "leftPulse" if side == "left" else "rightPulse"
+    raw = origin.get(key)
+    if not isinstance(raw, list) or len(raw) < 6:
+        return None
+    try:
+        return [float(value) for value in raw[:6]]
+    except (TypeError, ValueError):
+        return None
+
+
+def relative_motion_positions(
+    config: dict[str, Any],
+    positions: list[float],
+    pulses: list[float] | None,
+) -> list[float]:
+    origin = config.get("motion", {}).get("origin", {})
+    if not isinstance(origin, dict) or pulses is None or len(pulses) != 12:
+        return positions
+    next_positions = (list(positions) + [0.0] * 12)[:12]
+    relative_pulses = list(pulses)
+    left_origin = origin_side_pulses(origin, "left")
+    right_origin = origin_side_pulses(origin, "right")
+    left_valid = bool(origin.get("leftValid", origin.get("valid", False)))
+    right_valid = bool(origin.get("rightValid", origin.get("valid", False)))
+    if left_valid and left_origin is not None:
+        relative_pulses[:6] = [float(pulses[index]) - left_origin[index] for index in range(6)]
+    if right_valid and right_origin is not None:
+        relative_pulses[6:12] = [float(pulses[index + 6]) - right_origin[index] for index in range(6)]
+    if not left_valid and not right_valid:
+        return next_positions
+    relative_positions = pulses_to_ui_state(relative_pulses)
+    if left_valid and left_origin is not None:
+        next_positions[:6] = relative_positions[:6]
+    if right_valid and right_origin is not None:
+        next_positions[6:12] = relative_positions[6:12]
+    return next_positions
 
 
 def runtime_dir_from_env() -> Path:
@@ -438,6 +478,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             return envelope(await commands.disable_motion_side(side))
         except RuntimeError as exc:
             logs.error("[HAL]", f"disable_motion_side failed: {exc}")
+            raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
+
+    @app.post("/api/motion/{side}/stop")
+    async def stop_motion_side(side: str) -> ApiEnvelope:
+        if side not in {"left", "right"}:
+            raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
+        try:
+            return envelope(await commands.stop_motion_side(side))
+        except RuntimeError as exc:
+            logs.error("[HAL]", f"stop_motion_side failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
 
     @app.post("/api/motion/{side}/home")
@@ -949,6 +999,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                                 logs.error("[HAL]", f"motion state failed: {exc}")
                         motion_state = cached_motion_state
                     motion_positions = None
+                    motion_pulses = None
                     motion_estop_active = None
                     motion_enabled = None
                     motion_axis_enabled = None
@@ -956,13 +1007,26 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         raw_positions = motion_state.get("positions")
                         if isinstance(raw_positions, list) and len(raw_positions) == 12:
                             motion_positions = [float(value) for value in raw_positions]
+                        raw_pulses = motion_state.get("pulses")
+                        if isinstance(raw_pulses, list) and len(raw_pulses) == 12:
+                            motion_pulses = [float(value) for value in raw_pulses]
+                        if motion_positions is not None:
+                            motion_positions = relative_motion_positions(
+                                settings.get_config(),
+                                motion_positions,
+                                motion_pulses,
+                            )
                         if isinstance(motion_state.get("estop_active"), bool):
                             motion_estop_active = bool(motion_state["estop_active"])
                         raw_enabled = motion_state.get("enabled")
                         if isinstance(raw_enabled, list) and len(raw_enabled) == 12:
+                            left_axis_enabled = [bool(value) for value in raw_enabled[:6]]
+                            right_axis_enabled: list[bool | None] = [bool(value) for value in raw_enabled[6:12]]
+                            if any(value is True for index, value in enumerate(right_axis_enabled) if index != 3):
+                                right_axis_enabled[3] = True if right_axis_enabled[3] is True else None
                             motion_axis_enabled = {
-                                "left": [bool(value) for value in raw_enabled[:6]],
-                                "right": [bool(value) for value in raw_enabled[6:12]],
+                                "left": left_axis_enabled,
+                                "right": right_axis_enabled,
                             }
                             motion_enabled = {
                                 "left": all(motion_axis_enabled["left"]),

@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import {
+  acknowledgeSafety as acknowledgeSafetyApi,
   applyParameterSnapshotApi,
   createParameterSnapshot as createParameterSnapshotApi,
   createSession as createRecordSessionApi,
@@ -256,7 +257,7 @@ interface TelemetryStore {
   toggleRecordClutch: () => void
   setRecordSpeedMode: (mode: ManualSpeedMode) => void
   homeRecordArms: () => void
-  triggerRecordEmergencyStop: () => void
+  triggerEmergencyStop: () => void
   clearRecordSession: () => void
   setClutchActive: (active: boolean) => void
   setAutoRunning: (running: boolean) => void
@@ -649,14 +650,15 @@ function commitBackendFrame(set: TelemetryStoreSet, frame: TelemetryFrame, force
       || state.history.length === 0
       || lastBackendHistoryCommitAt === 0
       || now - lastBackendHistoryCommitAt >= chartHistoryIntervalMs
+    const nextFrame = state.dangerOverride === null ? frame : { ...frame, dangerIndex: state.dangerOverride }
     historyCommitted = shouldCommitHistory
     return {
       tick: state.tick + 1,
-      frame,
-      recording: frame.recording,
-      episodeCount: frame.episodeCount,
-      frameCount: frame.frameCount,
-      recordSession: nextRecordSessionFromBackend(state, frame),
+      frame: nextFrame,
+      recording: nextFrame.recording,
+      episodeCount: nextFrame.episodeCount,
+      frameCount: nextFrame.frameCount,
+      recordSession: nextRecordSessionFromBackend(state, nextFrame),
       ...(shouldCommitHistory ? { history: appendTelemetryHistory(state.history, sample) } : {}),
     }
   })
@@ -1383,10 +1385,11 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     }))
   },
 
-  triggerRecordEmergencyStop: () => {
+  triggerEmergencyStop: () => {
     void emergencyStopApi()
     set((state) => ({
       recording: false,
+      autoRunning: false,
       dangerOverride: 1.1,
       logPanelOpen: true,
       frame: {
@@ -1402,7 +1405,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
         recorderElapsedS: 0,
         recorderTotalS: -1,
       },
-      logs: appendLog(state.logs, makeLog('ERROR', '录制页面触发硬件急停', '[SAFETY]')),
+      logs: appendLog(state.logs, makeLog('ERROR', '操作员触发硬件急停', '[SAFETY]')),
     }))
   },
 
@@ -1448,15 +1451,21 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       },
     })),
 
-  acknowledgeSafety: () =>
+  acknowledgeSafety: () => {
+    void acknowledgeSafetyApi().catch((error) => {
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('ERROR', `safety acknowledge failed: ${String(error)}`, '[SAFETY]')),
+      }))
+    })
     set((state) => ({
-      dangerOverride: 0,
+      dangerOverride: null,
       frame: {
         ...state.frame,
         dangerIndex: 0,
       },
-      logs: appendLog(state.logs, makeLog('INFO', 'Safety overlay acknowledged by operator', '[SAFETY]')),
-    })),
+      logs: appendLog(state.logs, makeLog('INFO', '操作员确认安全复位', '[SAFETY]')),
+    }))
+  },
 
   injectLog: (level, msg, channel) =>
     set((state) => ({

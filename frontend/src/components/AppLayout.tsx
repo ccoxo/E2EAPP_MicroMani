@@ -17,6 +17,7 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { useTelemetryStore } from '../stores/telemetry'
 import { LogPanel } from './LogPanel'
 import { MetricPill } from './MetricPill'
+import { GlobalEmergencyStopButton } from './GlobalEmergencyStopButton'
 import { SafetyOverlay } from './SafetyOverlay'
 import { StatusBar } from './StatusBar'
 
@@ -60,9 +61,7 @@ function TopStatus({ clock }: { clock: string }) {
 export function AppLayout() {
   const selectedMode = useTelemetryStore((state) => state.selectedMode)
   const setMode = useTelemetryStore((state) => state.setMode)
-  const setDangerOverride = useTelemetryStore((state) => state.setDangerOverride)
-  const setLogPanelOpen = useTelemetryStore((state) => state.setLogPanelOpen)
-  const injectLog = useTelemetryStore((state) => state.injectLog)
+  const triggerEmergencyStop = useTelemetryStore((state) => state.triggerEmergencyStop)
   const [clock, setClock] = useState(() => dayjs().format('HH:mm:ss'))
   const navigate = useNavigate()
 
@@ -75,13 +74,11 @@ export function AppLayout() {
     const handler = (event: KeyboardEvent) => {
       if (event.key !== 'F12') return
       event.preventDefault()
-      setDangerOverride(1.1)
-      setLogPanelOpen(true)
-      injectLog('ERROR', 'Operator emergency stop triggered by F12', '[SAFETY]')
+      triggerEmergencyStop()
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [injectLog, setDangerOverride, setLogPanelOpen])
+  }, [triggerEmergencyStop])
 
   return (
     <div className="app-shell">
@@ -120,11 +117,7 @@ export function AppLayout() {
             className="nav-emergency"
             danger
             icon={<Activity size={17} />}
-            onClick={() => {
-              setDangerOverride(1.1)
-              setLogPanelOpen(true)
-              injectLog('ERROR', 'Operator emergency stop triggered by navigation button', '[SAFETY]')
-            }}
+            onClick={triggerEmergencyStop}
           >
             F12
           </Button>
@@ -137,6 +130,7 @@ export function AppLayout() {
       <LogPanel />
       <StatusBar />
       <SafetyOverlay />
+      <GlobalEmergencyStopButton />
       <Button className="floating-settings" icon={<SlidersHorizontal size={16} />} onClick={() => navigate('/settings')} />
     </div>
   )

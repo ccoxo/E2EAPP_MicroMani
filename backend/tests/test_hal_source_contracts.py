@@ -101,6 +101,27 @@ def test_hal_stage_axis_configuration_matches_icf_card_counts() -> None:
     assert "axisNoInt < stageAxisCount(side)" in normalized
 
 
+def test_hal_enable_side_rejects_partial_servo_failures() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
+    normalized = " ".join(source.split())
+
+    assert "if (failed > 0) { throw std::runtime_error(failures.str()); }" in normalized
+    assert "succeeded == 0 && failed > 0" not in normalized
+
+
+def test_hal_skips_sevon_pin_for_right_roll_axis_eight() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
+    normalized = " ".join(source.split())
+
+    assert "bool usesSevonPin(appstation::hal::Side side, appstation::hal::SemanticAxis axis)" in normalized
+    assert "return physicalAxis(side, axis) < 8;" in normalized
+    assert "if (dmcReadSevonPin && usesSevonPin(side, axis))" in normalized
+    assert (
+        "if (!usesSevonPin(side, axis)) { enabled_[stateIndex(side, axis)] = enabled; "
+        "++succeeded; continue; }"
+    ) in normalized
+
+
 def test_hal_stage_axis_and_direction_signs_match_icf_mapping() -> None:
     source = (REPO_ROOT / "hal" / "include" / "HalTypes.h").read_text(encoding="utf-8")
     normalized = " ".join(source.split())

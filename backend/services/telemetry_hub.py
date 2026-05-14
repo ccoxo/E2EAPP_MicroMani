@@ -113,7 +113,7 @@ class TelemetryHub:
             force_left = list(self.force_left)
             force_right = list(self.force_right)
         if real_mode:
-            danger = 0.0
+            danger = 1.1 if self.estop_active else 0.0
         else:
             danger = 1.1 if self.estop_active else self._danger_index(force_left, force_right, config)
         if self.recording:

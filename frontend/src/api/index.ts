@@ -219,6 +219,9 @@ export const enableMotionSide = (side: ManualControlSide) =>
 export const disableMotionSide = (side: ManualControlSide) =>
   postCommand(`/motion/${side}/disable_all`)
 
+export const stopMotionSide = (side: ManualControlSide) =>
+  postCommand(`/motion/${side}/stop`)
+
 export const homeMotionSide = (side: ManualControlSide) =>
   postCommand(`/motion/${side}/home`)
 
@@ -424,6 +427,8 @@ export const zeroTeleopForceFeedback = (side: ManualControlSide) =>
 
 // Emergency
 export const emergencyStop = () => postCommand('/motion/emergency_stop')
+
+export const acknowledgeSafety = () => postCommand('/motion/safety/acknowledge')
 
 export const homeAll = () => postCommand('/motion/home_all')
 

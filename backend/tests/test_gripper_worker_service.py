@@ -38,11 +38,14 @@ class FakeTelemetry:
 
 
 class FakeHal:
-    def __init__(self, enabled: bool = True) -> None:
+    def __init__(self, enabled: bool = True, enabled_values: list[bool] | None = None) -> None:
         self.enabled = enabled
+        self.enabled_values = enabled_values
         self.commands: list[tuple[str, dict[str, Any]]] = []
 
     async def motion_state(self) -> dict[str, Any]:
+        if self.enabled_values is not None:
+            return {"enabled": self.enabled_values}
         return {"enabled": [self.enabled] * 12}
 
     async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -187,6 +190,46 @@ def test_manual_axis_move_allows_enabled_motion_side() -> None:
 
     assert result["hal"]["command"] == "motion.manual_axis_move"
     assert hal.commands[0][0] == "motion.manual_axis_move"
+
+
+def test_manual_axis_move_allows_right_roll_without_sevon_feedback_when_right_side_enabled() -> None:
+    config = default_config()
+    settings = FakeSettings(config)
+    enabled_values = [True] * 12
+    enabled_values[9] = False
+    hal = FakeHal(enabled_values=enabled_values)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    result = asyncio.run(
+        service.manual_axis_move(
+            ManualAxisMoveRequest(side="right", axis="Roll", direction=1, step=1, speedMode="fine")
+        )
+    )
+
+    assert result["hal"]["command"] == "motion.manual_axis_move"
+    assert hal.commands[0][0] == "motion.manual_axis_move"
+
+
+def test_manual_axis_move_rejects_right_roll_when_right_side_is_fully_disabled() -> None:
+    config = default_config()
+    settings = FakeSettings(config)
+    enabled_values = [True] * 6 + [False] * 6
+    hal = FakeHal(enabled_values=enabled_values)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    try:
+        asyncio.run(
+            service.manual_axis_move(
+                ManualAxisMoveRequest(side="right", axis="Roll", direction=1, step=1, speedMode="fine")
+            )
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected disabled right Roll command to fail")
+
+    assert "right Roll motion axis is disabled" in message
+    assert hal.commands == []
 
 
 def test_gripper_worker_sync_stops_workers_when_disabled() -> None:

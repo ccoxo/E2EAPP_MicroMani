@@ -42,6 +42,7 @@ import {
   zeroTeleopForceFeedback,
   startGripperTeleop,
   stopGripperTeleop,
+  stopMotionSide,
   fetchGripperTeleopStatus,
   mockMode,
 } from '../api'
@@ -151,6 +152,18 @@ function cameraByKey(cameras: CameraTelemetry[], key: CameraKey) {
 
 function formatAxisValue(value: number, semanticIndex: number) {
   return semanticIndex < 3 ? `${value.toFixed(1)} µm` : `${value.toFixed(3)}°`
+}
+
+function displaySoftLimitValue(value: number, semanticIndex: number) {
+  return semanticIndex < 3 ? value : value / 1000
+}
+
+function configSoftLimitValue(value: number, semanticIndex: number) {
+  return semanticIndex < 3 ? value : value * 1000
+}
+
+function formatSoftLimitValue(value: number, semanticIndex: number) {
+  return semanticIndex < 3 ? value.toFixed(0) : value.toFixed(3)
 }
 
 function formatForceValue(value: number, index: number) {
@@ -491,6 +504,8 @@ function AxisMappingTable({
             const pulse = side === 'left' ? axis.leftPulsePerUnit : axis.rightPulsePerUnit
             const group = index < 3 ? 'translation' : 'rotation'
             const axisKey = softLimitRows[index].key
+            const minLimit = displaySoftLimitValue(limits[axisKey].min, index)
+            const maxLimit = displaySoftLimitValue(limits[axisKey].max, index)
             return (
               <tr key={axis.axis} className={axis.warning ? 'axis-row-warning' : ''}>
                 <td><b>{axis.axis}</b></td>
@@ -506,11 +521,21 @@ function AxisMappingTable({
                 <td>{renderProfileInput(group, 'accTimeSec', 0.01)}</td>
                 <td>{renderProfileInput(group, 'decTimeSec', 0.01)}</td>
                 <td>
-                  <InputNumber className="axis-map-input axis-limit-input" value={limits[axisKey].min} onChange={(value) => updateLimit(axisKey, 'min', Number(value ?? 0))} />
+                  <InputNumber
+                    className="axis-map-input axis-limit-input"
+                    step={index < 3 ? 100 : 0.1}
+                    value={minLimit}
+                    onChange={(value) => updateLimit(axisKey, 'min', configSoftLimitValue(Number(value ?? 0), index))}
+                  />
                 </td>
                 <td>
                   <span className="axis-limit-field">
-                    <InputNumber className="axis-map-input axis-limit-input" value={limits[axisKey].max} onChange={(value) => updateLimit(axisKey, 'max', Number(value ?? 0))} />
+                    <InputNumber
+                      className="axis-map-input axis-limit-input"
+                      step={index < 3 ? 100 : 0.1}
+                      value={maxLimit}
+                      onChange={(value) => updateLimit(axisKey, 'max', configSoftLimitValue(Number(value ?? 0), index))}
+                    />
                     <span className="axis-unit">{axis.unit}</span>
                   </span>
                 </td>
@@ -521,7 +546,7 @@ function AxisMappingTable({
       </table>
       <div className="axis-map-note">
         <Tag>平移单位 um，速度 um/s</Tag>
-        <Tag>旋转单位 °，速度 °/s</Tag>
+        <Tag>旋转界面单位 °，配置存储 mdeg</Tag>
         <Tag>LTDMC profile 使用初始速度、最大速度、加速时间、减速时间</Tag>
         <Tag color="processing">同侧同类型 3 轴共用速度 profile；软限位逐轴独立</Tag>
       </div>
@@ -538,6 +563,7 @@ function MotionCard({
   motionEnabled,
   motionAxisEnabled,
   injectLog,
+  triggerEmergencyStop,
   snapshotMenu,
   openSnapshotModal,
 }: {
@@ -549,6 +575,7 @@ function MotionCard({
   motionEnabled: boolean | null | undefined
   motionAxisEnabled?: Array<boolean | null>
   injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
+  triggerEmergencyStop: () => void
   snapshotMenu: (scope: ParameterSnapshotScope) => MenuProps
   openSnapshotModal: (scope: ParameterSnapshotScope) => void
 }) {
@@ -578,7 +605,7 @@ function MotionCard({
   const [pendingOriginAction, setPendingOriginAction] = useState<'capture' | 'clear' | null>(null)
   const [optimisticEnabled, setOptimisticEnabled] = useState<boolean | null>(null)
   useEffect(() => {
-    if (optimisticEnabled !== null && motionEnabled !== null && motionEnabled !== undefined) {
+    if (optimisticEnabled !== null && motionEnabled === optimisticEnabled) {
       const timer = window.setTimeout(() => setOptimisticEnabled(null), 0)
       return () => window.clearTimeout(timer)
     }
@@ -599,7 +626,7 @@ function MotionCard({
     setPendingMotionAction('enable')
     try {
       await enableMotionSide(side)
-      setOptimisticEnabled(null)
+      setOptimisticEnabled(true)
       commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel}全部轴使能请求已发送`)
     } catch (error) {
       injectLog('ERROR', `${sideSpec.shortLabel}使能失败：${commandErrorMessage(error)}`, '[HAL]')
@@ -709,7 +736,7 @@ function MotionCard({
           <Button icon={<RotateCcw size={15} />} loading={pendingMotionAction === 'home'} onClick={handleHome}>
             回零
           </Button>
-          <Button danger icon={<ShieldAlert size={15} />} onClick={() => commandLog(injectLog, '[SAFETY]', `${sideSpec.shortLabel}运动急停`)}>
+          <Button danger icon={<ShieldAlert size={15} />} onClick={triggerEmergencyStop}>
             急停
           </Button>
         </Space>
@@ -1670,6 +1697,7 @@ function ManualArmControl({
   setManualAxisStep,
   setManualSpeedMode,
   issueManualAxisMove,
+  triggerEmergencyStop,
   injectLog,
 }: {
   side: RobotSide
@@ -1683,6 +1711,7 @@ function ManualArmControl({
   setManualAxisStep: (unit: 'um' | '°', value: number) => void
   setManualSpeedMode: (mode: ManualSpeedMode) => void
   issueManualAxisMove: (side: RobotSide, axis: ManualControlAxis, direction: -1 | 1) => void
+  triggerEmergencyStop: () => void
   injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
 }) {
   const sideSpec = armHardwareSpecs[side]
@@ -1692,8 +1721,12 @@ function ManualArmControl({
   const unit = manualAxisUnit(selectedAxis)
   const position = positions[sideSpec.stateOffset + axisIndex] ?? 0
   const limits = side === 'left' ? config.motion.leftSoftLimits[axisKey] : config.motion.rightSoftLimits[axisKey]
+  const displayLimits = {
+    min: displaySoftLimitValue(limits.min, axisIndex),
+    max: displaySoftLimitValue(limits.max, axisIndex),
+  }
   const stepValue = unit === 'um' ? manualControl.axisStepUm : manualControl.axisStepDeg
-  const softMargin = Math.min(Math.abs(position - limits.min), Math.abs(limits.max - position))
+  const softMargin = Math.min(Math.abs(position - displayLimits.min), Math.abs(displayLimits.max - position))
   const profile = side === 'left' ? config.motion.leftProfile : config.motion.rightProfile
   const group = axisIndex < 3 ? profile.translation : profile.rotation
   const busyKey = `${side}-${selectedAxis}`
@@ -1701,10 +1734,12 @@ function ManualArmControl({
   const axisBusy = busyUntil > nowMs
   const busyText = `${Math.max(0, (busyUntil - nowMs) / 1000).toFixed(1)}s`
   const speedUnit = axisIndex < 3 ? 'um/s' : '°/s'
-  const [pendingMotionAction, setPendingMotionAction] = useState<'enable' | 'disable' | null>(null)
+  const originValid = side === 'left' ? config.motion.origin.leftValid : config.motion.origin.rightValid
+  const originHint = originValid ? '相对采集零点' : '未设置零点，显示 HAL 绝对位置'
+  const [pendingMotionAction, setPendingMotionAction] = useState<'enable' | 'disable' | 'stop' | null>(null)
   const [optimisticEnabled, setOptimisticEnabled] = useState<boolean | null>(null)
   useEffect(() => {
-    if (optimisticEnabled !== null && motionEnabled !== null && motionEnabled !== undefined) {
+    if (optimisticEnabled !== null && motionEnabled === optimisticEnabled) {
       const timer = window.setTimeout(() => setOptimisticEnabled(null), 0)
       return () => window.clearTimeout(timer)
     }
@@ -1724,7 +1759,7 @@ function ManualArmControl({
       } else {
         await disableMotionSide(side)
       }
-      setOptimisticEnabled(nextMotionAction === 'enable' ? null : false)
+      setOptimisticEnabled(nextMotionAction === 'enable')
       injectLog(
         'INFO',
         `${sideSpec.shortLabel} manual ${nextMotionAction === 'enable' ? 'enable' : 'disable'} requested`,
@@ -1736,6 +1771,17 @@ function ManualArmControl({
         `${sideSpec.shortLabel} manual ${nextMotionAction === 'enable' ? 'enable' : 'disable'} failed: ${String(error)}`,
         '[HAL]',
       )
+    } finally {
+      setPendingMotionAction(null)
+    }
+  }
+  const stopMotion = async () => {
+    setPendingMotionAction('stop')
+    try {
+      await stopMotionSide(side)
+      injectLog('WARNING', `${sideSpec.shortLabel} manual stop requested`, '[HAL]')
+    } catch (error) {
+      injectLog('ERROR', `${sideSpec.shortLabel} manual stop failed: ${commandErrorMessage(error)}`, '[HAL]')
     } finally {
       setPendingMotionAction(null)
     }
@@ -1752,6 +1798,7 @@ function ManualArmControl({
           <Tag color={effectiveMotionEnabled === true ? 'success' : effectiveMotionEnabled === false || partialMotionEnabled ? 'warning' : 'default'}>
             {effectiveMotionEnabled === true ? '已使能' : partialMotionEnabled ? '部分使能' : effectiveMotionEnabled === false ? '未使能' : '使能未知'}
           </Tag>
+          <Tag color={originValid ? 'success' : 'warning'}>{originValid ? '零点已设置' : '零点未设置'}</Tag>
           <Tag>检测通过</Tag>
           <Tag color="processing">{manualControl.speedMode}</Tag>
         </Space>
@@ -1780,11 +1827,11 @@ function ManualArmControl({
         <div className="manual-axis-controls">
           <div className="manual-readout-row">
             <MetricBox label="当前轴" value={selectedAxis} />
-            <MetricBox label="当前位置" value={`${position.toFixed(unit === 'um' ? 1 : 3)} ${unit}`} />
+            <MetricBox label="当前位置" value={`${position.toFixed(unit === 'um' ? 1 : 3)} ${unit}`} hint={originHint} tone={originValid ? 'neutral' : 'warn'} />
             <MetricBox label="软限位余量" value={`${softMargin.toFixed(unit === 'um' ? 0 : 2)} ${unit}`} tone={softMargin < (unit === 'um' ? 500 : 2) ? 'warn' : 'ok'} />
             <MetricBox label="最大速度" value={`${group.maxSpeed} ${speedUnit}`} />
           </div>
-          <Form layout="vertical" className="manual-command-form">
+          <Form layout="vertical" className="manual-command-form manual-command-form-arm">
             <Form.Item label={`目标增量 ${unit}`}>
               <InputNumber min={0} step={unit === 'um' ? 10 : 0.1} value={stepValue} onChange={(value) => setManualAxisStep(unit, Number(value ?? 0))} />
             </Form.Item>
@@ -1792,7 +1839,10 @@ function ManualArmControl({
               <Select value={manualControl.speedMode} options={speedModeOptions} onChange={setManualSpeedMode} />
             </Form.Item>
             <Form.Item label="软限位范围">
-              <Input value={`${limits.min} ~ ${limits.max} ${unit}`} readOnly />
+              <Input
+                value={`${formatSoftLimitValue(displayLimits.min, axisIndex)} ~ ${formatSoftLimitValue(displayLimits.max, axisIndex)} ${unit}`}
+                readOnly
+              />
             </Form.Item>
           </Form>
           <div className="manual-action-row">
@@ -1802,7 +1852,7 @@ function ManualArmControl({
             <Button type="primary" disabled={axisBusy || !motionReady} onClick={() => issueManualAxisMove(side, selectedAxis, 1)}>
               {axisBusy ? busyText : `+${stepValue}${unit}`}
             </Button>
-            <Button icon={<Square size={15} />} onClick={() => injectLog('WARNING', `${sideSpec.shortLabel} ${selectedAxis} manual stop requested`, '[HAL]')}>
+            <Button icon={<Square size={15} />} loading={pendingMotionAction === 'stop'} onClick={() => void stopMotion()}>
               停止
             </Button>
             <Button icon={<Activity size={15} />} onClick={() => injectLog('INFO', `${sideSpec.shortLabel} manual self-check requested`, '[HAL]')}>
@@ -1816,7 +1866,7 @@ function ManualArmControl({
             >
               {nextMotionAction === 'enable' ? '使能' : '断使能'}
             </Button>
-            <Button danger icon={<ShieldAlert size={15} />} onClick={() => injectLog('ERROR', `${sideSpec.shortLabel} manual emergency stop requested`, '[SAFETY]')}>
+            <Button danger icon={<ShieldAlert size={15} />} onClick={triggerEmergencyStop}>
               急停
             </Button>
           </div>
@@ -2016,6 +2066,7 @@ function ManualControlPanel({
   setManualSpeedMode,
   issueManualAxisMove,
   issueManualGripperMove,
+  triggerEmergencyStop,
   startManualRecording,
   stopManualRecording,
   saveManualMemory,
@@ -2037,6 +2088,7 @@ function ManualControlPanel({
   setManualSpeedMode: (mode: ManualSpeedMode) => void
   issueManualAxisMove: (side: RobotSide, axis: ManualControlAxis, direction: -1 | 1) => void
   issueManualGripperMove: (side: RobotSide, command: ManualGripperCommand, targetMm?: number) => void
+  triggerEmergencyStop: () => void
   startManualRecording: () => void
   stopManualRecording: () => void
   saveManualMemory: (name?: string) => void
@@ -2068,6 +2120,7 @@ function ManualControlPanel({
             setManualAxisStep={setManualAxisStep}
             setManualSpeedMode={setManualSpeedMode}
             issueManualAxisMove={issueManualAxisMove}
+            triggerEmergencyStop={triggerEmergencyStop}
             injectLog={injectLog}
           />
         ))}
@@ -2109,6 +2162,7 @@ export function SettingsView() {
   const setManualSpeedMode = useTelemetryStore((state) => state.setManualSpeedMode)
   const issueManualAxisMove = useTelemetryStore((state) => state.issueManualAxisMove)
   const issueManualGripperMove = useTelemetryStore((state) => state.issueManualGripperMove)
+  const triggerEmergencyStop = useTelemetryStore((state) => state.triggerEmergencyStop)
   const startManualRecording = useTelemetryStore((state) => state.startManualRecording)
   const stopManualRecording = useTelemetryStore((state) => state.stopManualRecording)
   const saveManualMemory = useTelemetryStore((state) => state.saveManualMemory)
@@ -2238,6 +2292,7 @@ export function SettingsView() {
                       motionEnabled={frame.motionEnabled?.[side] ?? null}
                       motionAxisEnabled={frame.motionAxisEnabled?.[side] ?? undefined}
                       injectLog={injectLog}
+                      triggerEmergencyStop={triggerEmergencyStop}
                       snapshotMenu={snapshotMenu}
                       openSnapshotModal={openSnapshotModal}
                     />
@@ -2312,6 +2367,7 @@ export function SettingsView() {
                 setManualSpeedMode={setManualSpeedMode}
                 issueManualAxisMove={issueManualAxisMove}
                 issueManualGripperMove={issueManualGripperMove}
+                triggerEmergencyStop={triggerEmergencyStop}
                 startManualRecording={startManualRecording}
                 stopManualRecording={stopManualRecording}
                 saveManualMemory={saveManualMemory}

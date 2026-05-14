@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
-from backend.app import create_app
+from backend.app import create_app, relative_motion_positions
 from backend.core.defaults import default_config
 from backend.core.logging import LogService
 from backend.drivers.camera_opencv import OpenCVCameraDriver
@@ -221,8 +221,31 @@ def test_motion_side_enable_and_home_routes(tmp_path: Path, monkeypatch: MonkeyP
     state = asyncio.run(client.app.state.hal.motion_state())
     assert state["enabled"][:6] == [False] * 6
 
+    stop_response = client.post("/api/motion/right/stop")
+    assert stop_response.status_code == 200
+    assert stop_response.json()["data"]["command"] == "motion.teleop_stop_side"
+
     bad_side_response = client.post("/api/motion/center/enable_all")
     assert bad_side_response.status_code == 400
+
+
+def test_motion_positions_are_relative_to_captured_origin() -> None:
+    config = default_config()
+    config["motion"]["origin"] = {
+        "valid": False,
+        "leftValid": True,
+        "rightValid": False,
+        "leftPulse": [100.0, 200.0, 300.0, 400.0, 500.0, 600.0],
+        "rightPulse": [0.0] * 6,
+        "updatedAt": 1,
+    }
+    positions = [999.0] * 12
+    pulses = [100.0, 200.0, 300.0, 400.0, 500.0, 600.0] + [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+
+    relative = relative_motion_positions(config, positions, pulses)
+
+    assert relative[:6] == [0.0] * 6
+    assert relative[6:] == [999.0] * 6
 
 
 def test_motion_origin_capture_clear_and_per_side_config(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -716,6 +739,45 @@ def test_manual_axis_move_rejects_unsafe_step(tmp_path: Path) -> None:
     )
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "MOTION_UNAVAILABLE"
+
+
+def test_manual_axis_move_rejects_soft_limit_target(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+    client = TestClient(create_app(tmp_path))
+    config = default_config()
+    config["hal"]["mode"] = "real"
+    config["motion"]["origin"] = {
+        "valid": False,
+        "leftValid": True,
+        "rightValid": False,
+        "leftPulse": [0.0] * 6,
+        "rightPulse": [0.0] * 6,
+        "updatedAt": 1,
+    }
+    config["motion"]["leftSoftLimits"]["x"] = {"min": -10, "max": 10}
+    assert client.put("/api/settings", json=config).status_code == 200
+
+    class FakeHal:
+        async def motion_state(self) -> dict:
+            return {
+                "positions": [9.0] + [0.0] * 11,
+                "pulses": [-81.0] + [0.0] * 11,
+                "enabled": [True] * 12,
+                "estop_active": False,
+            }
+
+        async def command(self, name: str, payload: dict | None = None) -> dict:
+            return {"command": name, "payload": payload or {}}
+
+    client.app.state.commands.hal = FakeHal()
+
+    response = client.post(
+        "/api/motion/manual_axis_move",
+        json={"side": "left", "axis": "X", "direction": 1, "step": 5, "speedMode": "fine"},
+    )
+
+    assert response.status_code == 503
+    assert "soft limit" in response.json()["detail"]["message"]
 
 
 def test_camera_snapshot_endpoint_returns_jpeg(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

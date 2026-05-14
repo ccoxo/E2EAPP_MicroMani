@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { stopMotionSide } from './api'
 import App from './App'
 import { defaultConfig } from './data'
 import { chartHistoryIntervalMs, uiFrameIntervalMs, useTelemetryStore } from './stores/telemetry'
@@ -103,6 +104,22 @@ describe('AppStation M0 frontend', () => {
     expect(labels).toEqual(['主页', '录制', '数据集', '模型', '微调', '自动', '设置'])
   })
 
+  it('keeps the global emergency stop available across pages', () => {
+    render(<App />)
+    fireEvent.click(screen.getByRole('link', { name: '数据集' }))
+
+    const emergencyButton = screen.getByRole('button', { name: '全局急停 F12' })
+    expect(emergencyButton).toBeInTheDocument()
+    fireEvent.click(emergencyButton)
+
+    expect(useTelemetryStore.getState().frame.dangerIndex).toBe(1.1)
+    const resetButton = screen.getByRole('button', { name: '确认安全复位' })
+    expect(resetButton).toBeInTheDocument()
+    fireEvent.click(resetButton)
+
+    expect(useTelemetryStore.getState().frame.dangerIndex).toBe(0)
+  })
+
   it('navigates to the record workflow', () => {
     render(<App />)
     fireEvent.click(screen.getByRole('link', { name: '录制' }))
@@ -164,6 +181,10 @@ describe('AppStation M0 frontend', () => {
     expect(window.location.pathname).toBe('/settings')
     expect(window.location.hash).toBe('#motion-left')
     expect(screen.getByText('左臂运动控制卡 · Card 1')).toBeInTheDocument()
+  })
+
+  it('maps manual motion stop to the backend command route', async () => {
+    await expect(stopMotionSide('left')).resolves.toMatchObject({ path: '/motion/left/stop' })
   })
 
   it('renders hardware-specific settings from the reference manual', () => {

@@ -24,7 +24,6 @@ export default function RecordPage() {
   const toggleRecordClutch = useTelemetryStore((s) => s.toggleRecordClutch)
   const setRecordSpeedMode = useTelemetryStore((s) => s.setRecordSpeedMode)
   const homeRecordArms = useTelemetryStore((s) => s.homeRecordArms)
-  const triggerRecordEmergencyStop = useTelemetryStore((s) => s.triggerRecordEmergencyStop)
   const acceptRecordQualityReport = useTelemetryStore((s) => s.acceptRecordQualityReport)
   const rejectRecordQualityReport = useTelemetryStore((s) => s.rejectRecordQualityReport)
 
@@ -85,11 +84,6 @@ export default function RecordPage() {
           if (phase === 'idle' || phase === 'resetting') homeRecordArms()
           break
 
-        case 'F12':
-          e.preventDefault()
-          triggerRecordEmergencyStop()
-          break
-
         default:
           break
       }
@@ -108,7 +102,6 @@ export default function RecordPage() {
     setRecordSpeedMode,
     tareRecordForceSensors,
     toggleRecordClutch,
-    triggerRecordEmergencyStop,
   ])
 
   return (

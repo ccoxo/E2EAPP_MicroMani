@@ -49,6 +49,7 @@ class LTDMCDriver {
   void ensureInitialized() const;
   void configureStageAxes(Side side);
   void checkLimits(const std::array<double, 12>& targetUi, const std::array<AxisLimit, 12>& limits) const;
+  bool axisMotionEnabled(Side side, SemanticAxis axis) const;
 
   mutable std::mutex mutex_;
   bool initialized_{false};

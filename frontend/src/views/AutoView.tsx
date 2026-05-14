@@ -10,7 +10,7 @@ export function AutoView() {
   const history = useTelemetryStore((state) => state.history)
   const autoRunning = useTelemetryStore((state) => state.autoRunning)
   const setAutoRunning = useTelemetryStore((state) => state.setAutoRunning)
-  const setDangerOverride = useTelemetryStore((state) => state.setDangerOverride)
+  const triggerEmergencyStop = useTelemetryStore((state) => state.triggerEmergencyStop)
   const injectLog = useTelemetryStore((state) => state.injectLog)
 
   return (
@@ -83,7 +83,7 @@ export function AutoView() {
             <Button icon={<Square size={16} />} onClick={() => setAutoRunning(false)}>
               停止
             </Button>
-            <Button danger icon={<ShieldAlert size={16} />} onClick={() => setDangerOverride(1.1)}>
+            <Button danger icon={<ShieldAlert size={16} />} onClick={triggerEmergencyStop}>
               急停 F12
             </Button>
             <Button
