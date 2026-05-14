@@ -199,6 +199,12 @@ class CameraProbeResult:
     cameras: list[CameraTelemetry]
 
 
+@dataclass(frozen=True)
+class CameraFrameSnapshot:
+    frame: Any
+    monotonic_s: float
+
+
 def _backend_candidates(cv2: Any) -> list[tuple[int, str]]:
     """Return Windows OpenCV capture backends in the order we should try them.
 
@@ -354,6 +360,9 @@ class OpenCVCameraDriver:
         raise RuntimeError(f"{camera} index {index} frame read failed")
 
     def snapshot_frame(self, config: dict[str, Any], camera: str) -> Any:
+        return self.snapshot_frame_with_timestamp(config, camera).frame
+
+    def snapshot_frame_with_timestamp(self, config: dict[str, Any], camera: str) -> CameraFrameSnapshot:
         try:
             cv2 = import_module("cv2")
         except Exception as exc:
@@ -375,13 +384,15 @@ class OpenCVCameraDriver:
             if frame_lock is not None:
                 with frame_lock:
                     frame = self._latest_frames.get(index)
+                    latest_at = self._latest_at.get(index)
                     if frame is not None and hasattr(frame, "copy"):
                         frame = frame.copy()
             else:
                 frame = None
+                latest_at = None
             if frame is not None:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                return rgb
+                return CameraFrameSnapshot(rgb, float(latest_at or time.monotonic()))
             event = self._frame_events.get(index)
             if event is None:
                 time.sleep(0.01)

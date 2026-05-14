@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -106,6 +107,8 @@ def test_dataset_recorder_collect_frame_uses_timed_buffers() -> None:
     source = (Path(__file__).resolve().parents[1] / "services" / "dataset_recorder.py").read_text(encoding="utf-8")
 
     assert "class TimedRingBuffer" in source
+    assert "self._sampler_threads" in source
+    assert "Thread(" in source
     assert "self._start_sampler_tasks_locked()" in source
     assert 'recorder._aligned_sample("hal", target_monotonic_s)' in source
     assert 'recorder._aligned_sample("force", target_monotonic_s)' in source
@@ -125,10 +128,29 @@ def test_dataset_recorder_source_sampler_uses_shared_source_epoch() -> None:
 def test_dataset_recorder_alignment_time_uses_warmup_plus_dataset_timestamp() -> None:
     recorder = object.__new__(DatasetRecorderService)
     recorder._record_fps_hz = 30
-    recorder._episode_source_time0_s = 0.5
+    recorder._sampler_start_monotonic_s = 100.0
+    recorder._episode_start_monotonic_s = 100.5
 
-    assert recorder._record_target_timestamp_s(0) == pytest.approx(0.5)
-    assert recorder._record_target_timestamp_s(15) == pytest.approx(1.0)
+    assert recorder._record_target_timestamp_s(0) == pytest.approx(100.5)
+    assert recorder._record_target_timestamp_s(15) == pytest.approx(101.0)
+
+
+def test_dataset_recorder_sample_buffer_covers_warmup_delay_jitter_and_lookback() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._record_fps_hz = 30
+
+    retention = recorder._sample_buffer_retention_s(
+        {
+            "storage": {
+                "recordFps": 30,
+                "maxConsumerLatencyS": 2.0,
+                "maxSampleJitterS": 0.2,
+                "sampleLookbackWindowS": 0.3,
+            }
+        }
+    )
+
+    assert retention == pytest.approx(3.0)
 
 
 def test_dataset_recorder_source_sample_time_uses_source_frequency() -> None:
@@ -164,7 +186,33 @@ def test_dataset_recorder_timed_source_records_timeout_drop() -> None:
 def test_dataset_recorder_source_timestamp_uses_assigned_sample_time() -> None:
     recorder = object.__new__(DatasetRecorderService)
 
-    assert recorder._source_sample_monotonic({"received_monotonic_ms": 1, "monotonic_s": 2.0}, 42.0) == 42.0
+    assert recorder._source_sample_monotonic({"received_monotonic_ms": 1, "monotonic_s": 2.0}, 42.0) == 2.0
+
+
+def test_dataset_recorder_source_timestamp_uses_real_sample_time() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+
+    assert recorder._source_sample_monotonic({"received_monotonic_ms": 100250}, 42.0) == pytest.approx(100.25)
+    assert recorder._source_sample_monotonic(SimpleNamespace(sample_monotonic_s=100.5), 42.0) == pytest.approx(100.5)
+    assert recorder._source_sample_monotonic({"monotonic_s": 2.0}, 42.0) == pytest.approx(2.0)
+
+
+def test_dataset_recorder_camera_frame_returns_capture_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeCameras:
+        def snapshot_frame_with_timestamp(self, _config: dict[str, object], _camera: str) -> tuple[str, float]:
+            return ("rgb-frame", 125.25)
+
+    class FakeHardware:
+        cameras = FakeCameras()
+
+    recorder = object.__new__(DatasetRecorderService)
+    recorder.hardware = FakeHardware()
+    monkeypatch.setattr(recorder, "_coerce_rgb_frame", lambda frame, _config, _camera: frame)
+
+    frame, sampled_at = recorder._camera_recording_frame_with_time({}, "global")
+
+    assert frame == "rgb-frame"
+    assert sampled_at == pytest.approx(125.25)
 
 
 def test_dataset_recorder_gripper_source_uses_assigned_sample_time() -> None:
@@ -214,7 +262,7 @@ def test_dataset_recorder_gripper_source_uses_assigned_sample_time() -> None:
 
     assert sample.ok is True
     assert sample.value == [4.0, 5.0]
-    assert sample.monotonic_s == pytest.approx(3.5)
+    assert sample.monotonic_s > 3.5
 
 
 def test_native_preflight_does_not_import_lerobot_record_script() -> None:
