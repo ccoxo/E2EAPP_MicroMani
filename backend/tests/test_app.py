@@ -5,6 +5,7 @@ import importlib.util
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -176,7 +177,9 @@ def test_websocket_telemetry_compatibility_and_log_shape(tmp_path: Path, monkeyp
     assert {"id", "ts", "channel", "level", "msg"}.issubset(log["data"])
 
 
-def test_websocket_marks_right_roll_enabled_feedback_unknown(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_websocket_reports_card0_dmc5c10_enabled_feedback(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
 
     class FakeHal:
@@ -207,7 +210,8 @@ def test_websocket_marks_right_roll_enabled_feedback_unknown(tmp_path: Path, mon
     with client.websocket_connect("/ws") as websocket:
         frame = websocket.receive_json()["data"]
 
-    assert frame["motionAxisEnabled"]["right"] == [False, False, False, None, False, False]
+    assert frame["motionAxisEnabled"]["right"] == [False, False, False, False, False, False]
+    assert frame["motionEnabled"]["right"] is False
 
 
 def test_hardware_status_uses_gripper_workers_in_dual_mode(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -252,6 +256,11 @@ def test_motion_side_enable_and_home_routes(tmp_path: Path, monkeypatch: MonkeyP
     home_response = client.post("/api/motion/right/home")
     assert home_response.status_code == 200
     assert home_response.json()["data"]["command"] == "motion.home_side"
+
+    origin_response = client.post("/api/motion/right/return_origin")
+    assert origin_response.status_code == 200
+    assert origin_response.json()["data"]["command"] == "motion.home_origin_side"
+    assert origin_response.json()["data"]["payload"]["side"] == "right"
 
     disable_response = client.post("/api/motion/left/disable_all")
     assert disable_response.status_code == 200
@@ -344,6 +353,85 @@ def test_home_all_requires_and_sends_captured_work_origin(tmp_path: Path, monkey
     }
 
 
+def test_motion_origin_capture_preserves_previous_work_origin(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+
+    class FakeHal:
+        async def motion_state(self) -> dict:
+            return {
+                "positions": [0.0] * 12,
+                "pulses": [float(value) for value in range(1, 13)],
+                "enabled": [True] * 12,
+                "estop_active": False,
+            }
+
+        async def command(self, name: str, payload: dict | None = None) -> dict:
+            return {"command": name, "payload": payload or {}}
+
+    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: FakeHal())
+    client = TestClient(create_app(tmp_path))
+    settings = client.app.state.settings
+    config = settings.get_config()
+    config["motion"]["origin"] = {
+        "valid": True,
+        "leftValid": True,
+        "rightValid": True,
+        "leftPulse": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+        "rightPulse": [70.0, 80.0, 90.0, 100.0, 110.0, 120.0],
+        "updatedAt": 1234,
+        "previousValid": False,
+        "previousLeftPulse": [0.0] * 6,
+        "previousRightPulse": [0.0] * 6,
+        "previousUpdatedAt": 0,
+    }
+    settings.save_config(config, emit_log=False)
+
+    response = client.post("/api/motion/origin/capture")
+
+    assert response.status_code == 200
+    origin = response.json()["data"]["origin"]
+    assert origin["leftPulse"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert origin["rightPulse"] == [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+    assert origin["previousValid"] is True
+    assert origin["previousLeftPulse"] == [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+    assert origin["previousRightPulse"] == [70.0, 80.0, 90.0, 100.0, 110.0, 120.0]
+    assert origin["previousUpdatedAt"] == 1234
+
+
+def test_restore_previous_motion_origin_swaps_current_and_previous(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    settings = client.app.state.settings
+    config = settings.get_config()
+    config["motion"]["origin"] = {
+        "valid": True,
+        "leftValid": True,
+        "rightValid": True,
+        "leftPulse": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "rightPulse": [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        "updatedAt": 100,
+        "previousValid": True,
+        "previousLeftPulse": [101.0, 102.0, 103.0, 104.0, 105.0, 106.0],
+        "previousRightPulse": [107.0, 108.0, 109.0, 110.0, 111.0, 112.0],
+        "previousUpdatedAt": 50,
+    }
+    settings.save_config(config, emit_log=False)
+
+    response = client.post("/api/motion/origin/restore_previous")
+
+    assert response.status_code == 200
+    origin = response.json()["data"]["origin"]
+    assert origin["leftPulse"] == [101.0, 102.0, 103.0, 104.0, 105.0, 106.0]
+    assert origin["rightPulse"] == [107.0, 108.0, 109.0, 110.0, 111.0, 112.0]
+    assert origin["updatedAt"] == 50
+    assert origin["previousValid"] is True
+    assert origin["previousLeftPulse"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert origin["previousRightPulse"] == [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+    assert origin["previousUpdatedAt"] == 100
+
+
 def test_motion_origin_relative_positions_are_applied_per_side(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     client = TestClient(create_app(tmp_path))
@@ -416,7 +504,7 @@ def test_runtime_release_handles_disconnects_teleop_and_grippers(tmp_path: Path,
     assert saved["teleop"]["rightConnected"] is False
 
 
-def test_teleop_logical_connect_disconnect_does_not_touch_motion(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_teleop_logical_connect_enables_mapped_motion_side(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     client = TestClient(create_app(tmp_path))
 
@@ -438,7 +526,7 @@ def test_teleop_logical_connect_disconnect_does_not_touch_motion(tmp_path: Path,
 
     command_response = client.post(
         "/api/motion/manual_axis_move",
-        json={"side": "left", "axis": "X", "direction": 1, "step": 100, "speedMode": "fine"},
+        json={"side": "right", "axis": "X", "direction": 1, "step": 100, "speedMode": "fine"},
     )
     assert command_response.status_code == 200
 
@@ -544,7 +632,10 @@ def test_record_session_writes_native_lerobot_dataset_when_available(tmp_path: P
         assert info["features"]["observation.state"]["shape"] == [14]
         assert info["features"]["action"]["shape"] == [14]
         assert "observation.gripper" not in info["features"]
-        assert (dataset_root / "native_unit_test_dataset" / "data" / "chunk-000" / "file-000.parquet").exists()
+        dataset_dir = dataset_root / "native_unit_test_dataset"
+        assert (dataset_dir / "data" / "chunk-000" / "file-000.parquet").exists()
+        assert list((dataset_dir / "videos" / "observation.images.global").glob("chunk-*/*.mp4"))
+        assert not list(dataset_dir.glob("images/**/*.png"))
 
         finish_response = client.post("/api/record/session/finish")
         assert finish_response.status_code == 200
@@ -1063,7 +1154,7 @@ def test_default_camera_mapping_matches_deployment_hardware() -> None:
     assert config["cameras"]["tuning"]["wrist_right"]["exposure"] == -6.0
 
 
-def test_camera_tuning_clamps_wrist_profile() -> None:
+def test_camera_tuning_allows_manual_wrist_exposure() -> None:
     driver = OpenCVCameraDriver()
     config = default_config()
     config["cameras"]["tuning"]["wrist_left"] = {
@@ -1076,8 +1167,8 @@ def test_camera_tuning_clamps_wrist_profile() -> None:
     profile = driver._camera_tuning(config, "wrist_left")  # noqa: SLF001
 
     assert profile == {
-        "autoExposure": False,
-        "exposure": -5.0,
+        "autoExposure": True,
+        "exposure": -3.0,
         "gain": 64.0,
         "autoWhiteBalance": True,
     }
@@ -1213,6 +1304,7 @@ def test_real_hal_http_error_preserves_hal_message(monkeypatch: MonkeyPatch) -> 
 
 def test_real_hal_client_maps_teleop_continuous_commands(monkeypatch: MonkeyPatch) -> None:
     calls: list[tuple[str, str]] = []
+    bodies: list[dict[str, Any]] = []
 
     class FakeResponse:
         status = 200
@@ -1230,8 +1322,12 @@ def test_real_hal_client_maps_teleop_continuous_commands(monkeypatch: MonkeyPatc
             return None
 
         def request(self, method: str, path: str, *args: object, **kwargs: object) -> None:
-            _ = (args, kwargs)
             calls.append((method, path))
+            body = kwargs.get("body")
+            if body is None and args:
+                body = args[0]
+            if isinstance(body, bytes):
+                bodies.append(json.loads(body.decode("utf-8")))
 
         def getresponse(self) -> FakeResponse:
             return FakeResponse()
@@ -1242,13 +1338,22 @@ def test_real_hal_client_maps_teleop_continuous_commands(monkeypatch: MonkeyPatc
     monkeypatch.setattr("backend.hal_client.client.http.client.HTTPConnection", FakeConnection)
     client = RealHalClient("http://127.0.0.1:8091", 5000, LogService())
 
-    asyncio.run(client.command("motion.teleop_target_update", {"side": "left"}))
+    asyncio.run(
+        client.command(
+            "motion.teleop_target_update",
+            {"side": "left", "deltas": {"X": 12.5, "Yaw": -0.2}},
+        )
+    )
     asyncio.run(client.command("motion.teleop_stop_side", {"side": "left"}))
+    asyncio.run(client.command("motion.home_origin_side", {"side": "right", "pulse": [0, 1, 2, 3, 4, 5]}))
 
     assert calls == [
         ("POST", "/motion/teleop_target_update"),
         ("POST", "/motion/teleop_stop_side"),
+        ("POST", "/motion/home_origin_side"),
     ]
+    assert bodies[0]["X"] == 12.5
+    assert bodies[0]["Yaw"] == -0.2
 
 
 def test_hal_state_clients_include_receive_timestamps(monkeypatch: MonkeyPatch) -> None:

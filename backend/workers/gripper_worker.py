@@ -98,7 +98,12 @@ class _GripperWorker:
             if not self._ensure_open():
                 self._send_response(message, False, f"COM{self.port} open failed")
                 return
-            ok, detail, position_mm = self._execute_command(command, target_mm)
+            ok, detail, position_mm = self._execute_command(
+                command,
+                target_mm,
+                message.get("speed"),
+                message.get("torque"),
+            )
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             self._send_response(message, ok, detail, position_mm=position_mm, elapsedMs=elapsed_ms)
             self._publish_status(ok=ok, message=detail, position_mm=position_mm)
@@ -106,7 +111,13 @@ class _GripperWorker:
             self._send_response(message, False, f"COM{self.port} command error: {exc}")
             self._publish_status(ok=False, message=str(exc))
 
-    def _execute_command(self, command: str, target_mm: Any) -> tuple[bool, str, float | None]:
+    def _execute_command(
+        self,
+        command: str,
+        target_mm: Any,
+        speed_override: Any = None,
+        torque_override: Any = None,
+    ) -> tuple[bool, str, float | None]:
         assert self.dll is not None
         if command not in {"enable", "disable", "stop"} and not self.enabled:
             return False, f"{self.side} gripper is disabled; enable it before motion commands", None
@@ -134,8 +145,8 @@ class _GripperWorker:
             command,
             float(target_mm) if target_mm is not None else None,
             self.stroke_mm,
-            int(self.config["gripper"].get("commandSpeed", 10)),
-            int(self.config["gripper"].get("commandTorque", 1)),
+            int(speed_override if speed_override is not None else self.config["gripper"].get("commandSpeed", 10)),
+            int(torque_override if torque_override is not None else self.config["gripper"].get("commandTorque", 1)),
         )
         ret = int(self.dll.runWithParam(self.slave, pos, speed, torque))
         return (

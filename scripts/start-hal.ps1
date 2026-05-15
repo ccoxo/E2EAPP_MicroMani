@@ -14,7 +14,7 @@ $jodellBin = Join-Path $repo "hal\vendor\jodell"
 $runtimeConfig = Join-Path $repo "backend\runtime\config.json"
 $omegaLeftOpenId = 0
 $omegaRightOpenId = 1
-$omegaSwapHands = $true
+$omegaSwapHands = $false
 
 function Promote-HalCandidate {
   if (!(Test-Path $halNextExe)) {

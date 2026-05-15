@@ -117,6 +117,8 @@ class GripperWorkerService:
                     "id": request_id,
                     "command": command,
                     "targetMm": target_mm,
+                    "speed": int(config.get("gripper", {}).get("commandSpeed", 10)),
+                    "torque": int(config.get("gripper", {}).get("commandTorque", 1)),
                 }
             )
             deadline = time.monotonic() + timeout_sec

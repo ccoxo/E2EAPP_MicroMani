@@ -57,7 +57,7 @@ export default function RecordPage() {
 
         case 'Escape':
           e.preventDefault()
-          if (phase !== 'idle' && phase !== 'finishing') handleStopSession()
+          if (phase === 'recording' || phase === 'resetting') handleStopSession()
           break
 
         case 'Control':

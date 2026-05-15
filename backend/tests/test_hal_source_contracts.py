@@ -10,25 +10,29 @@ def test_hal_home_all_requires_work_origin_payload() -> None:
     normalized = " ".join(source.split())
 
     assert "jsonWorkOriginPulse(requestBody(request))" in normalized
+    assert "motion.homeOriginSide(side, jsonSideWorkOriginPulse(bodyText))" in normalized
     assert "home_all requires leftPulse[6] work origin payload" in source
     assert "home_all requires rightPulse[6] work origin payload" in source
+    assert "home_origin_side requires pulse[6] work origin payload" in source
 
 
 def test_hal_teleop_target_update_uses_absolute_target_mode() -> None:
     source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
     normalized = " ".join(source.split())
-    teleop_body = source.split("void LTDMCDriver::updateTeleopTargetUi(", 1)[1].split(
+    teleop_body = source.split("TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(", 1)[1].split(
         "void LTDMCDriver::stopTeleopSide", 1
     )[0]
 
     assert "const auto updateTargetPulse = static_cast<long>(std::llround(targetPulse));" in normalized
     assert "updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse)" in normalized
+    assert "TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(" in source
+    assert "result.appliedDeltaUi[axisIndex]" in source
+    assert "result.targetPulse[axisIndex]" in source
     assert "void updateTeleopTargetBestEffort" in source
     assert "const auto retUpdate = dmcUpdateTargetPosition(card, axisNo, targetPulse, 1);" in normalized
     assert "(void)retUpdate;" in normalized
     assert 'dmcFailureMessage("dmc_update_target_position"' not in source
-    assert "dmcPMove" not in teleop_body
-    assert "dmc_pmove" not in teleop_body
+    assert "dmcPMove(card, axisNo, updateTargetPulse, 1)" in teleop_body
     assert "syncZeroDeltaTarget" in source
     assert "teleopTargetPulse_[index] = pulse_[index];" in normalized
     assert "axis busy before teleop target" not in source
@@ -37,7 +41,7 @@ def test_hal_teleop_target_update_uses_absolute_target_mode() -> None:
 def test_hal_teleop_soft_limit_clips_to_payload_range() -> None:
     source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
     normalized = " ".join(source.split())
-    teleop_body = source.split("void LTDMCDriver::updateTeleopTargetUi(", 1)[1].split(
+    teleop_body = source.split("TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(", 1)[1].split(
         "void LTDMCDriver::stopTeleopSide", 1
     )[0]
 
@@ -59,11 +63,20 @@ def test_hal_teleop_limits_and_step_caps_come_from_payload() -> None:
     assert "jsonTeleopSoftLimits(bodyText)" in server_source
     assert 'jsonNumberValue(bodyText, "translationStepLimitPulse", 0.0)' in server_source
     assert 'jsonNumberValue(bodyText, "rotationStepLimitPulse", 0.0)' in server_source
+    assert 'jsonNumberValue(bodyText, "translationPulseDeadband", 0.0)' in server_source
+    assert 'jsonNumberValue(bodyText, "rotationPulseDeadband", 0.0)' in server_source
     assert 'jsonBoolValue(bodyText, "syncZeroDeltaTarget", false)' in server_source
     assert "jsonTeleopEnabledAxes(bodyText)" in server_source
+    assert "jsonTeleopTargetUpdateResult(side, result)" in server_source
+    assert '\\"appliedDeltas\\"' in server_source
     assert "const std::array<AxisLimit, 6>& limits" in normalized_header
+    assert "TeleopTargetUpdateResult updateTeleopTargetUi" in normalized_header
     assert "const auto stepLimitPulse = rotation ? rotationStepPulse : translationStepPulse;" in normalized_driver
-    assert "clampPulseStep(requestedDeltaPulse, stepLimitPulse)" in normalized_driver
+    assert (
+        "const auto pulseDeadband = rotation ? rotationPulseDeadband : translationPulseDeadband;"
+        in normalized_driver
+    )
+    assert "clampPulseStep(deadbandedDeltaPulse, stepLimitPulse)" in normalized_driver
     assert "const auto limit = limits[axisIndex];" in normalized_driver
 
 
@@ -77,7 +90,7 @@ def test_hal_omega7_assignment_supports_icf_swap_hands() -> None:
     assert "takeDeviceByHandedness(true)" in driver_source
     assert "takeDeviceByOpenId(leftOpenId)" in driver_source
     assert "std::swap(state_[0], state_[1])" in driver_source
-    assert 'envBoolValue("APPSTATION_OMEGA7_SWAP_HANDS", true)' in server_source
+    assert 'envBoolValue("APPSTATION_OMEGA7_SWAP_HANDS", false)' in server_source
     assert "APPSTATION_OMEGA7_SWAP_HANDS" in start_hal
 
 
@@ -109,18 +122,20 @@ def test_hal_enable_side_rejects_partial_servo_failures() -> None:
     assert "succeeded == 0 && failed > 0" not in normalized
 
 
-def test_hal_skips_sevon_pin_for_right_roll_axis_eight() -> None:
+def test_hal_reads_card0_dmc5c10_sevon_feedback() -> None:
     source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
     normalized = " ".join(source.split())
 
     assert "bool usesSevonPin(appstation::hal::Side side, appstation::hal::SemanticAxis axis)" in normalized
-    assert "return physicalAxis(side, axis) < 8;" in normalized
-    assert "if (dmcReadSevonPin && usesSevonPin(side, axis))" in normalized
+    assert "return physicalAxis(side, axis) < stageAxisCount(side);" in normalized
+    assert "bool hasReadableSevonFeedback(appstation::hal::Side side, appstation::hal::SemanticAxis axis)" in normalized
+    assert "if (side == appstation::hal::Side::Right) { return false; }" not in normalized
+    assert "if (dmcReadSevonPin && hasReadableSevonFeedback(side, axis))" in normalized
     assert (
         "if (!usesSevonPin(side, axis)) { enabled_[stateIndex(side, axis)] = enabled; "
         "++succeeded; continue; }"
     ) in normalized
-    assert "Axis 8 (right Roll) has no readable SEVON pin" in source
+    assert "DMC3C00 servo feedback can read false" not in source
 
 
 def test_hal_stage_axis_and_direction_signs_match_icf_mapping() -> None:
@@ -129,5 +144,5 @@ def test_hal_stage_axis_and_direction_signs_match_icf_mapping() -> None:
 
     assert "kLeftPhysicalAxis{0, 1, 3, 5, 4, 2}" in normalized
     assert "kRightPhysicalAxis{2, 0, 5, 8, 1, 7}" in normalized
-    assert "kLeftPulsePerUnit{-5000.0, -10000.0, -10000.0, 1666.666667, 2500.0, 3333.333333}" in normalized
     assert "-5000.0, 10000.0, -10000.0, 1666.666667, -2500.0, -3333.333333" in normalized
+    assert "-5000.0, -10000.0, -10000.0, 1666.666667, 2500.0, 666.0" in normalized

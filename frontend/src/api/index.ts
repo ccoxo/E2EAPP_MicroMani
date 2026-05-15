@@ -225,6 +225,9 @@ export const stopMotionSide = (side: ManualControlSide) =>
 export const homeMotionSide = (side: ManualControlSide) =>
   postCommand(`/motion/${side}/home`)
 
+export const returnMotionOriginSide = (side: ManualControlSide) =>
+  postCommand(`/motion/${side}/return_origin`)
+
 export interface MotionOriginResponse {
   ok: boolean
   data?: {
@@ -246,6 +249,9 @@ export const captureMotionOrigin = (side?: ManualControlSide) =>
 export const clearMotionOrigin = (side?: ManualControlSide) =>
   postCommand(side ? `/motion/${side}/origin/clear` : '/motion/origin/clear') as Promise<MotionOriginResponse>
 
+export const restorePreviousMotionOrigin = () =>
+  postCommand('/motion/origin/restore_previous') as Promise<MotionOriginResponse>
+
 export async function gripperCommand(side: ManualControlSide, command: ManualGripperCommand, targetMm?: number, forceLimitN?: number) {
   return postCommand(`/gripper/${side}/command`, { side, command, targetMm, forceLimitN })
 }
@@ -258,7 +264,29 @@ export const fetchGripperTeleopStatus = () => fetch(`${apiBase}/api/teleop/gripp
 export const createSession = (datasetName: string, task: string) =>
   postCommand('/record/session/create', { dataset_name: datasetName, task })
 
-export const saveEpisode = () => postCommand('/record/episode/save')
+export interface RecordEpisodeSaveApi {
+  id?: string
+  episodeIndex?: number
+  frames?: number
+  durationS?: number
+  lateFrames?: number
+  maxForceLeft?: number
+  maxForceRight?: number
+  cameraDrops?: Partial<Record<'global' | 'wrist_left' | 'wrist_right', number>>
+  warnings?: string[]
+}
+
+export interface SaveEpisodeResponse {
+  ok?: boolean
+  data?: {
+    episode?: RecordEpisodeSaveApi
+    status?: unknown
+  }
+  ts?: number
+}
+
+export const saveEpisode = () =>
+  postCommand('/record/episode/save') as Promise<SaveEpisodeResponse>
 
 export const discardEpisode = () => postCommand('/record/episode/discard')
 

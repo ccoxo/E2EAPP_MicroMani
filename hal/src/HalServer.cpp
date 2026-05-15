@@ -94,6 +94,51 @@ std::string jsonMotionState(const appstation::hal::MotionState& state) {
   return out.str();
 }
 
+void appendDoubleArray(std::ostringstream& out, const std::array<double, 6>& values) {
+  out << "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) {
+      out << ",";
+    }
+    out << values[i];
+  }
+  out << "]";
+}
+
+void appendBoolArray(std::ostringstream& out, const std::array<bool, 6>& values) {
+  out << "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) {
+      out << ",";
+    }
+    out << (values[i] ? "true" : "false");
+  }
+  out << "]";
+}
+
+std::string jsonTeleopTargetUpdateResult(
+    appstation::hal::Side side,
+    const appstation::hal::TeleopTargetUpdateResult& result) {
+  std::ostringstream out;
+  out << "{\"ok\":true,\"side\":\"" << (side == appstation::hal::Side::Left ? "left" : "right") << "\"";
+  out << ",\"requestedDeltas\":";
+  appendDoubleArray(out, result.requestedDeltaUi);
+  out << ",\"appliedDeltas\":";
+  appendDoubleArray(out, result.appliedDeltaUi);
+  out << ",\"targetUi\":";
+  appendDoubleArray(out, result.targetUi);
+  out << ",\"requestedDeltaPulse\":";
+  appendDoubleArray(out, result.requestedDeltaPulse);
+  out << ",\"appliedDeltaPulse\":";
+  appendDoubleArray(out, result.appliedDeltaPulse);
+  out << ",\"targetPulse\":";
+  appendDoubleArray(out, result.targetPulse);
+  out << ",\"clipped\":";
+  appendBoolArray(out, result.clipped);
+  out << "}";
+  return out.str();
+}
+
 std::string jsonOmegaState(const std::array<appstation::hal::Omega7State, 2>& state) {
   std::ostringstream out;
   out << "{\"timestamp_ms\":" << timestampOrNow(state[0].readTimestampMs) << ",\"hands\":[";
@@ -374,6 +419,16 @@ std::array<double, 12> jsonWorkOriginPulse(const std::string& body) {
   return pulses;
 }
 
+std::array<double, 6> jsonSideWorkOriginPulse(const std::string& body) {
+  std::array<double, 6> pulses{};
+  for (size_t i = 0; i < pulses.size(); ++i) {
+    if (!jsonNumberArrayValue(body, "pulse", i, &pulses[i])) {
+      throw std::runtime_error("home_origin_side requires pulse[6] work origin payload");
+    }
+  }
+  return pulses;
+}
+
 std::array<appstation::hal::AxisLimit, 6> jsonTeleopSoftLimits(const std::string& body) {
   std::array<appstation::hal::AxisLimit, 6> limits{};
   for (size_t i = 0; i < limits.size(); ++i) {
@@ -494,6 +549,11 @@ void serveConnection(
       } else if (request.rfind("POST /motion/home_all ", 0) == 0) {
         motion.homeAll(jsonWorkOriginPulse(requestBody(request)));
         body = "{\"ok\":true}";
+      } else if (request.rfind("POST /motion/home_origin_side ", 0) == 0) {
+        const auto bodyText = requestBody(request);
+        const auto side = parseSide(jsonStringValue(bodyText, "side"));
+        motion.homeOriginSide(side, jsonSideWorkOriginPulse(bodyText));
+        body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/enable_side ", 0) == 0) {
         const auto side = parseSide(jsonStringValue(requestBody(request), "side"));
         const auto message = motion.enableSide(side, true);
@@ -536,11 +596,13 @@ void serveConnection(
             jsonNumberValue(bodyText, "Roll", 0.0),
             jsonNumberValue(bodyText, "Pitch", 0.0),
             jsonNumberValue(bodyText, "Yaw", 0.0)};
-        motion.updateTeleopTargetUi(
+        const auto result = motion.updateTeleopTargetUi(
             side,
             deltas,
             jsonNumberValue(bodyText, "translationStepLimitPulse", 0.0),
             jsonNumberValue(bodyText, "rotationStepLimitPulse", 0.0),
+            jsonNumberValue(bodyText, "translationPulseDeadband", 0.0),
+            jsonNumberValue(bodyText, "rotationPulseDeadband", 0.0),
             jsonTeleopEnabledAxes(bodyText),
             jsonBoolValue(bodyText, "syncZeroDeltaTarget", false),
             jsonTeleopSoftLimits(bodyText),
@@ -550,7 +612,7 @@ void serveConnection(
             jsonNumberValue(bodyText, "rotationStartVelocityUiPerSec", 0.0),
             jsonNumberValue(bodyText, "accTimeSec", 0.0),
             jsonNumberValue(bodyText, "decTimeSec", 0.0));
-        body = "{\"ok\":true}";
+        body = jsonTeleopTargetUpdateResult(side, result);
       } else if (request.rfind("POST /motion/teleop_stop_side ", 0) == 0) {
         const auto side = parseSide(jsonStringValue(requestBody(request), "side"));
         motion.stopTeleopSide(side);
@@ -588,7 +650,7 @@ int main() {
   const bool motionOk = motion.initialize();
   const int leftOpenId = envIntValue("APPSTATION_OMEGA7_LEFT_OPEN_ID", 0);
   const int rightOpenId = envIntValue("APPSTATION_OMEGA7_RIGHT_OPEN_ID", 1);
-  const bool swapHands = envBoolValue("APPSTATION_OMEGA7_SWAP_HANDS", true);
+  const bool swapHands = envBoolValue("APPSTATION_OMEGA7_SWAP_HANDS", false);
   omega.initialize(leftOpenId, rightOpenId, swapHands);
 
   MotionControlThread motionThread(motion);

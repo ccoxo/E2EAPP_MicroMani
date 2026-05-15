@@ -5,20 +5,20 @@ from typing import Any
 
 DEFAULT_MOTION_PROFILE: dict[str, Any] = {
     "translation": {
-        "startSpeed": 100,
-        "maxSpeed": 1000,
+        "startSpeed": 300,
+        "maxSpeed": 4000,
         "accTimeSec": 0.05,
         "decTimeSec": 0.05,
     },
     "rotation": {
-        "startSpeed": 0.3,
-        "maxSpeed": 3,
-        "accTimeSec": 0.02,
-        "decTimeSec": 0.02,
+        "startSpeed": 0.5,
+        "maxSpeed": 6,
+        "accTimeSec": 0.05,
+        "decTimeSec": 0.05,
     },
 }
 
-ICF_TELEOP_STRATEGY_VERSION = "icf_omega7_qserialtest_limits_20260513"
+ICF_TELEOP_STRATEGY_VERSION = "icf_omega7_qserialtest_v19_platform1_roll_yaw_direction_fix_20260515"
 ICF_WORK_ORIGIN_VERSION = "icf_work_origin_20260513"
 
 ICF_CAMERA_DEFAULTS: dict[str, Any] = {
@@ -56,56 +56,104 @@ ICF_CAMERA_DEFAULTS: dict[str, Any] = {
 }
 
 DEFAULT_SOFT_LIMITS: dict[str, Any] = {
-    "x": {"min": -40000000, "max": 40000000},
-    "y": {"min": -20000000, "max": 20000000},
-    "z": {"min": -20000000, "max": 20000000},
-    "roll": {"min": -120000, "max": 120000},
-    "pitch": {"min": -80000, "max": 80000},
-    "yaw": {"min": -60000, "max": 60000},
+    "x": {"min": -25000, "max": 25000},
+    "y": {"min": -37500, "max": 37500},
+    "z": {"min": -37500, "max": 37500},
+    "roll": {"min": -90000, "max": 90000},
+    "pitch": {"min": -90000, "max": 90000},
+    "yaw": {"min": -7000, "max": 7000},
 }
 
-ICF_TELEOP_SOFT_LIMIT_MIN = [-200000000.0] * 6
-ICF_TELEOP_SOFT_LIMIT_MAX = [200000000.0] * 6
+ICF_LEFT_MOTION_SOFT_LIMITS: dict[str, Any] = {
+    "x": {"min": -25000, "max": 25000},
+    "y": {"min": -37500, "max": 37500},
+    "z": {"min": -37500, "max": 37500},
+    "roll": {"min": -90000, "max": 90000},
+    "pitch": {"min": -90000, "max": 90000},
+    "yaw": {"min": -7000, "max": 7000},
+}
+
+ICF_RIGHT_MOTION_SOFT_LIMITS: dict[str, Any] = {
+    "x": {"min": -25000, "max": 25000},
+    "y": {"min": -37500, "max": 37500},
+    "z": {"min": -37500, "max": 37500},
+    "roll": {"min": -90000, "max": 90000},
+    "pitch": {"min": -90000, "max": 90000},
+    "yaw": {"min": -7000, "max": 7000},
+}
+
+ICF_KINEMATICS_DEFAULTS: dict[str, Any] = {
+    "source": "QSerialTest/config.ini",
+    "axisOrder": ["x", "y", "z", "roll", "pitch", "yaw"],
+    "leftAxisMap": [0, 1, 3, 5, 4, 2],
+    "rightAxisMap": [8, 6, 11, 14, 7, 13],
+    "leftPhysicalAxis": [0, 1, 3, 5, 4, 2],
+    "rightPhysicalAxis": [2, 0, 5, 8, 1, 7],
+    "axisUnitSpec": ["mm", "mm", "mm", "deg", "deg", "deg"],
+    "leftPulsePerUnit": [5000.0, 10000.0, 10000.0, 1666.666667, 2500.0, 3333.333333],
+    "rightPulsePerUnit": [5000.0, 10000.0, 10000.0, 1666.666667, 2500.0, 666.0],
+    "leftDirectionSign": [-1, 1, -1, 1, -1, -1],
+    "rightDirectionSign": [-1, -1, -1, 1, 1, 1],
+    "leftSignedPulsePerUnit": [-5000.0, 10000.0, -10000.0, 1666.666667, -2500.0, -3333.333333],
+    "rightSignedPulsePerUnit": [-5000.0, -10000.0, -10000.0, 1666.666667, 2500.0, 666.0],
+    "syncActionPulseCoeff": True,
+    "updatedAt": "2026-04-17T00:00:00",
+}
+
+ICF_TELEOP_SOFT_LIMIT_UNIT_SPEC = ["um", "um", "um", "deg", "deg", "deg"]
+ICF_LEFT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -90.0, -90.0, -7.0]
+ICF_LEFT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 90.0, 90.0, 7.0]
+ICF_RIGHT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -90.0, -90.0, -7.0]
+ICF_RIGHT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 90.0, 90.0, 7.0]
 
 ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "strategyVersion": ICF_TELEOP_STRATEGY_VERSION,
-    "swapHands": True,
-    "stabilityMode": "free",
+    "swapHands": False,
+    "swapTeleopChannels": True,
+    "stabilityMode": "off",
     "leftTranslationScale": 0.30,
     "rightTranslationScale": 0.30,
     "leftRotationScale": 0.10,
-    "rightRotationScale": 0.05,
-    "leftAxisOutputScale": [0.20, 0.20, 1.00, 1.00, 0.50, 0.10],
-    "rightAxisOutputScale": [0.20, 0.20, 1.00, 1.00, 0.50, 0.10],
+    "rightRotationScale": 0.10,
+    "homeBeforeStart": True,
+    "leftAxisOutputScale": [0.40, 0.20, 0.20, 1.00, 0.20, 0.20],
+    "rightAxisOutputScale": [0.40, 0.20, 0.20, 1.00, 0.20, 0.20],
     "translationDeadzone": 0.00002,
-    "rotationDeadzone": 0.05,
+    "rotationDeadzone": 0.03,
     "incrementalTranslationMinEffectiveDelta": 0.00005,
     "incrementalTranslationReverseDeadzone": 0.00010,
     "translationStepLimitPulse": 4000,
     "rotationStepLimitPulse": 1250,
+    "translationPulseDeadband": 2,
+    "rotationPulseDeadband": 2,
     "translationStepUm": 5000.0,
     "rotationStepDeg": 0.2,
     "translationStartVelocityUmS": 300.0,
     "translationMaxVelocityUmS": 4000.0,
-    "rotationStartVelocityDegS": 0.25,
-    "rotationMaxVelocityDegS": 3.0,
+    "rotationStartVelocityDegS": 0.50,
+    "rotationMaxVelocityDegS": 6.0,
     "motionProfileAccSec": 0.05,
     "motionProfileDecSec": 0.05,
     "leftEnabledAxes": [True, True, True, True, True, True],
     "rightEnabledAxes": [True, True, True, True, True, True],
-    "leftSoftLimitMin": list(ICF_TELEOP_SOFT_LIMIT_MIN),
-    "leftSoftLimitMax": list(ICF_TELEOP_SOFT_LIMIT_MAX),
-    "rightSoftLimitMin": list(ICF_TELEOP_SOFT_LIMIT_MIN),
-    "rightSoftLimitMax": list(ICF_TELEOP_SOFT_LIMIT_MAX),
+    "softLimitUnitSpec": list(ICF_TELEOP_SOFT_LIMIT_UNIT_SPEC),
+    "leftSoftLimitMin": list(ICF_LEFT_TELEOP_SOFT_LIMIT_MIN),
+    "leftSoftLimitMax": list(ICF_LEFT_TELEOP_SOFT_LIMIT_MAX),
+    "rightSoftLimitMin": list(ICF_RIGHT_TELEOP_SOFT_LIMIT_MIN),
+    "rightSoftLimitMax": list(ICF_RIGHT_TELEOP_SOFT_LIMIT_MAX),
 }
 
 ICF_WORK_ORIGIN_DEFAULTS: dict[str, Any] = {
     "valid": True,
     "leftValid": True,
     "rightValid": True,
-    "leftPulse": [100000.0, 0.0, -35179.0, 64833.0, 64839.0, -2947.0],
-    "rightPulse": [-233.0, -19221.0, 593101.0, 4427.0, -81110.0, -180.0],
-    "updatedAt": 1778586070000,
+    "leftPulse": [258510.0, -200013.0, 274821.0, 49833.0, 84839.0, 381102.0],
+    "rightPulse": [99769.0, 382483.0, 881210.0, -35473.0, -215115.0, -5006.0],
+    "updatedAt": 1778834471000,
+    "previousValid": True,
+    "previousLeftPulse": [258510.0, -200013.0, 144821.0, 49833.0, 84839.0, 381102.0],
+    "previousRightPulse": [99769.0, 382483.0, 881210.0, -35473.0, -215115.0, -5006.0],
+    "previousUpdatedAt": 1778834438000,
 }
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -145,7 +193,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "motionThreadHz": 1000,
         "jogStepUm": 50,
         "jogStepDeg": 0.05,
-        "yawSoftLimitDeg": 60000,
+        "yawSoftLimitDeg": 7,
         "positionSource": "dmc_get_position",
         "workOriginStrategyVersion": ICF_WORK_ORIGIN_VERSION,
         "origin": deepcopy(ICF_WORK_ORIGIN_DEFAULTS),
@@ -155,8 +203,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "leftProfile": deepcopy(DEFAULT_MOTION_PROFILE),
         "rightProfile": deepcopy(DEFAULT_MOTION_PROFILE),
-        "leftSoftLimits": deepcopy(DEFAULT_SOFT_LIMITS),
-        "rightSoftLimits": deepcopy(DEFAULT_SOFT_LIMITS),
+        "leftSoftLimits": deepcopy(ICF_LEFT_MOTION_SOFT_LIMITS),
+        "rightSoftLimits": deepcopy(ICF_RIGHT_MOTION_SOFT_LIMITS),
+        "kinematics": deepcopy(ICF_KINEMATICS_DEFAULTS),
     },
     "gripper": {
         "leftPort": "COM8",
@@ -189,7 +238,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "fzStopN": 5,
         "momentWarnNm": 0.02,
         "momentStopNm": 0.04,
-        "yawSoftLimitDeg": 60000,
+        "yawSoftLimitDeg": 7,
         "watchdogMs": 50,
     },
     "zmq": {
@@ -238,10 +287,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "rightForceFeedback": False,
         **deepcopy(ICF_TELEOP_DEFAULTS),
         "requireClutch": False,
-        "stabilityMode": "free",
+        "stabilityMode": "off",
         "tcpFallbackPort": 12345,
         "gripperTeleop": {
-            "enabled": False,
+            "enabled": True,
             "loopHz": 100,
             "leftGapMinMm": 0.0,
             "leftGapMaxMm": 25.0,
@@ -251,8 +300,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "closeThreshold": 0.70,
             "gripSpeed": 128,
             "gripTorque": 192,
+            "positionDeadbandCounts": 2,
+            "minCommandIntervalMs": 50,
+            "autoGapCalibration": True,
+            "autoGapMinSpanMm": 2.0,
+            "autoGapMarginMm": 1.0,
             "releaseSpeed": 255,
             "releaseTorque": 64,
+            "leftSourceHand": "PhysicalRight",
+            "rightSourceHand": "PhysicalLeft",
             "objectDetectMargin": 10,
             "buttonFallback": True,
             "diagLog": False,

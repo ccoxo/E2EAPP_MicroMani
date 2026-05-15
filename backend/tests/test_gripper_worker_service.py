@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 from typing import Any
 
 from backend.core.defaults import default_config
@@ -9,6 +10,7 @@ from backend.drivers.gripper_rs485 import GripperResult
 from backend.services.command_service import CommandService
 from backend.services.gripper_worker_service import GripperWorkerService
 from backend.services.telemetry_hub import TelemetryHub
+from backend.workers.gripper_worker import _GripperWorker
 
 
 class FakeSettings:
@@ -151,6 +153,33 @@ def test_dual_worker_gripper_command_rejects_disabled_side() -> None:
     assert "left gripper is disabled" in result.message
 
 
+def test_gripper_worker_motion_uses_command_speed_and_torque_overrides() -> None:
+    config = default_config()
+    config["gripper"]["leftEnabled"] = True
+
+    class FakeDll:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int, int, int]] = []
+
+        def clawEnable(self, _slave: int, _enabled: bool) -> int:
+            return 1
+
+        def runWithParam(self, slave: int, pos: int, speed: int, torque: int) -> int:
+            self.calls.append((slave, pos, speed, torque))
+            return 1
+
+    fake_dll = FakeDll()
+    worker = _GripperWorker("left", config, queue.Queue(), queue.Queue(), queue.Queue())
+    worker.dll = fake_dll
+    worker.enabled = True
+
+    ok, message, _ = worker._execute_command("target", 7.5, 128, 192)
+
+    assert ok is True
+    assert fake_dll.calls[0][2:] == (128, 192)
+    assert "speed=128, torque=192" in message
+
+
 def test_gripper_motion_command_rejects_disabled_side() -> None:
     config = default_config()
     settings = FakeSettings(config)
@@ -203,7 +232,7 @@ def test_manual_axis_move_allows_enabled_motion_side() -> None:
     assert hal.commands[0][0] == "motion.manual_axis_move"
 
 
-def test_motion_enabled_refresh_marks_right_roll_feedback_unknown() -> None:
+def test_motion_enabled_refresh_reports_card0_dmc5c10_feedback() -> None:
     config = default_config()
     settings = FakeSettings(config)
     telemetry = FakeTelemetry()
@@ -213,10 +242,10 @@ def test_motion_enabled_refresh_marks_right_roll_feedback_unknown() -> None:
 
     asyncio.run(service.enable_motion_side("right"))
 
-    assert telemetry.motion_axis_enabled["right"] == [False, False, False, None, False, False]
+    assert telemetry.motion_axis_enabled["right"] == [False, False, False, False, False, False]
 
 
-def test_manual_axis_move_allows_right_roll_without_sevon_feedback_when_right_side_enabled() -> None:
+def test_manual_axis_move_rejects_right_roll_when_card0_feedback_is_disabled() -> None:
     config = default_config()
     settings = FakeSettings(config)
     enabled_values = [True] * 12
@@ -224,31 +253,42 @@ def test_manual_axis_move_allows_right_roll_without_sevon_feedback_when_right_si
     hal = FakeHal(enabled_values=enabled_values)
     service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
 
-    result = asyncio.run(
-        service.manual_axis_move(
-            ManualAxisMoveRequest(side="right", axis="Roll", direction=1, step=1, speedMode="fine")
+    try:
+        asyncio.run(
+            service.manual_axis_move(
+                ManualAxisMoveRequest(side="right", axis="Roll", direction=1, step=1, speedMode="fine")
+            )
         )
-    )
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected disabled right Roll feedback to fail")
 
-    assert result["hal"]["command"] == "motion.manual_axis_move"
-    assert hal.commands[0][0] == "motion.manual_axis_move"
+    assert "right Roll motion axis is disabled" in message
+    assert hal.commands == []
 
 
-def test_manual_axis_move_allows_right_roll_when_enabled_feedback_is_unreadable() -> None:
+def test_manual_axis_move_rejects_right_pitch_when_card0_feedback_is_disabled() -> None:
     config = default_config()
     settings = FakeSettings(config)
-    enabled_values = [True] * 6 + [False] * 6
+    enabled_values = [True] * 12
+    enabled_values[10] = False
     hal = FakeHal(enabled_values=enabled_values)
     service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
 
-    result = asyncio.run(
-        service.manual_axis_move(
-            ManualAxisMoveRequest(side="right", axis="Roll", direction=1, step=1, speedMode="fine")
+    try:
+        asyncio.run(
+            service.manual_axis_move(
+                ManualAxisMoveRequest(side="right", axis="Pitch", direction=1, step=1, speedMode="fine")
+            )
         )
-    )
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected disabled right Pitch feedback to fail")
 
-    assert result["hal"]["command"] == "motion.manual_axis_move"
-    assert hal.commands[0][0] == "motion.manual_axis_move"
+    assert "right Pitch motion axis is disabled" in message
+    assert hal.commands == []
 
 
 def test_gripper_worker_sync_stops_workers_when_disabled() -> None:

@@ -8,6 +8,9 @@ from typing import Any, cast
 from backend.core.defaults import (
     DEFAULT_SOFT_LIMITS,
     ICF_CAMERA_DEFAULTS,
+    ICF_KINEMATICS_DEFAULTS,
+    ICF_LEFT_MOTION_SOFT_LIMITS,
+    ICF_RIGHT_MOTION_SOFT_LIMITS,
     ICF_TELEOP_DEFAULTS,
     ICF_TELEOP_STRATEGY_VERSION,
     ICF_WORK_ORIGIN_DEFAULTS,
@@ -204,13 +207,41 @@ class SettingsService:
                 teleop[key] = json.loads(json.dumps(value))
             motion = config.get("motion", {})
             if isinstance(motion, dict):
-                motion["leftSoftLimits"] = json.loads(json.dumps(DEFAULT_SOFT_LIMITS))
-                motion["rightSoftLimits"] = json.loads(json.dumps(DEFAULT_SOFT_LIMITS))
-                motion["yawSoftLimitDeg"] = DEFAULT_SOFT_LIMITS["yaw"]["max"]
+                motion["leftSoftLimits"] = json.loads(json.dumps(ICF_LEFT_MOTION_SOFT_LIMITS))
+                motion["rightSoftLimits"] = json.loads(json.dumps(ICF_RIGHT_MOTION_SOFT_LIMITS))
+                motion["yawSoftLimitDeg"] = 7
+                motion["kinematics"] = json.loads(json.dumps(ICF_KINEMATICS_DEFAULTS))
             safety = config.get("safety", {})
             if isinstance(safety, dict):
-                safety["yawSoftLimitDeg"] = DEFAULT_SOFT_LIMITS["yaw"]["max"]
+                safety["yawSoftLimitDeg"] = 7
+            gripper = config.get("gripper", {})
+            if isinstance(gripper, dict):
+                gripper["leftPort"] = "COM8"
+                gripper["rightPort"] = "COM9"
+                gripper["leftSlaveId"] = 10
+                gripper["rightSlaveId"] = 9
+                gripper["strokeMm"] = 26
+            gripper_teleop = teleop.get("gripperTeleop", {})
+            if isinstance(gripper_teleop, dict):
+                gripper_teleop["enabled"] = True
+                gripper_teleop["leftGapMinMm"] = 0.0
+                gripper_teleop["leftGapMaxMm"] = 25.0
+                gripper_teleop["rightGapMinMm"] = 0.0
+                gripper_teleop["rightGapMaxMm"] = 25.0
+                gripper_teleop["gripSpeed"] = 128
+                gripper_teleop["gripTorque"] = 192
+                gripper_teleop["positionDeadbandCounts"] = 2
+                gripper_teleop["minCommandIntervalMs"] = 50
+                gripper_teleop["autoGapCalibration"] = True
+                gripper_teleop["autoGapMinSpanMm"] = 2.0
+                gripper_teleop["autoGapMarginMm"] = 1.0
+                gripper_teleop["leftSourceHand"] = "PhysicalRight"
+                gripper_teleop["rightSourceHand"] = "PhysicalLeft"
         if isinstance(teleop, dict):
+            if teleop.get("swapHands") is True:
+                teleop["swapHands"] = ICF_TELEOP_DEFAULTS["swapHands"]
+            if teleop.get("swapTeleopChannels") is False:
+                teleop["swapTeleopChannels"] = ICF_TELEOP_DEFAULTS["swapTeleopChannels"]
             try:
                 has_legacy_icf_translation_speed = (
                     float(teleop.get("translationStartVelocityUmS", 0.0)) == 400.0
@@ -221,6 +252,14 @@ class SettingsService:
             if has_legacy_icf_translation_speed:
                 teleop["translationStartVelocityUmS"] = ICF_TELEOP_DEFAULTS["translationStartVelocityUmS"]
                 teleop["translationMaxVelocityUmS"] = ICF_TELEOP_DEFAULTS["translationMaxVelocityUmS"]
+            if teleop.get("leftAxisOutputScale") == [0.20, 0.20, 0.20, 0.25, 0.25, 1.00]:
+                teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
+            if teleop.get("rightAxisOutputScale") == [0.20, 0.20, 0.20, 0.25, 0.25, 1.00]:
+                teleop["rightAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["rightAxisOutputScale"]))
+            if teleop.get("leftAxisOutputScale") == [1, 1, 1, 1, 1, 1]:
+                teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
+            if teleop.get("rightAxisOutputScale") == [1, 1, 1, 1, 1, 1]:
+                teleop["rightAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["rightAxisOutputScale"]))
         cameras = config.get("cameras", {})
         if isinstance(cameras, dict):
             has_legacy_reversed_wrist_cameras = (
@@ -242,6 +281,19 @@ class SettingsService:
                         continue
                     cameras[key] = json.loads(json.dumps(value))
         motion = config.get("motion", {})
+        if isinstance(motion, dict):
+            if self._uses_legacy_motion_profile(motion.get("leftProfile")):
+                motion["leftProfile"] = json.loads(json.dumps(default_config()["motion"]["leftProfile"]))
+            if self._uses_legacy_motion_profile(motion.get("rightProfile")):
+                motion["rightProfile"] = json.loads(json.dumps(default_config()["motion"]["rightProfile"]))
+            if self._uses_pre_icf_rotation_profile(motion.get("leftProfile")):
+                motion["leftProfile"] = json.loads(json.dumps(default_config()["motion"]["leftProfile"]))
+            if self._uses_pre_icf_rotation_profile(motion.get("rightProfile")):
+                motion["rightProfile"] = json.loads(json.dumps(default_config()["motion"]["rightProfile"]))
+            if motion.get("leftSoftLimits") == DEFAULT_SOFT_LIMITS:
+                motion["leftSoftLimits"] = json.loads(json.dumps(ICF_LEFT_MOTION_SOFT_LIMITS))
+            if motion.get("rightSoftLimits") == DEFAULT_SOFT_LIMITS:
+                motion["rightSoftLimits"] = json.loads(json.dumps(ICF_RIGHT_MOTION_SOFT_LIMITS))
         if isinstance(motion, dict) and not has_current_work_origin_strategy:
             origin = motion.get("origin", {})
             origin_valid = isinstance(origin, dict) and bool(origin.get("valid", False))
@@ -258,4 +310,41 @@ class SettingsService:
                 for key in ("leftGapMaxMm", "rightGapMaxMm"):
                     if float(gripper_teleop.get(key, 25.0)) == 50.0:
                         gripper_teleop[key] = 25.0
+            if gripper_teleop.get("leftSourceHand") == "PhysicalLeft":
+                gripper_teleop["leftSourceHand"] = "PhysicalRight"
+            if gripper_teleop.get("rightSourceHand") == "PhysicalRight":
+                gripper_teleop["rightSourceHand"] = "PhysicalLeft"
         return config
+
+    def _uses_legacy_motion_profile(self, profile: object) -> bool:
+        if not isinstance(profile, dict):
+            return False
+        translation = profile.get("translation")
+        rotation = profile.get("rotation")
+        if not isinstance(translation, dict) or not isinstance(rotation, dict):
+            return False
+        try:
+            return (
+                float(translation.get("startSpeed", 0.0)) == 100.0
+                and float(translation.get("maxSpeed", 0.0)) == 1000.0
+                and float(rotation.get("startSpeed", 0.0)) == 0.3
+                and float(rotation.get("maxSpeed", 0.0)) == 3.0
+                and float(rotation.get("accTimeSec", 0.0)) == 0.02
+                and float(rotation.get("decTimeSec", 0.0)) == 0.02
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _uses_pre_icf_rotation_profile(self, profile: object) -> bool:
+        if not isinstance(profile, dict):
+            return False
+        rotation = profile.get("rotation")
+        if not isinstance(rotation, dict):
+            return False
+        try:
+            return (
+                float(rotation.get("startSpeed", 0.0)) == 0.25
+                and float(rotation.get("maxSpeed", 0.0)) == 3.0
+            )
+        except (TypeError, ValueError):
+            return False

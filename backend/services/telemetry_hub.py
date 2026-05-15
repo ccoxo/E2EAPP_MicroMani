@@ -197,7 +197,8 @@ class TelemetryHub:
         while len(normalized) < 6:
             normalized.append(None)
         self.motion_axis_enabled[side] = normalized
-        self.motion_enabled[side] = all(value is True for value in normalized)
+        known = [value for value in normalized if value is not None]
+        self.motion_enabled[side] = all(value is True for value in known) if known else None
 
     def emergency_stop(self) -> None:
         self.recording = False

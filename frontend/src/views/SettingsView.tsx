@@ -52,6 +52,7 @@ import {
   axisHardwareSpecs,
   cameraHardwareSpecs,
   forceChannels,
+  motionCardModelByNo,
   nano17Spec,
   semanticAxes,
   type RobotSide,
@@ -99,6 +100,10 @@ const defaultCameraTuning: Record<CameraKey, CameraTuningProfile> = {
     autoWhiteBalance: false,
   },
 }
+const cameraExposureMin = -13
+const cameraExposureMax = 0
+const cameraGainMin = 0
+const cameraGainMax = 64
 const previewResolutionOptions = [
   { value: '640x480', label: '640x480（推荐）' },
   { value: '320x240', label: '320x240（低负载）' },
@@ -583,6 +588,7 @@ function MotionCard({
   const id = `motion-${side}`
   const snapshotScope = motionSnapshotScope(side)
   const configCardNo = side === 'left' ? config.motion.leftCardNo : config.motion.rightCardNo
+  const cardModel = motionCardModelByNo[configCardNo] ?? 'DMC'
   const profileKey = side === 'left' ? 'leftProfile' : 'rightProfile'
   const softLimitKey = side === 'left' ? 'leftSoftLimits' : 'rightSoftLimits'
   const updateCardNo = (cardNo: number) =>
@@ -716,7 +722,7 @@ function MotionCard({
       focusHash={focusHash}
       icon={<Cpu size={20} />}
       title={`${sideSpec.shortLabel}运动控制卡 · Card ${configCardNo}`}
-      subtitle={`LTDMC/DMC3000 · ${sideSpec.configKey} · 6 轴串行控制`}
+      subtitle={`LTDMC/${cardModel} · ${sideSpec.configKey} · 6 轴串行控制`}
       state="ok"
       badges={
         <>
@@ -851,15 +857,13 @@ function CameraCard({
             ? 'warn'
             : 'ok'
   const tuning = config.cameras.tuning?.[cameraKey] ?? defaultCameraTuning[cameraKey]
-  const isWristCamera = cameraKey !== 'global'
   const [pendingCameraAction, setPendingCameraAction] = useState<'apply' | 'reconnect' | null>(null)
   const sanitizeTuning = (next: CameraTuningProfile): CameraTuningProfile => {
-    const exposure = Math.min(0, Math.max(-13, Number(next.exposure)))
-    const wristExposure = isWristCamera ? Math.min(exposure, -5) : exposure
-    const gain = Math.min(64, Math.max(0, Number(next.gain)))
+    const exposure = Math.min(cameraExposureMax, Math.max(cameraExposureMin, Number(next.exposure)))
+    const gain = Math.min(cameraGainMax, Math.max(cameraGainMin, Number(next.gain)))
     return {
-      autoExposure: isWristCamera ? false : Boolean(next.autoExposure),
-      exposure: Number.isFinite(wristExposure) ? wristExposure : defaultCameraTuning[cameraKey].exposure,
+      autoExposure: Boolean(next.autoExposure),
+      exposure: Number.isFinite(exposure) ? exposure : defaultCameraTuning[cameraKey].exposure,
       gain: Number.isFinite(gain) ? gain : defaultCameraTuning[cameraKey].gain,
       autoWhiteBalance: Boolean(next.autoWhiteBalance),
     }
@@ -952,26 +956,41 @@ function CameraCard({
           <Space direction="vertical" size={8} style={{ width: '100%' }}>
             <Switch
               checked={Boolean(tuning.autoExposure)}
-              disabled={isWristCamera}
               checkedChildren="Auto"
               unCheckedChildren="Manual"
               onChange={(checked) => updateTuning({ autoExposure: checked })}
             />
-            <Space size={8} wrap>
+            <Space size={8} wrap style={{ width: '100%' }}>
               <Typography.Text type="secondary">Exposure</Typography.Text>
+              <Slider
+                min={cameraExposureMin}
+                max={cameraExposureMax}
+                step={0.5}
+                value={tuning.exposure}
+                onChange={(value) => updateTuning({ exposure: Number(value) })}
+                style={{ minWidth: 180, flex: 1 }}
+              />
               <InputNumber
-                min={-13}
-                max={isWristCamera ? -5 : 0}
+                min={cameraExposureMin}
+                max={cameraExposureMax}
                 step={0.5}
                 value={tuning.exposure}
                 onChange={(value) => updateTuning({ exposure: Number(value ?? defaultCameraTuning[cameraKey].exposure) })}
               />
             </Space>
-            <Space size={8} wrap>
+            <Space size={8} wrap style={{ width: '100%' }}>
               <Typography.Text type="secondary">Gain</Typography.Text>
+              <Slider
+                min={cameraGainMin}
+                max={cameraGainMax}
+                step={1}
+                value={tuning.gain}
+                onChange={(value) => updateTuning({ gain: Number(value) })}
+                style={{ minWidth: 180, flex: 1 }}
+              />
               <InputNumber
-                min={0}
-                max={64}
+                min={cameraGainMin}
+                max={cameraGainMax}
                 step={1}
                 value={tuning.gain}
                 onChange={(value) => updateTuning({ gain: Number(value ?? 0) })}
@@ -1278,6 +1297,9 @@ function GripperCard({
             <Form.Item label="诊断日志">
               <Switch checked={gt.diagLog} checkedChildren="开" unCheckedChildren="关" onChange={(v) => setGt({ diagLog: v })} />
             </Form.Item>
+            <Form.Item label="Gap 自动量程">
+              <Switch checked={gt.autoGapCalibration} checkedChildren="开" unCheckedChildren="关" onChange={(v) => setGt({ autoGapCalibration: v })} />
+            </Form.Item>
           </Form>
         </div>
       </div>
@@ -1480,7 +1502,7 @@ function TeleopHandCard({
         .finally(() => setConnectionPending(false))
       return
     }
-    commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel} Omega.7 connect dhdOpenID(${openId})`)
+    commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel} Omega.7 connect dhdOpenID(${openId}) and return mapped work origin`)
     void connectTeleopHand(side)
       .then((result) => {
         const payload = result as { data?: { connected?: boolean; message?: string } }
@@ -1525,7 +1547,7 @@ function TeleopHandCard({
             onClick={toggleConnection}
             loading={connectionPending}
           >
-            {logicalConnected ? '断开主手' : '连接主手'}
+            {logicalConnected ? '断开主手' : '连接并回工作原点'}
           </Button>
           <Button icon={<PlugZap size={15} />} onClick={() => setGravityEnabled(!gravityCompensation)}>
             重力补偿
@@ -1576,7 +1598,9 @@ function TeleopHandCard({
           <Select
             value={config.teleop.stabilityMode}
             options={[
-              { value: 'free', label: 'Off / Free' },
+              { value: 'hold', label: 'Hold' },
+              { value: 'track', label: 'Track' },
+              { value: 'off', label: 'Off / Free' },
             ]}
             onChange={(value) => updateTeleop({ stabilityMode: value })}
           />
@@ -1598,6 +1622,12 @@ function TeleopHandCard({
         </Form.Item>
         <Form.Item label="旋转死区 °">
           <InputNumber min={0} step={0.01} value={config.teleop.rotationDeadzone} onChange={(value) => updateTeleop({ rotationDeadzone: Number(value ?? 0.08) })} />
+        </Form.Item>
+        <Form.Item label="Translation pulse deadband">
+          <InputNumber min={0} step={1} value={config.teleop.translationPulseDeadband} onChange={(value) => updateTeleop({ translationPulseDeadband: Number(value ?? 2) })} />
+        </Form.Item>
+        <Form.Item label="Rotation pulse deadband">
+          <InputNumber min={0} step={1} value={config.teleop.rotationPulseDeadband} onChange={(value) => updateTeleop({ rotationPulseDeadband: Number(value ?? 2) })} />
         </Form.Item>
         <Form.Item label="Translation min delta">
           <InputNumber min={0} step={0.00001} value={config.teleop.incrementalTranslationMinEffectiveDelta} onChange={(value) => updateTeleop({ incrementalTranslationMinEffectiveDelta: Number(value ?? 0.00005) })} />
@@ -1637,6 +1667,10 @@ function TeleopHandCard({
         <span>
           <small>Swap hands</small>
           <Switch checked={config.teleop.swapHands} checkedChildren="On" unCheckedChildren="Off" onChange={(value) => updateTeleop({ swapHands: value })} />
+        </span>
+        <span>
+          <small>Swap teleop channels</small>
+          <Switch checked={config.teleop.swapTeleopChannels} checkedChildren="On" unCheckedChildren="Off" onChange={(value) => updateTeleop({ swapTeleopChannels: value })} />
         </span>
         <span>
           <small>重力补偿</small>
@@ -2266,7 +2300,7 @@ export function SettingsView() {
               <section className="hardware-settings-page">
                 <div className="hardware-focus-strip">
                   <MetricBox label="平台轴数" value="12 轴 + 2 夹爪" />
-                  <MetricBox label="运动控制卡" value="2× LTDMC / DMC3000" hint="Card 1 左，Card 0 右" />
+                  <MetricBox label="运动控制卡" value="Card 0 DMC5C10 / Card 1 DMC3C00" hint="Card 1 左，Card 0 右" />
                   <MetricBox label="相机" value="AR0234 + 2xIMX258" hint="按原始比例预览" />
                   <MetricBox label="力觉" value="2× ATI Nano-17" hint="显示 mN / mN·m" />
                 </div>

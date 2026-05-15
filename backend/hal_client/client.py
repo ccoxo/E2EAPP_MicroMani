@@ -173,6 +173,7 @@ class RealHalClient(HalClient):
             "hal.reconnect": "/health",
             "motion.emergency_stop": "/motion/emergency_stop",
             "motion.home_all": "/motion/home_all",
+            "motion.home_origin_side": "/motion/home_origin_side",
             "motion.enable_side": "/motion/enable_side",
             "motion.disable_side": "/motion/disable_side",
             "motion.home_side": "/motion/home_side",
@@ -184,9 +185,22 @@ class RealHalClient(HalClient):
         if path is None:
             raise RuntimeError(f"Real HAL command is not mapped: {name}")
         method = "GET" if name == "hal.reconnect" else "POST"
-        response = await self._request(method, path, payload or {})
+        request_payload = self._hal_command_payload(name, payload or {})
+        response = await self._request(method, path, request_payload)
         self.logs.info("[HAL]", f"{name} forwarded to real HAL")
         return {"mode": "real", "command": name, "response": response}
+
+    def _hal_command_payload(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if name != "motion.teleop_target_update":
+            return payload
+        deltas = payload.get("deltas")
+        if not isinstance(deltas, dict):
+            return payload
+        request_payload = dict(payload)
+        for axis in ("X", "Y", "Z", "Roll", "Pitch", "Yaw"):
+            if axis in deltas:
+                request_payload[axis] = deltas[axis]
+        return request_payload
 
     async def motion_state(self) -> dict[str, Any]:
         return self._with_receive_timestamp(await self._request("GET", "/motion/state"))

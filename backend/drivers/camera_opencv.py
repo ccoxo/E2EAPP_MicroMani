@@ -826,9 +826,6 @@ class OpenCVCameraDriver:
             float(CAMERA_TUNING_DEFAULTS[role]["gain"]),
         )
         profile["autoWhiteBalance"] = bool(profile.get("autoWhiteBalance", False))
-        if role in {"wrist_left", "wrist_right"}:
-            profile["autoExposure"] = False
-            profile["exposure"] = min(float(profile["exposure"]), -5.0)
         return profile
 
     def _apply_tuning(self, cv2: Any, capture: Any, profile: dict[str, float | bool]) -> dict[str, float | None]:

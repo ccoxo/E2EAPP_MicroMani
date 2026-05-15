@@ -24,6 +24,7 @@ import {
   tareForceSensors as tareForceSensorsApi,
   toggleClutch as toggleClutchApi,
   putConfig,
+  type RecordEpisodeSaveApi,
   wsUrl,
 } from '../api/index'
 import { defaultConfig, defaultDiagnostics, logChannels } from '../data'
@@ -833,6 +834,28 @@ function makeRecordQualityReport(state: TelemetryStore): RecordQualityReport {
   }
 }
 
+function reportFromSavedEpisode(fallback: RecordQualityReport, episode?: RecordEpisodeSaveApi): RecordQualityReport {
+  if (!episode) return fallback
+  const warnings = Array.isArray(episode.warnings) ? episode.warnings : fallback.warnings
+  const drops = episode.cameraDrops ?? {}
+  return {
+    ...fallback,
+    index: typeof episode.episodeIndex === 'number' ? episode.episodeIndex : fallback.index,
+    frameCount: typeof episode.frames === 'number' ? episode.frames : fallback.frameCount,
+    durationS: typeof episode.durationS === 'number' ? episode.durationS : fallback.durationS,
+    lateFrames: typeof episode.lateFrames === 'number' ? episode.lateFrames : fallback.lateFrames,
+    maxForceLeft: typeof episode.maxForceLeft === 'number' ? episode.maxForceLeft : fallback.maxForceLeft,
+    maxForceRight: typeof episode.maxForceRight === 'number' ? episode.maxForceRight : fallback.maxForceRight,
+    cameraDrops: {
+      global: drops.global ?? fallback.cameraDrops.global,
+      wristLeft: drops.wrist_left ?? fallback.cameraDrops.wristLeft,
+      wristRight: drops.wrist_right ?? fallback.cameraDrops.wristRight,
+    },
+    warnings,
+    passed: warnings.length === 0,
+  }
+}
+
 function makeDiscardedEpisodeRecord(session: RecordSessionState): EpisodeRecord {
   return {
     index: session.currentEpisode,
@@ -1181,16 +1204,11 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   },
 
   saveRecordEpisode: () => {
-    void saveRecordEpisodeApi().catch((error) => {
-      set((state) => ({
-        logs: appendLog(state.logs, makeLog('ERROR', `record episode save failed: ${String(error)}`, '[LEROBOT]')),
-      }))
-    })
+    let pendingReport: RecordQualityReport | null = null
     set((state) => {
       if (state.recordSession.phase !== 'recording') return state
-      const report = makeRecordQualityReport(state)
-      const nextSavedEpisodes = state.recordSession.savedEpisodes + 1
-      const nextCurrentEpisode = report.index + 1
+      pendingReport = makeRecordQualityReport(state)
+      const report = pendingReport
       return {
         recording: false,
         recordSession: {
@@ -1199,14 +1217,50 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
           phaseStartedAt: Date.now(),
           recorderElapsedS: 0,
           recorderTotalS: -1,
-          savedEpisodes: nextSavedEpisodes,
-          currentEpisode: nextCurrentEpisode,
-          latestQualityReport: report,
-          episodeHistory: [report, ...state.recordSession.episodeHistory].slice(0, 20),
+          latestQualityReport: null,
         },
-        logs: appendLog(state.logs, makeLog('INFO', `Episode #${report.index} 已保存，等待质量确认`, '[LEROBOT]')),
+        logs: appendLog(state.logs, makeLog('INFO', `Episode #${report.index} save started; waiting for LeRobot files`, '[LEROBOT]')),
       }
     })
+    if (!pendingReport) return
+    const reportSnapshot = pendingReport
+
+    void saveRecordEpisodeApi()
+      .then((payload) => {
+        set((state) => {
+          if (state.recordSession.phase !== 'saving') return state
+          const report = reportFromSavedEpisode(reportSnapshot, payload.data?.episode)
+          const nextSavedEpisodes = state.recordSession.savedEpisodes + 1
+          const nextCurrentEpisode = report.index + 1
+          return {
+            recording: false,
+            recordSession: {
+              ...state.recordSession,
+              savedEpisodes: nextSavedEpisodes,
+              currentEpisode: nextCurrentEpisode,
+              latestQualityReport: report,
+              episodeHistory: [report, ...state.recordSession.episodeHistory].slice(0, 20),
+            },
+            logs: appendLog(state.logs, makeLog('INFO', `Episode #${report.index} save completed; quality report ready`, '[LEROBOT]')),
+          }
+        })
+      })
+      .catch((error) => {
+        set((state) => ({
+          recording: false,
+          recordSession: state.recordSession.phase === 'saving'
+            ? {
+                ...state.recordSession,
+                phase: 'recording',
+                phaseStartedAt: Date.now(),
+                recorderFps: 0,
+                recorderTotalS: -1,
+                latestQualityReport: null,
+              }
+            : state.recordSession,
+          logs: appendLog(state.logs, makeLog('ERROR', `record episode save failed: ${String(error)}`, '[LEROBOT]')),
+        }))
+      })
   },
 
   discardRecordEpisode: () => {
@@ -1282,6 +1336,12 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   },
 
   finishRecordSession: () => {
+    if (get().recordSession.phase === 'saving') {
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('WARNING', 'record session finish skipped while episode save is pending', '[LEROBOT]')),
+      }))
+      return
+    }
     void finishRecordSessionApi().finally(() => {
       set((state) => ({
         recording: false,

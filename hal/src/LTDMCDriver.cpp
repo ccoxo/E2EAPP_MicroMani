@@ -96,7 +96,11 @@ int stageAxisCount(appstation::hal::Side side) {
 }
 
 bool usesSevonPin(appstation::hal::Side side, appstation::hal::SemanticAxis axis) {
-  return physicalAxis(side, axis) < 8;
+  return physicalAxis(side, axis) < stageAxisCount(side);
+}
+
+bool hasReadableSevonFeedback(appstation::hal::Side side, appstation::hal::SemanticAxis axis) {
+  return usesSevonPin(side, axis);
 }
 
 double clipTeleopTargetToLimit(double targetUi, const AxisLimit& limit) {
@@ -226,7 +230,7 @@ MotionState LTDMCDriver::readState() {
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
       const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
       pulse_[index] = static_cast<double>(dmcGetPosition(card, axisNo));
-      if (dmcReadSevonPin && usesSevonPin(side, axis)) {
+      if (dmcReadSevonPin && hasReadableSevonFeedback(side, axis)) {
         enabled_[index] = dmcReadSevonPin(card, axisNo) > 0;
       }
       state.axes[index].moving = dmcCheckDone(card, axisNo) == 0;
@@ -359,10 +363,10 @@ void LTDMCDriver::homeAll(const std::array<double, 12>& workOriginPulse) {
   if (!dmcSetProfile || !dmcPMove || !dmcCheckDone) {
     throw std::runtime_error("required LTDMC motion exports missing");
   }
-  constexpr double kTranslationMaxVelocityPulse = 10000.0;
-  constexpr double kRotationMaxVelocityPulse = 5000.0;
-  constexpr double kTranslationStartVelocityPulse = 1000.0;
-  constexpr double kRotationStartVelocityPulse = 500.0;
+  constexpr double kTranslationMaxVelocityUi = 4000.0;
+  constexpr double kRotationMaxVelocityUi = 6.0;
+  constexpr double kTranslationStartVelocityUi = 300.0;
+  constexpr double kRotationStartVelocityUi = 0.5;
   constexpr double kRampSec = 0.05;
   for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
@@ -376,8 +380,10 @@ void LTDMCDriver::homeAll(const std::array<double, 12>& workOriginPulse) {
         throw std::runtime_error(dmcAxisFailureMessage("axis busy before home_all", -1, card, axisNo));
       }
       const auto rotation = isRotation(axis);
-      const auto maxVelocityPulse = rotation ? kRotationMaxVelocityPulse : kTranslationMaxVelocityPulse;
-      const auto startVelocityPulse = rotation ? kRotationStartVelocityPulse : kTranslationStartVelocityPulse;
+      const auto maxVelocityPulse =
+          velocityToPulsePerSec(side, axis, rotation ? kRotationMaxVelocityUi : kTranslationMaxVelocityUi);
+      const auto startVelocityPulse =
+          velocityToPulsePerSec(side, axis, rotation ? kRotationStartVelocityUi : kTranslationStartVelocityUi);
       const auto retProfile =
           dmcSetProfile(card, axisNo, startVelocityPulse, maxVelocityPulse, kRampSec, kRampSec, 0.0);
       if (retProfile != 0) {
@@ -395,6 +401,61 @@ void LTDMCDriver::homeAll(const std::array<double, 12>& workOriginPulse) {
   }
 #else
   pulse_ = workOriginPulse;
+#endif
+  estopActive_ = false;
+}
+
+void LTDMCDriver::homeOriginSide(Side side, const std::array<double, 6>& workOriginPulse) {
+  std::scoped_lock lock(mutex_);
+  ensureInitialized();
+#if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
+  if (!dmcSetProfile || !dmcPMove || !dmcCheckDone) {
+    throw std::runtime_error("required LTDMC motion exports missing");
+  }
+  constexpr double kTranslationMaxVelocityUi = 4000.0;
+  constexpr double kRotationMaxVelocityUi = 6.0;
+  constexpr double kTranslationStartVelocityUi = 300.0;
+  constexpr double kRotationStartVelocityUi = 0.5;
+  constexpr double kRampSec = 0.05;
+  const auto card = cardForSide(side);
+  for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    const auto axis = static_cast<SemanticAxis>(axisIndex);
+    const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
+    if (dmcCheckDone(card, axisNo) == 0) {
+      throw std::runtime_error(dmcAxisFailureMessage("axis busy before home_origin_side", -1, card, axisNo));
+    }
+  }
+  for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    const auto axis = static_cast<SemanticAxis>(axisIndex);
+    const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
+    const auto index = stateIndex(side, axis);
+    const auto targetPulse = static_cast<long>(std::llround(workOriginPulse[axisIndex]));
+    const auto rotation = isRotation(axis);
+    const auto maxVelocityPulse =
+        velocityToPulsePerSec(side, axis, rotation ? kRotationMaxVelocityUi : kTranslationMaxVelocityUi);
+    const auto startVelocityPulse =
+        velocityToPulsePerSec(side, axis, rotation ? kRotationStartVelocityUi : kTranslationStartVelocityUi);
+    const auto retProfile =
+        dmcSetProfile(card, axisNo, startVelocityPulse, maxVelocityPulse, kRampSec, kRampSec, 0.0);
+    if (retProfile != 0) {
+      throw std::runtime_error(dmcFailureMessage("dmc_set_profile", retProfile, card, axisNo, targetPulse));
+    }
+    if (dmcSetSProfile) {
+      dmcSetSProfile(card, axisNo, 0, 0.0);
+    }
+    const auto retMove = dmcPMove(card, axisNo, targetPulse, 1);
+    if (retMove != 0) {
+      throw std::runtime_error(dmcFailureMessage("dmc_pmove", retMove, card, axisNo, targetPulse));
+    }
+    pulse_[index] = static_cast<double>(targetPulse);
+    teleopTargetActive_[index] = false;
+  }
+#else
+  for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    const auto index = stateIndex(side, static_cast<SemanticAxis>(axisIndex));
+    pulse_[index] = workOriginPulse[axisIndex];
+    teleopTargetActive_[index] = false;
+  }
 #endif
   estopActive_ = false;
 }
@@ -495,11 +556,13 @@ void LTDMCDriver::moveRelativeUi(
   estopActive_ = false;
 }
 
-void LTDMCDriver::updateTeleopTargetUi(
+TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
     Side side,
     const std::array<double, 6>& deltaUi,
     double translationStepPulse,
     double rotationStepPulse,
+    double translationPulseDeadband,
+    double rotationPulseDeadband,
     const std::array<bool, 6>& enabledAxes,
     bool syncZeroDeltaTarget,
     const std::array<AxisLimit, 6>& limits,
@@ -517,12 +580,15 @@ void LTDMCDriver::updateTeleopTargetUi(
   if (translationStepPulse <= 0 || rotationStepPulse <= 0) {
     throw std::runtime_error("teleop pulse step limit must be positive");
   }
+  translationPulseDeadband = (std::max)(0.0, translationPulseDeadband);
+  rotationPulseDeadband = (std::max)(0.0, rotationPulseDeadband);
   const double tacc = accTimeSec > 0 ? accTimeSec : 0.05;
   const double tdec = decTimeSec > 0 ? decTimeSec : 0.05;
   const auto card = cardForSide(side);
+  TeleopTargetUpdateResult result;
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
-  if (!dmcSetProfile || !dmcCheckDone || !dmcUpdateTargetPosition) {
-    throw std::runtime_error("required LTDMC teleop exports missing: set_profile/check_done/update_target_position");
+  if (!dmcSetProfile || !dmcPMove || !dmcCheckDone || !dmcUpdateTargetPosition) {
+    throw std::runtime_error("required LTDMC teleop exports missing: set_profile/pmove/check_done/update_target_position");
   }
 #endif
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
@@ -530,13 +596,24 @@ void LTDMCDriver::updateTeleopTargetUi(
     const auto delta = deltaUi[axisIndex];
     const auto rotation = isRotation(axis);
     const auto index = stateIndex(side, axis);
+    const auto currentTargetPulse = teleopTargetActive_[index] ? teleopTargetPulse_[index] : pulse_[index];
+    result.requestedDeltaUi[axisIndex] = delta;
+    result.targetPulse[axisIndex] = currentTargetPulse;
+    result.targetUi[axisIndex] = pulseToUi(currentTargetPulse, side, axis);
     if (!enabledAxes[axisIndex]) {
       teleopTargetActive_[index] = false;
       continue;
     }
     const auto stepLimitPulse = rotation ? rotationStepPulse : translationStepPulse;
+    const auto pulseDeadband = rotation ? rotationPulseDeadband : translationPulseDeadband;
     const auto requestedDeltaPulse = static_cast<long>(std::llround(uiToPulse(delta, side, axis)));
-    const auto deltaPulse = clampPulseStep(requestedDeltaPulse, stepLimitPulse);
+    const auto deadbandedDeltaPulse =
+        std::abs(requestedDeltaPulse) <= static_cast<long>(std::llround(pulseDeadband)) ? 0 : requestedDeltaPulse;
+    const auto deltaPulse = clampPulseStep(deadbandedDeltaPulse, stepLimitPulse);
+    result.requestedDeltaPulse[axisIndex] = static_cast<double>(requestedDeltaPulse);
+    if (deltaPulse != requestedDeltaPulse) {
+      result.clipped[axisIndex] = true;
+    }
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
     if (deltaPulse == 0) {
       if (syncZeroDeltaTarget) {
@@ -549,6 +626,8 @@ void LTDMCDriver::updateTeleopTargetUi(
 #endif
         teleopTargetPulse_[index] = pulse_[index];
         teleopTargetActive_[index] = true;
+        result.targetPulse[axisIndex] = pulse_[index];
+        result.targetUi[axisIndex] = pulseToUi(pulse_[index], side, axis);
       }
       continue;
     }
@@ -571,16 +650,26 @@ void LTDMCDriver::updateTeleopTargetUi(
     const bool moving = false;
 #endif
     const auto basePulse = teleopTargetActive_[index] ? teleopTargetPulse_[index] : pulse_[index];
+    const auto baseUi = pulseToUi(basePulse, side, axis);
     const auto limit = limits[axisIndex];
     const auto unclippedTargetPulse = basePulse + static_cast<double>(deltaPulse);
     const auto unclippedTargetUi = pulseToUi(unclippedTargetPulse, side, axis);
     const auto targetUi = clipTeleopTargetToLimit(unclippedTargetUi, limit);
     const auto targetPulse = uiToPulse(targetUi, side, axis);
+    const auto updateTargetPulse = static_cast<long>(std::llround(targetPulse));
+    const auto appliedTargetPulse = static_cast<double>(updateTargetPulse);
+    const auto appliedTargetUi = pulseToUi(appliedTargetPulse, side, axis);
+    if (std::abs(targetUi - unclippedTargetUi) > 1e-9) {
+      result.clipped[axisIndex] = true;
+    }
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
     if (!moving) {
       applyMotionProfile(card, axisNo, startVelocityPulse, maxVelocityPulse, tacc, tdec, deltaPulse);
+      const auto retMove = dmcPMove(card, axisNo, updateTargetPulse, 1);
+      if (retMove != 0) {
+        throw std::runtime_error(dmcFailureMessage("dmc_pmove", retMove, card, axisNo, deltaPulse));
+      }
     }
-    const auto updateTargetPulse = static_cast<long>(std::llround(targetPulse));
     updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse);
 #else
     (void)card;
@@ -591,11 +680,16 @@ void LTDMCDriver::updateTeleopTargetUi(
     (void)tacc;
     (void)tdec;
 #endif
-    teleopTargetPulse_[index] = targetPulse;
+    result.appliedDeltaPulse[axisIndex] = appliedTargetPulse - basePulse;
+    result.appliedDeltaUi[axisIndex] = appliedTargetUi - baseUi;
+    result.targetPulse[axisIndex] = appliedTargetPulse;
+    result.targetUi[axisIndex] = appliedTargetUi;
+    teleopTargetPulse_[index] = appliedTargetPulse;
     teleopTargetActive_[index] = true;
-    pulse_[index] = targetPulse;
+    pulse_[index] = appliedTargetPulse;
   }
   estopActive_ = false;
+  return result;
 }
 
 void LTDMCDriver::stopTeleopSide(Side side) {
@@ -678,11 +772,10 @@ bool LTDMCDriver::axisMotionEnabled(Side side, SemanticAxis axis) const {
   if (enabled_[stateIndex(side, axis)]) {
     return true;
   }
-  if (usesSevonPin(side, axis)) {
+  if (hasReadableSevonFeedback(side, axis)) {
     return false;
   }
-  // Axis 8 (right Roll) has no readable SEVON pin, so a false cached flag
-  // means unknown rather than definitely disabled.
+  // Treat unreadable feedback as unknown rather than definitely disabled.
   return true;
 }
 

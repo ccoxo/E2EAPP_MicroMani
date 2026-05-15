@@ -17,6 +17,7 @@ class LTDMCDriver {
   std::string enableSide(Side side, bool enabled = true);
   void homeSide(Side side);
   void homeAll(const std::array<double, 12>& workOriginPulse);
+  void homeOriginSide(Side side, const std::array<double, 6>& workOriginPulse);
   void moveAllUi(const std::array<double, 12>& targetUi, const std::array<AxisLimit, 12>& limits);
   // maxVelocityUiPerSec/startVelocityUiPerSec are in the semantic UI unit
   // (um/s for translation, deg/s for rotation). Pass <= 0 to fall back to the
@@ -29,11 +30,13 @@ class LTDMCDriver {
       double startVelocityUiPerSec = 0.0,
       double accTimeSec = 0.0,
       double decTimeSec = 0.0);
-  void updateTeleopTargetUi(
+  TeleopTargetUpdateResult updateTeleopTargetUi(
       Side side,
       const std::array<double, 6>& deltaUi,
       double translationStepPulse,
       double rotationStepPulse,
+      double translationPulseDeadband,
+      double rotationPulseDeadband,
       const std::array<bool, 6>& enabledAxes,
       bool syncZeroDeltaTarget,
       const std::array<AxisLimit, 6>& limits,

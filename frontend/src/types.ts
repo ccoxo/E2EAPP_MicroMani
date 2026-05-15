@@ -126,6 +126,24 @@ export interface ArmMotionProfile {
   rotation: MotionAxisProfile
 }
 
+export interface MotionKinematicsConfig {
+  source: string
+  axisOrder: string[]
+  leftAxisMap: number[]
+  rightAxisMap: number[]
+  leftPhysicalAxis: number[]
+  rightPhysicalAxis: number[]
+  axisUnitSpec: string[]
+  leftPulsePerUnit: number[]
+  rightPulsePerUnit: number[]
+  leftDirectionSign: number[]
+  rightDirectionSign: number[]
+  leftSignedPulsePerUnit: number[]
+  rightSignedPulsePerUnit: number[]
+  syncActionPulseCoeff: boolean
+  updatedAt: string
+}
+
 export interface AxisSoftLimitConfig {
   min: number
   max: number
@@ -147,6 +165,10 @@ export interface MotionOriginConfig {
   leftPulse: number[]
   rightPulse: number[]
   updatedAt: number
+  previousValid: boolean
+  previousLeftPulse: number[]
+  previousRightPulse: number[]
+  previousUpdatedAt: number
 }
 
 export interface MotionStartupHomeConfig {
@@ -160,7 +182,7 @@ export type ManualSpeedMode = 'fine' | 'medium' | 'coarse'
 export type ManualGripperCommand = 'enable' | 'disable' | 'open' | 'close' | 'home' | 'target' | 'stop'
 export type PicoVisionCameraSource = CameraTelemetry['key']
 export type PicoVisionRotation = 'none' | 'cw90' | 'ccw90' | '180'
-export type Omega7StabilityMode = 'track' | 'hold' | 'free'
+export type Omega7StabilityMode = 'track' | 'hold' | 'off'
 
 export type RecorderPhase = 'idle' | 'recording' | 'resetting' | 'saving' | 'finishing'
 
@@ -365,6 +387,7 @@ export interface AppConfig {
     rightProfile: ArmMotionProfile
     leftSoftLimits: ArmSoftLimitConfig
     rightSoftLimits: ArmSoftLimitConfig
+    kinematics: MotionKinematicsConfig
   }
   gripper: {
     leftPort: string
@@ -441,16 +464,20 @@ export interface AppConfig {
     rightForceFeedback: boolean
     strategyVersion: string
     swapHands: boolean
+    swapTeleopChannels: boolean
     leftTranslationScale: number
     rightTranslationScale: number
     leftRotationScale: number
     rightRotationScale: number
+    homeBeforeStart: boolean
     leftAxisOutputScale: number[]
     rightAxisOutputScale: number[]
     translationStepUm: number
     rotationStepDeg: number
     translationStepLimitPulse: number
     rotationStepLimitPulse: number
+    translationPulseDeadband: number
+    rotationPulseDeadband: number
     translationDeadzone: number
     rotationDeadzone: number
     incrementalTranslationMinEffectiveDelta: number
@@ -463,6 +490,7 @@ export interface AppConfig {
     motionProfileDecSec: number
     leftEnabledAxes: boolean[]
     rightEnabledAxes: boolean[]
+    softLimitUnitSpec: string[]
     leftSoftLimitMin: number[]
     leftSoftLimitMax: number[]
     rightSoftLimitMin: number[]
@@ -481,8 +509,15 @@ export interface AppConfig {
       closeThreshold: number
       gripSpeed: number
       gripTorque: number
+      positionDeadbandCounts: number
+      minCommandIntervalMs: number
+      autoGapCalibration: boolean
+      autoGapMinSpanMm: number
+      autoGapMarginMm: number
       releaseSpeed: number
       releaseTorque: number
+      leftSourceHand: string
+      rightSourceHand: string
       objectDetectMargin: number
       buttonFallback: boolean
       diagLog: boolean

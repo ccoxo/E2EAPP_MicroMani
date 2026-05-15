@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import os
@@ -25,7 +25,7 @@ from backend.core.schemas import (
 )
 from backend.core.units import pulses_to_ui_state
 from backend.hal_client.client import HalClient, RealHalClient, TestHalClient
-from backend.services.command_service import CommandService
+from backend.services.command_service import CommandService, normalize_motion_axis_enabled
 from backend.services.dataset_recorder import DatasetRecorderService, DatasetSaveError
 from backend.services.gripper_tele_service import GripperTeleService
 from backend.services.gripper_worker_service import GripperWorkerService
@@ -37,12 +37,12 @@ from backend.services.teleop_mapping import TeleopMappingService
 
 
 def envelope(data: dict[str, Any] | None = None) -> ApiEnvelope:
-    # 统一 API 响应外壳，便于前端按 ok/data/ts 的固定结构处理结果。
+    # 缁熶竴 API 鍝嶅簲澶栧３锛屼究浜庡墠绔寜 ok/data/ts 鐨勫浐瀹氱粨鏋勫鐞嗙粨鏋溿€?
     return ApiEnvelope(ok=True, data=data or {}, ts=now_ms())
 
 
 def mask_omega_state_for_logical_connection(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    # 物理设备可能仍然在线；这里按前端的逻辑连接开关隐藏未启用的手柄状态。
+    # 鐗╃悊璁惧鍙兘浠嶇劧鍦ㄧ嚎锛涜繖閲屾寜鍓嶇鐨勯€昏緫杩炴帴寮€鍏抽殣钘忔湭鍚敤鐨勬墜鏌勭姸鎬併€?
     masked = dict(state)
     hands = state.get("hands")
     if not isinstance(hands, list):
@@ -105,7 +105,7 @@ def relative_motion_positions(
         relative_pulses[6:12] = [float(pulses[index + 6]) - right_origin[index] for index in range(6)]
     if not left_valid and not right_valid:
         return next_positions
-    relative_positions = pulses_to_ui_state(relative_pulses)
+    relative_positions = pulses_to_ui_state(relative_pulses, config)
     if left_valid and left_origin is not None:
         next_positions[:6] = relative_positions[:6]
     if right_valid and right_origin is not None:
@@ -114,7 +114,7 @@ def relative_motion_positions(
 
 
 def runtime_dir_from_env() -> Path:
-    # 测试和本地运行可以通过环境变量隔离 runtime 数据目录。
+    # 娴嬭瘯鍜屾湰鍦拌繍琛屽彲浠ラ€氳繃鐜鍙橀噺闅旂 runtime 鏁版嵁鐩綍銆?
     raw = os.environ.get("APPSTATION_RUNTIME_DIR")
     if raw:
         return Path(raw)
@@ -132,7 +132,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    # 服务实例集中挂到 app.state，FastAPI 路由和 WebSocket 循环共享同一套运行时状态。
+    # 鏈嶅姟瀹炰緥闆嗕腑鎸傚埌 app.state锛孎astAPI 璺敱鍜?WebSocket 寰幆鍏变韩鍚屼竴濂楄繍琛屾椂鐘舵€併€?
     logs = LogService()
     settings = SettingsService(runtime_dir or runtime_dir_from_env(), logs)
     hardware = HardwareService(settings, logs)
@@ -163,7 +163,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     stability.set_ws_client_count_provider(lambda: len(app.state.ws_clients))
 
     def set_teleop_logical_connection(side: str, connected: bool) -> dict[str, Any]:
-        # 逻辑连接状态写入配置，让页面刷新后仍能保留操作员显式选择。
+        # 閫昏緫杩炴帴鐘舵€佸啓鍏ラ厤缃紝璁╅〉闈㈠埛鏂板悗浠嶈兘淇濈暀鎿嶄綔鍛樻樉寮忛€夋嫨銆?
         config = settings.get_config()
         config["teleop"][f"{side}Connected"] = connected
         return settings.save_config(config, emit_log=False)
@@ -195,7 +195,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         }
 
     async def delayed_runtime_shutdown(reason: str) -> None:
-        # 浏览器关闭后延迟停栈，给快速刷新或 WebSocket 重连留出缓冲时间。
+        # 娴忚鍣ㄥ叧闂悗寤惰繜鍋滄爤锛岀粰蹇€熷埛鏂版垨 WebSocket 閲嶈繛鐣欏嚭缂撳啿鏃堕棿銆?
         delay_sec = float(os.environ.get("APPSTATION_CLOSE_SHUTDOWN_DELAY_SEC", "5"))
         await asyncio.sleep(delay_sec)
         active_clients = len(app.state.ws_clients)
@@ -444,6 +444,14 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def clear_motion_origin_all() -> ApiEnvelope:
         return envelope(commands.clear_motion_origin())
 
+    @app.post("/api/motion/origin/restore_previous")
+    async def restore_previous_motion_origin() -> ApiEnvelope:
+        try:
+            return envelope(commands.restore_previous_motion_origin())
+        except RuntimeError as exc:
+            logs.error("[HAL]", f"restore_previous_motion_origin failed: {exc}")
+            raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
+
     @app.post("/api/motion/{side}/origin/capture")
     async def capture_motion_origin_side(side: str) -> ApiEnvelope:
         if side not in {"left", "right"}:
@@ -498,6 +506,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             return envelope(await commands.home_motion_side(side))
         except RuntimeError as exc:
             logs.error("[HAL]", f"home_motion_side failed: {exc}")
+            raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
+
+    @app.post("/api/motion/{side}/return_origin")
+    async def return_motion_origin_side(side: str) -> ApiEnvelope:
+        if side not in {"left", "right"}:
+            raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
+        try:
+            return envelope(await commands.return_motion_origin_side(side))
+        except RuntimeError as exc:
+            logs.error("[HAL]", f"return_motion_origin_side failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
 
     @app.post("/api/motion/manual_axis_move")
@@ -614,7 +632,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             physical_connected = False
             if hal_health.omega7_ok:
                 try:
-                    # 连接按钮只建立“逻辑连接”；真实设备仍由 HAL 持有并持续采样。
+                    # 杩炴帴鎸夐挳鍙缓绔嬧€滈€昏緫杩炴帴鈥濓紱鐪熷疄璁惧浠嶇敱 HAL 鎸佹湁骞舵寔缁噰鏍枫€?
                     omega_state = await hal.omega_state()
                     hand = next(
                         (
@@ -633,8 +651,30 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 message = hal_health.message or "Omega.7 not ready"
         set_teleop_logical_connection(side, connected)
         if connected:
-            # 只在设备读数可信时启动映射，避免断连手柄触发运动命令。
-            await teleop_mapper.start("teleop-connect")
+            # Only start mapping from trustworthy device samples.
+            config = settings.get_config()
+            teleop_config = config.get("teleop", {})
+            swap_channels = (
+                isinstance(teleop_config, dict)
+                and bool(teleop_config.get("swapTeleopChannels", False))
+            )
+            mapped_side = ("right" if side == "left" else "left") if swap_channels else side
+            try:
+                await commands.enable_motion_side(mapped_side)
+            except RuntimeError as exc:
+                logs.error("[HAL]", f"teleop connect enable mapped {mapped_side} failed: {exc}")
+            try:
+                await commands.return_motion_origin_side(mapped_side)
+            except RuntimeError as exc:
+                logs.error("[HAL]", f"teleop connect return-to-work-origin {mapped_side} failed: {exc}")
+            try:
+                await teleop_mapper.start("teleop-connect", pre_home=False)
+            except RuntimeError as exc:
+                logs.error("[HAL]", f"teleop mapper start failed: {exc}")
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)},
+                ) from exc
         logs.info(
             "[HAL]",
             f"{side} Omega.7 logical connect requested; connected={connected}, physical={physical_connected}",
@@ -667,6 +707,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             return envelope(mask_omega_state_for_logical_connection(omega_state, settings.get_config()))
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail={"code": "OMEGA_UNAVAILABLE", "message": str(exc)}) from exc
+
+    @app.get("/api/teleop/mapping/status")
+    async def teleop_mapping_status() -> ApiEnvelope:
+        return envelope(teleop_mapper.status())
 
     @app.post("/api/teleop/{side}/gravity_compensation")
     async def teleop_gravity_compensation(side: str, payload: dict[str, Any] | None = None) -> ApiEnvelope:
@@ -919,7 +963,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/datasets/{dataset_id}/episodes/{episode_id}")
     async def dataset_episode_detail(dataset_id: str, episode_id: str) -> ApiEnvelope:
-        """返回单条 episode 复核详情，保持 ok/data/ts envelope 契约。"""
+        """Return one episode review detail in the standard envelope."""
         try:
             return envelope(recorder.episode_detail(dataset_id, episode_id))
         except FileNotFoundError as exc:
@@ -1003,7 +1047,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         if now - last_motion_state_at >= state_period:
                             last_motion_state_at = now
                             try:
-                                # 运动轴状态变化快，但 50ms 缓存足够支撑 UI，并减少 HAL HTTP 往返。
+                                # 杩愬姩杞寸姸鎬佸彉鍖栧揩锛屼絾 50ms 缂撳瓨瓒冲鏀拺 UI锛屽苟鍑忓皯 HAL HTTP 寰€杩斻€?
                                 cached_motion_state = await hal.motion_state()
                             except RuntimeError as exc:
                                 cached_motion_state = None
@@ -1031,19 +1075,25 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                             motion_estop_active = bool(motion_state["estop_active"])
                         raw_enabled = motion_state.get("enabled")
                         if isinstance(raw_enabled, list) and len(raw_enabled) == 12:
-                            left_axis_enabled = [bool(value) for value in raw_enabled[:6]]
-                            right_axis_enabled: list[bool | None] = [bool(value) for value in raw_enabled[6:12]]
-                            # Right Roll is physical axis 8 and has no readable SEVON feedback.
-                            # Surface a false readback as unknown instead of a hard-disabled axis.
-                            if right_axis_enabled[3] is not True:
-                                right_axis_enabled[3] = None
+                            left_axis_enabled = normalize_motion_axis_enabled("left", raw_enabled[:6])
+                            right_axis_enabled = normalize_motion_axis_enabled("right", raw_enabled[6:12])
                             motion_axis_enabled = {
                                 "left": left_axis_enabled,
                                 "right": right_axis_enabled,
                             }
+                            left_known_enabled = [value for value in left_axis_enabled if value is not None]
+                            right_known_enabled = [value for value in right_axis_enabled if value is not None]
                             motion_enabled = {
-                                "left": all(motion_axis_enabled["left"]),
-                                "right": all(motion_axis_enabled["right"]),
+                                "left": (
+                                    all(value is True for value in left_known_enabled)
+                                    if left_known_enabled
+                                    else None
+                                ),
+                                "right": (
+                                    all(value is True for value in right_known_enabled)
+                                    if right_known_enabled
+                                    else None
+                                ),
                             }
                         elif isinstance(raw_enabled, dict):
                             raw_left_enabled = raw_enabled.get("left")
@@ -1057,7 +1107,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         if now - last_omega_state_at >= state_period:
                             last_omega_state_at = now
                             try:
-                                # Omega.7 状态随遥操作连接一起推送，前端再按逻辑连接过滤显示。
+                                # Omega.7 鐘舵€侀殢閬ユ搷浣滆繛鎺ヤ竴璧锋帹閫侊紝鍓嶇鍐嶆寜閫昏緫杩炴帴杩囨护鏄剧ず銆?
                                 omega_state = await hal.omega_state()
                                 raw_hands = omega_state.get("hands")
                                 cached_omega_hands = [
@@ -1080,7 +1130,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     frame.processStatus[0].label = "HalServer.exe" if hal_health.mode == "real" else "Test HAL boundary"
                     frame.processStatus[0].status = "running" if hal_health.connected else "error"
                     await ws.send_json({"type": "telemetry", "data": frame.model_dump(mode="json")})
-                    # 日志和遥测走同一条 WebSocket，前端不需要再轮询日志接口。
+                    # 鏃ュ織鍜岄仴娴嬭蛋鍚屼竴鏉?WebSocket锛屽墠绔笉闇€瑕佸啀杞鏃ュ織鎺ュ彛銆?
                     for entry in logs.entries_after(last_log_id):
                         await ws.send_json({"type": "log", "data": entry.model_dump(mode="json")})
                         last_log_id = max(last_log_id, entry.id)
@@ -1106,7 +1156,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
 
 def make_hal_client(config: dict[str, Any], logs: LogService) -> HalClient:
-    # HAL 模式优先读取环境变量，方便测试脚本覆盖持久化配置。
+    # HAL 妯″紡浼樺厛璇诲彇鐜鍙橀噺锛屾柟渚挎祴璇曡剼鏈鐩栨寔涔呭寲閰嶇疆銆?
     env_mode = os.environ.get("APPSTATION_HAL_MODE")
     hal_config = config.get("hal", {})
     mode = str(env_mode or hal_config.get("mode", "real")).lower()

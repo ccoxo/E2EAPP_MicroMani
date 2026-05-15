@@ -1,6 +1,12 @@
+from __future__ import annotations
+
+from typing import Any
+
+from backend.core.defaults import ICF_KINEMATICS_DEFAULTS
+
 ROTATION_AXES = {3, 4, 5, 9, 10, 11}
-LEFT_PULSE_PER_UNIT = (-9000.0, -10000.0, -10000.0, 1666.666667, 2500.0, 3333.333333)
-RIGHT_PULSE_PER_UNIT = (-4878.0487804878, 10000.0, -1923.07692307692, 1666.666667, -2500.0, -3333.333333)
+LEFT_PULSE_PER_UNIT = tuple(float(value) for value in ICF_KINEMATICS_DEFAULTS["leftSignedPulsePerUnit"])
+RIGHT_PULSE_PER_UNIT = tuple(float(value) for value in ICF_KINEMATICS_DEFAULTS["rightSignedPulsePerUnit"])
 MOTION_PULSE_PER_UNIT = LEFT_PULSE_PER_UNIT + RIGHT_PULSE_PER_UNIT
 
 
@@ -27,10 +33,49 @@ def lerobot_to_ui_state(values: list[float]) -> list[float]:
     return [float(value) / 1000.0 if idx in ROTATION_AXES else float(value) for idx, value in enumerate(values)]
 
 
-def pulses_to_ui_state(pulses: list[float]) -> list[float]:
+def motion_pulse_per_unit(config: dict[str, Any] | None = None) -> tuple[float, ...]:
+    """Return signed pulse-per-unit for all 12 axes from runtime kinematics config."""
+    motion = config.get("motion", {}) if isinstance(config, dict) else {}
+    kinematics = motion.get("kinematics", {}) if isinstance(motion, dict) else {}
+    if not isinstance(kinematics, dict):
+        kinematics = ICF_KINEMATICS_DEFAULTS
+    left = _side_pulse_per_unit("left", kinematics)
+    right = _side_pulse_per_unit("right", kinematics)
+    return left + right
+
+
+def pulses_to_ui_state(pulses: list[float], config: dict[str, Any] | None = None) -> list[float]:
     """Convert signed LTDMC pulse counts to frontend units for all 12 axes."""
     values = (list(pulses) + [0.0] * 12)[:12]
+    pulse_per_unit = motion_pulse_per_unit(config)
     return [
-        pulse_to_ui(float(pulse), idx, MOTION_PULSE_PER_UNIT[idx])
+        pulse_to_ui(float(pulse), idx, pulse_per_unit[idx])
         for idx, pulse in enumerate(values)
     ]
+
+
+def _side_pulse_per_unit(side: str, kinematics: dict[str, Any]) -> tuple[float, ...]:
+    defaults = ICF_KINEMATICS_DEFAULTS
+    signed_key = f"{side}SignedPulsePerUnit"
+    signed = _coerce_axis_array(kinematics.get(signed_key))
+    if signed is not None:
+        return signed
+    pulse_key = f"{side}PulsePerUnit"
+    direction_key = f"{side}DirectionSign"
+    pulse_per_unit = _coerce_axis_array(kinematics.get(pulse_key))
+    direction = _coerce_axis_array(kinematics.get(direction_key))
+    if pulse_per_unit is not None and direction is not None:
+        return tuple(pulse_per_unit[index] * direction[index] for index in range(6))
+    return tuple(float(value) for value in defaults[signed_key])
+
+
+def _coerce_axis_array(raw: Any) -> tuple[float, ...] | None:
+    if not isinstance(raw, list) or len(raw) != 6:
+        return None
+    try:
+        values = tuple(float(value) for value in raw)
+    except (TypeError, ValueError):
+        return None
+    if any(value == 0.0 for value in values):
+        return None
+    return values

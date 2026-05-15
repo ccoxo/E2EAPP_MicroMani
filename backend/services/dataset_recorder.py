@@ -86,7 +86,6 @@ ACTION_FEATURE_NAMES: tuple[str, ...] = (
     "right_gripper_target_mm",
 )
 FORCE_FEATURE_NAMES: tuple[str, ...] = ("fx", "fy", "fz", "mx", "my", "mz")
-GRIPPER_FEATURE_NAMES: tuple[str, str] = ("left_gap_mm", "right_gap_mm")
 CAMERA_SOURCE_KEYS: dict[str, str] = {key: f"camera_{key}" for key in CAMERA_KEYS}
 CAMERA_KEY_BY_SOURCE: dict[str, str] = {source: key for key, source in CAMERA_SOURCE_KEYS.items()}
 SOURCE_KEYS: tuple[str, ...] = (
@@ -98,7 +97,6 @@ SOURCE_KEYS: tuple[str, ...] = (
 )
 SOURCE_TIMEOUT_S: dict[str, float] = {
     "hal": 0.020,
-    "camera": 0.0333,
     "force": 0.020,
     "omega": 0.020,
     **{source: 0.035 for source in CAMERA_SOURCE_KEYS.values()},
@@ -118,6 +116,8 @@ SOURCE_DROP_SKEW_MS: dict[str, float] = {source: 35.0 for source in CAMERA_SOURC
 RING_BUFFER_RETENTION_S = 3.0
 WRITE_QUEUE_MAX_FRAMES = 1200
 WRITE_QUEUE_PUT_TIMEOUT_S = 1.0
+ASSEMBLY_QUEUE_MAX_FRAMES = 120
+ASSEMBLY_QUEUE_PUT_TIMEOUT_S = 1.0
 SAMPLER_START_LEAD_S = 0.05
 RECORDER_HARDWARE_WARMUP_S = 0.5
 MAX_SAMPLE_JITTER_S = 0.10
@@ -164,6 +164,15 @@ class PendingFrame:
 
 
 # 存放采样数据的缓存区，按 source 分类，支持按时间查找最近样本。
+@dataclass(frozen=True)
+class FrameAssemblyJob:
+    episode_index: int
+    episode_generation: int
+    frame_index: int
+    target_monotonic_s: float
+    period_s: float
+
+
 @dataclass(frozen=True)
 class WriterCommand:
     kind: str
@@ -220,7 +229,7 @@ class LeRobotWriterThread:
                 if self._error:
                     raise RuntimeError(self._error)
                 if self._dataset is not None:
-                    self._dataset.save_episode(parallel_encoding=False)
+                    self._dataset.save_episode(parallel_encoding=True)
                     self._dataset.finalize()
                     self._dataset = self._recorder._resume_native_dataset_locked()
                 command.future.set_result(self._native_total_frames())
@@ -388,11 +397,6 @@ class TimedRingBuffer:
         with self._lock:
             return bool(self._samples and self._samples[-1].monotonic_s >= target_s)
 
-    def prune(self, before_s: float) -> None:
-        """处理录制服务逻辑：prune。"""
-        with self._lock:
-            self._prune_locked(before_s)
-
     def _prune_locked(self, before_s: float) -> None:
         while self._samples and self._samples[0].monotonic_s < before_s:
             self._samples.popleft()
@@ -434,9 +438,11 @@ class DatasetRecorderService:
         self.teleop = teleop
         self._lock = asyncio.Lock()
         self._loop_task: asyncio.Task[None] | None = None
+        self._assembler_task: asyncio.Task[None] | None = None
         self._writer_thread: LeRobotWriterThread | None = None
         self._sampler_threads: dict[str, Thread] = {}
         self._sampler_stop_event = Event()
+        self._assembly_queue: asyncio.Queue[FrameAssemblyJob] | None = None
         self._write_queue: queue.Queue[PendingFrame | WriterCommand | None] = queue.Queue(
             maxsize=WRITE_QUEUE_MAX_FRAMES
         )
@@ -451,6 +457,7 @@ class DatasetRecorderService:
         self._task = ""
         self._dataset_dir: Path | None = None
         self._episode_index = 0
+        self._episode_generation = 0
         self._episode_started_at = 0.0
         self._episode_start_monotonic_s = 0.0
         self._sampler_start_monotonic_s = 0.0
@@ -481,7 +488,6 @@ class DatasetRecorderService:
         self._native_dataset_from_index = 0
         self._native_total_frames_cached = 0
         self._last_native_camera_frames: dict[str, Any] = {}
-        self._last_camera_cache_used: dict[str, bool] = {key: False for key in CAMERA_KEYS}
         self._record_fps_hz = 30
         self._force_sample_hz = 200.0
         self._recording_config_snapshot: dict[str, Any] = {}
@@ -512,7 +518,7 @@ class DatasetRecorderService:
             self._native_error = ""
             self._native_total_frames_cached = 0
             self._last_native_camera_frames = {}
-            self._last_camera_cache_used = {key: False for key in CAMERA_KEYS}
+            self._assembly_queue = asyncio.Queue(maxsize=ASSEMBLY_QUEUE_MAX_FRAMES)
             self._write_queue = queue.Queue(maxsize=WRITE_QUEUE_MAX_FRAMES)
             self._writer_thread = LeRobotWriterThread(self, self._write_queue)
             self._writer_thread.start()
@@ -530,6 +536,7 @@ class DatasetRecorderService:
             self._begin_episode_locked()
             self._start_sampler_tasks_locked()
             self._loop_task = asyncio.create_task(self._record_loop(), name="dataset-recorder")
+            self._assembler_task = asyncio.create_task(self._frame_assembler_loop(), name="dataset-frame-assembler")
             self.telemetry.episode_count = self._episode_index
             self.telemetry.frame_count = 0
             self.telemetry.recording = True
@@ -632,6 +639,7 @@ class DatasetRecorderService:
             except asyncio.CancelledError:
                 pass
         self._loop_task = None
+        await self._stop_assembler_task()
         await self._stop_sampler_tasks()
         await self._finalize_native_dataset()
         await self._stop_writer_task()
@@ -1095,7 +1103,6 @@ class DatasetRecorderService:
 
     async def _try_begin_native_dataset(self, config: dict[str, Any]) -> bool:
         """Open or resume the native dataset on the writer thread."""
-        _ = config
         if not self._native_recording_requested():
             self._native_error = "native LeRobot disabled by APPSTATION_LEROBOT_NATIVE"
             return False
@@ -1166,8 +1173,26 @@ class DatasetRecorderService:
     async def _drain_recording_queues(self) -> None:
         # 内部说明。
         """处理录制服务逻辑：_drain_recording_queues。"""
+        assembly_queue = self._assembly_queue
+        if assembly_queue is not None:
+            await assembly_queue.join()
         await self._write_enqueue_idle.wait()
         await asyncio.to_thread(self._write_queue.join)
+
+    async def _stop_assembler_task(self) -> None:
+        """Stop the frame assembler task after pending frame jobs have settled."""
+        assembly_queue = self._assembly_queue
+        if assembly_queue is not None:
+            await assembly_queue.join()
+        task = self._assembler_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._assembler_task = None
+        self._assembly_queue = None
 
     async def _stop_writer_task(self) -> None:
         # 停止 writer 前必须先排空队列，保证 metadata 的帧数和磁盘内容一致。
@@ -1216,15 +1241,6 @@ class DatasetRecorderService:
             except Exception as exc:  # noqa: BLE001
                 self.logs.warning("[LEROBOT]", f"{source} sampler recovered: {exc}")
                 self._sampler_stop_event.wait(0.1)
-
-    def _next_phase_aligned_sample_time(self, source: str, config: dict[str, Any], now_s: float) -> float:
-        """Return the next wall-clock sample time from the shared hardware epoch."""
-        start_s = self._sampler_start_monotonic_s or now_s
-        rate_hz = self._source_sample_rate_hz(source, config)
-        if now_s < start_s:
-            return start_s
-        next_index = int(math.floor(((now_s - start_s) * rate_hz) + 1e-9)) + 1
-        return start_s + self._source_sample_timestamp_s(source, next_index, config)
 
     def _source_sample_timestamp_s(self, source: str, sample_index: int, config: dict[str, Any]) -> float:
         """Return the hardware-relative timestamp for a source sample index."""
@@ -1283,10 +1299,6 @@ class DatasetRecorderService:
                 missing.add(source)
         return missing
 
-    async def _sample_source_once(self, source: str, config: dict[str, Any], target_s: float) -> TimedSample:
-        """Sample a concrete hardware source for a preassigned absolute timestamp."""
-        return await asyncio.to_thread(self._sample_source_once_sync, source, config, target_s)
-
     def _sample_source_once_sync(self, source: str, config: dict[str, Any], target_s: float) -> TimedSample:
         """Sample a concrete hardware source from its dedicated sampler thread."""
         if source == "hal":
@@ -1301,10 +1313,6 @@ class DatasetRecorderService:
         if camera is not None:
             return self._sample_camera_source_sync(config, camera, target_s)
         return self._fallback_sample(source, target_s, f"{source} unsupported")
-
-    async def _sample_force_source(self, config: dict[str, Any], target_s: float) -> TimedSample:
-        """处理录制服务逻辑：_sample_force_source。"""
-        return await asyncio.to_thread(self._sample_force_source_sync, config, target_s)
 
     def _sample_force_source_sync(self, config: dict[str, Any], target_s: float) -> TimedSample:
         """Read force data in the force sampler thread and timestamp it immediately."""
@@ -1342,10 +1350,6 @@ class DatasetRecorderService:
             stale=not ok,
         )
 
-    async def _sample_camera_source(self, config: dict[str, Any], camera: str, target_s: float) -> TimedSample:
-        """处理录制服务逻辑：_sample_camera_source。"""
-        return await asyncio.to_thread(self._sample_camera_source_sync, config, camera, target_s)
-
     def _sample_camera_source_sync(self, config: dict[str, Any], camera: str, target_s: float) -> TimedSample:
         """Read one camera source in its sampler thread and keep its last valid frame."""
         source = CAMERA_SOURCE_KEYS[camera]
@@ -1375,7 +1379,7 @@ class DatasetRecorderService:
         except Exception as exc:  # noqa: BLE001
             ok = False
             message = f"{source} cache used: {exc}"
-            value = self._last_camera_value(camera, feature_key)
+            value = self._last_camera_value(feature_key)
             sampled_at = None
         finished = time.monotonic()
         sample_time = sampled_at if sampled_at is not None else finished
@@ -1432,7 +1436,7 @@ class DatasetRecorderService:
             value = list(self.telemetry.gripper_positions)
         elif source in CAMERA_KEY_BY_SOURCE:
             camera = CAMERA_KEY_BY_SOURCE[source]
-            value = self._last_camera_value(camera, CAMERA_FEATURE_KEYS[camera])
+            value = self._last_camera_value(CAMERA_FEATURE_KEYS[camera])
         return SourceSample(
             source,
             target_s,
@@ -1454,68 +1458,157 @@ class DatasetRecorderService:
                     recording = self._recording
                     frame_index = self._queued_episode_frames
                     episode_index = self._episode_index
+                    episode_generation = self._episode_generation
                     period_s = 1.0 / max(1, self._record_fps_hz)
-                    config = self._recording_config()
                 if not recording:
                     await asyncio.sleep(0.05)
                     continue
                 target_tick = self._record_target_timestamp_s(frame_index)
-                scheduled_tick = self._frame_assembly_due_s(target_tick, config)
                 now = time.monotonic()
-                if now < scheduled_tick:
-                    await asyncio.sleep(scheduled_tick - now)
-                frame = await self._collect_frame(target_tick, frame_index=frame_index)
-                capture_tick = time.monotonic()
-                pending = PendingFrame(
+                if now < target_tick:
+                    await asyncio.sleep(target_tick - now)
+                job = FrameAssemblyJob(
                     episode_index=episode_index,
+                    episode_generation=episode_generation,
                     frame_index=frame_index,
-                    timestamp=float(frame["timestamp"]),
-                    frame=frame,
+                    target_monotonic_s=target_tick,
+                    period_s=period_s,
                 )
-                queued = False
-                async with self._lock:
-                    if (
-                        not self._recording
-                        or self._episode_index != episode_index
-                        or frame_index != self._queued_episode_frames
-                    ):
-                        continue
-                    self._quality_tracker.record_tick_locked(target_tick, scheduled_tick, capture_tick, period_s)
-                    self._queued_episode_frames = frame_index + 1
-                    if time.monotonic() - self._last_telemetry_frame_update_s >= 0.1:
-                        self.telemetry.frame_count = max(self.telemetry.frame_count, self._queued_episode_frames)
-                        self._last_telemetry_frame_update_s = time.monotonic()
-                    try:
-                        self._write_queue.put_nowait(pending)
-                        queued = True
-                    except queue.Full:
-                        self._write_enqueue_pending += 1
-                        self._write_enqueue_idle.clear()
-                        pass
-                if not queued:
-                    # 内部说明。
-                    try:
-                        await asyncio.to_thread(self._write_queue.put, pending, True, WRITE_QUEUE_PUT_TIMEOUT_S)
-                    except queue.Full:
-                        async with self._lock:
-                            self._recording = False
-                            self.telemetry.recording = False
-                            self._episode_late_frames += 1
-                            self._source_warnings.append("writer backpressure timeout")
-                            self._native_error = "writer queue backpressure timeout"
-                        self.logs.error("[LEROBOT]", "writer queue backpressure timeout; current episode stopped")
-                    finally:
-                        async with self._lock:
-                            self._write_enqueue_pending = max(0, self._write_enqueue_pending - 1)
-                            if self._write_enqueue_pending == 0:
-                                self._write_enqueue_idle.set()
-                next_target = self._frame_assembly_due_s(self._record_target_timestamp_s(frame_index + 1), config)
+                await self._enqueue_assembly_job(job)
+                next_target = self._record_target_timestamp_s(frame_index + 1)
                 await asyncio.sleep(max(0.0, next_target - time.monotonic()))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 self.logs.error("[LEROBOT]", f"record loop recovered: {exc}")
                 await asyncio.sleep(0.2)
+
+    async def _enqueue_assembly_job(self, job: FrameAssemblyJob) -> bool:
+        """Queue one target timestamp for the single frame assembler consumer."""
+        deadline_s = time.monotonic() + ASSEMBLY_QUEUE_PUT_TIMEOUT_S
+        while True:
+            async with self._lock:
+                if not self._is_current_frame_job_locked(job):
+                    return False
+                assembly_queue = self._assembly_queue
+                if assembly_queue is None:
+                    self._stop_recording_for_backpressure_locked("frame assembly queue is not open")
+                    return False
+                try:
+                    assembly_queue.put_nowait(job)
+                except asyncio.QueueFull:
+                    pass
+                else:
+                    self._mark_frame_job_queued_locked(job)
+                    return True
+            if time.monotonic() >= deadline_s:
+                async with self._lock:
+                    if self._is_current_frame_job_locked(job):
+                        self._stop_recording_for_backpressure_locked("frame assembly queue backpressure timeout")
+                self.logs.error("[LEROBOT]", "frame assembly queue backpressure timeout; current episode stopped")
+                return False
+            await asyncio.sleep(0.005)
+
+    async def _frame_assembler_loop(self) -> None:
+        """Assemble queued frame jobs in order and hand complete frames to the writer."""
+        while self._session_active:
+            assembly_queue = self._assembly_queue
+            if assembly_queue is None:
+                await asyncio.sleep(0.05)
+                continue
+            try:
+                job = await assembly_queue.get()
+            except asyncio.CancelledError:
+                raise
+            try:
+                if not await self._frame_job_is_current(job):
+                    continue
+                config = self._recording_config()
+                scheduled_tick = self._frame_assembly_due_s(job.target_monotonic_s, config)
+                now = time.monotonic()
+                if now < scheduled_tick:
+                    await asyncio.sleep(scheduled_tick - now)
+                if not await self._frame_job_is_current(job):
+                    continue
+                frame = await self._collect_frame(job.target_monotonic_s, frame_index=job.frame_index)
+                capture_tick = time.monotonic()
+                pending = PendingFrame(
+                    episode_index=job.episode_index,
+                    frame_index=job.frame_index,
+                    timestamp=float(frame["timestamp"]),
+                    frame=frame,
+                )
+                async with self._lock:
+                    if not self._frame_job_belongs_to_current_episode_locked(job):
+                        continue
+                    self._quality_tracker.record_tick_locked(
+                        job.target_monotonic_s,
+                        scheduled_tick,
+                        capture_tick,
+                        job.period_s,
+                    )
+                await self._enqueue_pending_frame(pending, job)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.logs.error("[LEROBOT]", f"frame assembler recovered: {exc}")
+                await asyncio.sleep(0.05)
+            finally:
+                assembly_queue.task_done()
+
+    async def _enqueue_pending_frame(self, pending: PendingFrame, job: FrameAssemblyJob) -> bool:
+        """Queue an assembled frame for the native writer without blocking the assembler forever."""
+        deadline_s = time.monotonic() + WRITE_QUEUE_PUT_TIMEOUT_S
+        while True:
+            async with self._lock:
+                if not self._frame_job_belongs_to_current_episode_locked(job):
+                    return False
+                try:
+                    self._write_queue.put_nowait(pending)
+                except queue.Full:
+                    pass
+                else:
+                    return True
+            if time.monotonic() >= deadline_s:
+                async with self._lock:
+                    if self._frame_job_belongs_to_current_episode_locked(job):
+                        self._stop_recording_for_backpressure_locked("writer queue backpressure timeout")
+                self.logs.error("[LEROBOT]", "writer queue backpressure timeout; current episode stopped")
+                return False
+            await asyncio.sleep(0.005)
+
+    async def _frame_job_is_current(self, job: FrameAssemblyJob) -> bool:
+        """Return whether a queued assembly job still belongs to the active episode."""
+        async with self._lock:
+            return self._frame_job_belongs_to_current_episode_locked(job)
+
+    def _is_current_frame_job_locked(self, job: FrameAssemblyJob) -> bool:
+        return (
+            self._recording
+            and self._episode_index == job.episode_index
+            and self._episode_generation == job.episode_generation
+            and self._queued_episode_frames == job.frame_index
+        )
+
+    def _frame_job_belongs_to_current_episode_locked(self, job: FrameAssemblyJob) -> bool:
+        return (
+            self._recording
+            and self._episode_index == job.episode_index
+            and self._episode_generation == job.episode_generation
+        )
+
+    def _mark_frame_job_queued_locked(self, job: FrameAssemblyJob) -> None:
+        self._queued_episode_frames = job.frame_index + 1
+        if time.monotonic() - self._last_telemetry_frame_update_s >= 0.1:
+            self.telemetry.frame_count = max(self.telemetry.frame_count, self._queued_episode_frames)
+            self._last_telemetry_frame_update_s = time.monotonic()
+
+    def _stop_recording_for_backpressure_locked(self, message: str) -> None:
+        self._recording = False
+        self.telemetry.recording = False
+        self._episode_late_frames += 1
+        self._source_warnings.append(message)
+        self._native_error = message
 
     async def _collect_frame(
         self,
@@ -1531,47 +1624,6 @@ class DatasetRecorderService:
         )
         await self._wait_for_critical_sources(config, target_monotonic_s)
         return self._frame_assembler.assemble(config, target_monotonic_s, frame_index)
-
-    async def _cached_source(
-        self,
-        source: str,
-        value: Any,
-        target_monotonic_s: float,
-        *,
-        record_quality: bool = True,
-    ) -> SourceSample:
-        # 内部说明。
-        """处理录制服务逻辑：_cached_source。"""
-        now = time.monotonic()
-        sample = SourceSample(
-            source,
-            target_monotonic_s,
-            value,
-            True,
-            "",
-            target_monotonic_s=target_monotonic_s,
-            started_monotonic_s=now,
-            finished_monotonic_s=now,
-        )
-        if record_quality:
-            self._record_source_quality(sample, target_monotonic_s, 0.0)
-        return sample
-
-    async def _gripper_source(
-        self,
-        config: dict[str, Any],
-        target_monotonic_s: float,
-        *,
-        record_quality: bool = True,
-    ) -> SourceSample:
-        # 夹爪位置由 telemetry/worker 后台刷新；录制帧只读取缓存并检查是否过期。
-        """处理录制服务逻辑：_gripper_source。"""
-        return await asyncio.to_thread(
-            self._gripper_source_sync,
-            config,
-            target_monotonic_s,
-            record_quality=record_quality,
-        )
 
     def _gripper_source_sync(
         self,
@@ -1671,7 +1723,6 @@ class DatasetRecorderService:
             elapsed_ms=elapsed_ms,
             timed_out=timed_out,
             stale=not ok,
-            cache_used=source == "camera" and any(self._last_camera_cache_used.values()),
         )
         if record_quality:
             self._record_source_quality(sample, target_monotonic_s, elapsed_ms)
@@ -1863,7 +1914,7 @@ class DatasetRecorderService:
             relative_pulses[6:12] = [float(pulses[index + 6]) - right_origin[index] for index in range(6)]
         if not left_valid and not right_valid:
             return next_positions
-        relative_positions = pulses_to_ui_state(relative_pulses)
+        relative_positions = pulses_to_ui_state(relative_pulses, config)
         if left_valid and left_origin is not None:
             next_positions[:6] = relative_positions[:6]
         if right_valid and right_origin is not None:
@@ -1886,6 +1937,7 @@ class DatasetRecorderService:
         # 每个 episode 独立统计质量指标，保存或丢弃时可以精确回滚。
         sampler_start_s = time.monotonic() + SAMPLER_START_LEAD_S
         record_start_s = sampler_start_s + RECORDER_HARDWARE_WARMUP_S
+        self._episode_generation += 1
         self._sampler_start_monotonic_s = sampler_start_s
         self._record_loop_start_monotonic_s = record_start_s
         self._episode_started_at = record_start_s
@@ -1909,7 +1961,6 @@ class DatasetRecorderService:
         self._sample_buffers = self._new_sample_buffers(self._recording_config())
         self._source_sample_indices = {key: 0 for key in SOURCE_KEYS}
         self._source_warnings = []
-        self._last_camera_cache_used = {key: False for key in CAMERA_KEYS}
         self._max_force_left = 0.0
         self._max_force_right = 0.0
         if not self._native_writer_active():
@@ -1996,6 +2047,7 @@ class DatasetRecorderService:
             "nativeLeRobotAvailable": True,
             "useVideos": self._native_use_videos,
             "vcodec": self._native_vcodec(),
+            "streamingEncoding": True,
             "recording": {
                 "fps": self._record_fps_hz,
                 "forceSampleHz": self._force_sample_hz,
@@ -2051,9 +2103,8 @@ class DatasetRecorderService:
                 root=dataset_dir,
                 robot_type="dual_arm_micro_assembly",
                 use_videos=self._native_use_videos,
-                batch_encoding_size=1,
-                vcodec=self._native_vcodec(),
                 metadata_buffer_size=1,
+                **self._native_writer_kwargs(),
             )
             dataset.finalize()
             self._write_appstation_info(dataset_dir, config)
@@ -2095,9 +2146,8 @@ class DatasetRecorderService:
                         root=dataset_dir,
                         robot_type="dual_arm_micro_assembly",
                         use_videos=self._native_use_videos,
-                        batch_encoding_size=1,
-                        vcodec=self._native_vcodec(),
                         metadata_buffer_size=1,
+                        **self._native_writer_kwargs(),
                     )
                     if app_info:
                         self._write_json(dataset_dir / "meta" / "appstation_info.json", app_info)
@@ -2106,8 +2156,7 @@ class DatasetRecorderService:
                     dataset = LeRobotDataset.resume(
                         repo_id=repo_id,
                         root=dataset_dir,
-                        batch_encoding_size=1,
-                        vcodec=self._native_vcodec(),
+                        **self._native_writer_kwargs(),
                     )
                     self._sync_recording_shape_from_native_info(dataset_dir)
             elif dataset_dir.exists() and any(dataset_dir.iterdir()):
@@ -2123,9 +2172,8 @@ class DatasetRecorderService:
                     root=dataset_dir,
                     robot_type="dual_arm_micro_assembly",
                     use_videos=self._native_use_videos,
-                    batch_encoding_size=1,
-                    vcodec=self._native_vcodec(),
                     metadata_buffer_size=1,
+                    **self._native_writer_kwargs(),
                 )
             return dataset
         except Exception as exc:  # noqa: BLE001
@@ -2201,8 +2249,32 @@ class DatasetRecorderService:
 
     def _native_use_videos_requested(self) -> bool:
         """处理录制服务逻辑：_native_use_videos_requested。"""
-        value = os.environ.get("APPSTATION_LEROBOT_USE_VIDEOS", "1").strip().lower()
-        return value not in {"0", "false", "off", "no"}
+        return True
+
+    def _native_writer_kwargs(self) -> dict[str, Any]:
+        return {
+            "batch_encoding_size": 1,
+            "vcodec": self._native_vcodec(),
+            "streaming_encoding": True,
+            "encoder_queue_maxsize": self._native_encoder_queue_maxsize(),
+            "encoder_threads": self._native_encoder_threads(),
+        }
+
+    def _native_encoder_queue_maxsize(self) -> int:
+        raw = os.environ.get("APPSTATION_LEROBOT_ENCODER_QUEUE_MAXSIZE", "180").strip()
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return 180
+
+    def _native_encoder_threads(self) -> int | None:
+        raw = os.environ.get("APPSTATION_LEROBOT_ENCODER_THREADS", "").strip()
+        if not raw:
+            return None
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return None
 
     def _native_vcodec(self) -> str:
         """处理录制服务逻辑：_native_vcodec。"""
@@ -2219,8 +2291,7 @@ class DatasetRecorderService:
         return LeRobotDataset.resume(
             repo_id=f"local/{self._dataset_id}",
             root=self._dataset_dir,
-            batch_encoding_size=1,
-            vcodec=self._native_vcodec(),
+            **self._native_writer_kwargs(),
         )
 
     def _is_native_dataset_info(self, info: dict[str, Any]) -> bool:
@@ -2243,11 +2314,6 @@ class DatasetRecorderService:
                 raise
             return LeRobotDataset(f"local/{dataset_id}", root=dataset_dir)
 
-    def _camera_recording_frame(self, config: dict[str, Any], camera: str) -> Any:
-        """Return an RGB camera frame for native recording without using preview JPEGs."""
-        frame, _sampled_at = self._camera_recording_frame_with_time(config, camera)
-        return frame
-
     def _camera_recording_frame_with_time(self, config: dict[str, Any], camera: str) -> tuple[Any, float | None]:
         """Return an RGB camera frame and the capture thread timestamp when available."""
         raw_snapshot_with_time = getattr(self.hardware.cameras, "snapshot_frame_with_timestamp", None)
@@ -2259,10 +2325,10 @@ class DatasetRecorderService:
                 "monotonic_s",
                 snapshot[1] if isinstance(snapshot, tuple) and len(snapshot) > 1 else None,
             )
-            return self._coerce_rgb_frame(frame, config, camera), self._coerce_float(sampled_at)
+            return self._coerce_rgb_frame(frame, camera), self._coerce_float(sampled_at)
         raw_snapshot = getattr(self.hardware.cameras, "snapshot_frame", None)
         if callable(raw_snapshot):
-            return self._coerce_rgb_frame(raw_snapshot(config, camera), config, camera), time.monotonic()
+            return self._coerce_rgb_frame(raw_snapshot(config, camera), camera), time.monotonic()
         jpeg = self.hardware.cameras.snapshot(config, camera)
         return self._decode_jpeg_to_rgb(jpeg, config, camera), time.monotonic()
 
@@ -2283,9 +2349,8 @@ class DatasetRecorderService:
             rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_AREA)
         return rgb
 
-    def _coerce_rgb_frame(self, frame: Any, config: dict[str, Any], camera: str = "global") -> Any:
+    def _coerce_rgb_frame(self, frame: Any, camera: str = "global") -> Any:
         """Resize a raw RGB camera frame to the LeRobot feature shape."""
-        _ = config
         imports = self._native_imports()
         if imports is None:
             return frame
@@ -2320,9 +2385,8 @@ class DatasetRecorderService:
         """处理录制服务逻辑：_camera_placeholder_value。"""
         return self._synthetic_camera_frame(feature_key)
 
-    def _last_camera_value(self, camera: str, feature_key: str) -> Any:
+    def _last_camera_value(self, feature_key: str) -> Any:
         """处理录制服务逻辑：_last_camera_value。"""
-        _ = camera
         return self._last_native_camera_frames.get(feature_key) or self._synthetic_camera_frame(feature_key)
 
     def _np_float32(self, values: object) -> Any:
@@ -2879,12 +2943,6 @@ class DatasetRecorderService:
         delta_vector = last_action.get("deltaVector")
         if isinstance(delta_vector, list):
             return self._motion_delta_to_action_delta(delta_vector)
-        if isinstance(delta_vector, list) and len(delta_vector) == 12:
-            converted: list[float] = []
-            for index, raw_value in enumerate(delta_vector):
-                value = float(raw_value)
-                converted.append(value * 1000.0 if index % 6 >= 3 else value)
-            return converted
         side = last_action.get("side")
         axis = last_action.get("axis")
         if side not in {"left", "right"} or axis not in {"X", "Y", "Z", "Roll", "Pitch", "Yaw"}:

@@ -11,6 +11,21 @@ from backend.hal_client.client import HalClient
 from backend.services.hardware_service import HardwareService
 from backend.services.telemetry_hub import TelemetryHub
 
+AXIS_ORDER = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
+UNREADABLE_SEVON_FEEDBACK_AXES: set[tuple[str, str]] = set()
+
+
+def axis_enabled_feedback_unreadable(side: str, axis: str) -> bool:
+    return (side, axis) in UNREADABLE_SEVON_FEEDBACK_AXES
+
+
+def normalize_motion_axis_enabled(side: str, values: list[Any]) -> list[bool | None]:
+    normalized: list[bool | None] = [bool(value) for value in values[:6]]
+    for axis_index, axis in enumerate(AXIS_ORDER[: len(normalized)]):
+        if axis_enabled_feedback_unreadable(side, axis) and normalized[axis_index] is not True:
+            normalized[axis_index] = None
+    return normalized
+
 
 class CommandService:
     def __init__(
@@ -63,6 +78,27 @@ class CommandService:
         self.logs.info("[HAL]", "home all requested")
         return result
 
+    async def return_motion_origin_side(self, side: str) -> dict[str, object]:
+        self._validate_side(side)
+        config = self.settings.get_config()
+        origin = self._normalized_motion_origin(config)
+        valid_key = "leftValid" if side == "left" else "rightValid"
+        pulse_key = "leftPulse" if side == "left" else "rightPulse"
+        if not bool(origin[valid_key]):
+            raise RuntimeError(f"{side} motion work origin is not captured")
+        pulse = cast(list[float], origin[pulse_key])
+        result = await self.hal.command(
+            "motion.home_origin_side",
+            {
+                "side": side,
+                "pulse": pulse,
+            },
+        )
+        self.telemetry.home_side(side)
+        side_label = "left" if side == "left" else "right"
+        self.logs.info("[HAL]", f"{side_label} return-to-work-origin requested")
+        return result
+
     async def enable_motion_side(self, side: str) -> dict[str, object]:
         self._validate_side(side)
         result = await self.hal.command("motion.enable_side", {"side": side})
@@ -105,6 +141,11 @@ class CommandService:
         pulses = self._motion_state_pulses(state)
         config = self.settings.get_config()
         origin = self._normalized_motion_origin(config)
+        if bool(origin["valid"]):
+            origin["previousValid"] = True
+            origin["previousLeftPulse"] = list(cast(list[float], origin["leftPulse"]))
+            origin["previousRightPulse"] = list(cast(list[float], origin["rightPulse"]))
+            origin["previousUpdatedAt"] = int(origin["updatedAt"])
         if side in {None, "left"}:
             origin["leftPulse"] = pulses[:6]
             origin["leftValid"] = True
@@ -117,6 +158,30 @@ class CommandService:
         saved = self.settings.save_config(config, emit_log=False)
         label = side or "both"
         self.logs.info("[HAL]", f"{label} motion software origin captured")
+        return {"origin": saved["motion"]["origin"], "config": saved}
+
+    def restore_previous_motion_origin(self) -> dict[str, object]:
+        config = self.settings.get_config()
+        origin = self._normalized_motion_origin(config)
+        if not bool(origin["previousValid"]):
+            raise RuntimeError("previous motion work origin is not available")
+        current_valid = bool(origin["valid"])
+        current_left = list(cast(list[float], origin["leftPulse"]))
+        current_right = list(cast(list[float], origin["rightPulse"]))
+        current_updated_at = int(origin["updatedAt"])
+        origin["leftPulse"] = list(cast(list[float], origin["previousLeftPulse"]))
+        origin["rightPulse"] = list(cast(list[float], origin["previousRightPulse"]))
+        origin["updatedAt"] = int(origin["previousUpdatedAt"])
+        origin["leftValid"] = True
+        origin["rightValid"] = True
+        origin["valid"] = True
+        origin["previousValid"] = current_valid
+        origin["previousLeftPulse"] = current_left
+        origin["previousRightPulse"] = current_right
+        origin["previousUpdatedAt"] = current_updated_at if current_valid else 0
+        config["motion"]["origin"] = origin
+        saved = self.settings.save_config(config, emit_log=False)
+        self.logs.info("[HAL]", "previous motion work origin restored")
         return {"origin": saved["motion"]["origin"], "config": saved}
 
     def clear_motion_origin(self, side: str | None = None) -> dict[str, object]:
@@ -283,9 +348,9 @@ class CommandService:
         raw_enabled = state.get("enabled")
         axis_enabled: bool | None = None
         if isinstance(raw_enabled, list) and len(raw_enabled) == 12:
-            axis_index = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"].index(axis)
+            axis_index = AXIS_ORDER.index(axis)
             state_index = (0 if side == "left" else 6) + axis_index
-            if self._axis_enabled_feedback_unreadable(side, axis):
+            if axis_enabled_feedback_unreadable(side, axis):
                 return
             axis_enabled = bool(raw_enabled[state_index])
         elif isinstance(raw_enabled, dict):
@@ -310,7 +375,7 @@ class CommandService:
         axis_order = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
         axis_index = axis_order.index(request.axis)
         state_index = side_offset + axis_index
-        current = pulses_to_ui_state(relative_pulses)[state_index]
+        current = pulses_to_ui_state(relative_pulses, config)[state_index]
         target = current + request.step * request.direction
         limit_key = request.axis.lower()
         limits_key = "leftSoftLimits" if request.side == "left" else "rightSoftLimits"
@@ -327,13 +392,10 @@ class CommandService:
             )
 
     def _normalize_motion_axis_enabled(self, side: str, values: list[Any]) -> list[bool | None]:
-        normalized: list[bool | None] = [bool(value) for value in values[:6]]
-        if side == "right" and len(normalized) >= 4 and normalized[3] is not True:
-            normalized[3] = None
-        return normalized
+        return normalize_motion_axis_enabled(side, values)
 
     def _axis_enabled_feedback_unreadable(self, side: str, axis: str) -> bool:
-        return side == "right" and axis == "Roll"
+        return axis_enabled_feedback_unreadable(side, axis)
 
     def _axis_profile(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> dict[str, float]:
         motion = config["motion"]
@@ -384,6 +446,8 @@ class CommandService:
         origin = raw_origin if isinstance(raw_origin, dict) else {}
         left_pulse = self._six_pulses(origin.get("leftPulse"))
         right_pulse = self._six_pulses(origin.get("rightPulse"))
+        previous_left_pulse = self._six_pulses(origin.get("previousLeftPulse"))
+        previous_right_pulse = self._six_pulses(origin.get("previousRightPulse"))
         left_valid = bool(origin.get("leftValid", origin.get("valid", False)))
         right_valid = bool(origin.get("rightValid", origin.get("valid", False)))
         updated_at = origin.get("updatedAt", 0)
@@ -391,6 +455,11 @@ class CommandService:
             updated_at = int(updated_at)
         except (TypeError, ValueError):
             updated_at = 0
+        previous_updated_at = origin.get("previousUpdatedAt", 0)
+        try:
+            previous_updated_at = int(previous_updated_at)
+        except (TypeError, ValueError):
+            previous_updated_at = 0
         return {
             "valid": bool(left_valid and right_valid),
             "leftValid": left_valid,
@@ -398,6 +467,10 @@ class CommandService:
             "leftPulse": left_pulse,
             "rightPulse": right_pulse,
             "updatedAt": updated_at,
+            "previousValid": bool(origin.get("previousValid", False)),
+            "previousLeftPulse": previous_left_pulse,
+            "previousRightPulse": previous_right_pulse,
+            "previousUpdatedAt": previous_updated_at,
         }
 
     def _six_pulses(self, value: object) -> list[float]:

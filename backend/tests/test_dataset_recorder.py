@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from backend.services.dataset_recorder import DatasetRecorderService, TimedRingBuffer, TimedSample
+from backend.services.dataset_recorder import DatasetRecorderService, FrameAssemblyJob, TimedRingBuffer, TimedSample
 
 
 def hal_motion_fixture(timestamp_ms: int = 1234) -> dict[str, object]:
@@ -91,6 +91,29 @@ def test_dataset_recorder_native_features_follow_v3_contract() -> None:
     assert "observation.gripper" not in features
 
 
+def test_dataset_recorder_requires_streaming_video_writer(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    monkeypatch.setenv("APPSTATION_LEROBOT_USE_VIDEOS", "0")
+    monkeypatch.setenv("APPSTATION_LEROBOT_VCODEC", "h264")
+    monkeypatch.setenv("APPSTATION_LEROBOT_ENCODER_QUEUE_MAXSIZE", "90")
+    monkeypatch.setenv("APPSTATION_LEROBOT_ENCODER_THREADS", "2")
+
+    assert recorder._native_use_videos_requested() is True
+    assert recorder._native_writer_kwargs() == {
+        "batch_encoding_size": 1,
+        "vcodec": "h264",
+        "streaming_encoding": True,
+        "encoder_queue_maxsize": 90,
+        "encoder_threads": 2,
+    }
+
+
+def test_dataset_recorder_saves_episode_with_parallel_encoding() -> None:
+    source = (Path(__file__).resolve().parents[1] / "services" / "dataset_recorder.py").read_text(encoding="utf-8")
+
+    assert "save_episode(parallel_encoding=True)" in source
+
+
 def test_timed_ring_buffer_nearest_respects_skew_and_prunes() -> None:
     buffer = TimedRingBuffer(retention_s=1.0, maxlen=3)
     buffer.append(TimedSample("hal", 10.0, {"value": 10}))
@@ -124,14 +147,46 @@ def test_dataset_recorder_collect_frame_uses_timed_buffers() -> None:
     assert "CAMERA_SOURCE_KEYS" in source
 
 
-def test_dataset_recorder_source_sampler_uses_shared_source_epoch() -> None:
-    recorder = object.__new__(DatasetRecorderService)
-    recorder._sampler_start_monotonic_s = 100.0
-    recorder._record_fps_hz = 30
+def test_dataset_recorder_record_loop_delegates_frame_assembly() -> None:
+    source = (Path(__file__).resolve().parents[1] / "services" / "dataset_recorder.py").read_text(encoding="utf-8")
+    record_loop_start = source.index("    async def _record_loop")
+    assembler_loop_start = source.index("    async def _frame_assembler_loop", record_loop_start)
+    collect_frame_start = source.index("    async def _collect_frame", assembler_loop_start)
+    record_loop_source = source[record_loop_start:assembler_loop_start]
+    assembler_loop_source = source[assembler_loop_start:collect_frame_start]
 
-    due = recorder._next_phase_aligned_sample_time("hal", {"motion": {"motionThreadHz": 1000}}, 100.005)
+    assert "FrameAssemblyJob(" in record_loop_source
+    assert "_enqueue_assembly_job(job)" in record_loop_source
+    assert "_collect_frame(" not in record_loop_source
+    assert "_collect_frame(" in assembler_loop_source
+    assert "_enqueue_pending_frame(pending, job)" in assembler_loop_source
 
-    assert due == pytest.approx(100.006, abs=0.001)
+
+def test_dataset_recorder_enqueue_assembly_job_guards_episode_generation() -> None:
+    async def run_case() -> None:
+        recorder = object.__new__(DatasetRecorderService)
+        recorder._lock = asyncio.Lock()
+        recorder._recording = True
+        recorder._episode_index = 2
+        recorder._episode_generation = 3
+        recorder._queued_episode_frames = 0
+        recorder._last_telemetry_frame_update_s = 0.0
+        recorder._assembly_queue = asyncio.Queue(maxsize=2)
+        recorder.telemetry = SimpleNamespace(frame_count=0, recording=True)
+        recorder._episode_late_frames = 0
+        recorder._source_warnings = []
+        recorder._native_error = ""
+
+        stale = FrameAssemblyJob(2, 2, 0, 10.0, 1 / 30)
+        current = FrameAssemblyJob(2, 3, 0, 10.0, 1 / 30)
+
+        assert await recorder._enqueue_assembly_job(stale) is False
+        assert recorder._assembly_queue.qsize() == 0
+        assert await recorder._enqueue_assembly_job(current) is True
+        assert recorder._queued_episode_frames == 1
+        assert recorder._assembly_queue.get_nowait() == current
+
+    asyncio.run(run_case())
 
 
 def test_dataset_recorder_alignment_time_uses_warmup_plus_dataset_timestamp() -> None:
@@ -246,7 +301,7 @@ def test_dataset_recorder_camera_frame_returns_capture_timestamp(monkeypatch: py
 
     recorder = object.__new__(DatasetRecorderService)
     recorder.hardware = FakeHardware()
-    monkeypatch.setattr(recorder, "_coerce_rgb_frame", lambda frame, _config, _camera: frame)
+    monkeypatch.setattr(recorder, "_coerce_rgb_frame", lambda frame, _camera: frame)
 
     frame, sampled_at = recorder._camera_recording_frame_with_time({}, "global")
 
@@ -297,7 +352,7 @@ def test_dataset_recorder_gripper_source_uses_assigned_sample_time() -> None:
     recorder._source_warnings = []
     config = {"hal": {"mode": "real"}, "gripper": {"sampleHz": 30, "sampleStaleMs": 500}}
 
-    sample = asyncio.run(recorder._gripper_source(config, 3.5))
+    sample = recorder._gripper_source_sync(config, 3.5)
 
     assert sample.ok is True
     assert sample.value == [4.0, 5.0]
@@ -340,7 +395,7 @@ def test_dataset_recorder_samples_current_force_without_window(monkeypatch) -> N
     recorder.hardware = FakeHardware()
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
 
-    result = asyncio.run(recorder._sample_force_source({"hal": {"mode": "real"}}, 1.0))
+    result = recorder._sample_force_source_sync({"hal": {"mode": "real"}}, 1.0)
 
     assert result.value == {"ok": True, "left": [1.0] * 6, "right": [2.0] * 6}
     assert recorder.hardware.force.sample_calls == 1
