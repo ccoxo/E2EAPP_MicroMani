@@ -205,6 +205,10 @@ class SettingsService:
         if isinstance(teleop, dict) and not has_current_teleop_strategy:
             for key, value in ICF_TELEOP_DEFAULTS.items():
                 teleop[key] = json.loads(json.dumps(value))
+            teleop["leftGravityCompensation"] = True
+            teleop["rightGravityCompensation"] = True
+            teleop["leftForceFeedback"] = True
+            teleop["rightForceFeedback"] = True
             motion = config.get("motion", {})
             if isinstance(motion, dict):
                 motion["leftSoftLimits"] = json.loads(json.dumps(ICF_LEFT_MOTION_SOFT_LIMITS))
@@ -228,6 +232,8 @@ class SettingsService:
                 gripper_teleop["leftGapMaxMm"] = 25.0
                 gripper_teleop["rightGapMinMm"] = 0.0
                 gripper_teleop["rightGapMaxMm"] = 25.0
+                gripper_teleop["leftGapInvert"] = False
+                gripper_teleop["rightGapInvert"] = True
                 gripper_teleop["gripSpeed"] = 128
                 gripper_teleop["gripTorque"] = 192
                 gripper_teleop["positionDeadbandCounts"] = 2
@@ -260,6 +266,16 @@ class SettingsService:
                 teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
             if teleop.get("rightAxisOutputScale") == [1, 1, 1, 1, 1, 1]:
                 teleop["rightAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["rightAxisOutputScale"]))
+            if teleop.get("leftDirectionSign") != ICF_TELEOP_DEFAULTS["leftDirectionSign"]:
+                teleop["leftDirectionSign"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftDirectionSign"]))
+            if teleop.get("rightDirectionSign") != ICF_TELEOP_DEFAULTS["rightDirectionSign"]:
+                teleop["rightDirectionSign"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["rightDirectionSign"]))
+            if teleop.get("leftImpulseCoeff") != ICF_TELEOP_DEFAULTS["leftImpulseCoeff"]:
+                teleop["leftImpulseCoeff"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftImpulseCoeff"]))
+            if teleop.get("rightImpulseCoeff") != ICF_TELEOP_DEFAULTS["rightImpulseCoeff"]:
+                teleop["rightImpulseCoeff"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["rightImpulseCoeff"]))
+            if teleop.get("syncImpulseCoeffFromKinematics") is not False:
+                teleop["syncImpulseCoeffFromKinematics"] = False
         cameras = config.get("cameras", {})
         if isinstance(cameras, dict):
             has_legacy_reversed_wrist_cameras = (
@@ -314,6 +330,8 @@ class SettingsService:
                 gripper_teleop["leftSourceHand"] = "PhysicalRight"
             if gripper_teleop.get("rightSourceHand") == "PhysicalRight":
                 gripper_teleop["rightSourceHand"] = "PhysicalLeft"
+            gripper_teleop.setdefault("leftGapInvert", False)
+            gripper_teleop.setdefault("rightGapInvert", True)
         return config
 
     def _uses_legacy_motion_profile(self, profile: object) -> bool:

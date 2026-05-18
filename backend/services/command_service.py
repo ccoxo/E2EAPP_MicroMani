@@ -6,13 +6,18 @@ from typing import Any, cast
 from backend.core.config import SettingsService
 from backend.core.logging import LogService, now_ms
 from backend.core.schemas import GripperCommandRequest, ManualAxisMoveRequest, SettingsCommandRequest
-from backend.core.units import pulses_to_ui_state
+from backend.core.units import motion_pulse_per_unit, pulses_to_ui_state
 from backend.hal_client.client import HalClient
 from backend.services.hardware_service import HardwareService
 from backend.services.telemetry_hub import TelemetryHub
 
 AXIS_ORDER = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
-UNREADABLE_SEVON_FEEDBACK_AXES: set[tuple[str, str]] = set()
+MANUAL_AXIS_STEP_LIMIT_PULSE = 100000.0
+UNREADABLE_SEVON_FEEDBACK_AXES: set[tuple[str, str]] = {("right", axis) for axis in AXIS_ORDER}
+MANUAL_AXIS_DIRECTION_SIGN: dict[str, list[int]] = {
+    "left": [-1, -1, -1, -1, 1, -1],
+    "right": [-1, -1, -1, -1, -1, 1],
+}
 
 
 def axis_enabled_feedback_unreadable(side: str, axis: str) -> bool:
@@ -224,16 +229,18 @@ class CommandService:
         config = self.settings.get_config()
         # 所有手动 jog 都先过后端安全边界，再决定发往真机还是本地模拟。
         self._validate_manual_axis_safety(config, request)
+        effective_direction = self._manual_axis_effective_direction(request.side, request.axis, request.direction)
         if self._real_hardware_mode(config):
             await self._validate_motion_axis_enabled(request.side, request.axis)
-            await self._validate_manual_axis_soft_limit(config, request)
+            await self._validate_manual_axis_soft_limit(config, request, effective_direction)
             profile = self._axis_profile(config, request)
             hal_result = await self.hal.command(
                 "motion.manual_axis_move",
                 {
                     "side": request.side,
                     "axis": request.axis,
-                    "direction": request.direction,
+                    "direction": effective_direction,
+                    "requestedDirection": request.direction,
                     "step": request.step,
                     "speedMode": request.speedMode,
                     "maxVelocityUiPerSec": profile["maxVelocity"],
@@ -245,11 +252,11 @@ class CommandService:
             side_label = "left" if request.side == "left" else "right"
             self.logs.info(
                 "[HAL]",
-                f"{side_label} {request.axis} {request.direction * request.step:+.3f} "
+                f"{side_label} {request.axis} {effective_direction * request.step:+.3f} "
                 f"{request.speedMode} HAL accepted",
             )
             return {"hal": hal_result}
-        applied = self.telemetry.apply_axis_move(request.side, request.axis, request.direction, request.step)
+        applied = self.telemetry.apply_axis_move(request.side, request.axis, effective_direction, request.step)
         side_label = "left" if request.side == "left" else "right"
         self.logs.info(
             "[HAL]",
@@ -318,18 +325,33 @@ class CommandService:
             raise RuntimeError(f"{request.side} gripper is disabled; enable it before motion commands")
 
     def _validate_manual_axis_safety(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> None:
-        # Per-jog safety bounds. The HAL applies its own absolute ceilings on top
-        # of these and the soft-limit table further constrains the absolute
-        # position; this layer just stops a typo (e.g. 50000 um) from reaching
-        # hardware. The user explicitly requested a 5mm/2deg test envelope, so
-        # bounds are sized to that.
-        if request.axis in {"X", "Y", "Z"}:
-            if abs(request.step) > 5000:
-                raise RuntimeError("manual translation step must be <= 5000 um for hardware testing")
-        elif abs(request.step) > 2:
-            raise RuntimeError("manual rotation step must be <= 2 degree for hardware testing")
+        step_pulse = self._manual_axis_step_pulse(config, request)
+        if step_pulse > MANUAL_AXIS_STEP_LIMIT_PULSE:
+            limit = self._manual_axis_step_ui_limit(config, request.side, request.axis)
+            unit = "um" if request.axis in {"X", "Y", "Z"} else "degree"
+            raise RuntimeError(
+                f"manual {request.axis} step must be <= {limit:.3f} {unit} "
+                f"({MANUAL_AXIS_STEP_LIMIT_PULSE:.0f} pulse cap)"
+            )
         if self._axis_profile(config, request)["maxVelocity"] <= 0:
             raise RuntimeError("manual axis velocity must be positive")
+
+    def _manual_axis_step_pulse(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> float:
+        return abs(float(request.step)) * self._manual_axis_pulse_per_ui_unit(config, request.side, request.axis)
+
+    def _manual_axis_step_ui_limit(self, config: dict[str, Any], side: str, axis: str) -> float:
+        pulse_per_ui_unit = self._manual_axis_pulse_per_ui_unit(config, side, axis)
+        if pulse_per_ui_unit <= 0:
+            return 0.0
+        return MANUAL_AXIS_STEP_LIMIT_PULSE / pulse_per_ui_unit
+
+    def _manual_axis_pulse_per_ui_unit(self, config: dict[str, Any], side: str, axis: str) -> float:
+        axis_index = AXIS_ORDER.index(axis)
+        state_index = (0 if side == "left" else 6) + axis_index
+        pulse_per_unit = abs(motion_pulse_per_unit(config)[state_index])
+        if axis_index < 3:
+            return pulse_per_unit / 1000.0
+        return pulse_per_unit
 
     async def _refresh_motion_enabled(self, side: str) -> None:
         state = await self.hal.motion_state()
@@ -360,7 +382,12 @@ class CommandService:
         if axis_enabled is not True:
             raise RuntimeError(f"{side} {axis} motion axis is disabled; enable the axis before manual jog")
 
-    async def _validate_manual_axis_soft_limit(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> None:
+    async def _validate_manual_axis_soft_limit(
+        self,
+        config: dict[str, Any],
+        request: ManualAxisMoveRequest,
+        effective_direction: int,
+    ) -> None:
         origin = self._normalized_motion_origin(config)
         origin_valid = bool(origin["leftValid"] if request.side == "left" else origin["rightValid"])
         if not origin_valid:
@@ -376,7 +403,7 @@ class CommandService:
         axis_index = axis_order.index(request.axis)
         state_index = side_offset + axis_index
         current = pulses_to_ui_state(relative_pulses, config)[state_index]
-        target = current + request.step * request.direction
+        target = current + request.step * effective_direction
         limit_key = request.axis.lower()
         limits_key = "leftSoftLimits" if request.side == "left" else "rightSoftLimits"
         limits = config["motion"][limits_key][limit_key]
@@ -426,6 +453,11 @@ class CommandService:
             "accTime": acc_time,
             "decTime": dec_time,
         }
+
+    def _manual_axis_effective_direction(self, side: str, axis: str, direction: int) -> int:
+        axis_index = AXIS_ORDER.index(axis)
+        sign = MANUAL_AXIS_DIRECTION_SIGN[side][axis_index]
+        return 1 if direction * sign >= 0 else -1
 
     def _real_hardware_mode(self, config: dict[str, Any]) -> bool:
         mode = os.environ.get("APPSTATION_HAL_MODE") or config["hal"].get("mode", "real")

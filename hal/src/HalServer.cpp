@@ -133,6 +133,8 @@ std::string jsonTeleopTargetUpdateResult(
   appendDoubleArray(out, result.appliedDeltaPulse);
   out << ",\"targetPulse\":";
   appendDoubleArray(out, result.targetPulse);
+  out << ",\"updateReturn\":";
+  appendDoubleArray(out, result.updateReturn);
   out << ",\"clipped\":";
   appendBoolArray(out, result.clipped);
   out << "}";
@@ -543,6 +545,15 @@ void serveConnection(
         body = jsonMotionState(motion.readState());
       } else if (request.rfind("GET /omega/state ", 0) == 0) {
         body = jsonOmegaState(omega.readState());
+      } else if (request.rfind("POST /omega7/gravity_compensation ", 0) == 0) {
+        const auto bodyText = requestBody(request);
+        omega.setGravityCompensation(
+            jsonBoolValue(bodyText, "leftEnabled", true),
+            jsonBoolValue(bodyText, "rightEnabled", true));
+        body = "{\"ok\":true}";
+      } else if (request.rfind("POST /omega7/zero_force_feedback ", 0) == 0) {
+        omega.zeroForceFeedback(static_cast<int>(jsonNumberValue(requestBody(request), "openId", -1)));
+        body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/emergency_stop ", 0) == 0) {
         motion.emergencyStop();
         body = "{\"ok\":true}";

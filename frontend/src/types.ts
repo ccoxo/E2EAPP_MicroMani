@@ -488,6 +488,7 @@ export interface AppConfig {
     rotationMaxVelocityDegS: number
     motionProfileAccSec: number
     motionProfileDecSec: number
+    diagLog: boolean
     leftEnabledAxes: boolean[]
     rightEnabledAxes: boolean[]
     softLimitUnitSpec: string[]
@@ -495,6 +496,11 @@ export interface AppConfig {
     leftSoftLimitMax: number[]
     rightSoftLimitMin: number[]
     rightSoftLimitMax: number[]
+    leftImpulseCoeff: number[]
+    rightImpulseCoeff: number[]
+    leftDirectionSign: number[]
+    rightDirectionSign: number[]
+    syncImpulseCoeffFromKinematics: boolean
     requireClutch: boolean
     stabilityMode: Omega7StabilityMode
     tcpFallbackPort: number
@@ -505,6 +511,8 @@ export interface AppConfig {
       leftGapMaxMm: number
       rightGapMinMm: number
       rightGapMaxMm: number
+      leftGapInvert: boolean
+      rightGapInvert: boolean
       openThreshold: number
       closeThreshold: number
       gripSpeed: number

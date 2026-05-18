@@ -168,8 +168,18 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         config["teleop"][f"{side}Connected"] = connected
         return settings.save_config(config, emit_log=False)
 
+    def gripper_teleop_enabled() -> bool:
+        config = settings.get_config()
+        teleop = config.get("teleop", {})
+        gripper_teleop = teleop.get("gripperTeleop", {}) if isinstance(teleop, dict) else {}
+        return isinstance(gripper_teleop, dict) and bool(gripper_teleop.get("enabled", False))
+
+    def start_gripper_teleop_source(source: str) -> None:
+        if gripper_teleop_enabled():
+            gripper_tele.start(source)
+
     async def release_runtime_handles(reason: str) -> dict[str, Any]:
-        gripper_tele.stop()
+        gripper_tele.stop(force=True)
         released_grippers: list[str] = []
         gripper_errors: dict[str, str] = {}
         for side in ("left", "right"):
@@ -242,6 +252,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
     @app.on_event("shutdown")
     async def stop_gripper_workers() -> None:
+        gripper_tele.stop(force=True)
         gripper_workers.stop_all()
 
     @app.get("/api/health")
@@ -596,12 +607,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/teleop/gripper/start")
     async def gripper_tele_start() -> ApiEnvelope:
-        gripper_tele.start()
+        gripper_tele.start("manual")
         return envelope(gripper_tele.get_status())
 
     @app.post("/api/teleop/gripper/stop")
     async def gripper_tele_stop() -> ApiEnvelope:
-        gripper_tele.stop()
+        gripper_tele.stop("manual")
         return envelope(gripper_tele.get_status())
 
     @app.get("/api/teleop/gripper/status")
@@ -658,15 +669,22 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 isinstance(teleop_config, dict)
                 and bool(teleop_config.get("swapTeleopChannels", False))
             )
+            if isinstance(teleop_config, dict):
+                try:
+                    await hal.command(
+                        "omega7.gravity_compensation",
+                        {
+                            "leftEnabled": bool(teleop_config.get("leftGravityCompensation", True)),
+                            "rightEnabled": bool(teleop_config.get("rightGravityCompensation", True)),
+                        },
+                    )
+                except RuntimeError as exc:
+                    logs.warning("[HAL]", f"Omega.7 force output apply failed: {exc}")
             mapped_side = ("right" if side == "left" else "left") if swap_channels else side
             try:
                 await commands.enable_motion_side(mapped_side)
             except RuntimeError as exc:
                 logs.error("[HAL]", f"teleop connect enable mapped {mapped_side} failed: {exc}")
-            try:
-                await commands.return_motion_origin_side(mapped_side)
-            except RuntimeError as exc:
-                logs.error("[HAL]", f"teleop connect return-to-work-origin {mapped_side} failed: {exc}")
             try:
                 await teleop_mapper.start("teleop-connect", pre_home=False)
             except RuntimeError as exc:
@@ -675,6 +693,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     status_code=503,
                     detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)},
                 ) from exc
+            start_gripper_teleop_source("teleop-connect")
         logs.info(
             "[HAL]",
             f"{side} Omega.7 logical connect requested; connected={connected}, physical={physical_connected}",
@@ -697,6 +716,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         teleop_config = config.get("teleop", {})
         if not bool(teleop_config.get("leftConnected", False)) and not bool(teleop_config.get("rightConnected", False)):
             await teleop_mapper.stop("teleop-connect")
+            gripper_tele.stop("teleop-connect")
         logs.info("[HAL]", f"{side} Omega.7 logical disconnect requested; HAL device handles remain open")
         return envelope({"side": side, "connected": False})
 
@@ -717,15 +737,29 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         enabled = bool((payload or {}).get("enabled", True))
+        config = settings.get_config()
+        config["teleop"][f"{side}GravityCompensation"] = enabled
+        config["teleop"][f"{side}ForceFeedback"] = enabled
+        saved = settings.save_config(config, emit_log=False)
+        await hal.command(
+            "omega7.gravity_compensation",
+            {
+                "leftEnabled": bool(saved["teleop"].get("leftGravityCompensation", False)),
+                "rightEnabled": bool(saved["teleop"].get("rightGravityCompensation", False)),
+            },
+        )
         logs.info("[HAL]", f"{side} Omega.7 gravity compensation={enabled}")
-        return envelope({"side": side, "enabled": enabled})
+        return envelope({"side": side, "enabled": enabled, "config": saved})
 
     @app.post("/api/teleop/{side}/zero_force_feedback")
     async def teleop_zero_force_feedback(side: str) -> ApiEnvelope:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
+        config = settings.get_config()
+        open_id = int(config["teleop"].get(f"{side}OpenId", 0 if side == "left" else 1))
+        await hal.command("omega7.zero_force_feedback", {"openId": open_id})
         logs.info("[HAL]", f"{side} Omega.7 zero force feedback requested")
-        return envelope({"side": side})
+        return envelope({"side": side, "openId": open_id})
 
     @app.post("/api/cameras/{camera}/enumerate")
     async def camera_enumerate(camera: str) -> ApiEnvelope:
@@ -844,7 +878,9 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         dataset_name = payload.get("dataset_name", "dataset")
         task = payload.get("task", "")
         try:
-            return envelope(await recorder.start_session(str(dataset_name), str(task)))
+            result = await recorder.start_session(str(dataset_name), str(task))
+            start_gripper_teleop_source("recording")
+            return envelope(result)
         except RuntimeError as exc:
             if "native LeRobot dataset is required" in str(exc):
                 raise HTTPException(
@@ -856,7 +892,9 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/record/episode/save")
     async def save_episode() -> ApiEnvelope:
         try:
-            return envelope(await recorder.save_episode())
+            result = await recorder.save_episode()
+            gripper_tele.stop("recording")
+            return envelope(result)
         except DatasetSaveError as exc:
             raise HTTPException(status_code=500, detail={"code": "RECORDING_SAVE_FAILED", "message": str(exc)}) from exc
         except RuntimeError as exc:
@@ -865,18 +903,24 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/record/episode/discard")
     async def discard_episode() -> ApiEnvelope:
         try:
-            return envelope(await recorder.discard_episode())
+            result = await recorder.discard_episode()
+            start_gripper_teleop_source("recording")
+            return envelope(result)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail={"code": "RECORDING_NOT_ACTIVE", "message": str(exc)}) from exc
 
     @app.post("/api/record/session/finish")
     async def finish_session() -> ApiEnvelope:
-        return envelope(await recorder.finish_session())
+        result = await recorder.finish_session()
+        gripper_tele.stop("recording")
+        return envelope(result)
 
     @app.post("/api/record/reset/skip")
     async def skip_reset() -> ApiEnvelope:
         try:
-            return envelope(await recorder.skip_reset())
+            result = await recorder.skip_reset()
+            start_gripper_teleop_source("recording")
+            return envelope(result)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail={"code": "RECORDING_NOT_ACTIVE", "message": str(exc)}) from exc
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -36,10 +37,14 @@ class Omega7Driver {
   void zeroForceFeedback(int openId);
 
  private:
+  void applyForceOutputUnlocked(std::size_t index, bool enabled);
+  int writeZeroForceUnlocked(const Omega7State& item);
+
   mutable std::mutex mutex_;
   bool initialized_{false};
   std::string lastError_;
   std::array<Omega7State, 2> state_{};
+  std::array<bool, 2> forceOutputEnabled_{{true, true}};
 };
 
 }  // namespace appstation::hal

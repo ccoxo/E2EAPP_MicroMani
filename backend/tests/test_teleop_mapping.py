@@ -57,6 +57,7 @@ class AppliedTeleopHal(FakeHal):
                 "response": {
                     "ok": True,
                     "appliedDeltas": [800.0, 0.0, 0.0, 0.02, 0.0, 0.0],
+                    "updateReturn": [0.0, 0.0, 0.0, 21.0, 0.0, 0.0],
                     "clipped": [True, False, False, True, False, False],
                 },
             }
@@ -76,9 +77,13 @@ def base_config(require_clutch: bool) -> dict[str, Any]:
     return {
         "teleop": {
             "leftConnected": True,
+            "rightConnected": True,
             "leftTranslationScale": 0.30,
+            "rightTranslationScale": 0.30,
             "leftRotationScale": 0.10,
+            "rightRotationScale": 0.10,
             "leftAxisOutputScale": [0.20, 0.20, 0.20, 0.25, 0.25, 1.50],
+            "rightAxisOutputScale": [0.20, 0.20, 0.20, 0.25, 0.25, 1.50],
             "translationStepUm": 5000.0,
             "rotationStepDeg": 0.2,
             "translationStepLimitPulse": 4000,
@@ -96,8 +101,11 @@ def base_config(require_clutch: bool) -> dict[str, Any]:
             "motionProfileAccSec": 0.05,
             "motionProfileDecSec": 0.05,
             "leftEnabledAxes": [True, True, True, True, True, True],
+            "rightEnabledAxes": [True, True, True, True, True, True],
             "leftSoftLimitMin": [-1000.0, -2000.0, -3000.0, -40.0, -50.0, -60.0],
             "leftSoftLimitMax": [1000.0, 2000.0, 3000.0, 40.0, 50.0, 60.0],
+            "rightSoftLimitMin": [-1000.0, -2000.0, -3000.0, -40.0, -50.0, -60.0],
+            "rightSoftLimitMax": [1000.0, 2000.0, 3000.0, 40.0, 50.0, 60.0],
             "requireClutch": require_clutch,
         },
         "motion": {
@@ -209,14 +217,12 @@ def test_teleop_mapper_sends_continuous_six_axis_delta() -> None:
         name, payload = hal.commands[0]
         assert name == "motion.teleop_target_update"
         assert payload["side"] == "left"
-        assert payload["deltas"] == {
-            "X": 1800.0,
-            "Y": -1800.0,
-            "Z": 30.0,
-            "Roll": 0.05,
-            "Pitch": -0.05,
-            "Yaw": 0.15000000000000002,
-        }
+        assert payload["deltas"]["X"] == 1800.0
+        assert payload["deltas"]["Y"] == -1800.0
+        assert payload["deltas"]["Z"] == 30.0
+        assert payload["deltas"]["Roll"] == pytest.approx(0.0498)
+        assert payload["deltas"]["Pitch"] == -0.05
+        assert payload["deltas"]["Yaw"] == pytest.approx(0.15)
         assert payload["translationStepUm"] == 5000.0
         assert payload["rotationStepDeg"] == 0.2
         assert payload["translationStepLimitPulse"] == 4000
@@ -231,20 +237,28 @@ def test_teleop_mapper_sends_continuous_six_axis_delta() -> None:
         assert payload["rotationVelocityUiPerSec"] == 6.0
         assert payload["translationStartVelocityUiPerSec"] == 300.0
         assert payload["rotationStartVelocityUiPerSec"] == 0.5
-        assert mapper.status()["lastAction"]["deltaVector"] == [
+        assert mapper.status()["lastAction"]["deltaVector"] == pytest.approx([
             1800.0,
             -1800.0,
             30.0,
-            0.05,
+            0.0498,
             -0.05,
-            0.15000000000000002,
+            0.15,
             0,
             0,
             0,
             0,
             0,
             0,
-        ]
+        ])
+        assert mapper.status()["lastAction"]["requestedPulseDeltas"] == {
+            "X": -9000.0,
+            "Y": -18000.0,
+            "Z": -300.0,
+            "Roll": 83.0,
+            "Pitch": 125.0,
+            "Yaw": -500.0,
+        }
         assert mapper.status()["actionHistory"][-1]["deltaVector"] == mapper.status()["lastAction"]["deltaVector"]
         assert mapper.status()["actionHistory"][-1]["monotonic_s"] > 0
 
@@ -271,6 +285,35 @@ def test_teleop_mapper_falls_back_to_icf_soft_limits_for_invalid_teleop_limits()
     asyncio.run(run_case([10.0] * 6, [9.0] * 6))
 
 
+def test_teleop_mapper_offsets_soft_limits_by_work_origin_before_hal() -> None:
+    async def run() -> None:
+        hal = FakeHal()
+        mapper = TeleopMappingService(settings=None, hal=hal, logs=None)  # type: ignore[arg-type]
+        config = base_config(require_clutch=False)
+        config["teleop"]["swapTeleopChannels"] = True
+        config["motion"]["origin"] = {
+            "valid": True,
+            "leftValid": True,
+            "rightValid": True,
+            "leftPulse": [0.0] * 6,
+            "rightPulse": [99769.0, 382483.0, 881210.0, -35473.0, -215115.0, -5006.0],
+            "updatedAt": 100,
+        }
+        hand = base_hand(clutch=False)
+
+        await mapper._step_side("left", hand, config)
+        await mapper._step_side("left", hand, config)
+
+        _, payload = hal.commands[0]
+        assert payload["side"] == "right"
+        assert payload["softLimitMin"][0] == pytest.approx(-20953.8)
+        assert payload["softLimitMax"][0] == pytest.approx(-18953.8)
+        assert payload["softLimitMin"][5] == pytest.approx(-67.5165)
+        assert payload["softLimitMax"][5] == pytest.approx(52.4835)
+
+    asyncio.run(run())
+
+
 def test_teleop_mapper_uses_configured_step_limits() -> None:
     async def run() -> None:
         hal = FakeHal()
@@ -286,7 +329,7 @@ def test_teleop_mapper_uses_configured_step_limits() -> None:
 
         _, payload = hal.commands[0]
         assert payload["deltas"]["X"] == 60.0
-        assert payload["deltas"]["Roll"] == 0.025
+        assert payload["deltas"]["Roll"] == pytest.approx(0.0252)
         assert payload["translationStepLimitPulse"] == 100.0
         assert payload["rotationStepLimitPulse"] == 50.0
 
@@ -315,6 +358,28 @@ def test_teleop_mapper_honors_icf_swapped_motion_channels() -> None:
     asyncio.run(run())
 
 
+def test_teleop_mapper_uses_source_hand_impulse_signs_when_channels_are_swapped() -> None:
+    async def run() -> None:
+        hal = FakeHal()
+        mapper = TeleopMappingService(settings=None, hal=hal, logs=None)  # type: ignore[arg-type]
+        config = base_config(require_clutch=False)
+        config["teleop"]["swapTeleopChannels"] = True
+        hand = base_hand(clutch=False)
+
+        await mapper._step_side("left", hand, config)
+        hand["pose"] = [0.0, 0.001, 0.0, 0.0, 1.0, 0.0]
+        await mapper._step_side("left", hand, config)
+
+        _, payload = hal.commands[0]
+        assert payload["side"] == "right"
+        assert payload["deltas"]["Y"] == -60.0
+        assert payload["deltas"]["Pitch"] == pytest.approx(-0.0252)
+        assert mapper.status()["lastAction"]["requestedPulseDeltas"]["Y"] == 600.0
+        assert mapper.status()["lastAction"]["requestedPulseDeltas"]["Pitch"] == -63.0
+
+    asyncio.run(run())
+
+
 def test_teleop_mapper_records_hal_applied_delta_after_clipping() -> None:
     async def run() -> None:
         hal = AppliedTeleopHal()
@@ -328,14 +393,15 @@ def test_teleop_mapper_records_hal_applied_delta_after_clipping() -> None:
 
         _, payload = hal.commands[0]
         assert payload["deltas"]["X"] == 1800.0
-        assert payload["deltas"]["Roll"] == 0.05
+        assert payload["deltas"]["Roll"] == pytest.approx(0.0498)
 
         last_action = mapper.status()["lastAction"]
         assert last_action["requestedDeltas"]["X"] == 1800.0
-        assert last_action["requestedDeltas"]["Roll"] == 0.05
+        assert last_action["requestedDeltas"]["Roll"] == pytest.approx(0.0498)
         assert last_action["deltas"]["X"] == 800.0
         assert last_action["deltas"]["Roll"] == 0.02
         assert last_action["appliedDeltas"]["X"] == 800.0
+        assert last_action["updateReturn"]["Roll"] == 21.0
         assert last_action["deltaVector"] == [800.0, 0.0, 0.0, 0.02, 0.0, 0.0, 0, 0, 0, 0, 0, 0]
 
     asyncio.run(run())
@@ -379,7 +445,7 @@ def test_teleop_mapper_uses_reverse_deadzone_for_translation_direction_change() 
 
         assert hal.commands[0][1]["deltas"]["X"] == pytest.approx(3.0)
         assert hal.commands[1][1]["syncZeroDeltaTarget"] is True
-        assert hal.commands[2][1]["deltas"]["X"] == pytest.approx(-6.3)
+        assert hal.commands[2][1]["deltas"]["X"] == pytest.approx(-6.4)
 
     asyncio.run(run())
 
@@ -499,8 +565,8 @@ def test_teleop_mapper_status_reports_updated_limits() -> None:
         "rotationStepLimitPulse": 1250.0,
         "translationPulseDeadband": 2.0,
         "rotationPulseDeadband": 2.0,
-        "translationVelocityUmS": 4000.0,
-        "rotationVelocityDegS": 6.0,
+        "translationVelocityUmS": 8000.0,
+        "rotationVelocityDegS": 12.0,
     }
 
 
@@ -516,6 +582,48 @@ def test_teleop_mapper_honors_clutch_when_required() -> None:
         await mapper._step_side("left", hand, config)
 
         assert hal.commands == []
+
+    asyncio.run(run())
+
+
+def test_teleop_mapper_status_reports_inactive_blockers() -> None:
+    async def run() -> None:
+        hal = FakeHal()
+        mapper = TeleopMappingService(settings=None, hal=hal, logs=None)  # type: ignore[arg-type]
+        config = base_config(require_clutch=True)
+        hand = base_hand(clutch=False)
+
+        await mapper._step_side("left", hand, config)
+
+        blocker = mapper.status()["blockers"]["left"]
+        assert blocker["active"] is False
+        assert blocker["targetSide"] == "left"
+        assert blocker["reasons"] == ["clutch is required but not pressed"]
+
+    asyncio.run(run())
+
+
+def test_teleop_mapper_diag_log_reports_requested_and_applied_motion() -> None:
+    async def run() -> None:
+        logs = LogService()
+        hal = AppliedTeleopHal()
+        mapper = TeleopMappingService(settings=None, hal=hal, logs=logs)  # type: ignore[arg-type]
+        config = base_config(require_clutch=False)
+        config["teleop"]["diagLog"] = True
+        hand = base_hand(clutch=False)
+
+        await mapper._step_side("left", hand, config)
+        hand["pose"] = [0.03, 0.0, 0.0, 2.0, 0.0, 0.0]
+        await mapper._step_side("left", hand, config)
+
+        messages = [entry.msg for entry in logs.list_entries()]
+        diag = next(message for message in messages if message.startswith("teleop diag left->left"))
+        assert "clip=X,Roll" in diag
+        assert "req=[X:1800,Roll:0.0498]" in diag
+        assert "app=[X:800,Roll:0.02]" in diag
+        assert "pulseReq=[X:-9000,Roll:83]" in diag
+        assert "updateRet=[Roll:21]" in diag
+        assert "latency=" in diag
 
     asyncio.run(run())
 
@@ -548,16 +656,17 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
     assert config["teleop"]["rightTranslationScale"] == 0.30
     assert config["teleop"]["leftRotationScale"] == 0.10
     assert config["teleop"]["rightRotationScale"] == 0.10
-    assert config["teleop"]["leftAxisOutputScale"] == [0.40, 0.20, 0.20, 1.00, 0.20, 0.20]
-    assert config["teleop"]["rightAxisOutputScale"] == [0.40, 0.20, 0.20, 1.00, 0.20, 0.20]
+    assert config["teleop"]["leftAxisOutputScale"] == [0.60, 0.30, 0.30, 1.50, 0.30, 1.00]
+    assert config["teleop"]["rightAxisOutputScale"] == [0.60, 0.30, 0.30, 1.50, 0.30, 0.30]
     assert config["teleop"]["translationStepLimitPulse"] == 4000
     assert config["teleop"]["rotationStepLimitPulse"] == 1250
     assert config["teleop"]["translationPulseDeadband"] == 2
     assert config["teleop"]["rotationPulseDeadband"] == 2
-    assert config["teleop"]["translationStartVelocityUmS"] == 300.0
-    assert config["teleop"]["translationMaxVelocityUmS"] == 4000.0
-    assert config["teleop"]["rotationStartVelocityDegS"] == 0.50
-    assert config["teleop"]["rotationMaxVelocityDegS"] == 6.0
+    assert config["teleop"]["translationStartVelocityUmS"] == 600.0
+    assert config["teleop"]["translationMaxVelocityUmS"] == 8000.0
+    assert config["teleop"]["rotationStartVelocityDegS"] == 1.0
+    assert config["teleop"]["rotationMaxVelocityDegS"] == 12.0
+    assert config["teleop"]["diagLog"] is False
     assert config["teleop"]["swapHands"] is False
     assert config["teleop"]["swapTeleopChannels"] is True
     assert config["teleop"]["stabilityMode"] == "off"
@@ -594,6 +703,11 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
         90.0,
         7.0,
     ]
+    assert config["teleop"]["leftImpulseCoeff"] == [-5000000, 10000000, -10000000, 1667, -2500, -3333]
+    assert config["teleop"]["rightImpulseCoeff"] == [-5000000, -10000000, -10000000, 1667, 2500, 666]
+    assert config["teleop"]["leftDirectionSign"] == [-1, 1, -1, 1, -1, -1]
+    assert config["teleop"]["rightDirectionSign"] == [-1, -1, -1, 1, 1, 1]
+    assert config["teleop"]["syncImpulseCoeffFromKinematics"] is False
     assert config["motion"]["leftSoftLimits"]["yaw"] == {"min": -7000, "max": 7000}
     assert config["motion"]["kinematics"]["rightPhysicalAxis"] == [2, 0, 5, 8, 1, 7]
     assert config["motion"]["kinematics"]["rightSignedPulsePerUnit"] == [
@@ -611,6 +725,7 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
     assert config["gripper"]["rightPort"] == "COM9"
     assert config["teleop"]["gripperTeleop"]["leftSourceHand"] == "PhysicalRight"
     assert config["teleop"]["gripperTeleop"]["rightSourceHand"] == "PhysicalLeft"
+    assert config["teleop"]["gripperTeleop"]["rightGapInvert"] is True
     assert config["teleop"]["gripperTeleop"]["autoGapCalibration"] is True
 
 
@@ -625,8 +740,8 @@ def test_settings_migration_updates_legacy_icf_translation_speed(tmp_path: Any) 
 
     config = SettingsService(runtime_dir, LogService()).get_config()
 
-    assert config["teleop"]["translationStartVelocityUmS"] == 300.0
-    assert config["teleop"]["translationMaxVelocityUmS"] == 4000.0
+    assert config["teleop"]["translationStartVelocityUmS"] == 600.0
+    assert config["teleop"]["translationMaxVelocityUmS"] == 8000.0
 
 
 def test_settings_migration_updates_legacy_reversed_wrist_cameras(tmp_path: Any) -> None:

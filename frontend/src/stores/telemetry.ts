@@ -65,9 +65,57 @@ const cameraLabels = {
 } as const
 const manualAxisOrder: ManualControlAxis[] = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']
 const manualAxisKeys = ['x', 'y', 'z', 'roll', 'pitch', 'yaw'] as const
+const manualAxisDirectionSign = {
+  left: [-1, -1, -1, -1, 1, -1],
+  right: [-1, -1, -1, -1, -1, 1],
+} as const
+const manualAxisStepLimitPulse = 100000
 
 function manualAxisBusyKey(side: ManualControlState['selectedSide'], axis: ManualControlAxis) {
   return `${side}-${axis}`
+}
+
+function manualAxisPulsePerUiUnit(
+  config: AppConfig,
+  side: ManualControlState['selectedSide'],
+  axisIndex: number,
+) {
+  const kinematics = config.motion.kinematics
+  const signed = side === 'left' ? kinematics.leftSignedPulsePerUnit : kinematics.rightSignedPulsePerUnit
+  const unsigned = side === 'left' ? kinematics.leftPulsePerUnit : kinematics.rightPulsePerUnit
+  const pulsePerUnit = Math.abs(Number(signed?.[axisIndex] ?? unsigned?.[axisIndex] ?? 0))
+  if (!Number.isFinite(pulsePerUnit) || pulsePerUnit <= 0) return 0
+  return axisIndex < 3 ? pulsePerUnit / 1000 : pulsePerUnit
+}
+
+function manualAxisStepLimit(
+  config: AppConfig,
+  side: ManualControlState['selectedSide'],
+  axis: ManualControlAxis,
+) {
+  const axisIndex = manualAxisOrder.indexOf(axis)
+  if (axisIndex < 0) return Number.POSITIVE_INFINITY
+  const pulsePerUiUnit = manualAxisPulsePerUiUnit(config, side, axisIndex)
+  if (pulsePerUiUnit <= 0) return Number.POSITIVE_INFINITY
+  return manualAxisStepLimitPulse / pulsePerUiUnit
+}
+
+function clampManualAxisStep(
+  config: AppConfig,
+  side: ManualControlState['selectedSide'],
+  axis: ManualControlAxis,
+  step: number,
+) {
+  return Math.min(Math.max(0, step), manualAxisStepLimit(config, side, axis))
+}
+
+function manualAxisEffectiveDirection(
+  side: ManualControlState['selectedSide'],
+  axisIndex: number,
+  direction: number,
+) {
+  const sign = manualAxisDirectionSign[side][axisIndex] ?? 1
+  return direction * sign >= 0 ? 1 : -1
 }
 
 function manualAxisLockMs(
@@ -1698,7 +1746,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
         }))
         return
       }
-      const step = axisIndex < 3 ? state.manualControl.axisStepUm : state.manualControl.axisStepDeg
+      const rawStep = axisIndex < 3 ? state.manualControl.axisStepUm : state.manualControl.axisStepDeg
+      const step = clampManualAxisStep(state.config, side, axis, rawStep)
       const speedMode = state.manualControl.speedMode
       const busyKey = manualAxisBusyKey(side, axis)
       const now = Date.now()
@@ -1754,10 +1803,12 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       const unit = axisIndex < 3 ? 'um' : '°'
       const stateIndex = (side === 'left' ? 0 : 6) + axisIndex
       const current = state.frame.jointPositions[stateIndex] ?? 0
-      const rawDelta = unit === 'um' ? state.manualControl.axisStepUm : state.manualControl.axisStepDeg
+      const rawStep = unit === 'um' ? state.manualControl.axisStepUm : state.manualControl.axisStepDeg
+      const rawDelta = clampManualAxisStep(state.config, side, axis, rawStep)
+      const effectiveDirection = manualAxisEffectiveDirection(side, axisIndex, direction)
       const limits = side === 'left' ? state.config.motion.leftSoftLimits[axisKey] : state.config.motion.rightSoftLimits[axisKey]
       // mock 模式沿用软限位，保证手动页演示行为接近真机路径。
-      const nextPosition = clamp(current + rawDelta * direction, limits.min, limits.max)
+      const nextPosition = clamp(current + rawDelta * effectiveDirection, limits.min, limits.max)
       const appliedDelta = nextPosition - current
       const offsetKey = `${side}-${axis}`
       const nextManual = {

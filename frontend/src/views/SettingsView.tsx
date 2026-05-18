@@ -34,6 +34,7 @@ import {
   disableMotionSide,
   enableMotionSide,
   applyCameraTuning,
+  homeAll,
   homeMotionSide,
   reconnectCamera,
   reconnectHal,
@@ -1492,6 +1493,15 @@ function TeleopHandCard({
   const rotationDeg = pose.slice(3, 6)
   const readState = !logicalConnected ? 'pending' : connected && handState?.lastReadOk ? 'ok' : 'warn'
   const [connectionPending, setConnectionPending] = useState(false)
+  const [returnOriginPending, setReturnOriginPending] = useState(false)
+  const returnToWorkOrigin = () => {
+    setReturnOriginPending(true)
+    commandLog(injectLog, '[HAL]', '双臂回工作原点')
+    void homeAll()
+      .then(() => injectLog('INFO', '双臂回工作原点完成', '[HAL]'))
+      .catch((error) => injectLog('ERROR', `双臂回工作原点失败: ${commandErrorMessage(error)}`, '[HAL]'))
+      .finally(() => setReturnOriginPending(false))
+  }
   const toggleConnection = () => {
     setConnectionPending(true)
     if (logicalConnected) {
@@ -1502,7 +1512,7 @@ function TeleopHandCard({
         .finally(() => setConnectionPending(false))
       return
     }
-    commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel} Omega.7 connect dhdOpenID(${openId}) and return mapped work origin`)
+    commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel} Omega.7 connect dhdOpenID(${openId})`)
     void connectTeleopHand(side)
       .then((result) => {
         const payload = result as { data?: { connected?: boolean; message?: string } }
@@ -1540,6 +1550,15 @@ function TeleopHandCard({
       }
       actions={
         <Space wrap>
+          {side === 'left' && (
+            <Button
+              icon={<RotateCcw size={15} />}
+              onClick={returnToWorkOrigin}
+              loading={returnOriginPending}
+            >
+              回工作原点
+            </Button>
+          )}
           <Button
             type={logicalConnected ? 'default' : 'primary'}
             danger={logicalConnected}
@@ -1547,7 +1566,7 @@ function TeleopHandCard({
             onClick={toggleConnection}
             loading={connectionPending}
           >
-            {logicalConnected ? '断开主手' : '连接并回工作原点'}
+            {logicalConnected ? '断开主手' : '连接主手'}
           </Button>
           <Button icon={<PlugZap size={15} />} onClick={() => setGravityEnabled(!gravityCompensation)}>
             重力补偿
@@ -1609,7 +1628,7 @@ function TeleopHandCard({
           <InputNumber min={0} step={0.01} value={translationScale} onChange={(value) => setTranslationScale(Number(value ?? 0.3))} />
         </Form.Item>
         <Form.Item label="旋转比例">
-          <InputNumber min={0} step={0.01} value={rotationScale} onChange={(value) => setRotationScale(Number(value ?? 0.18))} />
+          <InputNumber min={0} step={0.01} value={rotationScale} onChange={(value) => setRotationScale(Number(value ?? 0.1))} />
         </Form.Item>
         <Form.Item label="Translation step pulse">
           <InputNumber min={1} step={100} value={config.teleop.translationStepLimitPulse} onChange={(value) => updateTeleop({ translationStepLimitPulse: Number(value ?? 4000) })} />
@@ -1621,7 +1640,7 @@ function TeleopHandCard({
           <InputNumber min={0} step={0.00001} value={config.teleop.translationDeadzone} onChange={(value) => updateTeleop({ translationDeadzone: Number(value ?? 0) })} />
         </Form.Item>
         <Form.Item label="旋转死区 °">
-          <InputNumber min={0} step={0.01} value={config.teleop.rotationDeadzone} onChange={(value) => updateTeleop({ rotationDeadzone: Number(value ?? 0.08) })} />
+          <InputNumber min={0} step={0.01} value={config.teleop.rotationDeadzone} onChange={(value) => updateTeleop({ rotationDeadzone: Number(value ?? 0.02) })} />
         </Form.Item>
         <Form.Item label="Translation pulse deadband">
           <InputNumber min={0} step={1} value={config.teleop.translationPulseDeadband} onChange={(value) => updateTeleop({ translationPulseDeadband: Number(value ?? 2) })} />
@@ -1630,21 +1649,21 @@ function TeleopHandCard({
           <InputNumber min={0} step={1} value={config.teleop.rotationPulseDeadband} onChange={(value) => updateTeleop({ rotationPulseDeadband: Number(value ?? 2) })} />
         </Form.Item>
         <Form.Item label="Translation min delta">
-          <InputNumber min={0} step={0.00001} value={config.teleop.incrementalTranslationMinEffectiveDelta} onChange={(value) => updateTeleop({ incrementalTranslationMinEffectiveDelta: Number(value ?? 0.00005) })} />
+          <InputNumber min={0} step={0.00001} value={config.teleop.incrementalTranslationMinEffectiveDelta} onChange={(value) => updateTeleop({ incrementalTranslationMinEffectiveDelta: Number(value ?? 0.000025) })} />
         </Form.Item>
         <Form.Item label="Reverse deadzone">
-          <InputNumber min={0} step={0.00001} value={config.teleop.incrementalTranslationReverseDeadzone} onChange={(value) => updateTeleop({ incrementalTranslationReverseDeadzone: Number(value ?? 0.0001) })} />
+          <InputNumber min={0} step={0.00001} value={config.teleop.incrementalTranslationReverseDeadzone} onChange={(value) => updateTeleop({ incrementalTranslationReverseDeadzone: Number(value ?? 0.00005) })} />
         </Form.Item>
         <Form.Item label="Translation speed um/s">
           <Space.Compact>
             <InputNumber min={0} value={config.teleop.translationStartVelocityUmS} onChange={(value) => updateTeleop({ translationStartVelocityUmS: Number(value ?? 300) })} />
-            <InputNumber min={1} value={config.teleop.translationMaxVelocityUmS} onChange={(value) => updateTeleop({ translationMaxVelocityUmS: Number(value ?? 4000) })} />
+            <InputNumber min={1} value={config.teleop.translationMaxVelocityUmS} onChange={(value) => updateTeleop({ translationMaxVelocityUmS: Number(value ?? 8000) })} />
           </Space.Compact>
         </Form.Item>
         <Form.Item label="Rotation speed deg/s">
           <Space.Compact>
-            <InputNumber min={0} step={0.05} value={config.teleop.rotationStartVelocityDegS} onChange={(value) => updateTeleop({ rotationStartVelocityDegS: Number(value ?? 0.25) })} />
-            <InputNumber min={1} step={0.1} value={config.teleop.rotationMaxVelocityDegS} onChange={(value) => updateTeleop({ rotationMaxVelocityDegS: Number(value ?? 3) })} />
+            <InputNumber min={0} step={0.05} value={config.teleop.rotationStartVelocityDegS} onChange={(value) => updateTeleop({ rotationStartVelocityDegS: Number(value ?? 0.5) })} />
+            <InputNumber min={1} step={0.1} value={config.teleop.rotationMaxVelocityDegS} onChange={(value) => updateTeleop({ rotationMaxVelocityDegS: Number(value ?? 12) })} />
           </Space.Compact>
         </Form.Item>
         <Form.Item label="Profile acc/dec s">
@@ -1652,6 +1671,9 @@ function TeleopHandCard({
             <InputNumber min={0.001} step={0.01} value={config.teleop.motionProfileAccSec} onChange={(value) => updateTeleop({ motionProfileAccSec: Number(value ?? 0.05) })} />
             <InputNumber min={0.001} step={0.01} value={config.teleop.motionProfileDecSec} onChange={(value) => updateTeleop({ motionProfileDecSec: Number(value ?? 0.05) })} />
           </Space.Compact>
+        </Form.Item>
+        <Form.Item label="诊断日志">
+          <Switch checked={config.teleop.diagLog} checkedChildren="开" unCheckedChildren="关" onChange={(value) => updateTeleop({ diagLog: value })} />
         </Form.Item>
       </Form>
       <div className="teleop-switch-row">
@@ -1699,6 +1721,36 @@ function manualAxisUnit(axis: ManualControlAxis) {
 
 function manualAxisSoftKey(axis: ManualControlAxis): keyof ArmSoftLimitConfig {
   return axis === 'X' ? 'x' : axis === 'Y' ? 'y' : axis === 'Z' ? 'z' : axis === 'Roll' ? 'roll' : axis === 'Pitch' ? 'pitch' : 'yaw'
+}
+
+const manualAxisStepLimitPulse = 100000
+
+function manualAxisPulsePerUiUnit(config: AppConfig, side: RobotSide, axisIndex: number) {
+  const kinematics = config.motion.kinematics
+  const signed = side === 'left' ? kinematics.leftSignedPulsePerUnit : kinematics.rightSignedPulsePerUnit
+  const unsigned = side === 'left' ? kinematics.leftPulsePerUnit : kinematics.rightPulsePerUnit
+  const pulsePerUnit = Math.abs(Number(signed?.[axisIndex] ?? unsigned?.[axisIndex] ?? 0))
+  if (!Number.isFinite(pulsePerUnit) || pulsePerUnit <= 0) return 0
+  return axisIndex < 3 ? pulsePerUnit / 1000 : pulsePerUnit
+}
+
+function manualAxisStepLimit(config: AppConfig, side: RobotSide, axisIndex: number) {
+  const pulsePerUiUnit = manualAxisPulsePerUiUnit(config, side, axisIndex)
+  if (pulsePerUiUnit <= 0) return Number.POSITIVE_INFINITY
+  return manualAxisStepLimitPulse / pulsePerUiUnit
+}
+
+function clampManualAxisStep(value: number, limit: number) {
+  return Math.min(Math.max(0, value), limit)
+}
+
+function formatManualStepValue(value: number, unit: string) {
+  if (!Number.isFinite(value)) return '-'
+  return unit === 'um' ? value.toFixed(0) : value.toFixed(3)
+}
+
+function manualSpeedScale(mode: ManualSpeedMode) {
+  return mode === 'coarse' ? 1 : mode === 'medium' ? 0.5 : 0.2
 }
 
 function formatManualAction(action: ManualControlAction) {
@@ -1760,9 +1812,12 @@ function ManualArmControl({
     max: displaySoftLimitValue(limits.max, axisIndex),
   }
   const stepValue = unit === 'um' ? manualControl.axisStepUm : manualControl.axisStepDeg
+  const stepLimit = manualAxisStepLimit(config, side, axisIndex)
+  const boundedStepValue = clampManualAxisStep(stepValue, stepLimit)
   const softMargin = Math.min(Math.abs(position - displayLimits.min), Math.abs(displayLimits.max - position))
   const profile = side === 'left' ? config.motion.leftProfile : config.motion.rightProfile
   const group = axisIndex < 3 ? profile.translation : profile.rotation
+  const effectiveMaxSpeed = Math.min(group.maxSpeed, axisIndex < 3 ? 20000 : 30) * manualSpeedScale(manualControl.speedMode)
   const busyKey = `${side}-${selectedAxis}`
   const busyUntil = manualControl.axisBusyUntil[busyKey] ?? 0
   const axisBusy = busyUntil > nowMs
@@ -1863,11 +1918,26 @@ function ManualArmControl({
             <MetricBox label="当前轴" value={selectedAxis} />
             <MetricBox label="当前位置" value={`${position.toFixed(unit === 'um' ? 1 : 3)} ${unit}`} hint={originHint} tone={originValid ? 'neutral' : 'warn'} />
             <MetricBox label="软限位余量" value={`${softMargin.toFixed(unit === 'um' ? 0 : 2)} ${unit}`} tone={softMargin < (unit === 'um' ? 500 : 2) ? 'warn' : 'ok'} />
-            <MetricBox label="最大速度" value={`${group.maxSpeed} ${speedUnit}`} />
+            <MetricBox
+              label="最大速度"
+              value={`${effectiveMaxSpeed.toFixed(axisIndex < 3 ? 0 : 2)} ${speedUnit}`}
+              hint={`${manualControl.speedMode} · 配置 ${group.maxSpeed} ${speedUnit}`}
+            />
+            <MetricBox
+              label="单次上限"
+              value={`${formatManualStepValue(stepLimit, unit)} ${unit}`}
+              hint={`${manualAxisStepLimitPulse} pulse`}
+            />
           </div>
           <Form layout="vertical" className="manual-command-form manual-command-form-arm">
             <Form.Item label={`目标增量 ${unit}`}>
-              <InputNumber min={0} step={unit === 'um' ? 10 : 0.1} value={stepValue} onChange={(value) => setManualAxisStep(unit, Number(value ?? 0))} />
+              <InputNumber
+                min={0}
+                max={Number.isFinite(stepLimit) ? stepLimit : undefined}
+                step={unit === 'um' ? 10 : 0.1}
+                value={boundedStepValue}
+                onChange={(value) => setManualAxisStep(unit, clampManualAxisStep(Number(value ?? 0), stepLimit))}
+              />
             </Form.Item>
             <Form.Item label="速度档位">
               <Select value={manualControl.speedMode} options={speedModeOptions} onChange={setManualSpeedMode} />
@@ -1881,10 +1951,10 @@ function ManualArmControl({
           </Form>
           <div className="manual-action-row">
             <Button disabled={axisBusy || !motionReady} onClick={() => issueManualAxisMove(side, selectedAxis, -1)}>
-              {axisBusy ? busyText : `-${stepValue}${unit}`}
+              {axisBusy ? busyText : `-${boundedStepValue}${unit}`}
             </Button>
             <Button type="primary" disabled={axisBusy || !motionReady} onClick={() => issueManualAxisMove(side, selectedAxis, 1)}>
-              {axisBusy ? busyText : `+${stepValue}${unit}`}
+              {axisBusy ? busyText : `+${boundedStepValue}${unit}`}
             </Button>
             <Button icon={<Square size={15} />} loading={pendingMotionAction === 'stop'} onClick={() => void stopMotion()}>
               停止

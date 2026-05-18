@@ -28,11 +28,17 @@ def test_hal_teleop_target_update_uses_absolute_target_mode() -> None:
     assert "TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(" in source
     assert "result.appliedDeltaUi[axisIndex]" in source
     assert "result.targetPulse[axisIndex]" in source
-    assert "void updateTeleopTargetBestEffort" in source
+    assert "int updateTeleopTargetBestEffort" in source
     assert "const auto retUpdate = dmcUpdateTargetPosition(card, axisNo, targetPulse, 1);" in normalized
-    assert "(void)retUpdate;" in normalized
+    assert "return retUpdate;" in normalized
+    assert "result.updateReturn[axisIndex]" in source
+    server_source = (REPO_ROOT / "hal" / "src" / "HalServer.cpp").read_text(encoding="utf-8")
+    assert '\\"updateReturn\\"' in server_source
     assert 'dmcFailureMessage("dmc_update_target_position"' not in source
     assert "dmcPMove(card, axisNo, updateTargetPulse, 1)" in teleop_body
+    assert "dmcTeleopFailureMessage(" in teleop_body
+    assert "<< \" targetPulse=\" << targetPulse" in source
+    assert "<< \" limit=[\" << limit.min << \",\" << limit.max << \"]\"" in source
     assert "syncZeroDeltaTarget" in source
     assert "teleopTargetPulse_[index] = pulse_[index];" in normalized
     assert "axis busy before teleop target" not in source
@@ -94,6 +100,24 @@ def test_hal_omega7_assignment_supports_icf_swap_hands() -> None:
     assert "APPSTATION_OMEGA7_SWAP_HANDS" in start_hal
 
 
+def test_hal_omega7_force_output_is_wired_to_sdk() -> None:
+    header_source = (REPO_ROOT / "hal" / "include" / "Omega7Driver.h").read_text(encoding="utf-8")
+    driver_source = (REPO_ROOT / "hal" / "src" / "Omega7Driver.cpp").read_text(encoding="utf-8")
+    server_source = (REPO_ROOT / "hal" / "src" / "HalServer.cpp").read_text(encoding="utf-8")
+    client_source = (REPO_ROOT / "backend" / "hal_client" / "client.py").read_text(encoding="utf-8")
+
+    assert "void setGravityCompensation(bool leftEnabled, bool rightEnabled)" in header_source
+    assert "DhdEnableForce" in driver_source
+    assert "dhdEnableForce(enabled ? 1 : 0, deviceId)" in driver_source
+    assert "dhdSetGravityCompensation(enabled ? 1 : 0, deviceId)" in driver_source
+    assert "dhdSetForceAndTorqueAndGripperForce(" in driver_source
+    assert "writeZeroForceUnlocked(item)" in driver_source
+    assert 'POST /omega7/gravity_compensation ' in server_source
+    assert 'POST /omega7/zero_force_feedback ' in server_source
+    assert '"omega7.gravity_compensation": "/omega7/gravity_compensation"' in client_source
+    assert '"omega7.zero_force_feedback": "/omega7/zero_force_feedback"' in client_source
+
+
 def test_hal_launch_promotes_latest_built_binary() -> None:
     start_hal = (REPO_ROOT / "scripts" / "start-hal.ps1").read_text(encoding="utf-8")
     build_hal = (REPO_ROOT / "hal" / "build_hal.cmd").read_text(encoding="utf-8")
@@ -122,20 +146,19 @@ def test_hal_enable_side_rejects_partial_servo_failures() -> None:
     assert "succeeded == 0 && failed > 0" not in normalized
 
 
-def test_hal_reads_card0_dmc5c10_sevon_feedback() -> None:
+def test_hal_treats_card0_dmc5c10_sevon_feedback_as_unreadable() -> None:
     source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
     normalized = " ".join(source.split())
 
     assert "bool usesSevonPin(appstation::hal::Side side, appstation::hal::SemanticAxis axis)" in normalized
     assert "return physicalAxis(side, axis) < stageAxisCount(side);" in normalized
     assert "bool hasReadableSevonFeedback(appstation::hal::Side side, appstation::hal::SemanticAxis axis)" in normalized
-    assert "if (side == appstation::hal::Side::Right) { return false; }" not in normalized
+    assert "if (side == appstation::hal::Side::Right) { return false; }" in normalized
     assert "if (dmcReadSevonPin && hasReadableSevonFeedback(side, axis))" in normalized
     assert (
         "if (!usesSevonPin(side, axis)) { enabled_[stateIndex(side, axis)] = enabled; "
         "++succeeded; continue; }"
     ) in normalized
-    assert "DMC3C00 servo feedback can read false" not in source
 
 
 def test_hal_stage_axis_and_direction_signs_match_icf_mapping() -> None:

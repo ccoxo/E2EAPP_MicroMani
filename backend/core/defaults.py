@@ -18,7 +18,7 @@ DEFAULT_MOTION_PROFILE: dict[str, Any] = {
     },
 }
 
-ICF_TELEOP_STRATEGY_VERSION = "icf_omega7_qserialtest_v19_platform1_roll_yaw_direction_fix_20260515"
+ICF_TELEOP_STRATEGY_VERSION = "e2e_omega7_icf_v19_manual_gripper_response_force_20260518"
 ICF_WORK_ORIGIN_VERSION = "icf_work_origin_20260513"
 
 ICF_CAMERA_DEFAULTS: dict[str, Any] = {
@@ -116,24 +116,25 @@ ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "leftRotationScale": 0.10,
     "rightRotationScale": 0.10,
     "homeBeforeStart": True,
-    "leftAxisOutputScale": [0.40, 0.20, 0.20, 1.00, 0.20, 0.20],
-    "rightAxisOutputScale": [0.40, 0.20, 0.20, 1.00, 0.20, 0.20],
-    "translationDeadzone": 0.00002,
-    "rotationDeadzone": 0.03,
-    "incrementalTranslationMinEffectiveDelta": 0.00005,
-    "incrementalTranslationReverseDeadzone": 0.00010,
+    "leftAxisOutputScale": [0.60, 0.30, 0.30, 1.50, 0.30, 1.00],
+    "rightAxisOutputScale": [0.60, 0.30, 0.30, 1.50, 0.30, 0.30],
+    "translationDeadzone": 0.00001,
+    "rotationDeadzone": 0.02,
+    "incrementalTranslationMinEffectiveDelta": 0.000025,
+    "incrementalTranslationReverseDeadzone": 0.00005,
     "translationStepLimitPulse": 4000,
     "rotationStepLimitPulse": 1250,
     "translationPulseDeadband": 2,
     "rotationPulseDeadband": 2,
     "translationStepUm": 5000.0,
     "rotationStepDeg": 0.2,
-    "translationStartVelocityUmS": 300.0,
-    "translationMaxVelocityUmS": 4000.0,
-    "rotationStartVelocityDegS": 0.50,
-    "rotationMaxVelocityDegS": 6.0,
+    "translationStartVelocityUmS": 600.0,
+    "translationMaxVelocityUmS": 8000.0,
+    "rotationStartVelocityDegS": 1.0,
+    "rotationMaxVelocityDegS": 12.0,
     "motionProfileAccSec": 0.05,
     "motionProfileDecSec": 0.05,
+    "diagLog": False,
     "leftEnabledAxes": [True, True, True, True, True, True],
     "rightEnabledAxes": [True, True, True, True, True, True],
     "softLimitUnitSpec": list(ICF_TELEOP_SOFT_LIMIT_UNIT_SPEC),
@@ -141,6 +142,11 @@ ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "leftSoftLimitMax": list(ICF_LEFT_TELEOP_SOFT_LIMIT_MAX),
     "rightSoftLimitMin": list(ICF_RIGHT_TELEOP_SOFT_LIMIT_MIN),
     "rightSoftLimitMax": list(ICF_RIGHT_TELEOP_SOFT_LIMIT_MAX),
+    "leftImpulseCoeff": [-5000000, 10000000, -10000000, 1667, -2500, -3333],
+    "rightImpulseCoeff": [-5000000, -10000000, -10000000, 1667, 2500, 666],
+    "leftDirectionSign": [-1, 1, -1, 1, -1, -1],
+    "rightDirectionSign": [-1, -1, -1, 1, 1, 1],
+    "syncImpulseCoeffFromKinematics": False,
 }
 
 ICF_WORK_ORIGIN_DEFAULTS: dict[str, Any] = {
@@ -283,8 +289,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "rightConnected": False,
         "leftGravityCompensation": True,
         "rightGravityCompensation": True,
-        "leftForceFeedback": False,
-        "rightForceFeedback": False,
+        "leftForceFeedback": True,
+        "rightForceFeedback": True,
         **deepcopy(ICF_TELEOP_DEFAULTS),
         "requireClutch": False,
         "stabilityMode": "off",
@@ -296,6 +302,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "leftGapMaxMm": 25.0,
             "rightGapMinMm": 0.0,
             "rightGapMaxMm": 25.0,
+            "leftGapInvert": False,
+            "rightGapInvert": True,
             "openThreshold": 0.30,
             "closeThreshold": 0.70,
             "gripSpeed": 128,

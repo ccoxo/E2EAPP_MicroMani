@@ -78,6 +78,31 @@ std::string dmcFailureMessage(
   return out.str();
 }
 
+std::string dmcTeleopFailureMessage(
+    const char* operation,
+    short ret,
+    unsigned short card,
+    unsigned short axis,
+    long deltaPulse,
+    long targetPulse,
+    double basePulse,
+    double targetUi,
+    const AxisLimit& limit,
+    bool moving) {
+  std::ostringstream out;
+  out << operation << " failed"
+      << " ret=" << ret
+      << " card=" << card
+      << " axis=" << axis
+      << " deltaPulse=" << deltaPulse
+      << " targetPulse=" << targetPulse
+      << " basePulse=" << basePulse
+      << " targetUi=" << targetUi
+      << " limit=[" << limit.min << "," << limit.max << "]"
+      << " moving=" << (moving ? "true" : "false");
+  return out.str();
+}
+
 std::string dmcBusyMessage(unsigned short card, unsigned short axis, long deltaPulse) {
   std::ostringstream out;
   out << "axis busy before dmc_pmove"
@@ -100,6 +125,9 @@ bool usesSevonPin(appstation::hal::Side side, appstation::hal::SemanticAxis axis
 }
 
 bool hasReadableSevonFeedback(appstation::hal::Side side, appstation::hal::SemanticAxis axis) {
+  if (side == appstation::hal::Side::Right) {
+    return false;
+  }
   return usesSevonPin(side, axis);
 }
 
@@ -142,10 +170,10 @@ void applyMotionProfile(
   }
 }
 
-void updateTeleopTargetBestEffort(unsigned short card, unsigned short axisNo, long targetPulse) {
+int updateTeleopTargetBestEffort(unsigned short card, unsigned short axisNo, long targetPulse) {
   // Match ICF teleop: target refresh return codes must not break the 10 ms command loop.
   const auto retUpdate = dmcUpdateTargetPosition(card, axisNo, targetPulse, 1);
-  (void)retUpdate;
+  return retUpdate;
 }
 #endif
 }  // namespace
@@ -622,7 +650,8 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
           pulse_[index] = static_cast<double>(dmcGetPosition(card, axisNo));
         }
         const auto updateTargetPulse = static_cast<long>(std::llround(pulse_[index]));
-        updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse);
+        result.updateReturn[axisIndex] = static_cast<double>(
+            updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse));
 #endif
         teleopTargetPulse_[index] = pulse_[index];
         teleopTargetActive_[index] = true;
@@ -667,10 +696,21 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
       applyMotionProfile(card, axisNo, startVelocityPulse, maxVelocityPulse, tacc, tdec, deltaPulse);
       const auto retMove = dmcPMove(card, axisNo, updateTargetPulse, 1);
       if (retMove != 0) {
-        throw std::runtime_error(dmcFailureMessage("dmc_pmove", retMove, card, axisNo, deltaPulse));
+        throw std::runtime_error(dmcTeleopFailureMessage(
+            "dmc_pmove",
+            retMove,
+            card,
+            axisNo,
+            deltaPulse,
+            updateTargetPulse,
+            basePulse,
+            appliedTargetUi,
+            limit,
+            moving));
       }
     }
-    updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse);
+    result.updateReturn[axisIndex] =
+        static_cast<double>(updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse));
 #else
     (void)card;
     (void)axisNo;

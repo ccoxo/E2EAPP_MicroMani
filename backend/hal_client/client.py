@@ -180,6 +180,8 @@ class RealHalClient(HalClient):
             "motion.manual_axis_move": "/motion/manual_axis_move",
             "motion.teleop_target_update": "/motion/teleop_target_update",
             "motion.teleop_stop_side": "/motion/teleop_stop_side",
+            "omega7.gravity_compensation": "/omega7/gravity_compensation",
+            "omega7.zero_force_feedback": "/omega7/zero_force_feedback",
         }
         path = path_by_command.get(name)
         if path is None:

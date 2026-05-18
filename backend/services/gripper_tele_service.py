@@ -54,6 +54,8 @@ class FollowGripper:
         if abs(span) < 1e-6:
             return None
         open_ratio = max(0.0, min(1.0, (gap_mm - gap_min) / span))
+        if bool(cfg.get(f"{side}GapInvert", False)):
+            open_ratio = 1.0 - open_ratio
         target_mm = max(0.0, min(stroke_mm, open_ratio * stroke_mm))
         raw_position = round((1.0 - (target_mm / stroke_mm)) * 255) if stroke_mm > 0 else 255
         return self._maybe_command(target_mm, raw_position, cfg, now_ms)
@@ -145,17 +147,29 @@ class GripperTeleService:
         self._right = FollowGripper("right")
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
+        self._arm_sources: set[str] = set()
+        self._teleop_enabled_sides: set[str] = set()
 
-    def start(self) -> None:
+    def start(self, source: str = "manual") -> None:
+        self._arm_sources.add(source)
         if self._task is not None and not self._task.done():
             return
         self._stop_event = asyncio.Event()
         self._task = asyncio.get_running_loop().create_task(self._loop())
         self._logs.info("[GRIPPER]", "gripper teleop started")
 
-    def stop(self) -> None:
+    def stop(self, source: str = "manual", *, force: bool = False) -> None:
+        if force:
+            self._arm_sources.clear()
+        else:
+            self._arm_sources.discard(source)
+        if self._arm_sources:
+            return
         if self._stop_event is not None:
             self._stop_event.set()
+        self._left.reset()
+        self._right.reset()
+        self._teleop_enabled_sides.clear()
         self._logs.info("[GRIPPER]", "gripper teleop stopped")
 
     def is_running(self) -> bool:
@@ -170,6 +184,7 @@ class GripperTeleService:
     def get_status(self) -> dict[str, Any]:
         return {
             "running": self.is_running(),
+            "sources": sorted(self._arm_sources),
             "leftState": self._left.state,
             "rightState": self._right.state,
             "leftTargetMm": self._left.target_mm,
@@ -199,9 +214,6 @@ class GripperTeleService:
                 stroke_mm = float(config.get("gripper", {}).get("strokeMm", 26))
 
                 for side, follower in (("left", self._left), ("right", self._right)):
-                    if not bool(config.get("gripper", {}).get(f"{side}Enabled", False)):
-                        follower.reset()
-                        continue
                     hand = self._select_source_hand(hands, gt_cfg, side)
                     if not hand.get("connected") or not hand.get("lastReadOk", False):
                         follower.reset()
@@ -256,11 +268,15 @@ class GripperTeleService:
         target_mm: float | None,
     ) -> Any:
         cfg = copy.deepcopy(config)
-        if not bool(cfg.get("gripper", {}).get(f"{side}Enabled", False)):
-            raise RuntimeError(f"{side} gripper is disabled; enable it before teleop")
+        cfg.setdefault("gripper", {})[f"{side}Enabled"] = True
         cfg["gripper"]["commandSpeed"] = speed
         cfg["gripper"]["commandTorque"] = torque
         if self._gripper_workers is not None and self._gripper_workers.is_enabled(cfg):
+            if side not in self._teleop_enabled_sides:
+                enable_result = self._gripper_workers.command(cfg, side, "enable", None)
+                if not enable_result.ok:
+                    return enable_result
+                self._teleop_enabled_sides.add(side)
             return self._gripper_workers.command(cfg, side, cmd, target_mm)
         return self._hardware.gripper.command(cfg, side, cmd, target_mm)
 

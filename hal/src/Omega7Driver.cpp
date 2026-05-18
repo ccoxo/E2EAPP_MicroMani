@@ -5,6 +5,7 @@
 #endif
 
 #include <chrono>
+#include <cstddef>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -29,6 +30,11 @@ using DhdIsLeftHanded = bool(__stdcall*)(char);
 using DhdGetButton = int(__stdcall*)(int, char);
 using DhdGetPositionAndOrientationDeg = int(__stdcall*)(double*, double*, double*, double*, double*, double*, char);
 using DhdGetGripperGap = int(__stdcall*)(double*, char);
+using DhdEnableExpertMode = int(__stdcall*)();
+using DhdEnableForce = int(__stdcall*)(unsigned char, char);
+using DhdSetGravityCompensation = int(__stdcall*)(int, char);
+using DhdSetForceAndTorqueAndGripperForce =
+    int(__stdcall*)(double, double, double, double, double, double, double, char);
 using DhdErrorGetLastStr = const char* (__stdcall*)();
 
 HMODULE dhdModule = nullptr;
@@ -41,6 +47,10 @@ DhdIsLeftHanded dhdIsLeftHanded = nullptr;
 DhdGetButton dhdGetButton = nullptr;
 DhdGetPositionAndOrientationDeg dhdGetPositionAndOrientationDeg = nullptr;
 DhdGetGripperGap dhdGetGripperGap = nullptr;
+DhdEnableExpertMode dhdEnableExpertMode = nullptr;
+DhdEnableForce dhdEnableForce = nullptr;
+DhdSetGravityCompensation dhdSetGravityCompensation = nullptr;
+DhdSetForceAndTorqueAndGripperForce dhdSetForceAndTorqueAndGripperForce = nullptr;
 DhdErrorGetLastStr dhdErrorGetLastStr = nullptr;
 
 // SDK 调用失败时统一取最近错误。dhdErrorGetLastStr 本身也是可选导出，
@@ -61,6 +71,7 @@ bool Omega7Driver::initialize(int leftOpenId, int rightOpenId, bool swapHands) {
   initialized_ = false;
   lastError_.clear();
   state_ = {};
+  forceOutputEnabled_ = {true, true};
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   // 优先加载 64 位 SDK DLL，失败时再尝试旧名称 dhd.dll。
   // HalServer 运行目录或 PATH 里必须能找到该 DLL。
@@ -84,6 +95,12 @@ bool Omega7Driver::initialize(int leftOpenId, int rightOpenId, bool swapHands) {
   dhdGetPositionAndOrientationDeg = reinterpret_cast<DhdGetPositionAndOrientationDeg>(
       GetProcAddress(dhdModule, "dhdGetPositionAndOrientationDeg"));
   dhdGetGripperGap = reinterpret_cast<DhdGetGripperGap>(GetProcAddress(dhdModule, "dhdGetGripperGap"));
+  dhdEnableExpertMode = reinterpret_cast<DhdEnableExpertMode>(GetProcAddress(dhdModule, "dhdEnableExpertMode"));
+  dhdEnableForce = reinterpret_cast<DhdEnableForce>(GetProcAddress(dhdModule, "dhdEnableForce"));
+  dhdSetGravityCompensation = reinterpret_cast<DhdSetGravityCompensation>(
+      GetProcAddress(dhdModule, "dhdSetGravityCompensation"));
+  dhdSetForceAndTorqueAndGripperForce = reinterpret_cast<DhdSetForceAndTorqueAndGripperForce>(
+      GetProcAddress(dhdModule, "dhdSetForceAndTorqueAndGripperForce"));
   dhdErrorGetLastStr = reinterpret_cast<DhdErrorGetLastStr>(GetProcAddress(dhdModule, "dhdErrorGetLastStr"));
   if (!dhdGetDeviceCount || !dhdOpenID || !dhdGetPositionAndOrientationDeg) {
     lastError_ = "required Force Dimension exports missing";
@@ -184,6 +201,8 @@ bool Omega7Driver::initialize(int leftOpenId, int rightOpenId, bool swapHands) {
   if (swapHands) {
     std::swap(state_[0], state_[1]);
   }
+  applyForceOutputUnlocked(0, forceOutputEnabled_[0]);
+  applyForceOutputUnlocked(1, forceOutputEnabled_[1]);
 
   // 至少打开一台主手就认为 Omega7Driver 可用。只打开一台时保留 warning，
   // 让 /health 能提示“部分连接”而不是直接判整个模块不可用。
@@ -226,7 +245,8 @@ std::array<Omega7State, 2> Omega7Driver::readState() {
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   // 逐台读取已打开设备的实时状态。这里不重新打开设备，只复用 initialize
   // 保存下来的 deviceId，因此 readState 应该是轻量的周期性轮询。
-  for (auto& item : state_) {
+  for (std::size_t index = 0; index < state_.size(); ++index) {
+    auto& item = state_[index];
     if (!item.connected || item.deviceId < 0) {
       continue;
     }
@@ -256,6 +276,9 @@ std::array<Omega7State, 2> Omega7Driver::readState() {
         item.gripperGapAvailable = false;
       }
     }
+    if (forceOutputEnabled_[index]) {
+      writeZeroForceUnlocked(item);
+    }
   }
 #endif
   // 目前没有接入 SDK 校准状态查询，保持 false，避免前端误以为已经完成校准。
@@ -268,18 +291,67 @@ std::array<Omega7State, 2> Omega7Driver::readState() {
 
 void Omega7Driver::setGravityCompensation(bool leftEnabled, bool rightEnabled) {
   std::scoped_lock lock(mutex_);
-  (void)leftEnabled;
-  (void)rightEnabled;
-#ifdef APPSTATION_ENABLE_VENDOR_SDKS
-  // TODO: 后续在这里按左右主手分别调用 Force Dimension SDK 的重力补偿接口。
-#endif
+  applyForceOutputUnlocked(0, leftEnabled);
+  applyForceOutputUnlocked(1, rightEnabled);
 }
 
 void Omega7Driver::zeroForceFeedback(int openId) {
   std::scoped_lock lock(mutex_);
-  (void)openId;
-#ifdef APPSTATION_ENABLE_VENDOR_SDKS
-  // TODO: 后续在这里对指定 openId 的 Omega.7 输出零力/零力矩反馈。
+  for (const auto& item : state_) {
+    if (item.connected && item.deviceId >= 0 && (openId < 0 || item.openId == openId)) {
+      writeZeroForceUnlocked(item);
+    }
+  }
+}
+
+void Omega7Driver::applyForceOutputUnlocked(std::size_t index, bool enabled) {
+  if (index >= state_.size()) {
+    return;
+  }
+  forceOutputEnabled_[index] = enabled;
+  const auto& item = state_[index];
+  if (!item.connected || item.deviceId < 0) {
+    return;
+  }
+#if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
+  const auto deviceId = static_cast<char>(item.deviceId);
+  if (dhdEnableExpertMode) {
+    (void)dhdEnableExpertMode();
+  }
+  if (dhdSetGravityCompensation) {
+    (void)dhdSetGravityCompensation(enabled ? 1 : 0, deviceId);
+  }
+  if (dhdEnableForce) {
+    const int ret = dhdEnableForce(enabled ? 1 : 0, deviceId);
+    if (ret < 0) {
+      lastError_ = std::string("dhdEnableForce failed: ") + sdkError();
+    }
+  }
+  if (enabled) {
+    writeZeroForceUnlocked(item);
+  }
+#else
+  (void)enabled;
+#endif
+}
+
+int Omega7Driver::writeZeroForceUnlocked(const Omega7State& item) {
+#if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
+  if (!dhdSetForceAndTorqueAndGripperForce || !item.connected || item.deviceId < 0) {
+    return -1;
+  }
+  return dhdSetForceAndTorqueAndGripperForce(
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      static_cast<char>(item.deviceId));
+#else
+  (void)item;
+  return -1;
 #endif
 }
 

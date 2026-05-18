@@ -42,6 +42,7 @@ struct TeleopTargetUpdateResult {
   std::array<double, 6> requestedDeltaPulse{};
   std::array<double, 6> appliedDeltaPulse{};
   std::array<double, 6> targetPulse{};
+  std::array<double, 6> updateReturn{};
   std::array<bool, 6> clipped{};
 };
 

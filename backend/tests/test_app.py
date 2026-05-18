@@ -148,6 +148,22 @@ def test_command_envelope_and_telemetry_ws(tmp_path: Path, monkeypatch: MonkeyPa
     assert len(teleop_response.json()["data"]["hands"]) == 2
 
 
+def test_teleop_force_controls_forward_to_hal(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+
+    gravity_response = client.post("/api/teleop/right/gravity_compensation", json={"enabled": False})
+    assert gravity_response.status_code == 200
+    assert gravity_response.json()["data"]["enabled"] is False
+    config = client.get("/api/settings").json()
+    assert config["teleop"]["rightGravityCompensation"] is False
+    assert config["teleop"]["rightForceFeedback"] is False
+
+    zero_response = client.post("/api/teleop/right/zero_force_feedback")
+    assert zero_response.status_code == 200
+    assert zero_response.json()["data"]["openId"] == 1
+
+
 def test_websocket_telemetry_compatibility_and_log_shape(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     client = TestClient(create_app(tmp_path))
@@ -177,7 +193,7 @@ def test_websocket_telemetry_compatibility_and_log_shape(tmp_path: Path, monkeyp
     assert {"id", "ts", "channel", "level", "msg"}.issubset(log["data"])
 
 
-def test_websocket_reports_card0_dmc5c10_enabled_feedback(
+def test_websocket_reports_card0_dmc5c10_enabled_feedback_as_unknown(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
@@ -210,8 +226,8 @@ def test_websocket_reports_card0_dmc5c10_enabled_feedback(
     with client.websocket_connect("/ws") as websocket:
         frame = websocket.receive_json()["data"]
 
-    assert frame["motionAxisEnabled"]["right"] == [False, False, False, False, False, False]
-    assert frame["motionEnabled"]["right"] is False
+    assert frame["motionAxisEnabled"]["right"] == [None, None, None, None, None, None]
+    assert frame["motionEnabled"]["right"] is None
 
 
 def test_hardware_status_uses_gripper_workers_in_dual_mode(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -446,8 +462,8 @@ def test_motion_origin_relative_positions_are_applied_per_side(tmp_path: Path, m
     }
     positions = [42.0] * 12
     pulses = [
-        -8900.0,
-        -10200.0,
+        -4900.0,
+        9800.0,
         -9700.0,
         1666.666667,
         2500.0,
@@ -507,11 +523,18 @@ def test_runtime_release_handles_disconnects_teleop_and_grippers(tmp_path: Path,
 def test_teleop_logical_connect_enables_mapped_motion_side(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     client = TestClient(create_app(tmp_path))
+    gripper_start_calls: list[str] = []
+    monkeypatch.setattr(
+        client.app.state.gripper_tele,
+        "start",
+        lambda source="manual": gripper_start_calls.append(source),
+    )
 
     connect_response = client.post("/api/teleop/left/connect")
     assert connect_response.status_code == 200
     assert connect_response.json()["data"]["connected"] is True
     assert client.get("/api/settings").json()["teleop"]["leftConnected"] is True
+    assert gripper_start_calls == ["teleop-connect"]
 
     with client.websocket_connect("/ws") as websocket:
         frame = websocket.receive_json()["data"]
@@ -529,6 +552,100 @@ def test_teleop_logical_connect_enables_mapped_motion_side(tmp_path: Path, monke
         json={"side": "right", "axis": "X", "direction": 1, "step": 100, "speedMode": "fine"},
     )
     assert command_response.status_code == 200
+
+
+def test_record_session_controls_gripper_teleop_recording_source(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    start_calls: list[str] = []
+    stop_calls: list[str] = []
+
+    async def fake_start_session(_dataset_name: str, _task: str) -> dict[str, Any]:
+        return {"recording": True}
+
+    async def fake_save_episode() -> dict[str, Any]:
+        return {"recording": False}
+
+    monkeypatch.setattr(client.app.state.recorder, "start_session", fake_start_session)
+    monkeypatch.setattr(client.app.state.recorder, "save_episode", fake_save_episode)
+    monkeypatch.setattr(
+        client.app.state.gripper_tele,
+        "start",
+        lambda source="manual": start_calls.append(source),
+    )
+    monkeypatch.setattr(
+        client.app.state.gripper_tele,
+        "stop",
+        lambda source="manual", force=False: stop_calls.append("force" if force else source),
+    )
+
+    start_response = client.post(
+        "/api/record/session/create",
+        json={"dataset_name": "unit", "task": "teleop"},
+    )
+    save_response = client.post("/api/record/episode/save")
+
+    assert start_response.status_code == 200
+    assert save_response.status_code == 200
+    assert start_calls == ["recording"]
+    assert stop_calls == ["recording"]
+
+
+def test_teleop_logical_connect_does_not_return_to_work_origin(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    class FakeHal:
+        def __init__(self) -> None:
+            self.commands: list[tuple[str, dict]] = []
+
+        async def health(self) -> HalHealth:
+            return HalHealth(
+                ltdmc_ok=True,
+                omega7_ok=True,
+                version="fake-hal",
+                uptime_s=1.0,
+                connected=True,
+                mode="real",
+            )
+
+        async def omega_state(self) -> dict:
+            return {
+                "hands": [
+                    {
+                        "side": "left",
+                        "connected": True,
+                        "lastReadOk": True,
+                        "pose": [0.0] * 6,
+                    }
+                ]
+            }
+
+        async def motion_state(self) -> dict:
+            return {
+                "positions": [0.0] * 12,
+                "pulses": [0.0] * 12,
+                "enabled": [True] * 12,
+                "estop_active": False,
+            }
+
+        async def command(self, name: str, payload: dict | None = None) -> dict:
+            self.commands.append((name, payload or {}))
+            return {"command": name, "payload": payload or {}}
+
+    fake_hal = FakeHal()
+    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: fake_hal)
+    client = TestClient(create_app(tmp_path))
+
+    connect_response = client.post("/api/teleop/left/connect")
+    assert connect_response.status_code == 200
+    assert connect_response.json()["data"]["connected"] is True
+
+    client.post("/api/teleop/left/disconnect")
+
+    command_names = [name for name, _payload in fake_hal.commands]
+    assert "motion.enable_side" in command_names
+    assert "motion.home_origin_side" not in command_names
+    assert "motion.home_all" not in command_names
 
 
 def test_record_session_fails_when_native_lerobot_is_disabled(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -778,7 +895,7 @@ def test_manual_axis_move_rejects_unsafe_step(tmp_path: Path) -> None:
 
     response = client.post(
         "/api/motion/manual_axis_move",
-        json={"side": "left", "axis": "X", "direction": 1, "step": 5001, "speedMode": "fine"},
+        json={"side": "left", "axis": "X", "direction": 1, "step": 20001, "speedMode": "fine"},
     )
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "MOTION_UNAVAILABLE"
@@ -816,7 +933,7 @@ def test_manual_axis_move_rejects_soft_limit_target(tmp_path: Path, monkeypatch:
 
     response = client.post(
         "/api/motion/manual_axis_move",
-        json={"side": "left", "axis": "X", "direction": 1, "step": 5, "speedMode": "fine"},
+        json={"side": "left", "axis": "X", "direction": -1, "step": 5, "speedMode": "fine"},
     )
 
     assert response.status_code == 503
