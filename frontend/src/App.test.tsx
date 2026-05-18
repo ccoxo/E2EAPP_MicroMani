@@ -339,6 +339,85 @@ describe('AppStation M0 frontend', () => {
     await waitFor(() => expect(useTelemetryStore.getState().parameterSnapshots.some((snapshot) => snapshot.name === '微装配运动默认')).toBe(false))
   }, 10000)
 
+  it('shows before and after values before applying camera parameters', async () => {
+    window.history.pushState({}, '', '/settings#camera-global')
+    render(<App />)
+    const globalCameraCard = document.querySelector<HTMLElement>('#camera-global')
+    expect(globalCameraCard).toBeTruthy()
+
+    fireEvent.click(within(globalCameraCard!).getByRole('button', { name: '应用参数' }))
+
+    const dialog = (await screen.findByText('应用全局相机参数')).closest('[role="dialog"]') as HTMLElement
+    expect(dialog).toBeTruthy()
+    expect(within(dialog).getByText('当前')).toBeInTheDocument()
+    expect(within(dialog).getByText('将应用')).toBeInTheDocument()
+    expect(within(dialog).getAllByText('Exposure').length).toBeGreaterThan(0)
+    expect(within(dialog).getAllByText('Gain').length).toBeGreaterThan(0)
+    expect(within(dialog).getByRole('button', { name: '确认应用' })).toBeInTheDocument()
+  }, 10000)
+
+  it('shows before and after state before clearing a motion origin', async () => {
+    window.history.pushState({}, '', '/settings#motion-left')
+    render(<App />)
+    const leftCard = document.querySelector<HTMLElement>('#motion-left')
+    expect(leftCard).toBeTruthy()
+
+    fireEvent.click(within(leftCard!).getByText('设为采集零点').closest('button')!)
+    fireEvent.click((await screen.findByText('确认设为零点')).closest('button')!)
+    await waitFor(() => expect(within(leftCard!).getByText('已设置')).toBeInTheDocument())
+
+    fireEvent.click(within(leftCard!).getByText('清除零点').closest('button')!)
+
+    const dialog = (await screen.findByText('清除左臂采集零点')).closest('[role="dialog"]') as HTMLElement
+    expect(dialog).toBeTruthy()
+    expect(within(dialog).getByText('当前')).toBeInTheDocument()
+    expect(within(dialog).getByText('将应用')).toBeInTheDocument()
+    expect(within(dialog).getByText('确认清除')).toBeInTheDocument()
+  }, 10000)
+
+  it('shows before and after values before executing a gripper target', async () => {
+    window.history.pushState({}, '', '/settings#gripper-left')
+    useTelemetryStore.setState((state) => ({
+      config: {
+        ...state.config,
+        gripper: { ...state.config.gripper, leftEnabled: true },
+      },
+    }))
+    render(<App />)
+    const leftGripperCard = document.querySelector<HTMLElement>('#gripper-left')
+    expect(leftGripperCard).toBeTruthy()
+
+    fireEvent.click(within(leftGripperCard!).getByText('执行目标').closest('button')!)
+
+    const dialog = (await screen.findByText('左臂夹爪执行目标')).closest('[role="dialog"]') as HTMLElement
+    expect(dialog).toBeTruthy()
+    expect(within(dialog).getByText('当前')).toBeInTheDocument()
+    expect(within(dialog).getByText('将应用')).toBeInTheDocument()
+    expect(within(dialog).getByText('目标开合')).toBeInTheDocument()
+    expect(within(dialog).getByText('确认执行')).toBeInTheDocument()
+  }, 10000)
+
+  it('shows before and after values before executing a manual gripper target', async () => {
+    window.history.pushState({}, '', '/settings#manual')
+    useTelemetryStore.setState((state) => ({
+      config: {
+        ...state.config,
+        gripper: { ...state.config.gripper, leftEnabled: true },
+      },
+    }))
+    render(<App />)
+    const leftGripperCard = screen.getByText('左臂夹爪手动控制').closest('article')
+    expect(leftGripperCard).toBeTruthy()
+
+    fireEvent.click(within(leftGripperCard as HTMLElement).getByRole('button', { name: '执行目标' }))
+
+    const dialog = (await screen.findByText('左臂夹爪执行目标')).closest('[role="dialog"]') as HTMLElement
+    expect(dialog).toBeTruthy()
+    expect(within(dialog).getByText('当前')).toBeInTheDocument()
+    expect(within(dialog).getByText('将应用')).toBeInTheDocument()
+    expect(within(dialog).getByText('确认执行')).toBeInTheDocument()
+  }, 10000)
+
   it('renders manual control instead of old jog/developer pages', () => {
     window.history.pushState({}, '', '/settings#manual')
     render(<App />)
@@ -419,9 +498,11 @@ describe('AppStation M0 frontend', () => {
     expect(leftCard).toBeTruthy()
 
     fireEvent.click(within(leftCard!).getByText('设为采集零点').closest('button')!)
+    fireEvent.click((await screen.findByText('确认设为零点')).closest('button')!)
     await waitFor(() => expect(within(leftCard!).getByText('已设置')).toBeInTheDocument())
 
     fireEvent.click(within(leftCard!).getByText('清除零点').closest('button')!)
+    fireEvent.click((await screen.findByText('确认清除')).closest('button')!)
     await waitFor(() => expect(within(leftCard!).getByText('未设置')).toBeInTheDocument())
-  })
+  }, 10000)
 })

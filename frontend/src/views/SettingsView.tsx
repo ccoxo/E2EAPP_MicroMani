@@ -24,6 +24,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { useLocation } from 'react-router-dom'
+import { ActionCompareModal, type ActionCompareItem } from '../components/ActionCompareModal'
 import { CameraPreview } from '../components/CameraPreview'
 import { ForceChart } from '../components/Charts'
 import {
@@ -78,6 +79,17 @@ import type {
 } from '../types'
 
 type CameraKey = keyof typeof cameraHardwareSpecs
+
+interface PendingComparison {
+  title: string
+  tone?: 'default' | 'warning' | 'danger'
+  impact: ReactNode
+  expected?: ReactNode
+  current: ActionCompareItem[]
+  proposed: ActionCompareItem[]
+  confirmText: string
+  onConfirm: () => void | Promise<void>
+}
 
 const sideOrder: RobotSide[] = ['left', 'right']
 const cameraOrder: CameraKey[] = ['global', 'wrist_left', 'wrist_right']
@@ -572,6 +584,7 @@ function MotionCard({
   triggerEmergencyStop,
   snapshotMenu,
   openSnapshotModal,
+  requestComparison,
 }: {
   side: RobotSide
   config: AppConfig
@@ -584,6 +597,7 @@ function MotionCard({
   triggerEmergencyStop: () => void
   snapshotMenu: (scope: ParameterSnapshotScope) => MenuProps
   openSnapshotModal: (scope: ParameterSnapshotScope) => void
+  requestComparison: (comparison: PendingComparison) => void
 }) {
   const sideSpec = armHardwareSpecs[side]
   const id = `motion-${side}`
@@ -629,6 +643,18 @@ function MotionCard({
       : effectiveEnabled === false
         ? <Tag color="warning">未使能</Tag>
         : <Tag color="default">使能状态未知</Tag>
+  const motionStateText =
+    effectiveEnabled === true
+      ? '已使能'
+      : partialEnabled
+        ? '部分使能'
+        : effectiveEnabled === false
+          ? '未使能'
+          : '未知'
+  const sidePositionsText = positions
+    .slice(sideSpec.stateOffset, sideSpec.stateOffset + 6)
+    .map((value) => (Number.isFinite(value) ? value.toFixed(1) : '--'))
+    .join(', ')
   const handleEnable = async () => {
     setPendingMotionAction('enable')
     try {
@@ -653,24 +679,16 @@ function MotionCard({
       setPendingMotionAction(null)
     }
   }
-  const handleHome = () => {
-    Modal.confirm({
-      title: `${sideSpec.shortLabel}回零`,
-      content: '将通过 HAL 调用 LTDMC dmc_home_move，执行前请确认工作区安全。',
-      okText: '回零',
-      cancelText: '取消',
-      onOk: async () => {
-        setPendingMotionAction('home')
-        try {
-          await homeMotionSide(side)
-          commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel}回零请求已发送`)
-        } catch (error) {
-          injectLog('ERROR', `${sideSpec.shortLabel}回零失败：${commandErrorMessage(error)}`, '[HAL]')
-        } finally {
-          setPendingMotionAction(null)
-        }
-      },
-    })
+  const handleHome = async () => {
+    setPendingMotionAction('home')
+    try {
+      await homeMotionSide(side)
+      commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel}回零请求已发送`)
+    } catch (error) {
+      injectLog('ERROR', `${sideSpec.shortLabel}回零失败：${commandErrorMessage(error)}`, '[HAL]')
+    } finally {
+      setPendingMotionAction(null)
+    }
   }
   const handleCaptureOrigin = async () => {
     setPendingOriginAction('capture')
@@ -716,6 +734,57 @@ function MotionCard({
       setPendingOriginAction(null)
     }
   }
+  const requestHome = () =>
+    requestComparison({
+      title: `${sideSpec.shortLabel}回零`,
+      tone: 'danger',
+      impact: `将通过 HAL 调用 ${sideSpec.shortLabel} LTDMC 回零流程。`,
+      expected: '确认前请确认工作区安全；确认后会移动硬件轴。',
+      current: [
+        { label: '使能状态', value: motionStateText },
+        { label: '当前位置', value: sidePositionsText || '--' },
+      ],
+      proposed: [
+        { label: '目标动作', value: '执行回零' },
+        { label: '命令接口', value: 'dmc_home_move' },
+      ],
+      confirmText: '确认回零',
+      onConfirm: handleHome,
+    })
+  const requestCaptureOrigin = () =>
+    requestComparison({
+      title: `设为${sideSpec.shortLabel}采集零点`,
+      tone: 'warning',
+      impact: `将把${sideSpec.shortLabel}当前位置保存为采集零点。`,
+      expected: '确认后不会移动硬件，只保存当前位置作为后续相对显示基准。',
+      current: [
+        { label: '当前状态', value: originStatusText },
+        { label: '当前位置', value: sidePositionsText || '--' },
+      ],
+      proposed: [
+        { label: '当前状态', value: '已设置' },
+        { label: '更新时间', value: '确认时写入' },
+      ],
+      confirmText: '确认设为零点',
+      onConfirm: handleCaptureOrigin,
+    })
+  const requestClearOrigin = () =>
+    requestComparison({
+      title: `清除${sideSpec.shortLabel}采集零点`,
+      tone: 'danger',
+      impact: `将清除${sideSpec.shortLabel}采集零点，后续手动控制会显示 HAL 绝对位置。`,
+      expected: '确认后只影响当前侧零点标记和脉冲缓存，不会移动硬件。',
+      current: [
+        { label: '当前状态', value: originStatusText },
+        { label: '范围', value: originScopeText },
+      ],
+      proposed: [
+        { label: '当前状态', value: '未设置' },
+        { label: '范围', value: `${sideSpec.shortLabel}零点将清除` },
+      ],
+      confirmText: '确认清除',
+      onConfirm: handleClearOrigin,
+    })
 
   return (
     <HardwareConfigCard
@@ -740,7 +809,7 @@ function MotionCard({
           <Button danger icon={<Usb size={15} />} loading={pendingMotionAction === 'disable'} onClick={() => void handleDisable()}>
             断使能
           </Button>
-          <Button icon={<RotateCcw size={15} />} loading={pendingMotionAction === 'home'} onClick={handleHome}>
+          <Button icon={<RotateCcw size={15} />} loading={pendingMotionAction === 'home'} onClick={requestHome}>
             回零
           </Button>
           <Button danger icon={<ShieldAlert size={15} />} onClick={triggerEmergencyStop}>
@@ -793,14 +862,14 @@ function MotionCard({
           <Button
             icon={<Crosshair size={15} />}
             loading={pendingOriginAction === 'capture'}
-            onClick={() => void handleCaptureOrigin()}
+            onClick={requestCaptureOrigin}
           >
             设为采集零点
           </Button>
           <Button
             icon={<Trash2 size={15} />}
             loading={pendingOriginAction === 'clear'}
-            onClick={() => void handleClearOrigin()}
+            onClick={requestClearOrigin}
           >
             清除零点
           </Button>
@@ -830,6 +899,7 @@ function CameraCard({
   updateConfig,
   focusHash,
   injectLog,
+  requestComparison,
 }: {
   cameraKey: CameraKey
   camera?: CameraTelemetry
@@ -837,6 +907,7 @@ function CameraCard({
   updateConfig: (patch: Partial<AppConfig>) => void
   focusHash: string
   injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
+  requestComparison: (comparison: PendingComparison) => void
 }) {
   const spec = cameraHardwareSpecs[cameraKey]
   const id = cameraKey === 'global' ? 'camera-global' : cameraKey === 'wrist_left' ? 'camera-left' : 'camera-right'
@@ -914,6 +985,27 @@ function CameraCard({
       setPendingCameraAction(null)
     }
   }
+  const cameraTuningItems = (profile: CameraTuningProfile): ActionCompareItem[] => [
+    { label: '分辨率', value: previewResolution },
+    { label: 'FPS', value: `${config.cameras.fps}` },
+    { label: 'Exposure', value: `${profile.exposure}` },
+    { label: 'Gain', value: `${profile.gain}` },
+    { label: 'Auto exposure', value: profile.autoExposure ? '开' : '关' },
+    { label: 'Auto WB', value: profile.autoWhiteBalance ? '开' : '关' },
+  ]
+  const requestApplyTuning = () => {
+    const nextTuning = sanitizeTuning(tuning)
+    requestComparison({
+      title: `应用${spec.label}参数`,
+      tone: 'warning',
+      impact: `将写入${spec.label}预览参数，并刷新当前预览流。`,
+      expected: '确认后会调用现有相机参数接口，失败时继续写入日志面板。',
+      current: cameraTuningItems(tuning),
+      proposed: cameraTuningItems(nextTuning),
+      confirmText: '确认应用',
+      onConfirm: handleApplyTuning,
+    })
+  }
 
   return (
     <HardwareConfigCard
@@ -926,7 +1018,7 @@ function CameraCard({
       badges={<Tag color={stateTone(state)}>{previewResolution}</Tag>}
       actions={
         <Space wrap>
-          <Button icon={<Save size={15} />} loading={pendingCameraAction === 'apply'} onClick={() => void handleApplyTuning()}>
+          <Button icon={<Save size={15} />} loading={pendingCameraAction === 'apply'} onClick={requestApplyTuning}>
             应用参数
           </Button>
           <Button icon={<RefreshCw size={15} />} loading={pendingCameraAction === 'reconnect'} onClick={() => void handleReconnect()}>
@@ -1117,6 +1209,7 @@ function GripperCard({
   currentMm,
   issueManualGripperMove,
   injectLog,
+  requestComparison,
 }: {
   side: RobotSide
   config: AppConfig
@@ -1125,6 +1218,7 @@ function GripperCard({
   currentMm: number
   issueManualGripperMove: (side: RobotSide, command: ManualGripperCommand, targetMm?: number) => void
   injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
+  requestComparison: (comparison: PendingComparison) => void
 }) {
   const sideSpec = armHardwareSpecs[side]
   const id = `gripper-${side}`
@@ -1180,6 +1274,23 @@ function GripperCard({
       /* ignore */
     }
   }
+  const requestGripperTarget = () =>
+    requestComparison({
+      title: `${sideSpec.shortLabel}夹爪执行目标`,
+      tone: 'warning',
+      impact: `将向${sideSpec.shortLabel}夹爪下发目标开合命令。`,
+      expected: '确认后仍由现有夹爪安全限制和命令力限制保护。',
+      current: [
+        { label: '当前开合', value: currentText },
+        { label: '使能状态', value: gripperEnabled ? '已使能' : '未使能' },
+      ],
+      proposed: [
+        { label: '目标开合', value: `${config.gripper[targetKey].toFixed(1)} mm` },
+        { label: '命令力限制', value: `≤ ${config.gripper.commandForceLimitN.toFixed(1)} N` },
+      ],
+      confirmText: '确认执行',
+      onConfirm: () => issueManualGripperMove(side, 'target', config.gripper[targetKey]),
+    })
   return (
     <HardwareConfigCard
       id={id}
@@ -1246,7 +1357,7 @@ function GripperCard({
           >
             {gripperEnabled ? '断使能' : '使能'}
           </Button>
-          <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'target', config.gripper[targetKey])}>执行目标</Button>
+          <Button disabled={!gripperEnabled} onClick={requestGripperTarget}>执行目标</Button>
           <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'open')}>打开</Button>
           <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'close')}>闭合</Button>
           <Button disabled={!gripperEnabled} icon={<RotateCcw size={15} />} onClick={() => setTargetAndRun('回零', 0)}>
@@ -1986,12 +2097,14 @@ function ManualGripperControl({
   updateConfig,
   currentMm,
   issueManualGripperMove,
+  requestComparison,
 }: {
   side: RobotSide
   config: AppConfig
   updateConfig: (patch: Partial<AppConfig>) => void
   currentMm: number
   issueManualGripperMove: (side: RobotSide, command: ManualGripperCommand, targetMm?: number) => void
+  requestComparison: (comparison: PendingComparison) => void
 }) {
   const sideSpec = armHardwareSpecs[side]
   const portKey = side === 'left' ? 'leftPort' : 'rightPort'
@@ -2002,6 +2115,23 @@ function ManualGripperControl({
   const setTarget = (value: number) => updateConfig({ gripper: { ...config.gripper, [targetKey]: value } })
   const currentText = formatGripperPosition(currentMm)
   const jawMm = safeGripperPosition(currentMm)
+  const requestGripperTarget = () =>
+    requestComparison({
+      title: `${sideSpec.shortLabel}夹爪执行目标`,
+      tone: 'warning',
+      impact: `将向${sideSpec.shortLabel}夹爪下发目标开合命令。`,
+      expected: '确认后仍由现有夹爪安全限制和命令力限制保护。',
+      current: [
+        { label: '当前开合', value: currentText },
+        { label: '使能状态', value: gripperEnabled ? '已使能' : '未使能' },
+      ],
+      proposed: [
+        { label: '目标开合', value: `${config.gripper[targetKey].toFixed(1)} mm` },
+        { label: '命令力限制', value: `≤ ${config.gripper.commandForceLimitN.toFixed(1)} N` },
+      ],
+      confirmText: '确认执行',
+      onConfirm: () => issueManualGripperMove(side, 'target', config.gripper[targetKey]),
+    })
   return (
     <article className="manual-gripper-card">
       <div className="manual-card-head">
@@ -2039,7 +2169,7 @@ function ManualGripperControl({
             <Button type={gripperEnabled ? 'default' : 'primary'} icon={<PlugZap size={15} />} onClick={() => issueManualGripperMove(side, gripperEnabled ? 'disable' : 'enable')}>
               {gripperEnabled ? '断使能' : '使能'}
             </Button>
-            <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'target', config.gripper[targetKey])}>执行目标</Button>
+            <Button disabled={!gripperEnabled} onClick={requestGripperTarget}>执行目标</Button>
             <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'open')}>打开</Button>
             <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'close')}>闭合</Button>
             <Button disabled={!gripperEnabled} icon={<RotateCcw size={15} />} onClick={() => issueManualGripperMove(side, 'home')}>回零</Button>
@@ -2178,6 +2308,7 @@ function ManualControlPanel({
   pauseManualReplay,
   deleteManualMemory,
   injectLog,
+  requestComparison,
 }: {
   positions: number[]
   grippers: number[]
@@ -2200,6 +2331,7 @@ function ManualControlPanel({
   pauseManualReplay: () => void
   deleteManualMemory: (id: number) => void
   injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
+  requestComparison: (comparison: PendingComparison) => void
 }) {
   return (
     <section id="manual" className="manual-control-page">
@@ -2236,6 +2368,7 @@ function ManualControlPanel({
             updateConfig={updateConfig}
             currentMm={grippers[index] ?? -1}
             issueManualGripperMove={issueManualGripperMove}
+            requestComparison={requestComparison}
           />
         ))}
         <ManualReplayPanel
@@ -2282,6 +2415,8 @@ export function SettingsView() {
   const targetTab = tabForHardwareHash(focusHash)
   const [snapshotDraft, setSnapshotDraft] = useState<{ scope: ParameterSnapshotScope; name: string } | null>(null)
   const [manualClockMs, setManualClockMs] = useState(() => Date.now())
+  const [pendingComparison, setPendingComparison] = useState<PendingComparison | null>(null)
+  const [comparisonRunning, setComparisonRunning] = useState(false)
 
   const openSnapshotModal = (scope: ParameterSnapshotScope) => setSnapshotDraft({ scope, name: defaultSnapshotName(scope) })
   const commitSnapshot = () => {
@@ -2290,6 +2425,16 @@ export function SettingsView() {
     if (!name) return
     saveParameterSnapshot(snapshotDraft.scope, name)
     setSnapshotDraft(null)
+  }
+  const confirmPendingComparison = async () => {
+    if (!pendingComparison) return
+    setComparisonRunning(true)
+    try {
+      await pendingComparison.onConfirm()
+      setPendingComparison(null)
+    } finally {
+      setComparisonRunning(false)
+    }
   }
   const snapshotMenu = (scope: ParameterSnapshotScope): MenuProps => {
     const scopedSnapshots = parameterSnapshots.filter((item) => item.scope === scope)
@@ -2399,6 +2544,7 @@ export function SettingsView() {
                       triggerEmergencyStop={triggerEmergencyStop}
                       snapshotMenu={snapshotMenu}
                       openSnapshotModal={openSnapshotModal}
+                      requestComparison={setPendingComparison}
                     />
                   ))}
                   {cameraOrder.map((cameraKey) => (
@@ -2410,6 +2556,7 @@ export function SettingsView() {
                       updateConfig={updateConfig}
                       focusHash={focusHash}
                       injectLog={injectLog}
+                      requestComparison={setPendingComparison}
                     />
                   ))}
                   {sideOrder.map((side) => (
@@ -2434,6 +2581,7 @@ export function SettingsView() {
                       currentMm={frame.gripperPositions[index] ?? -1}
                       issueManualGripperMove={issueManualGripperMove}
                       injectLog={injectLog}
+                      requestComparison={setPendingComparison}
                     />
                   ))}
                   {sideOrder.map((side) => (
@@ -2479,6 +2627,7 @@ export function SettingsView() {
                 pauseManualReplay={pauseManualReplay}
                 deleteManualMemory={deleteManualMemory}
                 injectLog={injectLog}
+                requestComparison={setPendingComparison}
               />
             ),
           },
@@ -2505,6 +2654,19 @@ export function SettingsView() {
           </Form.Item>
         </Form>
       </Modal>
+      <ActionCompareModal
+        open={Boolean(pendingComparison)}
+        title={pendingComparison?.title ?? ''}
+        tone={pendingComparison?.tone}
+        impact={pendingComparison?.impact ?? ''}
+        expected={pendingComparison?.expected}
+        current={pendingComparison?.current ?? []}
+        proposed={pendingComparison?.proposed ?? []}
+        confirmText={pendingComparison?.confirmText ?? '确认'}
+        confirmLoading={comparisonRunning}
+        onCancel={() => setPendingComparison(null)}
+        onConfirm={() => void confirmPendingComparison()}
+      />
     </div>
   )
 }

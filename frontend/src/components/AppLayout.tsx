@@ -114,6 +114,7 @@ export function AppLayout() {
             </Tooltip>
           ))}
           <Button
+            aria-label="侧栏急停 F12"
             className="nav-emergency"
             danger
             icon={<Activity size={17} />}
@@ -131,7 +132,7 @@ export function AppLayout() {
       <StatusBar />
       <SafetyOverlay />
       <GlobalEmergencyStopButton />
-      <Button className="floating-settings" icon={<SlidersHorizontal size={16} />} onClick={() => navigate('/settings')} />
+      <Button aria-label="打开硬件设置" className="floating-settings" icon={<SlidersHorizontal size={16} />} onClick={() => navigate('/settings')} />
     </div>
   )
 }
