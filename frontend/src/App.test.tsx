@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { stopMotionSide } from './api'
 import App from './App'
+import { ActionCompareModal } from './components/ActionCompareModal'
 import { defaultConfig } from './data'
 import { chartHistoryIntervalMs, uiFrameIntervalMs, useTelemetryStore } from './stores/telemetry'
 import type { TelemetryFrame } from './types'
@@ -20,6 +21,41 @@ afterEach(() => {
 })
 
 describe('AppStation M0 frontend', () => {
+  it('renders a before and after comparison before confirming a high-risk action', () => {
+    const onConfirm = vi.fn()
+    const onCancel = vi.fn()
+
+    render(
+      <ActionCompareModal
+        open
+        title="应用相机参数"
+        tone="warning"
+        impact="将写入全局相机预览参数"
+        current={[
+          { label: 'Exposure', value: '-5.5' },
+          { label: 'Gain', value: '0' },
+        ]}
+        proposed={[
+          { label: 'Exposure', value: '-6.0' },
+          { label: 'Gain', value: '12' },
+        ]}
+        confirmText="确认应用"
+        onCancel={onCancel}
+        onConfirm={onConfirm}
+      />,
+    )
+
+    expect(screen.getByText('应用相机参数')).toBeInTheDocument()
+    expect(screen.getByText('当前')).toBeInTheDocument()
+    expect(screen.getByText('将应用')).toBeInTheDocument()
+    expect(screen.getByText('将写入全局相机预览参数')).toBeInTheDocument()
+    expect(screen.getByText('-5.5')).toBeInTheDocument()
+    expect(screen.getByText('-6.0')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '确认应用' }))
+    expect(onConfirm).toHaveBeenCalledTimes(1)
+  })
+
   it('renders the dashboard workbench', () => {
     render(<App />)
     expect(screen.getByText('AppStation')).toBeInTheDocument()
