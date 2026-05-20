@@ -449,6 +449,36 @@ def test_dataset_recorder_uses_native_gripper_targets_for_action() -> None:
     )[6::7] == [8.0, 9.0]
 
 
+def test_dataset_recorder_uses_native_gripper_positions_for_observation() -> None:
+    class FakeTeleop:
+        def status(self) -> dict[str, object]:
+            return {
+                "nativeStatus": {
+                    "grippers": {
+                        "left": {"positionMm": 3.25, "targetMm": 8.0},
+                        "right": {"positionMm": 4.5, "targetMm": 9.0},
+                    },
+                },
+            }
+
+    recorder = object.__new__(DatasetRecorderService)
+    recorder.teleop = FakeTeleop()
+    recorder._drop_counts = {"gripper": 0}
+    recorder._late_source_frames = {}
+    recorder._source_skews_ms = {"gripper": []}
+    recorder._source_elapsed_ms = {"gripper": []}
+    recorder._source_fail_streaks = {"gripper": 0}
+    recorder._source_warnings = []
+
+    sample = recorder._gripper_source_sync(
+        {"hal": {"mode": "real"}, "teleop": {"engine": "hal_native"}},
+        10.0,
+    )
+
+    assert sample.ok is True
+    assert sample.value == [3.25, 4.5]
+
+
 def test_dataset_recorder_action_vector_uses_last_action_before_target() -> None:
     class FakeTeleop:
         def status(self) -> dict[str, object]:
@@ -487,6 +517,53 @@ def test_dataset_recorder_action_vector_uses_last_action_before_target() -> None
         0.0,
         0.0,
         0.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
+
+
+def test_dataset_recorder_action_vector_combines_latest_action_per_side() -> None:
+    class FakeTeleop:
+        def status(self) -> dict[str, object]:
+            return {
+                "lastAction": {
+                    "ts": int(time.time() * 1000),
+                    "monotonic_s": 10.2,
+                    "side": "left",
+                    "deltaVector": [99.0] * 12,
+                },
+                "actionHistory": [
+                    {
+                        "ts": int(time.time() * 1000),
+                        "monotonic_s": 9.90,
+                        "side": "right",
+                        "deltaVector": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.25, 0.0, 0.0],
+                    },
+                    {
+                        "ts": int(time.time() * 1000),
+                        "monotonic_s": 9.95,
+                        "side": "left",
+                        "deltaVector": [5.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    },
+                ],
+            }
+
+    recorder = object.__new__(DatasetRecorderService)
+    recorder.teleop = FakeTeleop()
+
+    assert recorder._latest_action_vector([0.0] * 14, {}, 10.0) == [
+        5.0,
+        0.0,
+        0.0,
+        500.0,
+        0.0,
+        0.0,
+        0.0,
+        10.0,
+        0.0,
+        0.0,
+        250.0,
         0.0,
         0.0,
         0.0,

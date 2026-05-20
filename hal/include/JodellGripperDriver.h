@@ -27,6 +27,7 @@ class JodellGripperDriver {
   void configure(const JodellGripperConfig& config);
   bool commandTarget(Side side, double targetMm, int speed, int torque, std::string* message = nullptr);
   std::array<double, 2> targetMm() const;
+  std::array<double, 2> positionMm() const;
   std::string lastError() const;
 
  private:
@@ -38,6 +39,7 @@ class JodellGripperDriver {
   mutable std::mutex mutex_;
   JodellGripperConfig config_{};
   std::array<double, 2> targetMm_{{0.0, 0.0}};
+  std::array<double, 2> positionMm_{{-1.0, -1.0}};
   std::string lastError_;
 
 #ifdef _WIN32

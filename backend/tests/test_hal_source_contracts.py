@@ -918,6 +918,12 @@ def test_hal_native_gripper_surfaces_command_status_and_retries_port_open() -> N
     assert "const bool ok = gripper_.commandTarget" in normalized_controller
     assert "gripperLastCommandOk_[command.targetIndex] = ok;" in normalized_controller
     assert "gripperLastMessage_[command.targetIndex] = message;" in normalized_controller
+    assert '",\\"positionMm\\":' in controller_source
+    assert "const auto gripperPositions = gripper_.positionMm();" in controller_source
+    assert "std::array<double, 2> positionMm_" in (REPO_ROOT / "hal" / "include" / "JodellGripperDriver.h").read_text(
+        encoding="utf-8"
+    )
+    assert "getClawCurrentLocation_(slave)" in gripper_source
     assert "lastError_ = std::string(\"native gripper \")" in normalized_controller
     assert "constexpr auto kPortSwitchSettleMs = std::chrono::milliseconds(50);" in gripper_source
     assert "for (int attempt = 0; attempt < 5; ++attempt)" in normalized_gripper

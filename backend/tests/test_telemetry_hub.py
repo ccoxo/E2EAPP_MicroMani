@@ -43,7 +43,7 @@ def test_real_hal_ok_is_not_reported_faulted_when_force_probe_is_unavailable() -
         telemetry.shutdown()
 
 
-def test_hal_native_gripper_targets_are_visible_when_feedback_sampler_is_disabled() -> None:
+def test_hal_native_gripper_positions_do_not_fall_back_to_targets_when_feedback_is_missing() -> None:
     settings = FakeSettings()
     settings.config["gripper"]["targetLeftMm"] = 26.0
     settings.config["gripper"]["targetRightMm"] = 4.5
@@ -51,6 +51,7 @@ def test_hal_native_gripper_targets_are_visible_when_feedback_sampler_is_disable
     try:
         frame = telemetry.next_frame(hal_ok=True)
 
-        assert frame.gripperPositions == [26.0, 4.5]
+        assert frame.gripperPositions == [-1.0, -1.0]
+        assert telemetry.gripper_samples == {}
     finally:
         telemetry.shutdown()

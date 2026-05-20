@@ -1617,6 +1617,22 @@ class DatasetRecorderService:
         record_quality: bool = True,
     ) -> SourceSample:
         """Read gripper cache in the gripper sampler thread."""
+        native_positions = self._latest_native_gripper_positions(config)
+        if native_positions is not None:
+            sampled_at = time.monotonic()
+            sample = SourceSample(
+                "gripper",
+                sampled_at,
+                list(native_positions),
+                True,
+                "",
+                target_monotonic_s=target_monotonic_s,
+                started_monotonic_s=sampled_at,
+                finished_monotonic_s=sampled_at,
+            )
+            if record_quality:
+                self._record_source_quality(sample, target_monotonic_s, 0.0)
+            return sample
         if not self._real_hardware_mode(config):
             sampled_at = time.monotonic()
             sample = SourceSample(
@@ -1655,6 +1671,27 @@ class DatasetRecorderService:
         if record_quality:
             self._record_source_quality(sample, target_monotonic_s, 0.0)
         return sample
+
+    def _latest_native_gripper_positions(self, config: dict[str, Any]) -> tuple[float, float] | None:
+        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
+        if str(teleop.get("engine", "")).lower() != "hal_native":
+            return None
+        status = self.teleop.status()
+        native_status = status.get("nativeStatus") if isinstance(status, dict) else None
+        if not isinstance(native_status, dict):
+            return None
+        grippers = native_status.get("grippers")
+        if not isinstance(grippers, dict):
+            return None
+        left = grippers.get("left")
+        right = grippers.get("right")
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return None
+        left_position = self._coerce_float(left.get("positionMm"))
+        right_position = self._coerce_float(right.get("positionMm"))
+        if left_position is None or right_position is None:
+            return None
+        return left_position, right_position
 
     async def _refresh_gripper_cache(self, config: dict[str, Any]) -> None:
         """处理录制服务逻辑：_refresh_gripper_cache。"""
@@ -2935,28 +2972,66 @@ class DatasetRecorderService:
     def _latest_action_delta_vector(self, target_monotonic_s: float | None = None) -> list[float]:
         """处理录制服务逻辑：_latest_action_delta_vector。"""
         vector = [0.0] * 14
-        last_action = self._teleop_action_for_target(target_monotonic_s)
-        if not isinstance(last_action, dict):
-            return vector
-        action_monotonic_s = self._action_monotonic_s(last_action)
-        if target_monotonic_s is None:
-            ts = int(last_action.get("ts", 0))
-            if now_ms() - ts > int(ACTION_STALE_S * 1000):
-                return vector
-        elif action_monotonic_s is None or target_monotonic_s - action_monotonic_s > ACTION_STALE_S:
-            return vector
-        delta_vector = last_action.get("deltaVector")
+        for action in self._teleop_actions_for_target(target_monotonic_s):
+            action_delta = self._action_delta_vector(action)
+            vector = [vector[index] + action_delta[index] for index in range(14)]
+        return vector
+
+    def _action_delta_vector(self, action: dict[str, Any]) -> list[float]:
+        vector = [0.0] * 14
+        delta_vector = action.get("deltaVector")
         if isinstance(delta_vector, list):
             return self._motion_delta_to_action_delta(delta_vector)
-        side = last_action.get("side")
-        axis = last_action.get("axis")
+        side = action.get("side")
+        axis = action.get("axis")
         if side not in {"left", "right"} or axis not in {"X", "Y", "Z", "Roll", "Pitch", "Yaw"}:
             return vector
         axis_index = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"].index(str(axis))
         state_index = (0 if side == "left" else 7) + axis_index
-        value = float(last_action.get("delta", 0.0))
+        value = float(action.get("delta", 0.0))
         vector[state_index] = value * 1000.0 if axis_index >= 3 else value
         return vector
+
+    def _teleop_actions_for_target(self, target_monotonic_s: float | None) -> list[dict[str, Any]]:
+        status = self.teleop.status()
+        if target_monotonic_s is None:
+            last_action = status.get("lastAction")
+            if not isinstance(last_action, dict):
+                return []
+            ts = int(last_action.get("ts", 0))
+            return [last_action] if now_ms() - ts <= int(ACTION_STALE_S * 1000) else []
+        latest_by_side: dict[str, tuple[float, dict[str, Any]]] = {}
+        latest_global: tuple[float, dict[str, Any]] | None = None
+        history = status.get("actionHistory")
+        if isinstance(history, list):
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                monotonic_s = self._action_monotonic_s(item)
+                if monotonic_s is None or monotonic_s > target_monotonic_s:
+                    continue
+                if target_monotonic_s - monotonic_s > ACTION_STALE_S:
+                    continue
+                side = item.get("side")
+                if side in {"left", "right"}:
+                    current = latest_by_side.get(side)
+                    if current is None or monotonic_s > current[0]:
+                        latest_by_side[str(side)] = (monotonic_s, item)
+                elif latest_global is None or monotonic_s > latest_global[0]:
+                    latest_global = (monotonic_s, item)
+        if latest_by_side:
+            return [entry[1] for entry in latest_by_side.values()]
+        if latest_global is not None:
+            return [latest_global[1]]
+        last_action = status.get("lastAction")
+        if not isinstance(last_action, dict):
+            return []
+        monotonic_s = self._action_monotonic_s(last_action)
+        if monotonic_s is None or monotonic_s > target_monotonic_s:
+            return []
+        if target_monotonic_s - monotonic_s > ACTION_STALE_S:
+            return []
+        return [last_action]
 
     def _teleop_action_for_target(self, target_monotonic_s: float | None) -> dict[str, Any] | None:
         """Return the latest action not newer than target_monotonic_s."""

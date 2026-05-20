@@ -117,6 +117,11 @@ bool JodellGripperDriver::commandTarget(
     }
     return false;
   }
+  const int currentRaw = getClawCurrentLocation_(slave);
+  if (currentRaw >= 0) {
+    positionMm_[index] = stroke * (1.0 - std::clamp(currentRaw, 0, 255) / 255.0);
+    out << ", current=" << currentRaw << ", positionMm=" << positionMm_[index];
+  }
   if (message) {
     *message = out.str();
   }
@@ -133,6 +138,11 @@ bool JodellGripperDriver::commandTarget(
 std::array<double, 2> JodellGripperDriver::targetMm() const {
   std::scoped_lock lock(mutex_);
   return targetMm_;
+}
+
+std::array<double, 2> JodellGripperDriver::positionMm() const {
+  std::scoped_lock lock(mutex_);
+  return positionMm_;
 }
 
 std::string JodellGripperDriver::lastError() const {

@@ -564,28 +564,8 @@ class TelemetryHub:
         if self.hardware is None or getattr(self, "_shutdown", False):
             return
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
-        if str(teleop.get("engine", "")).lower() == "hal_native":
-            gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
-            for side, idx, key in (
-                ("left", 0, "targetLeftMm"),
-                ("right", 1, "targetRightMm"),
-            ):
-                try:
-                    value = float(gripper.get(key, self.gripper_positions[idx]))
-                except (TypeError, ValueError):
-                    continue
-                if math.isfinite(value):
-                    self.gripper_positions[idx] = value
-                    self.gripper_samples[side] = {
-                        "ok": True,
-                        "positionMm": value,
-                        "sampleHz": 0.0,
-                        "ageMs": 0.0,
-                        "tsMs": int(time.time() * 1000),
-                        "monotonicMs": int(now * 1000),
-                        "message": "HAL-native target position",
-                    }
-                    self._last_gripper_sample_at = now
+        hal_native = str(teleop.get("engine", "")).lower() == "hal_native"
+        if hal_native:
             return
         if self.gripper_workers is not None and self.gripper_workers.is_enabled(config):
             samples = self.gripper_workers.samples(config)
@@ -604,6 +584,8 @@ class TelemetryHub:
                     latest_sample_at = max(latest_sample_at, float(monotonic_ms) / 1000.0)
             if updated:
                 self._last_gripper_sample_at = latest_sample_at or now
+            return
+        if not hasattr(self.hardware, "gripper") or not hasattr(self, "_hardware_executor"):
             return
         if self._gripper_future is not None and self._gripper_future.done():
             try:

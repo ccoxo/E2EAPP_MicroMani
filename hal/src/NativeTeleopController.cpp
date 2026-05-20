@@ -363,6 +363,7 @@ bool NativeTeleopController::running() const {
 
 std::string NativeTeleopController::statusJson() const {
   const auto forceOutput = omega_.forceOutputEnabled();
+  const auto gripperPositions = gripper_.positionMm();
   std::scoped_lock lock(mutex_);
   std::ostringstream out;
   out << "{\"running\":" << (running_.load() ? "true" : "false")
@@ -423,10 +424,24 @@ std::string NativeTeleopController::statusJson() const {
   appendArray(out, gripperTargetsMm_);
   out << ",\"grippers\":{\"left\":{\"ok\":" << (gripperLastCommandOk_[0] ? "true" : "false")
       << ",\"targetMm\":" << gripperTargetsMm_[0]
+      << ",\"positionMm\":";
+  if (gripperPositions[0] >= 0.0) {
+    out << gripperPositions[0];
+  } else {
+    out << "null";
+  }
+  out
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[0]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[0]
       << "},\"right\":{\"ok\":" << (gripperLastCommandOk_[1] ? "true" : "false")
       << ",\"targetMm\":" << gripperTargetsMm_[1]
+      << ",\"positionMm\":";
+  if (gripperPositions[1] >= 0.0) {
+    out << gripperPositions[1];
+  } else {
+    out << "null";
+  }
+  out
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[1]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[1]
       << "}}";
