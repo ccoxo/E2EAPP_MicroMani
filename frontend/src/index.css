@@ -142,7 +142,7 @@ select {
 .main-content {
   min-width: 0;
   min-height: 0;
-  padding: 12px;
+  padding: 12px 108px 86px 12px;
   overflow: auto;
 }
 
@@ -1488,6 +1488,90 @@ select {
   min-width: max-content;
 }
 
+.camera-settings-panel {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.95fr) minmax(360px, 1.45fr);
+  gap: 10px;
+  align-items: stretch;
+}
+
+.camera-basics-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #dfe6ef;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.camera-basics-grid .ant-form-item {
+  margin-bottom: 0;
+}
+
+.camera-basics-grid .ant-input,
+.camera-basics-grid .ant-input-number,
+.camera-basics-grid .ant-select {
+  width: 100%;
+}
+
+.camera-tuning-panel {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #c9dbd5;
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(248, 253, 251, 0.96), rgba(240, 248, 245, 0.96)),
+    #f3faf7;
+}
+
+.camera-tuning-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.camera-tuning-actions {
+  justify-content: flex-end;
+}
+
+.camera-tuning-grid {
+  display: grid;
+  grid-template-columns: minmax(112px, 0.35fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.camera-toggle-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.camera-slider-stack {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.camera-slider-row {
+  display: grid;
+  grid-template-columns: 72px minmax(150px, 1fr) 96px;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.camera-slider-row .ant-slider {
+  min-width: 0;
+}
+
 .metric-pill {
   display: inline-flex;
   align-items: center;
@@ -1648,6 +1732,11 @@ select {
 .log-line em {
   color: #9fb3c8;
   font-style: normal;
+}
+
+.log-message {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .log-line-warning {
@@ -2125,33 +2214,52 @@ select {
 }
 
 .hardware-settings-view {
-  gap: 10px;
+  gap: 12px;
+}
+
+.hardware-settings-view .page-header {
+  border-color: #c8d6e6;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.96), rgba(246, 251, 252, 0.96)),
+    #ffffff;
+  box-shadow: 0 8px 22px rgba(29, 58, 91, 0.05);
 }
 
 .hardware-settings-view .ant-tabs-nav {
   margin-bottom: 10px;
+  padding: 0 10px;
+  border: 1px solid #d7dde7;
+  border-radius: 8px;
+  background: #ffffff;
 }
 
 .hardware-settings-page {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
 }
 
 .hardware-focus-strip {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
-  padding: 10px;
-  border: 1px solid #d7dde7;
+  padding: 8px;
+  border: 1px solid #cdd8e7;
   border-radius: 8px;
+  background: #f8fbfd;
+}
+
+.hardware-focus-strip .hardware-metric-box {
+  min-height: 64px;
+  border: 1px solid #e0e7f1;
+  border-left: 3px solid #2f6fed;
   background: #ffffff;
 }
 
 .hardware-settings-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+  gap: 12px;
   align-items: start;
 }
 
@@ -2201,10 +2309,11 @@ select {
   min-width: 0;
   padding: 12px;
   scroll-margin-top: 72px;
-  border: 1px solid #d7dde7;
+  border: 1px solid #ccd8e6;
   border-radius: 8px;
-  background: #ffffff;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  background:
+    linear-gradient(180deg, #ffffff 0%, #fbfdff 100%);
+  box-shadow: 0 8px 20px rgba(18, 38, 63, 0.05);
 }
 
 .hardware-config-card-wide {
@@ -2221,6 +2330,8 @@ select {
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #edf1f6;
 }
 
 .hardware-config-title {
@@ -2261,6 +2372,20 @@ select {
   background: transparent;
 }
 
+.hardware-config-actions .ant-space,
+.gripper-action-section,
+.manual-action-row,
+.motion-origin-actions {
+  align-items: center;
+}
+
+.hardware-config-actions .ant-btn,
+.gripper-action-section .ant-btn,
+.manual-action-row .ant-btn,
+.motion-origin-actions .ant-btn {
+  min-height: 32px;
+}
+
 .hardware-form-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -2273,6 +2398,12 @@ select {
 
 .hardware-form-grid .ant-form-item {
   margin-bottom: 0;
+}
+
+.hardware-form-grid .ant-form-item-label > label,
+.manual-command-form .ant-form-item-label > label {
+  color: #53657a;
+  font-size: 12px;
 }
 
 .hardware-form-grid .ant-input-number,
@@ -2445,6 +2576,73 @@ select {
 
 .hardware-metric-warn {
   background: #fff7e8;
+}
+
+.action-compare-impact {
+  margin-bottom: 12px;
+}
+
+.action-compare-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.action-compare-column {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #dfe6ef;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.action-compare-column:nth-child(2) {
+  border-color: #b9dfc8;
+  background: #f0faf5;
+}
+
+.action-compare-list {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.action-compare-row {
+  display: grid;
+  grid-template-columns: minmax(88px, 0.8fr) minmax(0, 1fr);
+  gap: 4px 8px;
+  min-width: 0;
+  padding: 7px 0;
+  border-top: 1px solid rgba(121, 137, 157, 0.18);
+}
+
+.action-compare-row small {
+  color: #5d6d80;
+  font-size: 12px;
+}
+
+.action-compare-row b {
+  min-width: 0;
+  color: #17324d;
+  font-size: 13px;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.action-compare-row em {
+  grid-column: 1 / -1;
+  color: #6b7788;
+  font-size: 11px;
+  font-style: normal;
+}
+
+.action-compare-expected {
+  margin: 12px 0 0 !important;
 }
 
 .safety-layer-grid {
@@ -3079,10 +3277,10 @@ select {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 132px;
-  min-width: 132px;
-  height: 58px;
-  padding: 0 14px;
+  width: 88px;
+  min-width: 88px;
+  height: 54px;
+  padding: 0 10px;
   border: 2px solid #9f1239;
   border-radius: 8px;
   background: #d83a52;
@@ -3115,8 +3313,8 @@ select {
 .floating-safety-reset.ant-btn {
   display: inline-flex;
   justify-content: center;
-  width: 132px;
-  min-width: 132px;
+  width: 88px;
+  min-width: 88px;
   height: 34px;
   border-color: #f0b5bd;
   background: #ffffff;
@@ -3138,7 +3336,7 @@ select {
 .floating-emergency-copy {
   display: inline-flex;
   flex-direction: column;
-  align-items: flex-start;
+  align-items: center;
   line-height: 1.05;
 }
 
@@ -3149,7 +3347,7 @@ select {
 }
 
 .floating-emergency-copy strong {
-  font-size: 16px;
+  font-size: 14px;
 }
 
 .floating-emergency-copy small {
@@ -3176,6 +3374,12 @@ select {
   right: 12px;
   bottom: 34px;
   z-index: 50;
+}
+
+@media (max-width: 1440px) {
+  .camera-settings-panel {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 1200px) {
@@ -3486,6 +3690,10 @@ select {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .action-compare-grid {
+    grid-template-columns: 1fr;
+  }
+
   .hardware-config-card-head {
     flex-direction: column;
   }
@@ -3498,6 +3706,21 @@ select {
   .force-oscilloscope-grid,
   .camera-metric-grid {
     grid-template-columns: 1fr;
+  }
+
+  .camera-settings-panel,
+  .camera-tuning-grid,
+  .camera-slider-row {
+    grid-template-columns: 1fr;
+  }
+
+  .camera-tuning-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .camera-tuning-actions {
+    justify-content: flex-start;
   }
 
   .jog-table-hardware .jog-row {
@@ -3543,8 +3766,8 @@ select {
 
   .floating-emergency-stop.ant-btn,
   .floating-safety-reset.ant-btn {
-    width: 112px;
-    min-width: 112px;
+    width: 78px;
+    min-width: 78px;
   }
 
   .floating-emergency-stop.ant-btn {

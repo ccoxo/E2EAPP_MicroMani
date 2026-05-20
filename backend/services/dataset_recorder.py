@@ -69,22 +69,6 @@ PULSE_FEATURE_NAMES: tuple[str, ...] = (
     "right_pitch_pulse",
     "right_yaw_pulse",
 )
-ACTION_FEATURE_NAMES: tuple[str, ...] = (
-    "left_dx_um",
-    "left_dy_um",
-    "left_dz_um",
-    "left_droll_mdeg",
-    "left_dpitch_mdeg",
-    "left_dyaw_mdeg",
-    "left_gripper_target_mm",
-    "right_dx_um",
-    "right_dy_um",
-    "right_dz_um",
-    "right_droll_mdeg",
-    "right_dpitch_mdeg",
-    "right_dyaw_mdeg",
-    "right_gripper_target_mm",
-)
 FORCE_FEATURE_NAMES: tuple[str, ...] = ("fx", "fy", "fz", "mx", "my", "mz")
 CAMERA_SOURCE_KEYS: dict[str, str] = {key: f"camera_{key}" for key in CAMERA_KEYS}
 CAMERA_KEY_BY_SOURCE: dict[str, str] = {source: key for key, source in CAMERA_SOURCE_KEYS.items()}
@@ -2204,7 +2188,7 @@ class DatasetRecorderService:
             "observation.pulses": {"dtype": "float32", "shape": (12,), "names": list(PULSE_FEATURE_NAMES)},
             "observation.force_left": {"dtype": "float32", "shape": (6,), "names": list(FORCE_FEATURE_NAMES)},
             "observation.force_right": {"dtype": "float32", "shape": (6,), "names": list(FORCE_FEATURE_NAMES)},
-            "action": {"dtype": "float32", "shape": (14,), "names": list(ACTION_FEATURE_NAMES)},
+            "action": {"dtype": "float32", "shape": (14,), "names": list(STATE_FEATURE_NAMES)},
         }
         for key, feature_key in CAMERA_FEATURE_KEYS.items():
             width, height = CAMERA_CAPTURE_SIZES[key]
@@ -2925,7 +2909,28 @@ class DatasetRecorderService:
         if gripper:
             action[6] = self._float_or_zero(gripper.get("targetLeftMm", base[6]))
             action[13] = self._float_or_zero(gripper.get("targetRightMm", base[13]))
+        native_gripper_targets = self._latest_native_gripper_targets()
+        if native_gripper_targets is not None:
+            action[6], action[13] = native_gripper_targets
         return action
+
+    def _latest_native_gripper_targets(self) -> tuple[float, float] | None:
+        status = self.teleop.status()
+        native_status = status.get("nativeStatus") if isinstance(status, dict) else None
+        if not isinstance(native_status, dict):
+            return None
+        raw_targets = native_status.get("gripperTargets")
+        if isinstance(raw_targets, list) and len(raw_targets) >= 2:
+            left = self._coerce_float(raw_targets[0])
+            right = self._coerce_float(raw_targets[1])
+        elif isinstance(raw_targets, dict):
+            left = self._coerce_float(raw_targets.get("leftMm", raw_targets.get("left")))
+            right = self._coerce_float(raw_targets.get("rightMm", raw_targets.get("right")))
+        else:
+            return None
+        if left is None or right is None:
+            return None
+        return left, right
 
     def _latest_action_delta_vector(self, target_monotonic_s: float | None = None) -> list[float]:
         """处理录制服务逻辑：_latest_action_delta_vector。"""

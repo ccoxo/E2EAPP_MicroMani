@@ -12,9 +12,13 @@ function Stop-ProcessTree {
 }
 
 foreach ($port in @(5173, 5174, 18080, 18082, 8091)) {
-  $pidOnPort = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
-    Select-Object -ExpandProperty OwningProcess -First 1
-  if ($pidOnPort) {
+  $pidsOnPort = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty OwningProcess |
+    Sort-Object -Unique)
+  foreach ($pidOnPort in $pidsOnPort) {
+    if (-not $pidOnPort) {
+      continue
+    }
     $rootPid = $pidOnPort
     if ($port -in @(18080, 18082)) {
       $allProcesses = Get-CimInstance Win32_Process

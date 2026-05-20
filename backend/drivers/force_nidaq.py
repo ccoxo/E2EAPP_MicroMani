@@ -116,7 +116,8 @@ class _PersistentTask:
 
 
 class NidaqForceDriver:
-    def __init__(self) -> None:
+    def __init__(self, logs: Any | None = None) -> None:
+        self._logs = logs
         self._sample_lock = Lock()
         self._last_sample_at = 0.0
         self._last_sample = ForceProbeResult(True, "force sample not read yet", [0.0] * 6, [0.0] * 6)
@@ -128,11 +129,38 @@ class NidaqForceDriver:
         self._lpf_signature: tuple[bool, float, float] | None = None
         self._calibration_cache: dict[tuple[str, str, bool], tuple[list[list[float]], str]] = {}
 
+    def _log_daq(self, level: str, **fields: Any) -> None:
+        if self._logs is None:
+            return
+        level_name = "ERROR" if level == "error" else "WARNING" if level == "warning" else "INFO"
+        detail = str(fields.get("detail", ""))
+        ret_code = "-50103" if "-50103" in detail else fields.get("retCode", "")
+        owner_hint = "resource reserved by HalServer/E2E/NI task" if ret_code == "-50103" else ""
+        try:
+            self._logs.event(
+                "[FORCE]",
+                level_name,
+                "force_daq",
+                component="FORCE",
+                taskName=fields.get("taskName", "probe"),
+                device=fields.get("device", ""),
+                channel=fields.get("channel", ""),
+                sampleRate=fields.get("sampleRate", 0),
+                retCode=ret_code,
+                statusCode=fields.get("statusCode", ""),
+                detail=detail,
+                ownerHint=owner_hint,
+                retryCount=fields.get("retryCount", 0),
+            )
+        except Exception:
+            pass
+
     def probe(self, config: dict[str, Any]) -> ForceProbeResult:
         try:
             nidaqmx = import_module("nidaqmx")
             constants = import_module("nidaqmx.constants")
         except Exception as exc:
+            self._log_daq("error", detail=str(exc), sampleRate=self._sample_hz(config))
             return ForceProbeResult(
                 False,
                 f"NI-DAQmx Python import failed: {exc}",
@@ -158,6 +186,7 @@ class NidaqForceDriver:
                         self._sample_hz(config),
                     )
                 except Exception as exc:
+                    self._log_daq("error", detail=str(exc), channel=channel, sampleRate=self._sample_hz(config))
                     errors.append(f"{label} {channel}: {exc}")
                     persistent.close()
         if errors:

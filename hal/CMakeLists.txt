@@ -4,8 +4,10 @@ project(AppStationHal LANGUAGES CXX)
 option(APPSTATION_ENABLE_VENDOR_SDKS "Compile LTDMC and Omega.7 vendor SDK calls" ON)
 
 add_library(appstation_hal_core
+  src/JodellGripperDriver.cpp
   src/LTDMCDriver.cpp
   src/MotionControlThread.cpp
+  src/NativeTeleopController.cpp
   src/Omega7Driver.cpp
 )
 target_include_directories(appstation_hal_core PUBLIC include)

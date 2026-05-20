@@ -70,16 +70,6 @@ export function AppLayout() {
     return () => window.clearInterval(timer)
   }, [])
 
-  useEffect(() => {
-    const handler = (event: KeyboardEvent) => {
-      if (event.key !== 'F12') return
-      event.preventDefault()
-      triggerEmergencyStop()
-    }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [triggerEmergencyStop])
-
   return (
     <div className="app-shell">
       <header className="top-bar">
@@ -114,12 +104,13 @@ export function AppLayout() {
             </Tooltip>
           ))}
           <Button
+            aria-label="侧栏急停"
             className="nav-emergency"
             danger
             icon={<Activity size={17} />}
             onClick={triggerEmergencyStop}
           >
-            F12
+            急停
           </Button>
         </nav>
         <main className="main-content">
@@ -131,7 +122,7 @@ export function AppLayout() {
       <StatusBar />
       <SafetyOverlay />
       <GlobalEmergencyStopButton />
-      <Button className="floating-settings" icon={<SlidersHorizontal size={16} />} onClick={() => navigate('/settings')} />
+      <Button aria-label="打开硬件设置" className="floating-settings" icon={<SlidersHorizontal size={16} />} onClick={() => navigate('/settings')} />
     </div>
   )
 }

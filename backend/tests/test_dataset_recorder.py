@@ -86,6 +86,7 @@ def test_dataset_recorder_native_features_follow_v3_contract() -> None:
 
     assert features["observation.state"]["shape"] == (14,)
     assert features["action"]["shape"] == (14,)
+    assert features["action"]["names"] == features["observation.state"]["names"]
     assert features["observation.images.global"]["dtype"] == "video"
     assert features["observation.images.global"]["shape"] == (480, 640, 3)
     assert "observation.gripper" not in features
@@ -426,6 +427,28 @@ def test_dataset_recorder_composes_14d_state_and_absolute_action() -> None:
     ) == [11, 2, 3, 600.0, 200.0, 300.0, 6.0, -13, 8, 9, 400.0, 500.0, 500.0, 7.0]
 
 
+def test_dataset_recorder_uses_native_gripper_targets_for_action() -> None:
+    class FakeTeleop:
+        def status(self) -> dict[str, object]:
+            return {
+                "lastAction": {
+                    "ts": int(time.time() * 1000),
+                    "deltaVector": [0.0] * 12,
+                },
+                "nativeStatus": {
+                    "gripperTargets": [8.0, 9.0],
+                },
+            }
+
+    recorder = object.__new__(DatasetRecorderService)
+    recorder.teleop = FakeTeleop()
+
+    assert recorder._latest_action_vector(
+        [0.0] * 14,
+        {"gripper": {"targetLeftMm": 1.0, "targetRightMm": 2.0}},
+    )[6::7] == [8.0, 9.0]
+
+
 def test_dataset_recorder_action_vector_uses_last_action_before_target() -> None:
     class FakeTeleop:
         def status(self) -> dict[str, object]:
@@ -495,5 +518,5 @@ def test_dataset_recorder_applies_work_origin_pulse_conversion() -> None:
 
     relative = recorder._recording_motion_positions({"motion": {"origin": origin}}, [42.0] * 12, pulses)
 
-    assert relative[:4] == [1000.0, 1000.0, 1000.0, 1.0]
+    assert relative[:4] == [1800.0, -1000.0, 1000.0, 1.0]
     assert relative[6] == 42.0

@@ -29,24 +29,42 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     config = default_config()
     teleop = config["teleop"]
 
-    assert teleop["strategyVersion"] == "icf_omega7_qserialtest_v19_platform1_roll_yaw_direction_fix_20260515"
+    assert teleop["engine"] == "hal_native"
+    assert teleop["controlMode"] == "incremental_position"
+    assert teleop["nativeLoopHz"] == 100
+    assert teleop["nativeTranslationDeadzoneM"] == 0.002
+    assert teleop["nativeTranslationFullScaleM"] == 0.04
+    assert teleop["nativeRotationDeadzoneDeg"] == 2.0
+    assert teleop["nativeRotationFullScaleDeg"] == 30.0
+    assert teleop["nativeVelocitySmoothingMs"] == 40.0
+    assert teleop["strategyVersion"] == "e2e_omega7_native_v27_right_yaw333_com9_20260520"
+    assert teleop["mappingMode"] == "direct"
     assert teleop["swapHands"] is False
     assert teleop["swapTeleopChannels"] is True
     assert teleop["stabilityMode"] == "off"
-    assert teleop["leftTranslationScale"] == 0.30
-    assert teleop["rightTranslationScale"] == 0.30
-    assert teleop["leftRotationScale"] == 0.10
-    assert teleop["rightRotationScale"] == 0.10
-    assert teleop["leftAxisOutputScale"] == [0.40, 0.20, 0.20, 1.00, 0.20, 0.20]
-    assert teleop["rightAxisOutputScale"] == [0.40, 0.20, 0.20, 1.00, 0.20, 0.20]
+    assert teleop["leftTranslationScale"] == 1.0
+    assert teleop["rightTranslationScale"] == 1.0
+    assert teleop["leftRotationScale"] == 1.0
+    assert teleop["rightRotationScale"] == 1.0
+    assert teleop["leftForceFeedback"] is True
+    assert teleop["rightForceFeedback"] is True
+    assert teleop["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
+    assert teleop["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
     assert teleop["translationStepLimitPulse"] == 4000
     assert teleop["rotationStepLimitPulse"] == 1250
     assert teleop["translationPulseDeadband"] == 2
     assert teleop["rotationPulseDeadband"] == 2
-    assert teleop["translationStartVelocityUmS"] == 300.0
-    assert teleop["translationMaxVelocityUmS"] == 4000.0
-    assert teleop["rotationStartVelocityDegS"] == 0.50
-    assert teleop["rotationMaxVelocityDegS"] == 6.0
+    assert teleop["translationStartVelocityUmS"] == 600.0
+    assert teleop["translationMaxVelocityUmS"] == 8000.0
+    assert teleop["rotationStartVelocityDegS"] == 1.0
+    assert teleop["rotationMaxVelocityDegS"] == 12.0
+    assert teleop["continuousIncrementMode"] is True
+    assert teleop["translationInputEpsilon"] == 0.00002
+    assert teleop["rotationInputEpsilon"] == 0.03
+    assert teleop["translationMinActivePulse"] == 3
+    assert teleop["rotationMinActivePulse"] == 3
+    assert teleop["continuousMicroConfirmTicks"] == 0
+    assert teleop["diagLog"] is False
     assert teleop["leftEnabledAxes"] == [True] * 6
     assert teleop["rightEnabledAxes"] == [True] * 6
     assert teleop["softLimitUnitSpec"] == ["um", "um", "um", "deg", "deg", "deg"]
@@ -54,6 +72,14 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["leftSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 90.0, 90.0, 7.0]
     assert teleop["rightSoftLimitMin"] == [-25000.0, -37500.0, -37500.0, -90.0, -90.0, -7.0]
     assert teleop["rightSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 90.0, 90.0, 7.0]
+    assert teleop["leftImpulseCoeff"] == [-5000000, 10000000, -10000000, 1667, -2500, -333.3333]
+    assert teleop["rightImpulseCoeff"] == [-5000000, -10000000, -10000000, 1667, 2500, 3333.333]
+    assert teleop["leftDirectionSign"] == [1, -1, -1, 1, -1, -1]
+    assert teleop["rightDirectionSign"] == [1, 1, -1, 1, 1, 1]
+    assert teleop["gripperTeleop"]["leftSourceHand"] == "PhysicalRight"
+    assert teleop["gripperTeleop"]["rightSourceHand"] == "PhysicalLeft"
+    assert teleop["gripperTeleop"]["leftGapInvert"] is False
+    assert teleop["gripperTeleop"]["rightGapInvert"] is False
 
 
 def test_motion_kinematics_defaults_match_icf_mapping() -> None:
@@ -65,14 +91,14 @@ def test_motion_kinematics_defaults_match_icf_mapping() -> None:
     assert kinematics["rightAxisMap"] == [8, 6, 11, 14, 7, 13]
     assert kinematics["leftPhysicalAxis"] == [0, 1, 3, 5, 4, 2]
     assert kinematics["rightPhysicalAxis"] == [2, 0, 5, 8, 1, 7]
-    assert kinematics["leftSignedPulsePerUnit"] == [-5000.0, 10000.0, -10000.0, 1666.666667, -2500.0, -3333.333333]
+    assert kinematics["leftSignedPulsePerUnit"] == [-5000.0, 10000.0, -10000.0, 1666.666667, -2500.0, -3333.333]
     assert kinematics["rightSignedPulsePerUnit"] == [
         -5000.0,
         -10000.0,
         -10000.0,
         1666.666667,
         2500.0,
-        666.0,
+        333.3333,
     ]
 
 
@@ -80,12 +106,12 @@ def test_work_origin_defaults_match_icf_reference_position() -> None:
     config = default_config()
     origin = config["motion"]["origin"]
 
-    assert config["motion"]["workOriginStrategyVersion"] == "icf_work_origin_20260513"
+    assert config["motion"]["workOriginStrategyVersion"] == "icf_work_origin_20260519"
     assert origin["valid"] is True
     assert origin["leftValid"] is True
     assert origin["rightValid"] is True
-    assert origin["leftPulse"] == [258510.0, -200013.0, 274821.0, 49833.0, 84839.0, 381102.0]
-    assert origin["rightPulse"] == [99769.0, 382483.0, 881210.0, -35473.0, -215115.0, -5006.0]
+    assert origin["leftPulse"] == [258494.0, -200013.0, 274821.0, 49833.0, 84839.0, 381102.0]
+    assert origin["rightPulse"] == [99772.0, 382486.0, 881207.0, 19527.0, -175127.0, -9668.0]
 
 
 def test_force_defaults_match_nidaq_reference_project() -> None:
@@ -135,9 +161,30 @@ def test_gripper_teleop_defaults_match_omega7_gap_range() -> None:
 
     assert gripper_teleop["leftGapMaxMm"] == 25.0
     assert gripper_teleop["rightGapMaxMm"] == 25.0
-    assert gripper_teleop["positionDeadbandCounts"] == 2
-    assert gripper_teleop["minCommandIntervalMs"] == 50
+    assert gripper_teleop["positionDeadbandCounts"] == 1
+    assert gripper_teleop["minCommandIntervalMs"] == 20
     assert gripper_teleop["leftSourceHand"] == "PhysicalRight"
     assert gripper_teleop["rightSourceHand"] == "PhysicalLeft"
+    assert gripper_teleop["leftGapInvert"] is False
+    assert gripper_teleop["rightGapInvert"] is False
     assert gripper_teleop["autoGapCalibration"] is True
     assert gripper_teleop["buttonFallback"] is True
+
+
+def test_native_teleop_xy_signs_match_site_verified_stage_direction() -> None:
+    teleop = default_config()["teleop"]
+
+    assert teleop["swapTeleopChannels"] is True
+    assert teleop["leftImpulseCoeff"][:2] == [-5000000, 10000000]
+    assert teleop["rightImpulseCoeff"][:2] == [-5000000, -10000000]
+
+
+def test_native_teleop_axis_scales_use_icf_effective_output_scale() -> None:
+    teleop = default_config()["teleop"]
+
+    assert teleop["leftTranslationScale"] == 1.0
+    assert teleop["rightTranslationScale"] == 1.0
+    assert teleop["leftRotationScale"] == 1.0
+    assert teleop["rightRotationScale"] == 1.0
+    assert teleop["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
+    assert teleop["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]

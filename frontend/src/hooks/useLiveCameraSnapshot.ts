@@ -25,7 +25,9 @@ export function useLiveCameraSnapshot(cameraKey: CameraTelemetry['key'], health?
       ? 'error'
       : 'pending'
     : failedCamera === cameraKey
-      ? 'error'
+      ? snapshotUrl
+        ? 'warn'
+        : 'error'
       : imageLoaded
         ? 'ok'
         : 'checking'
@@ -53,21 +55,12 @@ export function useLiveCameraSnapshot(cameraKey: CameraTelemetry['key'], health?
     objectUrls.current.clear()
   }, [])
 
-  const clearSnapshotUrl = useCallback(() => {
-    setSnapshotUrl((previous) => {
-      if (previous) revokeObjectUrlSoon(previous)
-      return null
-    })
-  }, [revokeObjectUrlSoon])
-
   const refreshStream = useCallback(() => {
     clearFrameTimer()
     clearAbort()
-    clearSnapshotUrl()
     setFailedCamera(null)
-    setImageLoaded(false)
     setRefreshNonce((nonce) => nonce + 1)
-  }, [clearAbort, clearFrameTimer, clearSnapshotUrl])
+  }, [clearAbort, clearFrameTimer])
 
   useEffect(() => {
     return () => {

@@ -41,20 +41,36 @@ class Rs485GripperDriver:
             return GripperResult(False, f"jodellTool.dll load failed: {exc}")
 
         errors: list[str] = []
+        ports: list[dict[str, Any]] = []
         gripper = config["gripper"]
         baudrate = int(gripper.get("baudrate", 115200))
         with self._io_lock:
-            for side, port_key in [
-                ("left", "leftPort"),
-                ("right", "rightPort"),
+            for side, port_key, slave_key in [
+                ("left", "leftPort", "leftSlaveId"),
+                ("right", "rightPort", "rightSlaveId"),
             ]:
                 port = self._port_number(str(gripper.get(port_key)))
+                slave = int(gripper.get(slave_key))
                 ret = self._select_port(dll, port, baudrate)
-                if ret not in {0, 1}:
-                    errors.append(f"{side} COM{port}: serialOperation open ret={ret}")
+                try:
+                    ports.append(
+                        {
+                            "side": side,
+                            "port": f"COM{port}",
+                            "slaveId": slave,
+                            "baudrate": baudrate,
+                            "openRet": ret,
+                            "ok": ret in {0, 1},
+                        }
+                    )
+                    if ret not in {0, 1}:
+                        errors.append(f"{side} COM{port}: serialOperation open ret={ret}")
+                finally:
+                    if ret in {0, 1}:
+                        self._close_port(dll, port, baudrate)
         if errors:
-            return GripperResult(False, "; ".join(errors))
-        return GripperResult(True, "jodell RS485 gripper ports open")
+            return GripperResult(False, "; ".join(errors), details={"ports": ports})
+        return GripperResult(True, "jodell RS485 gripper ports open", details={"ports": ports})
 
     def command(self, config: dict[str, Any], side: str, command: str, target_mm: float | None) -> GripperResult:
         gripper = config["gripper"]

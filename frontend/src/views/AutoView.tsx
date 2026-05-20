@@ -84,7 +84,7 @@ export function AutoView() {
               停止
             </Button>
             <Button danger icon={<ShieldAlert size={16} />} onClick={triggerEmergencyStop}>
-              急停 F12
+              急停
             </Button>
             <Button
               icon={<Send size={16} />}

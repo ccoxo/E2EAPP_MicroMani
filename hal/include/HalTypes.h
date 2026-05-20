@@ -42,6 +42,11 @@ struct TeleopTargetUpdateResult {
   std::array<double, 6> requestedDeltaPulse{};
   std::array<double, 6> appliedDeltaPulse{};
   std::array<double, 6> targetPulse{};
+  std::array<double, 6> currentPulse{};
+  std::array<double, 6> launchDeltaPulse{};
+  std::array<double, 6> updateReturn{};
+  std::array<bool, 6> movingBefore{};
+  std::array<bool, 6> moveStarted{};
   std::array<bool, 6> clipped{};
 };
 
@@ -54,14 +59,14 @@ struct HalHealth {
 
 constexpr std::array<int, 6> kLeftPhysicalAxis{0, 1, 3, 5, 4, 2};
 constexpr std::array<int, 6> kRightPhysicalAxis{2, 0, 5, 8, 1, 7};
-constexpr std::array<double, 6> kLeftPulsePerUnit{-5000.0, 10000.0, -10000.0, 1666.666667, -2500.0, -3333.333333};
+constexpr std::array<double, 6> kLeftPulsePerUnit{-5000.0, 10000.0, -10000.0, 1666.666667, -2500.0, -3333.333};
 constexpr std::array<double, 6> kRightPulsePerUnit{
     -5000.0,
     -10000.0,
     -10000.0,
     1666.666667,
     2500.0,
-    666.0};
+    333.3333};
 
 inline int stateIndex(Side side, SemanticAxis axis) {
   return (side == Side::Left ? 0 : 6) + static_cast<int>(axis);

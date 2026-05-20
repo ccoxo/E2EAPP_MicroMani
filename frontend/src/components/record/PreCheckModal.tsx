@@ -1,27 +1,38 @@
 import { Alert, Button, Checkbox, Modal, Steps } from 'antd'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { homeAll } from '../../api'
 import { useTelemetryStore } from '../../stores/telemetry'
-import type { RecordSessionState, TelemetryFrame } from '../../types'
+import type { DiagnosticItem, RecordSessionState, TelemetryFrame } from '../../types'
 
 interface StepDef {
   title: string
   description: string
   autoCheck: boolean
-  check: ((frame: TelemetryFrame, recordSession: RecordSessionState) => boolean) | null
+  check: ((frame: TelemetryFrame, recordSession: RecordSessionState, diagnostics: DiagnosticItem[]) => boolean) | null
   required?: boolean
   actionButton?: { label: string; apiCall: () => void }
+}
+
+function diagnosticReady(diagnostics: DiagnosticItem[], key: string) {
+  return diagnostics.find((item) => item.key === key)?.status === 'ok'
+}
+
+function teleopHandsReady(frame: TelemetryFrame) {
+  return frame.teleopHands.every((hand) => hand.connected && hand.lastReadOk)
 }
 
 const STEPS: StepDef[] = [
   {
     title: '硬件连接',
-    description: '确认 HAL、WebSocket 正常，三路相机在线且帧率高于 25Hz。',
+    description: '确认 HAL、WebSocket、相机、Omega.7 和夹爪串口均可识别。',
     autoCheck: true,
-    check: (frame) =>
+    check: (frame, _recordSession, diagnostics) =>
       frame.halOk &&
       frame.wsOk &&
-      frame.cameras.every((camera) => camera.fps >= 25 && camera.health === 'ok'),
+      frame.cameras.every((camera) => camera.fps >= 15 && camera.health === 'ok') &&
+      diagnosticReady(diagnostics, 'omega7') &&
+      teleopHandsReady(frame) &&
+      diagnosticReady(diagnostics, 'gripper'),
   },
   {
     title: '自动回到工作原点',
@@ -59,13 +70,19 @@ interface PreCheckModalProps {
 
 export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckModalProps) {
   const frame = useTelemetryStore((s) => s.frame)
+  const diagnostics = useTelemetryStore((s) => s.diagnostics)
   const recordSession = useTelemetryStore((s) => s.recordSession)
   const tareRecordForceSensors = useTelemetryStore((s) => s.tareRecordForceSensors)
+  const refreshHardwareStatus = useTelemetryStore((s) => s.refreshHardwareStatus)
   const [manualChecked, setManualChecked] = useState<Record<number, boolean>>({})
+
+  useEffect(() => {
+    if (open) void refreshHardwareStatus()
+  }, [open, refreshHardwareStatus])
 
   const stepStatuses = STEPS.map((step, i) => {
     if (step.autoCheck && step.check) {
-      return step.check(frame, recordSession)
+      return step.check(frame, recordSession, diagnostics)
     }
     return manualChecked[i] ?? false
   })

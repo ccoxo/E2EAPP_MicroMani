@@ -10,9 +10,9 @@ export function GlobalEmergencyStopButton() {
 
   return (
     <div className={`floating-emergency-stack ${active ? 'floating-emergency-stack-active' : ''}`}>
-      <Tooltip title="硬件急停，快捷键 F12" placement="left">
+      <Tooltip title="硬件急停" placement="left">
         <Button
-          aria-label="全局急停 F12"
+          aria-label="全局急停"
           className={`floating-emergency-stop ${active ? 'floating-emergency-stop-active' : ''}`}
           danger
           icon={<ShieldAlert size={24} />}
@@ -21,7 +21,7 @@ export function GlobalEmergencyStopButton() {
         >
           <span className="floating-emergency-copy">
             <strong>{active ? '已急停' : '急停'}</strong>
-            <small>F12</small>
+            <small>硬件</small>
           </span>
         </Button>
       </Tooltip>

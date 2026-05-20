@@ -180,14 +180,44 @@ class RealHalClient(HalClient):
             "motion.manual_axis_move": "/motion/manual_axis_move",
             "motion.teleop_target_update": "/motion/teleop_target_update",
             "motion.teleop_stop_side": "/motion/teleop_stop_side",
+            "omega7.gravity_compensation": "/omega7/gravity_compensation",
+            "omega7.zero_force_feedback": "/omega7/zero_force_feedback",
+            "teleop.native.configure": "/teleop/native/configure",
+            "teleop.native.start": "/teleop/native/start",
+            "teleop.native.stop": "/teleop/native/stop",
+            "teleop.native.status": "/teleop/native/status",
+            "gripper.command": "/gripper/command",
         }
         path = path_by_command.get(name)
         if path is None:
             raise RuntimeError(f"Real HAL command is not mapped: {name}")
-        method = "GET" if name == "hal.reconnect" else "POST"
+        method = "GET" if name in {"hal.reconnect", "teleop.native.status"} else "POST"
         request_payload = self._hal_command_payload(name, payload or {})
-        response = await self._request(method, path, request_payload)
-        self.logs.info("[HAL]", f"{name} forwarded to real HAL")
+        try:
+            response = await self._request(method, path, request_payload)
+        except RuntimeError as exc:
+            if name.startswith("motion."):
+                self.logs.event(
+                    "[HAL]",
+                    "ERROR",
+                    "motion_error",
+                    component="MOTION",
+                    api=name,
+                    card=request_payload.get("card", ""),
+                    physicalAxis=request_payload.get("axis", request_payload.get("physicalAxis", "")),
+                    logicalAxis=request_payload.get("axis", ""),
+                    ret="http_error",
+                    current="unknown",
+                    target=request_payload.get("target", request_payload.get("deltas", "")),
+                    velocityProfile={
+                        "max": request_payload.get("maxVelocityUiPerSec", ""),
+                        "start": request_payload.get("startVelocityUiPerSec", ""),
+                    },
+                    detail=str(exc),
+                )
+            raise
+        if name not in {"motion.teleop_target_update", "teleop.native.status"}:
+            self.logs.info("[HAL]", f"{name} forwarded to real HAL")
         return {"mode": "real", "command": name, "response": response}
 
     def _hal_command_payload(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:

@@ -60,6 +60,7 @@ class LTDMCDriver {
   std::string lastError_;
   std::array<double, 12> pulse_{};
   std::array<bool, 12> enabled_{};
+  std::array<bool, 12> commandedEnabled_{};
   std::array<double, 12> teleopTargetPulse_{};
   std::array<bool, 12> teleopTargetActive_{};
 };

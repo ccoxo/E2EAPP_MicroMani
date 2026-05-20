@@ -19,8 +19,14 @@ pushd "%BUILD%"
 echo Compiling LTDMCDriver.cpp ...
 cl %CXX_FLAGS% /c "%SRC%\LTDMCDriver.cpp" /Fo"LTDMCDriver.next.obj" || goto :err
 
+echo Compiling JodellGripperDriver.cpp ...
+cl %CXX_FLAGS% /c "%SRC%\JodellGripperDriver.cpp" /Fo"JodellGripperDriver.next.obj" || goto :err
+
 echo Compiling MotionControlThread.cpp ...
 cl %CXX_FLAGS% /c "%SRC%\MotionControlThread.cpp" /Fo"MotionControlThread.next.obj" || goto :err
+
+echo Compiling NativeTeleopController.cpp ...
+cl %CXX_FLAGS% /c "%SRC%\NativeTeleopController.cpp" /Fo"NativeTeleopController.next.obj" || goto :err
 
 echo Compiling Omega7Driver.cpp ...
 cl %CXX_FLAGS% /c "%SRC%\Omega7Driver.cpp" /Fo"Omega7Driver.next.obj" || goto :err
@@ -30,13 +36,25 @@ cl %CXX_FLAGS% /c "%SRC%\HalServer.cpp" /Fo"HalServer.next.obj" || goto :err
 
 echo Linking HalServer.next.exe ...
 link /nologo /OUT:"HalServer.next.exe" ^
-  HalServer.next.obj LTDMCDriver.next.obj MotionControlThread.next.obj Omega7Driver.next.obj ^
+  HalServer.next.obj LTDMCDriver.next.obj JodellGripperDriver.next.obj MotionControlThread.next.obj NativeTeleopController.next.obj Omega7Driver.next.obj ^
   ws2_32.lib ^
   || goto :err
 
 for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set BUILD_STAMP=%%I
-if exist "HalServer.exe" copy /Y "HalServer.exe" "HalServer.backup-%BUILD_STAMP%.exe" >nul || goto :err
-copy /Y "HalServer.next.exe" "HalServer.exe" >nul || goto :err
+if exist "HalServer.exe" copy /Y "HalServer.exe" "HalServer.backup-%BUILD_STAMP%.exe" >nul 2>nul
+if errorlevel 1 (
+  echo Build succeeded: %BUILD%\HalServer.next.exe
+  echo Deploy skipped: %BUILD%\HalServer.exe is in use. Stop HalServer.exe and copy HalServer.next.exe over it.
+  popd
+  exit /b 0
+)
+copy /Y "HalServer.next.exe" "HalServer.exe" >nul 2>nul
+if errorlevel 1 (
+  echo Build succeeded: %BUILD%\HalServer.next.exe
+  echo Deploy skipped: %BUILD%\HalServer.exe is in use. Stop HalServer.exe and copy HalServer.next.exe over it.
+  popd
+  exit /b 0
+)
 
 echo Build succeeded: %BUILD%\HalServer.exe
 popd

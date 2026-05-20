@@ -8,6 +8,11 @@ import type { LogLevel } from '../types'
 
 const levelOptions: Array<LogLevel | 'ALL'> = ['ALL', 'DEBUG', 'INFO', 'WARNING', 'ERROR']
 
+function formatLogTime(ts: number) {
+  const date = new Date(ts)
+  return `${date.toLocaleTimeString()}.${String(date.getMilliseconds()).padStart(3, '0')}`
+}
+
 function matchesSearch(text: string, search: string) {
   if (!search.trim()) return true
   try {
@@ -43,6 +48,10 @@ export function LogPanel() {
     estimateSize: () => 24,
     overscan: 20,
   })
+  const virtualItems = virtualizer.getVirtualItems()
+  const visibleItems = virtualItems.length > 0
+    ? virtualItems
+    : filtered.map((_, index) => ({ index, start: index * 24, key: index }))
 
   function exportLogs() {
     const body = filtered.map((entry) => `${new Date(entry.ts).toISOString()} ${entry.channel} ${entry.level} ${entry.msg}`).join('\n')
@@ -89,7 +98,7 @@ export function LogPanel() {
       {open && (
         <div ref={parentRef} className="log-viewport">
           <div style={{ height: `${virtualizer.getTotalSize()}px`, position: 'relative' }}>
-            {virtualizer.getVirtualItems().map((virtualItem) => {
+            {visibleItems.map((virtualItem) => {
               const entry = filtered[virtualItem.index]
               return (
                 <div
@@ -97,10 +106,10 @@ export function LogPanel() {
                   key={entry.id}
                   style={{ transform: `translateY(${virtualItem.start}px)` }}
                 >
-                  <span>{new Date(entry.ts).toLocaleTimeString()}</span>
+                  <span>{formatLogTime(entry.ts)}</span>
                   <b style={{ color: channelColor[entry.channel] }}>{entry.channel}</b>
                   <em>{entry.level}</em>
-                  <span>{entry.msg}</span>
+                  <span className="log-message" title={entry.msg}>{entry.msg}</span>
                 </div>
               )
             })}

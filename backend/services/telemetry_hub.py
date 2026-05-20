@@ -57,6 +57,21 @@ class TelemetryHub:
         self._gripper_future: Future[Any] | None = None
         self._camera_future: Future[Any] | None = None
         self._cached_cameras: list[CameraTelemetry] = self._offline_cameras("checking")
+        self._shutdown = False
+
+    def shutdown(self) -> None:
+        self._shutdown = True
+        for future in (self._force_future, self._gripper_future, self._camera_future):
+            if future is not None and not future.done():
+                future.cancel()
+        self._hardware_executor.shutdown(wait=True, cancel_futures=True)
+        self._force_future = None
+        self._gripper_future = None
+        self._camera_future = None
+        cameras = getattr(self.hardware, "cameras", None)
+        close_all = getattr(cameras, "close_all", None)
+        if callable(close_all):
+            close_all()
 
     def next_frame(
         self,
@@ -104,12 +119,10 @@ class TelemetryHub:
             self.estop_active = motion_estop_active
         force_left = self._force_values(elapsed, left=True)
         force_right = self._force_values(elapsed, left=False)
-        force_ok = True
         if self.hardware is not None and real_mode:
             # 真机传感器用缓存值出帧，采样频率由后台 future 控制。
             self._refresh_force_values(config, now)
             self.refresh_gripper_positions(config, now)
-            force_ok = self.force_ok
             force_left = list(self.force_left)
             force_right = list(self.force_right)
         if real_mode:
@@ -134,7 +147,7 @@ class TelemetryHub:
             recording=self.recording,
             episodeCount=self.episode_count,
             frameCount=self.frame_count,
-            halOk=hal_ok and force_ok,
+            halOk=hal_ok,
             wsOk=True,
             cameras=self._cameras(elapsed, config),
             teleopHands=self._teleop_hands(elapsed, config, omega_hands, real_mode),
@@ -512,7 +525,7 @@ class TelemetryHub:
             return 0.0, 0.0
 
     def _refresh_force_values(self, config: dict[str, Any], now: float) -> None:
-        if self.hardware is None:
+        if self.hardware is None or getattr(self, "_shutdown", False):
             return
         if self._force_future is not None and self._force_future.done():
             try:
@@ -530,7 +543,7 @@ class TelemetryHub:
             self._force_future = self._hardware_executor.submit(self.hardware.force.sample, config)
 
     def _refresh_cameras(self, config: dict[str, Any], now: float) -> None:
-        if self.hardware is None:
+        if self.hardware is None or getattr(self, "_shutdown", False):
             return
         if self._camera_future is not None and self._camera_future.done():
             try:
@@ -548,7 +561,31 @@ class TelemetryHub:
     def refresh_gripper_positions(self, config: dict[str, Any], now: float | None = None) -> None:
         """从当前采样后端刷新夹爪缓存位置。"""
         now = time.monotonic() if now is None else now
-        if self.hardware is None:
+        if self.hardware is None or getattr(self, "_shutdown", False):
+            return
+        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
+        if str(teleop.get("engine", "")).lower() == "hal_native":
+            gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
+            for side, idx, key in (
+                ("left", 0, "targetLeftMm"),
+                ("right", 1, "targetRightMm"),
+            ):
+                try:
+                    value = float(gripper.get(key, self.gripper_positions[idx]))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(value):
+                    self.gripper_positions[idx] = value
+                    self.gripper_samples[side] = {
+                        "ok": True,
+                        "positionMm": value,
+                        "sampleHz": 0.0,
+                        "ageMs": 0.0,
+                        "tsMs": int(time.time() * 1000),
+                        "monotonicMs": int(now * 1000),
+                        "message": "HAL-native target position",
+                    }
+                    self._last_gripper_sample_at = now
             return
         if self.gripper_workers is not None and self.gripper_workers.is_enabled(config):
             samples = self.gripper_workers.samples(config)
@@ -599,7 +636,7 @@ class TelemetryHub:
         self.refresh_gripper_positions(config, now)
 
     def _sample_gripper_positions(self, config: dict[str, Any]) -> list[float | None]:
-        if self.hardware is None:
+        if self.hardware is None or getattr(self, "_shutdown", False):
             return [None, None]
         # Read only one side per cycle — the Jodell DLL keeps a single COM port
         # active and switching costs ~140ms, which would otherwise block user

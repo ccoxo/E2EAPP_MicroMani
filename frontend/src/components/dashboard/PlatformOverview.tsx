@@ -109,7 +109,7 @@ export function PlatformOverview({
       state: frame.dangerIndex > 0.9 ? 'error' : frame.dangerIndex > 0.65 ? 'warn' : 'ok',
       primary: `danger_index ${frame.dangerIndex.toFixed(2)}`,
       secondary: '真实急停链路需由 Windows HAL 和硬件回报',
-      metric: 'F12',
+      metric: '硬件',
       group: '安全',
     },
   ]

@@ -1,6 +1,7 @@
 param(
   [int]$BackendPort = 18082,
-  [int]$FrontendPort = 5174
+  [int]$FrontendPort = 5174,
+  [switch]$SkipStartupHome
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,6 +43,7 @@ Start-Sleep -Seconds 1
 
 $env:APPSTATION_HAL_MODE = "real"
 $env:APPSTATION_HAL_BASE_URL = "http://127.0.0.1:8091"
+$env:APPSTATION_SKIP_STARTUP_HOME = if ($SkipStartupHome) { "true" } else { "false" }
 $backend = Start-Process `
   -FilePath (Join-Path $repo "backend\.venv\Scripts\python.exe") `
   -ArgumentList @("-m", "uvicorn", "backend.app:create_app", "--factory", "--host", "127.0.0.1", "--port", "$BackendPort") `
@@ -49,7 +51,7 @@ $backend = Start-Process `
   -WindowStyle Hidden `
   -PassThru
 
-$frontendCommand = "`$env:VITE_MOCK_MODE='false'; `$env:VITE_AUTO_SHUTDOWN_ON_CLOSE='false'; `$env:VITE_API_BASE='http://127.0.0.1:$BackendPort'; `$env:VITE_WS_URL='ws://127.0.0.1:$BackendPort/ws'; npm run dev -- --host 127.0.0.1 --port $FrontendPort"
+$frontendCommand = "`$env:VITE_MOCK_MODE='false'; `$env:VITE_AUTO_SHUTDOWN_ON_CLOSE='true'; `$env:VITE_API_BASE='http://127.0.0.1:$BackendPort'; `$env:VITE_WS_URL='ws://127.0.0.1:$BackendPort/ws'; npm run dev -- --host 127.0.0.1 --port $FrontendPort"
 $frontend = Start-Process `
   -FilePath "powershell.exe" `
   -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $frontendCommand) `
@@ -65,4 +67,5 @@ Start-Sleep -Seconds 3
   backend = "http://127.0.0.1:$BackendPort"
   frontend = "http://127.0.0.1:$FrontendPort"
   hal = "http://127.0.0.1:8091"
+  skipStartupHome = [bool]$SkipStartupHome
 }
