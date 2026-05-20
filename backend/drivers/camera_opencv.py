@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import time
+from collections import deque
 from dataclasses import dataclass
 from importlib import import_module
 from threading import Event, Lock, Thread, current_thread
@@ -44,6 +45,7 @@ IDENTITY_TOKEN_PATTERN = re.compile(r"[^a-z0-9]+")
 CAMERA_STALE_FRAME_SEC = 2.0
 CAMERA_INITIAL_FRAME_GRACE_SEC = 1.5
 CAMERA_FRAME_WAIT_SEC = 1.5
+CAMERA_FPS_WINDOW_SEC = 1.0
 CAMERA_TUNING_DEFAULTS: dict[str, dict[str, float | bool]] = {
     "global": {
         "autoExposure": False,
@@ -246,6 +248,7 @@ class OpenCVCameraDriver:
         self._latest_sequences: dict[int, int] = {}
         self._latest_at: dict[int, float] = {}
         self._latest_fps: dict[int, float] = {}
+        self._frame_timestamps: dict[int, deque[float]] = {}
         self._latest_mean: dict[int, list[float]] = {}
         self._jpeg_events: dict[int, Event] = {}
         self._reader_threads: dict[int, Thread] = {}
@@ -255,6 +258,7 @@ class OpenCVCameraDriver:
         self._latest_frames: dict[int, Any] = {}
         self._frame_locks: dict[int, Lock] = {}
         self._frame_events: dict[int, Event] = {}
+        self._last_camera_runtime_log_ms: dict[int, int] = {}
         self._resolved_cache_key: tuple[object, ...] | None = None
         self._resolved_cache_at = 0.0
         self._resolved_cache: dict[str, int] | None = None
@@ -272,6 +276,15 @@ class OpenCVCameraDriver:
                 self._logs.error("[CAMERA]", message)
             else:
                 self._logs.info("[CAMERA]", message)
+        except Exception:
+            pass
+
+    def _event(self, level: str, event: str, **fields: Any) -> None:
+        if self._logs is None:
+            return
+        level_name = "ERROR" if level == "error" else "WARNING" if level == "warning" else "INFO"
+        try:
+            self._logs.event("[CAMERA]", level_name, event, component="CAMERA", **fields)
         except Exception:
             pass
 
@@ -486,6 +499,13 @@ class OpenCVCameraDriver:
             self._clear_probe_cache()
         return self.probe(config)
 
+    def close_all(self) -> None:
+        with self._capture_lock:
+            indices = set(self._captures) | set(self._reader_threads) | set(self._encode_threads)
+            for index in list(indices):
+                self._drop_capture(index)
+            self._clear_probe_cache()
+
     def enumerate_devices(self, config: dict[str, Any], max_index: int = 3) -> list[dict[str, Any]]:
         try:
             cv2 = import_module("cv2")
@@ -616,6 +636,29 @@ class OpenCVCameraDriver:
         self._resolved_cache_key = cache_key
         self._resolved_cache_at = now
         self._resolved_cache = dict(resolved)
+        config_hash = ""
+        try:
+            from backend.core.logging import stable_config_hash
+
+            config_hash = stable_config_hash(config)
+        except Exception:
+            config_hash = ""
+        identities = self._camera_identities_by_index()
+        for role, resolved_index in resolved.items():
+            identity = identities.get(resolved_index, {})
+            self._event(
+                "info",
+                "camera_mapping",
+                role=role,
+                logicalIndex=role,
+                preferredIndex=str(cameras.get(CAMERA_DESCRIPTOR_KEYS[role], "")),
+                resolvedIndex=resolved_index,
+                deviceName=identity.get("name", ""),
+                devicePath=identity.get("devicePath", ""),
+                backend=self._backend_label or "unopened",
+                configPath="runtime/config.json",
+                configHash=config_hash,
+            )
         return resolved
 
     def _resolve_indices_by_identity(self, cameras: dict[str, Any]) -> dict[str, int]:
@@ -734,16 +777,75 @@ class OpenCVCameraDriver:
         capture = None
         backend_label = ""
         profile = self._camera_tuning(config, camera) if config is not None and camera is not None else None
-        for backend, label in _backend_candidates(cv2):
+        backend_candidates = _backend_candidates(cv2)
+        attempt_no = 0
+        for backend, label in backend_candidates:
+            attempt_no += 1
             candidate = cv2.VideoCapture(index, backend)
-            if not candidate.isOpened():
+            opened = bool(candidate.isOpened())
+            if not opened:
+                self._event(
+                    "warning",
+                    "camera_open_attempt",
+                    role=camera or "unknown",
+                    device=index,
+                    backend=label,
+                    attemptNo=attempt_no,
+                    fourcc="MJPG",
+                    width=width,
+                    height=height,
+                    fps=fps,
+                    strict=False,
+                    fallback=True,
+                    openRet=False,
+                    readRet="not_started",
+                    actualFourcc="",
+                    actualWidth=0,
+                    actualHeight=0,
+                    actualFps=0,
+                    reason="open_failed",
+                )
                 candidate.release()
                 continue
             self._configure_capture(cv2, candidate, width, height, fps, profile)
+            self._event(
+                "info",
+                "camera_open_attempt",
+                role=camera or "unknown",
+                device=index,
+                backend=label,
+                attemptNo=attempt_no,
+                fourcc="MJPG",
+                width=width,
+                height=height,
+                fps=fps,
+                strict=False,
+                fallback=label != backend_candidates[0][1],
+                openRet=True,
+                readRet="pending",
+                actualFourcc="",
+                actualWidth=self._safe_get(cv2, candidate, "CAP_PROP_FRAME_WIDTH") or 0,
+                actualHeight=self._safe_get(cv2, candidate, "CAP_PROP_FRAME_HEIGHT") or 0,
+                actualFps=self._safe_get(cv2, candidate, "CAP_PROP_FPS") or 0,
+                reason="opened",
+            )
             capture = candidate
             backend_label = label
             break
         if capture is None:
+            self._event(
+                "error",
+                "camera_open_failure",
+                role=camera or "unknown",
+                logicalIndex=camera or "unknown",
+                device=index,
+                backendTried=[label for _, label in backend_candidates],
+                requested={"width": width, "height": height, "fps": fps},
+                deviceName="",
+                deviceClass="opencv",
+                ownerHint="camera may be disconnected, unsupported, or already opened by E2E/OpenCV/DirectShow",
+                configPath="runtime/config.json",
+            )
             return None
         self._backend_label = backend_label
 
@@ -804,6 +906,35 @@ class OpenCVCameraDriver:
             capture.set(cv2.CAP_PROP_FPS, fps)
         if profile is not None:
             self._apply_tuning(cv2, capture, profile)
+
+    def _record_frame_timestamp(self, index: int, now: float) -> None:
+        timestamps = self._frame_timestamps.setdefault(index, deque())
+        timestamps.append(now)
+        cutoff = now - CAMERA_FPS_WINDOW_SEC
+        while len(timestamps) > 2 and timestamps[0] < cutoff:
+            timestamps.popleft()
+        if len(timestamps) < 2:
+            return
+        span = timestamps[-1] - timestamps[0]
+        if span > 0:
+            self._latest_fps[index] = (len(timestamps) - 1) / span
+        role = self._capture_roles.get(index, "unknown")
+        now_ms_value = int(now * 1000)
+        last_log_ms = self._last_camera_runtime_log_ms.get(index, 0)
+        if now_ms_value - last_log_ms < 1000:
+            return
+        self._last_camera_runtime_log_ms[index] = now_ms_value
+        self._event(
+            "info",
+            "camera_runtime",
+            role=role,
+            fps=round(self._latest_fps.get(index, 0.0), 1),
+            frameCount=self._latest_sequences.get(index, 0),
+            dropCount=0,
+            consecutiveFailures=0,
+            reopenCount=0,
+            lastError="",
+        )
 
     def _camera_tuning(self, config: dict[str, Any] | None, camera: str | None) -> dict[str, float | bool]:
         role = camera if camera in CAMERA_TUNING_DEFAULTS else "global"
@@ -887,6 +1018,8 @@ class OpenCVCameraDriver:
         self._latest_sequences.pop(index, None)
         self._latest_at.pop(index, None)
         self._latest_fps.pop(index, None)
+        self._last_camera_runtime_log_ms.pop(index, None)
+        self._frame_timestamps.pop(index, None)
         self._latest_mean.pop(index, None)
         self._jpeg_events.pop(index, None)
         self._latest_frames.pop(index, None)
@@ -914,13 +1047,7 @@ class OpenCVCameraDriver:
                     if ok and frame is not None:
                         consecutive_failures = 0
                         now = time.monotonic()
-                        last_at = self._latest_at.get(index)
-                        if last_at is not None and now > last_at:
-                            instant_fps = 1.0 / max(now - last_at, 0.001)
-                            previous_fps = self._latest_fps.get(index)
-                            self._latest_fps[index] = (
-                                instant_fps if previous_fps is None else previous_fps * 0.85 + instant_fps * 0.15
-                            )
+                        self._record_frame_timestamp(index, now)
                         self._latest_at[index] = now
                         with frame_lock:
                             self._latest_frames[index] = frame

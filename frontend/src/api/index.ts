@@ -20,6 +20,45 @@ export const wsUrl = import.meta.env.VITE_WS_URL || 'ws://127.0.0.1:18082/ws'
 export const mockMode = import.meta.env.MODE === 'test'
 export const autoShutdownOnClose = import.meta.env.VITE_AUTO_SHUTDOWN_ON_CLOSE === 'true'
 
+type ApiErrorPayload = {
+  detail?: {
+    code?: unknown
+    message?: unknown
+    drift?: unknown
+  }
+}
+
+export interface MotionOriginDriftAxis {
+  axis: string
+  deltaPulse: number
+  deltaUi: number
+  absDeltaUi: number
+  unit: 'um' | 'deg'
+  threshold: number
+}
+
+export interface MotionOriginDriftSide {
+  side: ManualControlSide
+  baseline: 'current' | 'previous'
+  axes: MotionOriginDriftAxis[]
+}
+
+export interface MotionOriginCaptureDrift {
+  requiresConfirmation: boolean
+  thresholds: {
+    translationUm: number
+    rotationDeg: number
+  }
+  sides: MotionOriginDriftSide[]
+}
+
+export interface ApiCommandError extends Error {
+  status?: number
+  code?: string
+  payload?: unknown
+  drift?: MotionOriginCaptureDrift
+}
+
 export type {
   DatasetApi,
   DatasetCameraKeyApi,
@@ -96,6 +135,42 @@ export function installRuntimeReleaseOnClose() {
   window.addEventListener('pagehide', requestRelease, { once: true })
 }
 
+export function formatApiErrorMessage(status: number, payload?: unknown, fallback = 'command failed') {
+  const detail = (payload as ApiErrorPayload | undefined)?.detail
+  const code = typeof detail?.code === 'string' ? detail.code : ''
+  const message = typeof detail?.message === 'string' ? detail.message : ''
+  const suffix = [code, message].filter(Boolean).join(': ')
+  return suffix ? `${fallback}: ${status} ${suffix}` : `${fallback}: ${status}`
+}
+
+async function commandErrorFromResponse(response: Response, fallback = 'command failed') {
+  let payload: unknown
+  try {
+    payload = await response.clone().json()
+  } catch {
+    payload = undefined
+  }
+  const error = new Error(formatApiErrorMessage(response.status, payload, fallback)) as ApiCommandError
+  const detail = (payload as ApiErrorPayload | undefined)?.detail
+  error.status = response.status
+  error.payload = payload
+  if (typeof detail?.code === 'string') error.code = detail.code
+  if (isMotionOriginCaptureDrift(detail?.drift)) error.drift = detail.drift
+  return error
+}
+
+function isMotionOriginCaptureDrift(value: unknown): value is MotionOriginCaptureDrift {
+  if (!value || typeof value !== 'object') return false
+  const drift = value as MotionOriginCaptureDrift
+  return (
+    typeof drift.requiresConfirmation === 'boolean' &&
+    Boolean(drift.thresholds) &&
+    typeof drift.thresholds.translationUm === 'number' &&
+    typeof drift.thresholds.rotationDeg === 'number' &&
+    Array.isArray(drift.sides)
+  )
+}
+
 export async function fetchConfig(): Promise<AppConfig> {
   if (mockMode) return structuredClone(defaultConfig)
   const response = await fetch(`${apiBase}/api/settings`)
@@ -103,21 +178,34 @@ export async function fetchConfig(): Promise<AppConfig> {
   return response.json() as Promise<AppConfig>
 }
 
-export async function fetchHardwareStatus(): Promise<{
+export interface HardwareProbeStatus {
   camera?: { ok: boolean; message: string }
   force?: { ok: boolean; message: string }
-  gripper?: { ok: boolean; message: string }
+  gripper?: {
+    ok: boolean | null
+    message: string
+    ports?: Array<{ side: string; port: string; slaveId: number; baudrate: number }>
+  }
+  omega7?: {
+    ok: boolean
+    message: string
+    hands?: Array<{
+      side: string
+      requestedId: number
+      connected: boolean
+      lastReadOk: boolean
+      deviceId: number | string
+      serial: string
+    }>
+  }
   pico?: { ok: boolean; message: string }
-}> {
+}
+
+export async function fetchHardwareStatus(): Promise<HardwareProbeStatus> {
   if (mockMode) return {}
   const response = await fetch(`${apiBase}/api/hardware/status`)
   if (!response.ok) throw new Error(`hardware status fetch failed: ${response.status}`)
-  return response.json() as Promise<{
-    camera?: { ok: boolean; message: string }
-    force?: { ok: boolean; message: string }
-    gripper?: { ok: boolean; message: string }
-    pico?: { ok: boolean; message: string }
-  }>
+  return response.json() as Promise<HardwareProbeStatus>
 }
 
 export async function postCommand(path: string, body?: unknown) {
@@ -129,7 +217,7 @@ export async function postCommand(path: string, body?: unknown) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  if (!response.ok) throw new Error(`command failed: ${response.status}`)
+  if (!response.ok) throw await commandErrorFromResponse(response)
   return response.json() as Promise<unknown>
 }
 
@@ -233,6 +321,7 @@ export interface MotionOriginResponse {
   data?: {
     origin?: MotionOriginConfig
     config?: AppConfig
+    originCaptureDrift?: MotionOriginCaptureDrift
   }
 }
 
@@ -243,8 +332,11 @@ export async function fetchMotionOrigin(): Promise<MotionOriginResponse> {
   return response.json() as Promise<MotionOriginResponse>
 }
 
-export const captureMotionOrigin = (side?: ManualControlSide) =>
-  postCommand(side ? `/motion/${side}/origin/capture` : '/motion/origin/capture') as Promise<MotionOriginResponse>
+export const captureMotionOrigin = (side?: ManualControlSide, options?: { confirmLargeDrift?: boolean }) =>
+  postCommand(
+    side ? `/motion/${side}/origin/capture` : '/motion/origin/capture',
+    options?.confirmLargeDrift ? { confirmLargeDrift: true } : undefined,
+  ) as Promise<MotionOriginResponse>
 
 export const clearMotionOrigin = (side?: ManualControlSide) =>
   postCommand(side ? `/motion/${side}/origin/clear` : '/motion/origin/clear') as Promise<MotionOriginResponse>
@@ -263,6 +355,21 @@ export const fetchGripperTeleopStatus = () => fetch(`${apiBase}/api/teleop/gripp
 // Session control
 export const createSession = (datasetName: string, task: string) =>
   postCommand('/record/session/create', { dataset_name: datasetName, task })
+
+export interface RecordStatusApi {
+  active?: boolean
+  recording?: boolean
+  datasetName?: string
+  task?: string
+}
+
+export async function fetchRecordStatus(): Promise<RecordStatusApi> {
+  if (mockMode) return { active: false, recording: false }
+  const response = await fetch(`${apiBase}/api/record/status`)
+  if (!response.ok) throw await commandErrorFromResponse(response, 'record status fetch failed')
+  const payload = await response.json() as { data?: RecordStatusApi }
+  return payload.data ?? {}
+}
 
 export interface RecordEpisodeSaveApi {
   id?: string
@@ -446,6 +553,8 @@ export const connectTeleopHand = (side: ManualControlSide) =>
 
 export const disconnectTeleopHand = (side: ManualControlSide) =>
   postCommand(`/teleop/${side}/disconnect`)
+
+export const fetchTeleopMappingStatus = () => fetch(`${apiBase}/api/teleop/mapping/status`).then((r) => r.json())
 
 export const setTeleopGravityCompensation = (side: ManualControlSide, enabled: boolean) =>
   postCommand(`/teleop/${side}/gravity_compensation`, { enabled })

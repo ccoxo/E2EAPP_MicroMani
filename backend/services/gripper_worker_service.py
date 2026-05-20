@@ -47,6 +47,9 @@ class GripperWorkerService:
 
     def is_enabled(self, config: dict[str, Any] | None = None) -> bool:
         active = config if config is not None else self.settings.get_config()
+        teleop = active.get("teleop", {}) if isinstance(active.get("teleop"), dict) else {}
+        if str(teleop.get("engine", "")).lower() == "hal_native":
+            return False
         return str(active.get("gripper", {}).get("sampleMode", "direct")).lower() == "dual_worker"
 
     def sync_config(self, config: dict[str, Any]) -> None:

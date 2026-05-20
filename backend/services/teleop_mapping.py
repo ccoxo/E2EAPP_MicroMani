@@ -10,6 +10,7 @@ from typing import Any, Literal
 from backend.core.config import SettingsService
 from backend.core.defaults import ICF_KINEMATICS_DEFAULTS, ICF_TELEOP_DEFAULTS
 from backend.core.logging import LogService, now_ms
+from backend.core.units import motion_pulse_per_unit
 from backend.hal_client.client import HalClient
 
 AxisName = Literal["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
@@ -20,10 +21,13 @@ DEFAULT_TRANSLATION_STEP_UM = 5000.0
 DEFAULT_ROTATION_STEP_DEG = 0.2
 DEFAULT_AXIS_OUTPUT_SCALE = [1.0] * 6
 DEFAULT_ENABLED_AXES = [True] * 6
+NATIVE_STATUS_SUMMARY_LOG_INTERVAL_MS = 5000
 
 
 class TeleopMappingService:
     """Continuous Omega.7 to slave-arm mapper used during recording."""
+
+    _NATIVE_GRIPPER_SOURCES = {"manual-gripper", "recording", "teleop-connect"}
 
     def __init__(self, settings: SettingsService, hal: HalClient, logs: LogService) -> None:
         self.settings = settings
@@ -34,6 +38,8 @@ class TeleopMappingService:
         self._references: dict[str, list[float]] = {}
         self._translation_carry: dict[SideName, list[float]] = {}
         self._translation_direction: dict[SideName, list[int]] = {}
+        self._continuous_direction: dict[SideName, list[int]] = {}
+        self._continuous_streak: dict[SideName, list[int]] = {}
         self._active_sides: set[SideName] = set()
         self._last_action: dict[str, Any] | None = None
         self._action_history: deque[dict[str, Any]] = deque(maxlen=1000)
@@ -43,6 +49,10 @@ class TeleopMappingService:
         self._arm_sources: set[str] = set()
         self._last_blockers: dict[str, dict[str, Any]] = {}
         self._last_diag_zero_log_ms: dict[str, int] = {}
+        self._last_native_diag_action_key = ""
+        self._last_native_status_summary = ""
+        self._last_native_status_summary_ms = 0
+        self._native_status_cache: dict[str, Any] = {}
 
     async def start(
         self,
@@ -52,7 +62,35 @@ class TeleopMappingService:
         pre_home: bool = True,
     ) -> dict[str, Any]:
         config = self.settings.get_config()
+        op_id = self.logs.new_op_id("teleop") if self.logs is not None else None
         mode = self._hal_mode(config)
+        if mode == "real" and self._native_engine(config):
+            if self._task is not None and not self._task.done():
+                self._arm_sources.add(source)
+                await self._configure_and_start_native(config)
+                return self.status()
+            if pre_home:
+                await self._return_to_work_origin_before_start(config, home_side)
+            self._arm_sources.add(source)
+            if self._armed_at_ms is None:
+                self._armed_at_ms = now_ms()
+                self._references.clear()
+                self._translation_carry.clear()
+                self._translation_direction.clear()
+                self._continuous_direction.clear()
+                self._continuous_streak.clear()
+                self._active_sides.clear()
+                self._action_history.clear()
+                self._last_action = None
+                self._last_native_diag_action_key = ""
+                self._native_status_cache = {}
+            await self._configure_and_start_native(config)
+            self._stop_event = asyncio.Event()
+            self._task = asyncio.create_task(self._run_native_status_loop(), name="hal-native-teleop-status")
+            self._log_teleop_mode(config, op_id, source, "start", native=True)
+            self._log_teleop_profiles(config, op_id)
+            self.logs.warning("[HAL]", "HAL-native teleop controller armed")
+            return self.status()
         if self._task is not None and not self._task.done():
             self._arm_sources.add(source)
             return self.status()
@@ -64,6 +102,8 @@ class TeleopMappingService:
             self._references.clear()
             self._translation_carry.clear()
             self._translation_direction.clear()
+            self._continuous_direction.clear()
+            self._continuous_streak.clear()
             self._active_sides.clear()
             self._action_history.clear()
         if mode != "real":
@@ -95,6 +135,8 @@ class TeleopMappingService:
         if side is None and not bool(origin["valid"]):
             raise RuntimeError("motion work origin is not captured")
         if side is None:
+            await self.hal.command("motion.enable_side", {"side": "left"})
+            await self.hal.command("motion.enable_side", {"side": "right"})
             await self.hal.command(
                 "motion.home_all",
                 {
@@ -108,6 +150,7 @@ class TeleopMappingService:
         pulse_key = "leftPulse" if side == "left" else "rightPulse"
         if not bool(origin[valid_key]):
             raise RuntimeError(f"{side} motion work origin is not captured")
+        await self.hal.command("motion.enable_side", {"side": side})
         await self.hal.command(
             "motion.home_origin_side",
             {
@@ -118,7 +161,39 @@ class TeleopMappingService:
         self.logs.info("[HAL]", f"teleop pre-start {side} return-to-work-origin completed")
 
     async def stop(self, source: str = "recording") -> dict[str, Any]:
+        config = self.settings.get_config() if self.settings is not None else {}
         self._arm_sources.discard(source)
+        if self._native_engine(config):
+            if self._arm_sources:
+                await self._configure_and_start_native(config)
+                return self.status()
+            self._armed_at_ms = None
+            self._reset_all_tracking()
+            stop_event = self._stop_event
+            task = self._task
+            if stop_event is not None:
+                stop_event.set()
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            await self.hal.command("teleop.native.stop", {})
+            self._task = None
+            self._stop_event = None
+            self._last_action = None
+            self._action_history.clear()
+            self._last_blockers = {}
+            self._last_error = ""
+            self._last_native_diag_action_key = ""
+            self._last_native_status_summary = ""
+            self._last_native_status_summary_ms = 0
+            self._native_status_cache = {}
+            if self.logs is not None:
+                self._log_teleop_mode(config, None, source, "stop", native=True)
+                self.logs.info("[HAL]", "HAL-native teleop controller stopped")
+            return self.status()
         if self._arm_sources:
             self._reset_all_tracking()
             return self.status()
@@ -144,6 +219,9 @@ class TeleopMappingService:
     def status(self) -> dict[str, Any]:
         running = self._task is not None and not self._task.done()
         config = self.settings.get_config() if self.settings is not None else {}
+        native_engine = self._native_engine(config)
+        if native_engine and self._native_status_cache:
+            running = bool(self._native_status_cache.get("running", running))
         return {
             "armed": self._armed_at_ms is not None,
             "running": running,
@@ -153,6 +231,7 @@ class TeleopMappingService:
             "actionHistory": list(self._action_history),
             "lastError": self._last_error,
             "blockers": dict(self._last_blockers),
+            "nativeStatus": dict(self._native_status_cache) if native_engine else {},
             "limits": {
                 "translationStepUm": self._translation_step_um(config),
                 "rotationStepDeg": self._rotation_step_deg(config),
@@ -162,8 +241,69 @@ class TeleopMappingService:
                 "rotationPulseDeadband": self._rotation_pulse_deadband(config),
                 "translationVelocityUmS": self._translation_max_velocity_um_s(config),
                 "rotationVelocityDegS": self._rotation_max_velocity_deg_s(config),
+                "continuousIncrementMode": self._continuous_increment_mode(config),
+                "translationInputEpsilon": self._translation_input_epsilon_m(config),
+                "rotationInputEpsilon": self._rotation_input_epsilon_deg(config),
+                "translationMinActivePulse": self._translation_min_active_pulse(config),
+                "rotationMinActivePulse": self._rotation_min_active_pulse(config),
+                "continuousMicroConfirmTicks": self._continuous_micro_confirm_ticks(config),
             },
         }
+
+    async def _run_native_status_loop(self) -> None:
+        assert self._stop_event is not None
+        while not self._stop_event.is_set():
+            try:
+                await self._refresh_native_status()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                now = time.monotonic()
+                message = str(exc)
+                if message != self._last_error or now - self._last_error_at > 2.0:
+                    self.logs.error("[HAL]", f"HAL-native teleop status recovered: {message}")
+                    self._last_error = message
+                    self._last_error_at = now
+            await asyncio.sleep(max(0.01, self._command_interval_s(self.settings.get_config())))
+
+    async def _configure_and_start_native(self, config: dict[str, Any]) -> None:
+        payload = self._native_payload(config)
+        await self.hal.command("teleop.native.configure", payload)
+        await self.hal.command("teleop.native.start", payload)
+        await self._refresh_native_status()
+
+    async def _refresh_native_status(self) -> None:
+        hal_result = await self.hal.command("teleop.native.status", {})
+        payload = self._hal_response_payload(hal_result)
+        self._native_status_cache = payload
+        if isinstance(payload, dict) and not bool(payload.get("running", False)):
+            self._last_action = None
+            self._action_history.clear()
+            self._last_blockers = {}
+            self._last_native_diag_action_key = ""
+            error = payload.get("lastError")
+            if isinstance(error, str):
+                self._last_error = error
+            return
+        last_action = payload.get("lastAction") if isinstance(payload, dict) else None
+        if isinstance(last_action, dict):
+            self._last_action = last_action
+            config = self.settings.get_config() if self.settings is not None else {}
+            self._log_native_diag_action(config, last_action)
+        history = payload.get("actionHistory") if isinstance(payload, dict) else None
+        if isinstance(history, list):
+            self._action_history.clear()
+            for item in history[-1000:]:
+                if isinstance(item, dict):
+                    self._action_history.append(item)
+        blockers = payload.get("blockers") if isinstance(payload, dict) else None
+        if isinstance(blockers, dict):
+            self._last_blockers = dict(blockers)
+        error = payload.get("lastError") if isinstance(payload, dict) else None
+        if isinstance(error, str):
+            self._last_error = error
+        config = self.settings.get_config() if self.settings is not None else {}
+        self._log_native_status_summary(config, payload)
 
     async def _run_loop(self) -> None:
         while self._stop_event is not None and not self._stop_event.is_set():
@@ -392,6 +532,26 @@ class TeleopMappingService:
                 return None
         return None
 
+    def _axis_dict_from_six(self, raw: Any) -> dict[str, float] | None:
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            return raw
+        values = self._six_axis_deltas(raw)
+        if values is None:
+            return None
+        return {axis: values[index] for index, axis in enumerate(AXES)}
+
+    def _axis_bool_dict_from_six(self, raw: Any) -> dict[str, bool] | None:
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            return raw
+        values = self._six_axis_bools(raw)
+        if values is None:
+            return None
+        return {axis: values[index] for index, axis in enumerate(AXES)}
+
     def _hal_response_payload(self, hal_result: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(hal_result, dict):
             return {}
@@ -408,7 +568,11 @@ class TeleopMappingService:
         requested_pulse = action.get("halRequestedPulseDeltas") or action.get("requestedPulseDeltas")
         applied_pulse = action.get("halAppliedPulseDeltas")
         target_pulse = action.get("targetPulse")
+        current_pulse = action.get("currentPulse")
+        launch_pulse = action.get("launchDeltaPulse")
         update_return = action.get("updateReturn")
+        moving_before = action.get("movingBefore")
+        move_started = action.get("moveStarted")
         clipped = action.get("clipped")
         has_motion = self._axis_dict_has_motion(requested) or self._axis_dict_has_motion(applied)
         has_clip = isinstance(clipped, dict) and any(bool(clipped.get(axis)) for axis in AXES)
@@ -424,6 +588,29 @@ class TeleopMappingService:
             or "-"
         )
         latency = float(action.get("commandLatencyMs", 0.0))
+        self.logs.event(
+            "[HAL]",
+            "INFO",
+            "teleop_status",
+            component="TELEOP",
+            rate_key=f"teleop_status:{action.get('sourceSide')}->{action.get('side')}",
+            rate_ms=1000 if not has_motion and not has_clip else None,
+            sideMap=f"{action.get('sourceSide')}->{action.get('side')}",
+            refState="active",
+            blockReason="-",
+            axis=action.get("axis"),
+            raw=self._format_axis_values(requested),
+            filtered=self._format_axis_values(applied),
+            reqPulse=self._format_axis_values(requested_pulse),
+            emitPulse=self._format_axis_values(applied_pulse or requested_pulse),
+            targetPulse=self._format_axis_values(target_pulse),
+            currentPulse=self._format_axis_values(current_pulse),
+            limit="payload",
+            clip=clip_axes,
+            updateRet=self._format_axis_values(update_return),
+            lastError=self._last_error or "",
+            latencyMs=round(latency, 3),
+        )
         self.logs.info(
             "[HAL]",
             (
@@ -434,8 +621,282 @@ class TeleopMappingService:
                 f"pulseReq={self._format_axis_values(requested_pulse)} "
                 f"pulseApp={self._format_axis_values(applied_pulse)} "
                 f"targetPulse={self._format_axis_values(target_pulse)} "
+                f"currentPulse={self._format_axis_values(current_pulse)} "
+                f"launchPulse={self._format_axis_values(launch_pulse)} "
+                f"movingBefore={self._format_axis_flags(moving_before)} "
+                f"moveStarted={self._format_axis_flags(move_started)} "
                 f"updateRet={self._format_axis_values(update_return)}"
             ),
+        )
+
+    def _log_native_diag_action(self, config: dict[str, Any], action: dict[str, Any]) -> None:
+        if not bool(config.get("teleop", {}).get("diagLog", False)):
+            return
+        action_key = self._native_diag_action_key(action)
+        if action_key == self._last_native_diag_action_key:
+            return
+        self._last_native_diag_action_key = action_key
+        diag_action = dict(action)
+        diag_action["requestedDeltas"] = self._axis_dict_from_six(
+            action.get("requestedDeltas") or action.get("deltas")
+        )
+        diag_action["appliedDeltas"] = self._axis_dict_from_six(
+            action.get("appliedDeltas") or action.get("deltas")
+        )
+        diag_action["halRequestedPulseDeltas"] = self._axis_dict_from_six(
+            action.get("halRequestedPulseDeltas")
+            or action.get("requestedDeltaPulse")
+            or action.get("requestedPulseDeltas")
+        )
+        diag_action["halAppliedPulseDeltas"] = self._axis_dict_from_six(
+            action.get("halAppliedPulseDeltas") or action.get("appliedDeltaPulse")
+        )
+        diag_action["targetPulse"] = self._axis_dict_from_six(action.get("targetPulse"))
+        diag_action["currentPulse"] = self._axis_dict_from_six(action.get("currentPulse"))
+        diag_action["launchDeltaPulse"] = self._axis_dict_from_six(action.get("launchDeltaPulse"))
+        diag_action["updateReturn"] = self._axis_dict_from_six(action.get("updateReturn"))
+        diag_action["movingBefore"] = self._axis_bool_dict_from_six(action.get("movingBefore"))
+        diag_action["moveStarted"] = self._axis_bool_dict_from_six(action.get("moveStarted"))
+        diag_action["clipped"] = self._axis_bool_dict_from_six(action.get("clipped"))
+        diag_action.setdefault("commandLatencyMs", 0.0)
+        self._log_diag_action(config, diag_action)
+
+    def _log_native_status_summary(self, config: dict[str, Any], payload: dict[str, Any]) -> None:
+        if self.logs is None or not isinstance(payload, dict) or not bool(payload.get("running", False)):
+            return
+        summary = self._native_status_summary(payload)
+        if not summary:
+            return
+        now = now_ms()
+        if (
+            self._last_native_status_summary_ms > 0
+            and now - self._last_native_status_summary_ms < NATIVE_STATUS_SUMMARY_LOG_INTERVAL_MS
+        ):
+            return
+        self._last_native_status_summary = summary
+        self._last_native_status_summary_ms = now
+        self._log_native_status_events(payload)
+        self.logs.info("[HAL]", summary)
+
+    def _log_teleop_mode(
+        self,
+        config: dict[str, Any],
+        op_id: str | None,
+        source: str,
+        action: str,
+        *,
+        native: bool,
+    ) -> None:
+        if self.logs is None:
+            return
+        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
+        command_interval_ms = round(self._command_interval_s(config) * 1000, 3)
+        self.logs.event(
+            "[HAL]",
+            "INFO",
+            "teleop_mode",
+            component="TELEOP",
+            op_id=op_id,
+            source=source,
+            action=action,
+            controlMode=teleop.get("controlMode", ""),
+            inputIntervalMs=command_interval_ms,
+            commandIntervalMs=command_interval_ms,
+            deviceCount="unknown",
+            mappingMode=teleop.get("mappingMode", ""),
+            swapTeleopChannels=teleop.get("swapTeleopChannels", False),
+            localStabilityMode=teleop.get("stabilityMode", ""),
+            zeroForceHold=teleop.get("zeroForceHold", False),
+            scales={
+                "left": teleop.get("leftAxisOutputScale", []),
+                "right": teleop.get("rightAxisOutputScale", []),
+            },
+            deadzones={
+                "translation": teleop.get("translationDeadzone", ""),
+                "rotation": teleop.get("rotationDeadzone", ""),
+            },
+            stepLimits={
+                "translationPulse": teleop.get("translationStepLimitPulse", ""),
+                "rotationPulse": teleop.get("rotationStepLimitPulse", ""),
+            },
+            engine="hal_native" if native else "python",
+        )
+
+    def _log_teleop_profiles(self, config: dict[str, Any], op_id: str | None) -> None:
+        if self.logs is None:
+            return
+        motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+        for side in ("left", "right"):
+            axis_map = self._physical_axis_map(side, config)
+            for index, axis in enumerate(AXES):
+                rotation = index >= 3
+                self.logs.event(
+                    "[HAL]",
+                    "INFO",
+                    "teleop_profile",
+                    component="TELEOP",
+                    op_id=op_id,
+                    axis=f"{side}.{axis}",
+                    side=side,
+                    card=motion.get(f"{side}CardNo", 1 if side == "left" else 0),
+                    physicalAxis=axis_map[index],
+                    pulsePerUnit=self._pulse_per_unit(side, axis, config),
+                    startSpeed=(
+                        self._rotation_start_velocity_deg_s(config)
+                        if rotation
+                        else self._translation_start_velocity_um_s(config)
+                    ),
+                    maxSpeed=(
+                        self._rotation_max_velocity_deg_s(config)
+                        if rotation
+                        else self._translation_max_velocity_um_s(config)
+                    ),
+                    acc=self._motion_profile_acc_sec(config),
+                    dec=self._motion_profile_dec_sec(config),
+                    profileRet="not_available",
+                    sProfileRet="not_available",
+                )
+
+    def _log_native_status_events(self, payload: dict[str, Any]) -> None:
+        if self.logs is None:
+            return
+        inputs = payload.get("inputs")
+        blockers = payload.get("blockers")
+        if not isinstance(inputs, dict):
+            return
+        for source_side in ("left", "right"):
+            detail = inputs.get(source_side)
+            if not isinstance(detail, dict):
+                continue
+            target_side = str(detail.get("targetSide") or "?")
+            block = blockers.get(source_side, {}) if isinstance(blockers, dict) else {}
+            self.logs.event(
+                "[HAL]",
+                "INFO",
+                "teleop_status",
+                component="TELEOP",
+                sideMap=f"{source_side}->{target_side}",
+                refState="ref" if bool(detail.get("referenceValid")) else "no-ref",
+                blockReason=str(block.get("state", "-")) if isinstance(block, dict) else "-",
+                raw=self._format_axis_values(self._axis_dict_from_six(detail.get("rawDelta"))),
+                filtered=self._format_axis_values(self._axis_dict_from_six(detail.get("outputDeltaUi"))),
+                reqPulse=self._format_axis_values(self._axis_dict_from_six(detail.get("requestedPulse"))),
+                emitPulse=self._format_axis_values(self._axis_dict_from_six(detail.get("emittedPulse"))),
+                targetPulse="-",
+                currentPulse="-",
+                limit="native",
+                clip="-",
+                updateRet="-",
+                lastError=str(payload.get("lastError") or ""),
+                latencyMs=0,
+            )
+
+    def _native_status_summary(self, payload: dict[str, Any]) -> str:
+        inputs = payload.get("inputs")
+        blockers = payload.get("blockers")
+        parts: list[str] = []
+        if isinstance(inputs, dict):
+            for source_side in ("left", "right"):
+                detail = inputs.get(source_side)
+                if not isinstance(detail, dict):
+                    continue
+                target_side = str(detail.get("targetSide") or "?")
+                block = blockers.get(source_side, {}) if isinstance(blockers, dict) else {}
+                parts.append(self._format_native_input_summary(source_side, target_side, detail, block))
+        last_action_summary = self._format_native_last_action_summary(payload.get("lastAction"))
+        if last_action_summary:
+            parts.append(last_action_summary)
+        gripper_summary = self._format_native_gripper_summary(payload.get("grippers"))
+        if gripper_summary:
+            parts.append(gripper_summary)
+        error = payload.get("lastError")
+        if isinstance(error, str) and error:
+            parts.append(f"lastError={error}")
+        return "native status " + " | ".join(parts) if parts else ""
+
+    def _format_native_input_summary(
+        self,
+        source_side: str,
+        target_side: str,
+        detail: dict[str, Any],
+        block: Any,
+    ) -> str:
+        raw = self._axis_dict_from_six(detail.get("rawDelta"))
+        requested = self._axis_dict_from_six(detail.get("requestedPulse"))
+        emitted = self._axis_dict_from_six(detail.get("emittedPulse"))
+        output = self._axis_dict_from_six(detail.get("outputDeltaUi"))
+        reference = "ref" if bool(detail.get("referenceValid")) else "no-ref"
+        input_state = "input" if bool(detail.get("inputActive")) else "idle"
+        block_text = ""
+        if isinstance(block, dict):
+            state = str(block.get("state", "") or "")
+            message = str(block.get("message", "") or "")
+            if state or message:
+                block_text = f" block={state}{':' + message if message else ''}"
+        return (
+            f"{source_side}->{target_side} {reference}/{input_state}{block_text} "
+            f"raw={self._format_axis_values(raw)} "
+            f"reqPulse={self._format_axis_values(requested)} "
+            f"emitPulse={self._format_axis_values(emitted)} "
+            f"out={self._format_axis_values(output)}"
+        )
+
+    def _format_native_last_action_summary(self, raw: Any) -> str:
+        if not isinstance(raw, dict):
+            return ""
+        source = str(raw.get("sourceSide") or "?")
+        side = str(raw.get("side") or "?")
+        launch = self._axis_dict_from_six(raw.get("launchDeltaPulse"))
+        update_return = self._axis_dict_from_six(raw.get("updateReturn"))
+        move_started = self._axis_bool_dict_from_six(raw.get("moveStarted"))
+        pieces = [
+            f"last={source}->{side}",
+            f"launchPulse={self._format_axis_values(launch)}",
+            f"moveStarted={self._format_axis_flags(move_started)}",
+            f"updateRet={self._format_axis_values(update_return)}",
+        ]
+        return " ".join(pieces)
+
+    def _format_native_gripper_summary(self, raw: Any) -> str:
+        if not isinstance(raw, dict):
+            return ""
+        parts: list[str] = []
+        for side in ("left", "right"):
+            detail = raw.get(side)
+            if not isinstance(detail, dict):
+                continue
+            try:
+                last_command_ts = int(detail.get("lastCommandTs", 0) or 0)
+            except (TypeError, ValueError):
+                last_command_ts = 0
+            if last_command_ts <= 0:
+                status = "IDLE"
+            else:
+                status = "OK" if bool(detail.get("ok", False)) else "ERR"
+            try:
+                target = float(detail.get("targetMm", 0.0))
+            except (TypeError, ValueError):
+                target = 0.0
+            message = str(detail.get("message", "") or "")
+            piece = f"{side}:{status} target={target:.4g}"
+            if message:
+                piece += f" {message}"
+            parts.append(piece)
+        return "grip=" + ";".join(parts) if parts else ""
+
+    def _native_diag_action_key(self, action: dict[str, Any]) -> str:
+        return "|".join(
+            str(action.get(key, ""))
+            for key in (
+                "ts",
+                "monotonicMs",
+                "monotonic_s",
+                "sourceSide",
+                "side",
+                "axis",
+                "delta",
+                "unit",
+            )
         )
 
     def _axis_dict_has_motion(self, raw: Any) -> bool:
@@ -462,6 +923,12 @@ class TeleopMappingService:
                 parts.append(f"{axis}:{value:.4g}")
         return "[" + ",".join(parts) + "]" if parts else "[0]"
 
+    def _format_axis_flags(self, raw: Any) -> str:
+        if not isinstance(raw, dict):
+            return "-"
+        parts = [f"{axis}:1" for axis in AXES if bool(raw.get(axis, False))]
+        return "[" + ",".join(parts) + "]" if parts else "[]"
+
     def _deltas_from_delta(
         self,
         side: SideName,
@@ -480,25 +947,55 @@ class TeleopMappingService:
         impulse_coeff = self._impulse_coefficients(side, config)
         target_signed_pulse_per_unit = self._signed_pulse_per_unit(target_side, config)
         translation_deadzone_m = float(teleop.get("translationDeadzone", 0.00002))
-        rotation_deadzone_deg = float(teleop.get("rotationDeadzone", 0.05))
+        rotation_deadzone_deg = float(teleop.get("rotationDeadzone", ICF_TELEOP_DEFAULTS["rotationDeadzone"]))
+        continuous_increment = self._continuous_increment_mode(config)
         deltas = [0.0] * 6
         requested_pulse_deltas = [0.0] * 6
         for idx in range(6):
             if not enabled_axes[idx]:
+                if continuous_increment:
+                    self._reset_continuous_axis(side, idx)
                 continue
             raw_delta = pose[idx] - reference[idx]
             if idx < 3:
-                filtered = self._filter_incremental_translation(side, idx, raw_delta, translation_deadzone_m, config)
+                filtered = self._filter_translation_delta(
+                    side,
+                    idx,
+                    raw_delta,
+                    translation_deadzone_m,
+                    config,
+                    continuous_increment,
+                )
                 if filtered == 0.0:
+                    if continuous_increment:
+                        self._reset_continuous_axis(side, idx)
                     continue
                 output_scale = translation_scale * axis_scale[idx]
+                deadband_pulse = self._translation_pulse_deadband(config)
+                min_active_pulse = self._translation_min_active_pulse(config)
             else:
-                if abs(raw_delta) < rotation_deadzone_deg:
+                filtered = self._filter_rotation_delta(raw_delta, rotation_deadzone_deg, config, continuous_increment)
+                if filtered == 0.0:
+                    if continuous_increment:
+                        self._reset_continuous_axis(side, idx)
                     continue
-                filtered = raw_delta
                 output_scale = rotation_scale * axis_scale[idx]
-            impulse = self._llround(filtered * impulse_coeff[idx])
+                deadband_pulse = self._rotation_pulse_deadband(config)
+                min_active_pulse = self._rotation_min_active_pulse(config)
+            impulse_float = filtered * impulse_coeff[idx]
+            requested_pulse_float = impulse_float * output_scale
+            impulse = self._llround(impulse_float)
             requested_pulse = self._llround(impulse * output_scale)
+            if continuous_increment:
+                requested_pulse = self._apply_continuous_pulse_gate(
+                    side,
+                    idx,
+                    requested_pulse,
+                    requested_pulse_float,
+                    deadband_pulse,
+                    min_active_pulse,
+                    config,
+                )
             requested_pulse_deltas[idx] = float(requested_pulse)
             deltas[idx] = self._pulse_delta_to_ui_delta(
                 float(requested_pulse),
@@ -506,6 +1003,76 @@ class TeleopMappingService:
                 target_signed_pulse_per_unit[idx],
             )
         return deltas, requested_pulse_deltas
+
+    def _filter_translation_delta(
+        self,
+        side: SideName,
+        axis_index: int,
+        raw_delta: float,
+        deadzone_m: float,
+        config: dict[str, Any],
+        continuous_increment: bool,
+    ) -> float:
+        if continuous_increment:
+            return raw_delta if abs(raw_delta) >= self._translation_input_epsilon_m(config) else 0.0
+        return self._filter_incremental_translation(side, axis_index, raw_delta, deadzone_m, config)
+
+    def _filter_rotation_delta(
+        self,
+        raw_delta: float,
+        deadzone_deg: float,
+        config: dict[str, Any],
+        continuous_increment: bool,
+    ) -> float:
+        threshold = self._rotation_input_epsilon_deg(config) if continuous_increment else deadzone_deg
+        return raw_delta if abs(raw_delta) >= threshold else 0.0
+
+    def _apply_continuous_pulse_gate(
+        self,
+        side: SideName,
+        axis_index: int,
+        requested_pulse: int,
+        requested_pulse_float: float,
+        pulse_deadband: float,
+        min_active_pulse: float,
+        config: dict[str, Any],
+    ) -> int:
+        if requested_pulse_float == 0.0:
+            self._reset_continuous_axis(side, axis_index)
+            return 0
+        sign = 1 if requested_pulse_float > 0 else -1
+        minimum = self._minimum_active_pulse(pulse_deadband, min_active_pulse)
+        directions = self._continuous_direction.setdefault(side, [0, 0, 0, 0, 0, 0])
+        streaks = self._continuous_streak.setdefault(side, [0, 0, 0, 0, 0, 0])
+        confirm_ticks = self._continuous_micro_confirm_ticks(config)
+
+        if abs(requested_pulse) >= minimum:
+            directions[axis_index] = sign
+            streaks[axis_index] = confirm_ticks
+            return requested_pulse
+        if confirm_ticks <= 0:
+            return 0
+
+        if directions[axis_index] == sign:
+            streaks[axis_index] += 1
+        else:
+            directions[axis_index] = sign
+            streaks[axis_index] = 1
+        if streaks[axis_index] < confirm_ticks:
+            return 0
+        return sign * minimum
+
+    def _minimum_active_pulse(self, pulse_deadband: float, min_active_pulse: float) -> int:
+        deadband_limit = int(math.floor(max(0.0, pulse_deadband)))
+        return max(1, int(math.ceil(min_active_pulse)), deadband_limit + 1)
+
+    def _reset_continuous_axis(self, side: SideName, axis_index: int) -> None:
+        direction = self._continuous_direction.get(side)
+        if direction is not None and 0 <= axis_index < len(direction):
+            direction[axis_index] = 0
+        streak = self._continuous_streak.get(side)
+        if streak is not None and 0 <= axis_index < len(streak):
+            streak[axis_index] = 0
 
     def _filter_incremental_translation(
         self,
@@ -539,6 +1106,116 @@ class TeleopMappingService:
 
     def _command_interval_s(self, config: dict[str, Any]) -> float:
         return max(1.0, float(config.get("teleop", {}).get("commandIntervalMs", 10))) / 1000.0
+
+    def _native_engine(self, config: dict[str, Any]) -> bool:
+        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
+        return str(teleop.get("engine", "python_mapper")).lower() == "hal_native"
+
+    def _native_payload(self, config: dict[str, Any]) -> dict[str, Any]:
+        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
+        gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
+        gripper_teleop = teleop.get("gripperTeleop", {}) if isinstance(teleop.get("gripperTeleop"), dict) else {}
+        payload: dict[str, Any] = {
+            "engine": str(teleop.get("engine", "hal_native")),
+            "controlMode": str(teleop.get("controlMode", "incremental_position")),
+            "mappingMode": str(teleop.get("mappingMode", ICF_TELEOP_DEFAULTS["mappingMode"])),
+            "nativeLoopHz": int(float(teleop.get("nativeLoopHz", 100))),
+            "nativeTranslationDeadzoneM": float(teleop.get("nativeTranslationDeadzoneM", 0.002)),
+            "nativeTranslationFullScaleM": float(teleop.get("nativeTranslationFullScaleM", 0.04)),
+            "nativeRotationDeadzoneDeg": float(teleop.get("nativeRotationDeadzoneDeg", 2.0)),
+            "nativeRotationFullScaleDeg": float(teleop.get("nativeRotationFullScaleDeg", 30.0)),
+            "nativeVelocitySmoothingMs": float(teleop.get("nativeVelocitySmoothingMs", 40.0)),
+            "translationDeadzone": float(teleop.get("translationDeadzone", 0.00002)),
+            "rotationDeadzone": float(teleop.get("rotationDeadzone", ICF_TELEOP_DEFAULTS["rotationDeadzone"])),
+            "incrementalTranslationMinEffectiveDelta": self._incremental_translation_min_effective_delta(config),
+            "incrementalTranslationReverseDeadzone": self._incremental_translation_reverse_deadzone(config),
+            "continuousIncrementMode": self._continuous_increment_mode(config),
+            "translationInputEpsilon": self._translation_input_epsilon_m(config),
+            "rotationInputEpsilon": self._rotation_input_epsilon_deg(config),
+            "translationMinActivePulse": self._translation_min_active_pulse(config),
+            "rotationMinActivePulse": self._rotation_min_active_pulse(config),
+            "continuousMicroConfirmTicks": self._continuous_micro_confirm_ticks(config),
+            "leftConnected": bool(teleop.get("leftConnected", False)),
+            "rightConnected": bool(teleop.get("rightConnected", False)),
+            "swapTeleopChannels": bool(teleop.get("swapTeleopChannels", True)),
+            "requireClutch": bool(teleop.get("requireClutch", False)),
+            "leftGravityCompensation": bool(teleop.get("leftGravityCompensation", True)),
+            "rightGravityCompensation": bool(teleop.get("rightGravityCompensation", True)),
+            "leftTranslationScale": float(
+                teleop.get("leftTranslationScale", ICF_TELEOP_DEFAULTS["leftTranslationScale"])
+            ),
+            "rightTranslationScale": float(
+                teleop.get("rightTranslationScale", ICF_TELEOP_DEFAULTS["rightTranslationScale"])
+            ),
+            "leftRotationScale": float(
+                teleop.get("leftRotationScale", ICF_TELEOP_DEFAULTS["leftRotationScale"])
+            ),
+            "rightRotationScale": float(
+                teleop.get("rightRotationScale", ICF_TELEOP_DEFAULTS["rightRotationScale"])
+            ),
+            "leftAxisOutputScale": self._axis_output_scale("left", config),
+            "rightAxisOutputScale": self._axis_output_scale("right", config),
+            "leftImpulseCoeff": self._impulse_coefficients("left", config),
+            "rightImpulseCoeff": self._impulse_coefficients("right", config),
+            "leftEnabledAxes": self._enabled_axes("left", config),
+            "rightEnabledAxes": self._enabled_axes("right", config),
+            "leftSoftLimitMin": self._soft_limit_arrays("left", config)[0],
+            "leftSoftLimitMax": self._soft_limit_arrays("left", config)[1],
+            "rightSoftLimitMin": self._soft_limit_arrays("right", config)[0],
+            "rightSoftLimitMax": self._soft_limit_arrays("right", config)[1],
+            "leftWorkOriginValid": self._work_origin_valid("left", config),
+            "rightWorkOriginValid": self._work_origin_valid("right", config),
+            "leftWorkOriginPulse": self._work_origin_pulse("left", config),
+            "rightWorkOriginPulse": self._work_origin_pulse("right", config),
+            "translationStepLimitPulse": self._translation_step_limit_pulse(config),
+            "rotationStepLimitPulse": self._rotation_step_limit_pulse(config),
+            "translationPulseDeadband": self._translation_pulse_deadband(config),
+            "rotationPulseDeadband": self._rotation_pulse_deadband(config),
+            "translationStartVelocityUmS": self._translation_start_velocity_um_s(config),
+            "translationMaxVelocityUmS": self._translation_max_velocity_um_s(config),
+            "rotationStartVelocityDegS": self._rotation_start_velocity_deg_s(config),
+            "rotationMaxVelocityDegS": self._rotation_max_velocity_deg_s(config),
+            "motionProfileAccSec": self._motion_profile_acc_sec(config),
+            "motionProfileDecSec": self._motion_profile_dec_sec(config),
+            "gripperTeleopEnabled": self._native_gripper_teleop_enabled(config),
+            "leftPort": str(gripper.get("leftPort", "COM8")),
+            "rightPort": str(gripper.get("rightPort", "COM9")),
+            "leftSlaveId": int(gripper.get("leftSlaveId", 10)),
+            "rightSlaveId": int(gripper.get("rightSlaveId", 9)),
+            "baudrate": int(gripper.get("baudrate", 115200)),
+            "strokeMm": float(gripper.get("strokeMm", 26)),
+            "jodellDllPath": str(gripper.get("jodellDllPath", "")),
+            "leftGapMinMm": float(gripper_teleop.get("leftGapMinMm", 0.0)),
+            "leftGapMaxMm": float(gripper_teleop.get("leftGapMaxMm", 25.0)),
+            "rightGapMinMm": float(gripper_teleop.get("rightGapMinMm", 0.0)),
+            "rightGapMaxMm": float(gripper_teleop.get("rightGapMaxMm", 25.0)),
+            "leftGapInvert": bool(gripper_teleop.get("leftGapInvert", False)),
+            "rightGapInvert": bool(gripper_teleop.get("rightGapInvert", False)),
+            "leftSourceHand": str(gripper_teleop.get("leftSourceHand", "PhysicalRight")),
+            "rightSourceHand": str(gripper_teleop.get("rightSourceHand", "PhysicalLeft")),
+            "gripSpeed": int(gripper_teleop.get("gripSpeed", 255)),
+            "gripTorque": int(gripper_teleop.get("gripTorque", 192)),
+            "positionDeadbandCounts": int(gripper_teleop.get("positionDeadbandCounts", 1)),
+            "minCommandIntervalMs": float(gripper_teleop.get("minCommandIntervalMs", 20)),
+            "buttonFallback": bool(gripper_teleop.get("buttonFallback", True)),
+        }
+        return payload
+
+    def _work_origin_valid(self, side: SideName, config: dict[str, Any]) -> bool:
+        origin = self._normalized_motion_origin(config)
+        return bool(origin["leftValid" if side == "left" else "rightValid"])
+
+    def _native_gripper_teleop_enabled(self, config: dict[str, Any]) -> bool:
+        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
+        gripper_teleop = teleop.get("gripperTeleop", {}) if isinstance(teleop.get("gripperTeleop"), dict) else {}
+        if not bool(gripper_teleop.get("enabled", True)):
+            return False
+        return any(source in self._arm_sources for source in self._NATIVE_GRIPPER_SOURCES)
+
+    def _work_origin_pulse(self, side: SideName, config: dict[str, Any]) -> list[float]:
+        origin = self._normalized_motion_origin(config)
+        pulses = origin["leftPulse" if side == "left" else "rightPulse"]
+        return [float(value) for value in pulses] if isinstance(pulses, list) else [0.0] * 6
 
     def _translation_step_um(self, config: dict[str, Any]) -> float:
         return max(0.0, float(config.get("teleop", {}).get("translationStepUm", DEFAULT_TRANSLATION_STEP_UM)))
@@ -618,6 +1295,73 @@ class TeleopMappingService:
             ),
         )
 
+    def _continuous_increment_mode(self, config: dict[str, Any]) -> bool:
+        return bool(
+            config.get("teleop", {}).get(
+                "continuousIncrementMode",
+                ICF_TELEOP_DEFAULTS["continuousIncrementMode"],
+            )
+        )
+
+    def _continuous_micro_confirm_ticks(self, config: dict[str, Any]) -> int:
+        return max(
+            0,
+            int(
+                math.ceil(
+                    float(
+                        config.get("teleop", {}).get(
+                            "continuousMicroConfirmTicks",
+                            ICF_TELEOP_DEFAULTS["continuousMicroConfirmTicks"],
+                        )
+                    )
+                )
+            ),
+        )
+
+    def _translation_input_epsilon_m(self, config: dict[str, Any]) -> float:
+        return max(
+            0.0,
+            float(
+                config.get("teleop", {}).get(
+                    "translationInputEpsilon",
+                    ICF_TELEOP_DEFAULTS["translationInputEpsilon"],
+                )
+            ),
+        )
+
+    def _rotation_input_epsilon_deg(self, config: dict[str, Any]) -> float:
+        return max(
+            0.0,
+            float(
+                config.get("teleop", {}).get(
+                    "rotationInputEpsilon",
+                    ICF_TELEOP_DEFAULTS["rotationInputEpsilon"],
+                )
+            ),
+        )
+
+    def _translation_min_active_pulse(self, config: dict[str, Any]) -> float:
+        return max(
+            1.0,
+            float(
+                config.get("teleop", {}).get(
+                    "translationMinActivePulse",
+                    ICF_TELEOP_DEFAULTS["translationMinActivePulse"],
+                )
+            ),
+        )
+
+    def _rotation_min_active_pulse(self, config: dict[str, Any]) -> float:
+        return max(
+            1.0,
+            float(
+                config.get("teleop", {}).get(
+                    "rotationMinActivePulse",
+                    ICF_TELEOP_DEFAULTS["rotationMinActivePulse"],
+                )
+            ),
+        )
+
     def _motion_profile_acc_sec(self, config: dict[str, Any]) -> float:
         return max(0.001, float(config.get("teleop", {}).get("motionProfileAccSec", 0.05)))
 
@@ -671,6 +1415,23 @@ class TeleopMappingService:
                 pass
         return [float(value) for value in ICF_KINEMATICS_DEFAULTS[key]]
 
+    def _physical_axis_map(self, side: str, config: dict[str, Any]) -> list[int]:
+        motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+        kinematics = motion.get("kinematics", {}) if isinstance(motion.get("kinematics"), dict) else {}
+        key = f"{side}PhysicalAxis"
+        legacy_key = f"{side}AxisMap"
+        raw = kinematics.get(key, kinematics.get(legacy_key, ICF_KINEMATICS_DEFAULTS[key]))
+        if not isinstance(raw, list) or len(raw) < 6:
+            raw = ICF_KINEMATICS_DEFAULTS[key]
+        try:
+            return [int(raw[index]) for index in range(6)]
+        except (TypeError, ValueError):
+            return [int(value) for value in ICF_KINEMATICS_DEFAULTS[key]]
+
+    def _pulse_per_unit(self, side: str, axis: str, config: dict[str, Any]) -> float:
+        offset = 0 if side == "left" else 6
+        return float(motion_pulse_per_unit(config)[offset + AXES.index(axis)])
+
     def _pulse_delta_to_ui_delta(self, pulse_delta: float, axis_index: int, signed_pulse_per_unit: float) -> float:
         if signed_pulse_per_unit == 0:
             return 0.0
@@ -701,22 +1462,7 @@ class TeleopMappingService:
             return default_mins, default_maxes
         if any(min_value >= max_value for min_value, max_value in zip(mins, maxes, strict=True)):
             return default_mins, default_maxes
-        origin = self._normalized_motion_origin(config)
-        valid_key = "leftValid" if side == "left" else "rightValid"
-        pulse_key = "leftPulse" if side == "left" else "rightPulse"
-        if bool(origin[valid_key]):
-            origin_ui = self._origin_ui_position(side, origin[pulse_key], config)
-            mins = [origin_ui[index] + mins[index] for index in range(6)]
-            maxes = [origin_ui[index] + maxes[index] for index in range(6)]
         return mins, maxes
-
-    def _origin_ui_position(self, side: SideName, origin_pulse: object, config: dict[str, Any]) -> list[float]:
-        pulses = self._six_pulses(origin_pulse)
-        signed_pulse_per_unit = self._signed_pulse_per_unit(side, config)
-        return [
-            self._pulse_delta_to_ui_delta(pulses[index], index, signed_pulse_per_unit[index])
-            for index in range(6)
-        ]
 
     def _target_side_for_source(self, side: SideName, config: dict[str, Any]) -> SideName:
         teleop = config.get("teleop", {})
@@ -760,11 +1506,15 @@ class TeleopMappingService:
         self._references.clear()
         self._translation_carry.clear()
         self._translation_direction.clear()
+        self._continuous_direction.clear()
+        self._continuous_streak.clear()
 
     def _reset_side_tracking(self, side: SideName) -> None:
         self._references.pop(side, None)
         self._translation_carry.pop(side, None)
         self._translation_direction.pop(side, None)
+        self._continuous_direction.pop(side, None)
+        self._continuous_streak.pop(side, None)
 
     async def _stop_all_active_sides(self) -> None:
         for side in tuple(self._active_sides):

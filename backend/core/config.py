@@ -17,7 +17,7 @@ from backend.core.defaults import (
     ICF_WORK_ORIGIN_VERSION,
     default_config,
 )
-from backend.core.logging import LogService, now_ms
+from backend.core.logging import LogService, now_ms, stable_config_hash
 from backend.core.schemas import (
     AppConfig,
     MotionCardSnapshotConfig,
@@ -27,6 +27,26 @@ from backend.core.schemas import (
 )
 
 SNAPSHOT_ID_SAFE = re.compile(r"[^a-zA-Z0-9_.-]+")
+
+
+def _compact_config_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return "{...}"
+    if isinstance(value, list):
+        return f"[{len(value)} items]"
+    return value
+
+
+def _changed_config_leaves(old: Any, new: Any, prefix: str = "") -> list[tuple[str, Any, Any]]:
+    if isinstance(old, dict) and isinstance(new, dict):
+        changes: list[tuple[str, Any, Any]] = []
+        for key in sorted(set(old) | set(new)):
+            path = f"{prefix}.{key}" if prefix else str(key)
+            changes.extend(_changed_config_leaves(old.get(key), new.get(key), path))
+        return changes
+    if old != new:
+        return [(prefix or "config", _compact_config_value(old), _compact_config_value(new))]
+    return []
 
 
 class SettingsService:
@@ -60,19 +80,67 @@ class SettingsService:
             )
             validated = AppConfig.model_validate(merged).model_dump(mode="json")
             if merged != data:
-                self.save_config(validated, emit_log=False)
+                self.save_config(validated, emit_log=False, source="startup")
             return validated
         except (OSError, json.JSONDecodeError, ValueError):
             config = default_config()
-            self.save_config(config)
+            self.save_config(config, source="startup")
             self.logs.warning("[BACKEND]", "config.json was invalid; default config restored")
             return config
 
-    def save_config(self, config: dict[str, Any], emit_log: bool = True) -> dict[str, Any]:
+    def save_config(
+        self,
+        config: dict[str, Any],
+        emit_log: bool = True,
+        *,
+        source: str = "ui",
+        op_id: str | None = None,
+    ) -> dict[str, Any]:
+        old_config: dict[str, Any] = {}
+        if self.config_path.exists():
+            try:
+                loaded = json.loads(self.config_path.read_text(encoding="utf-8"))
+                old_config = loaded if isinstance(loaded, dict) else {}
+            except (OSError, json.JSONDecodeError):
+                old_config = {}
         validated = AppConfig.model_validate(config).model_dump(mode="json")
+        old_hash = stable_config_hash(old_config) if old_config else "-"
+        new_hash = stable_config_hash(validated)
         self.config_path.write_text(json.dumps(validated, ensure_ascii=False, indent=2), encoding="utf-8")
         if emit_log:
-            self.logs.info("[BACKEND]", "settings saved to config.json")
+            changes = _changed_config_leaves(old_config, validated)
+            for key, old, new in changes[:50]:
+                self.logs.event(
+                    "[BACKEND]",
+                    "INFO",
+                    "config_write",
+                    component="CONFIG",
+                    op_id=op_id,
+                    source=source,
+                    scope=key.split(".", 1)[0],
+                    key=key,
+                    old=old,
+                    new=new,
+                    oldHash=old_hash,
+                    newHash=new_hash,
+                    configPath=str(self.config_path),
+                )
+            if len(changes) > 50:
+                self.logs.event(
+                    "[BACKEND]",
+                    "WARNING",
+                    "config_write",
+                    component="CONFIG",
+                    op_id=op_id,
+                    source=source,
+                    scope="all",
+                    key="truncated",
+                    old=f"{len(changes)} changes",
+                    new="first 50 logged",
+                    oldHash=old_hash,
+                    newHash=new_hash,
+                    configPath=str(self.config_path),
+                )
         return validated
 
     def apply_config(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -233,16 +301,32 @@ class SettingsService:
                 gripper_teleop["rightGapMinMm"] = 0.0
                 gripper_teleop["rightGapMaxMm"] = 25.0
                 gripper_teleop["leftGapInvert"] = False
-                gripper_teleop["rightGapInvert"] = True
-                gripper_teleop["gripSpeed"] = 128
+                gripper_teleop["rightGapInvert"] = False
+                gripper_teleop["gripSpeed"] = 255
                 gripper_teleop["gripTorque"] = 192
-                gripper_teleop["positionDeadbandCounts"] = 2
-                gripper_teleop["minCommandIntervalMs"] = 50
+                gripper_teleop["positionDeadbandCounts"] = 1
+                gripper_teleop["minCommandIntervalMs"] = 20
                 gripper_teleop["autoGapCalibration"] = True
                 gripper_teleop["autoGapMinSpanMm"] = 2.0
                 gripper_teleop["autoGapMarginMm"] = 1.0
                 gripper_teleop["leftSourceHand"] = "PhysicalRight"
                 gripper_teleop["rightSourceHand"] = "PhysicalLeft"
+        if isinstance(teleop, dict):
+            teleop.setdefault("engine", "hal_native")
+            teleop.setdefault("controlMode", "incremental_position")
+            teleop.setdefault("mappingMode", ICF_TELEOP_DEFAULTS["mappingMode"])
+            if teleop.get("mappingMode") not in {"direct", "legacy"}:
+                teleop["mappingMode"] = ICF_TELEOP_DEFAULTS["mappingMode"]
+            if teleop.get("engine") == "hal_native" and teleop.get("controlMode") == "incremental":
+                teleop["controlMode"] = "incremental_position"
+            if teleop.get("engine") == "hal_native" and teleop.get("controlMode") == "velocity_admittance":
+                teleop["controlMode"] = "incremental_position"
+            teleop.setdefault("nativeLoopHz", 100)
+            teleop.setdefault("nativeTranslationDeadzoneM", 0.002)
+            teleop.setdefault("nativeTranslationFullScaleM", 0.04)
+            teleop.setdefault("nativeRotationDeadzoneDeg", 2.0)
+            teleop.setdefault("nativeRotationFullScaleDeg", 30.0)
+            teleop.setdefault("nativeVelocitySmoothingMs", 40.0)
         if isinstance(teleop, dict):
             if teleop.get("swapHands") is True:
                 teleop["swapHands"] = ICF_TELEOP_DEFAULTS["swapHands"]
@@ -266,6 +350,24 @@ class SettingsService:
                 teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
             if teleop.get("rightAxisOutputScale") == [1, 1, 1, 1, 1, 1]:
                 teleop["rightAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["rightAxisOutputScale"]))
+            if teleop.get("leftAxisOutputScale") == [0.60, 0.30, 0.30, 1.50, 0.30, 1.00]:
+                teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
+            if teleop.get("rightAxisOutputScale") == [0.60, 0.30, 0.30, 1.50, 0.30, 0.30]:
+                teleop["rightAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["rightAxisOutputScale"]))
+            if teleop.get("leftAxisOutputScale") == [0.60, 0.30, 0.30, 1.50, 1.00, 1.00]:
+                teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
+            if teleop.get("rightAxisOutputScale") == [0.60, 0.30, 0.30, 1.50, 1.00, 0.30]:
+                teleop["rightAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["rightAxisOutputScale"]))
+            if float(teleop.get("translationDeadzone", 0.0)) == 0.00001:
+                teleop["translationDeadzone"] = ICF_TELEOP_DEFAULTS["translationDeadzone"]
+            if float(teleop.get("rotationDeadzone", 0.0)) == 0.02:
+                teleop["rotationDeadzone"] = ICF_TELEOP_DEFAULTS["rotationDeadzone"]
+            if float(teleop.get("translationInputEpsilon", 0.0)) == 1e-7:
+                teleop["translationInputEpsilon"] = ICF_TELEOP_DEFAULTS["translationInputEpsilon"]
+            if float(teleop.get("rotationInputEpsilon", 0.0)) in {0.001, 0.03}:
+                teleop["rotationInputEpsilon"] = ICF_TELEOP_DEFAULTS["rotationInputEpsilon"]
+            if int(teleop.get("continuousMicroConfirmTicks", 0)) == 2:
+                teleop["continuousMicroConfirmTicks"] = ICF_TELEOP_DEFAULTS["continuousMicroConfirmTicks"]
             if teleop.get("leftDirectionSign") != ICF_TELEOP_DEFAULTS["leftDirectionSign"]:
                 teleop["leftDirectionSign"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftDirectionSign"]))
             if teleop.get("rightDirectionSign") != ICF_TELEOP_DEFAULTS["rightDirectionSign"]:
@@ -331,7 +433,9 @@ class SettingsService:
             if gripper_teleop.get("rightSourceHand") == "PhysicalRight":
                 gripper_teleop["rightSourceHand"] = "PhysicalLeft"
             gripper_teleop.setdefault("leftGapInvert", False)
-            gripper_teleop.setdefault("rightGapInvert", True)
+            if teleop.get("engine") == "hal_native" and gripper_teleop.get("rightGapInvert") is True:
+                gripper_teleop["rightGapInvert"] = False
+            gripper_teleop.setdefault("rightGapInvert", False)
         return config
 
     def _uses_legacy_motion_profile(self, profile: object) -> bool:

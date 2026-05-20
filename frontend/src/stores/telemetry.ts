@@ -10,6 +10,7 @@ import {
   fetchConfig,
   fetchHardwareStatus,
   fetchParameterSnapshots,
+  fetchRecordStatus,
   finishSession as finishRecordSessionApi,
   gripperCommand as gripperCommandApi,
   homeAll as homeAllApi,
@@ -66,8 +67,8 @@ const cameraLabels = {
 const manualAxisOrder: ManualControlAxis[] = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']
 const manualAxisKeys = ['x', 'y', 'z', 'roll', 'pitch', 'yaw'] as const
 const manualAxisDirectionSign = {
-  left: [-1, -1, -1, -1, 1, -1],
-  right: [-1, -1, -1, -1, -1, 1],
+  left: [1, 1, 1, 1, 1, 1],
+  right: [1, 1, 1, 1, 1, 1],
 } as const
 const manualAxisStepLimitPulse = 100000
 
@@ -314,6 +315,7 @@ interface TelemetryStore {
   acknowledgeSafety: () => void
   injectLog: (level: LogLevel, msg: string, channel?: LogEntry['channel']) => void
   sendBackendCommandLog: (level: LogLevel, msg: string, channel?: LogEntry['channel']) => void
+  refreshHardwareStatus: () => Promise<void>
   runDiagnostics: () => Promise<void>
   updateConfig: (patch: Partial<AppConfig>) => void
   saveParameterSnapshot: (scope: ParameterSnapshotScope, name: string) => void
@@ -659,11 +661,43 @@ type TelemetryStorePatch = Partial<TelemetryStore>
 type TelemetryStoreSet = (partial: TelemetryStorePatch | ((state: TelemetryStore) => TelemetryStorePatch), replace?: false) => void
 type TelemetryStoreGet = () => TelemetryStore
 
+let finishRecordSessionAfterSave = false
 let pendingBackendFrame: TelemetryFrame | null = null
 let backendFrameDelayTimer: number | null = null
 let backendFrameRaf: number | null = null
 let lastBackendFrameCommitAt = 0
 let lastBackendHistoryCommitAt = 0
+
+function finishRecordSessionNow(set: TelemetryStoreSet) {
+  void finishRecordSessionApi().finally(() => {
+    finishRecordSessionAfterSave = false
+    set((state) => ({
+      recording: false,
+      recordSession: {
+        ...state.recordSession,
+        phase: 'idle',
+        phaseStartedAt: null,
+        recorderFps: 0,
+        recorderFrameCount: 0,
+        recorderLateFrames: 0,
+        recorderElapsedS: 0,
+        recorderTotalS: -1,
+        latestQualityReport: null,
+      },
+      logs: appendLog(state.logs, makeLog('INFO', 'record session finished and finalized', '[LEROBOT]')),
+    }))
+  })
+  set((state) => ({
+    recording: false,
+    recordSession: {
+      ...state.recordSession,
+      phase: 'finishing',
+      phaseStartedAt: Date.now(),
+      recorderElapsedS: 0,
+      recorderTotalS: -1,
+    },
+  }))
+}
 
 function backendFrameCommitIsUrgent(previous: TelemetryFrame, next: TelemetryFrame) {
   return previous.wsOk !== next.wsOk
@@ -802,10 +836,14 @@ function diagnosticsFromHardwareStatus(
       return { ...item, status: status.force.ok ? 'ok' : 'error', remediation: status.force.message }
     }
     if (item.key === 'gripper' && status.gripper) {
-      return { ...item, status: status.gripper.ok ? 'ok' : 'error', remediation: status.gripper.message }
+      return {
+        ...item,
+        status: status.gripper.ok === true ? 'ok' : status.gripper.ok === null ? 'pending' : 'error',
+        remediation: status.gripper.message,
+      }
     }
-    if (item.key === 'omega7') {
-      return { ...item, status: 'pending', remediation: 'Omega.7 状态由 C++ HalServer /health.omega7_ok 提供' }
+    if (item.key === 'omega7' && status.omega7) {
+      return { ...item, status: status.omega7.ok ? 'ok' : 'error', remediation: status.omega7.message }
     }
     return item
   })
@@ -1210,7 +1248,20 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     })),
 
   startRecordSession: (datasetName, task) => {
-    void createRecordSessionApi(datasetName.trim() || initialRecordSession.datasetName, task)
+    finishRecordSessionAfterSave = false
+    void (async () => {
+      const status = await fetchRecordStatus().catch(() => null)
+      if (status?.active) {
+        set((state) => ({
+          logs: appendLog(
+            state.logs,
+            makeLog('WARNING', 'backend still had an active record session; finalizing it before starting a new one', '[LEROBOT]'),
+          ),
+        }))
+        await finishRecordSessionApi()
+      }
+      await createRecordSessionApi(datasetName.trim() || initialRecordSession.datasetName, task)
+    })()
       .catch((error) => {
         set((state) => ({
           recording: false,
@@ -1292,6 +1343,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
             logs: appendLog(state.logs, makeLog('INFO', `Episode #${report.index} save completed; quality report ready`, '[LEROBOT]')),
           }
         })
+        if (finishRecordSessionAfterSave) finishRecordSessionNow(set)
       })
       .catch((error) => {
         set((state) => ({
@@ -1308,6 +1360,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
             : state.recordSession,
           logs: appendLog(state.logs, makeLog('ERROR', `record episode save failed: ${String(error)}`, '[LEROBOT]')),
         }))
+        if (finishRecordSessionAfterSave) finishRecordSessionNow(set)
       })
   },
 
@@ -1385,38 +1438,13 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
 
   finishRecordSession: () => {
     if (get().recordSession.phase === 'saving') {
+      finishRecordSessionAfterSave = true
       set((state) => ({
-        logs: appendLog(state.logs, makeLog('WARNING', 'record session finish skipped while episode save is pending', '[LEROBOT]')),
+        logs: appendLog(state.logs, makeLog('WARNING', 'record session finish queued until episode save completes', '[LEROBOT]')),
       }))
       return
     }
-    void finishRecordSessionApi().finally(() => {
-      set((state) => ({
-        recording: false,
-        recordSession: {
-          ...state.recordSession,
-          phase: 'idle',
-          phaseStartedAt: null,
-          recorderFps: 0,
-          recorderFrameCount: 0,
-          recorderLateFrames: 0,
-          recorderElapsedS: 0,
-          recorderTotalS: -1,
-          latestQualityReport: null,
-        },
-        logs: appendLog(state.logs, makeLog('INFO', '录制采集会话已结束并 finalize()', '[LEROBOT]')),
-      }))
-    })
-    set((state) => ({
-      recording: false,
-      recordSession: {
-        ...state.recordSession,
-        phase: 'finishing',
-        phaseStartedAt: Date.now(),
-        recorderElapsedS: 0,
-        recorderTotalS: -1,
-      },
-    }))
+    finishRecordSessionNow(set)
   },
 
   skipRecordReset: () => {
@@ -1593,6 +1621,20 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     }))
   },
 
+  refreshHardwareStatus: async () => {
+    try {
+      const status = await fetchHardwareStatus()
+      set((state) => ({
+        diagnostics: diagnosticsFromHardwareStatus(state.diagnostics, status),
+        logs: appendLog(state.logs, makeLog('INFO', 'Real hardware status probe completed', '[BACKEND]')),
+      }))
+    } catch (error) {
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('ERROR', `hardware status fetch failed: ${String(error)}`, '[BACKEND]')),
+      }))
+    }
+  },
+
   runDiagnostics: async () => {
     set((state) => ({
       diagnostics: state.diagnostics.map((item) => ({ ...item, status: item.status === 'pending' ? 'checking' : item.status })),
@@ -1764,6 +1806,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
         return
       }
       const lockUntil = now + manualAxisLockMs(state.config, side, axis, step, speedMode)
+      const effectiveDirection = manualAxisEffectiveDirection(side, axisIndex, direction)
       // 先标记轴忙，避免网络往返期间再次发出同轴命令。
       set((current) => ({
         manualControl: {
@@ -1776,7 +1819,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
           },
         },
       }))
-      void manualAxisMoveApi(side, axis, direction, step, speedMode)
+      void manualAxisMoveApi(side, axis, effectiveDirection, step, speedMode)
         .then(() => {
           set((current) => ({
             logs: appendLog(current.logs, makeLog('INFO', `${side} ${axis} jog command accepted by HAL`, '[HAL]')),
@@ -1850,7 +1893,12 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   issueManualGripperMove: (side, command, targetMm) => {
     if (!mockMode) {
       const enabledKey = side === 'left' ? 'leftEnabled' : 'rightEnabled'
-      if (!['enable', 'disable', 'stop'].includes(command) && !get().config.gripper[enabledKey]) {
+      const config = get().config
+      if (
+        config.teleop.engine !== 'hal_native'
+        && !['enable', 'disable', 'stop'].includes(command)
+        && !config.gripper[enabledKey]
+      ) {
         set((current) => ({
           logs: appendLog(current.logs, makeLog('WARNING', `${side} gripper ${command} skipped: gripper is disabled`, '[GRIPPER]')),
         }))

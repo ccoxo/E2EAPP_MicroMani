@@ -1488,6 +1488,90 @@ select {
   min-width: max-content;
 }
 
+.camera-settings-panel {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.95fr) minmax(360px, 1.45fr);
+  gap: 10px;
+  align-items: stretch;
+}
+
+.camera-basics-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #dfe6ef;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.camera-basics-grid .ant-form-item {
+  margin-bottom: 0;
+}
+
+.camera-basics-grid .ant-input,
+.camera-basics-grid .ant-input-number,
+.camera-basics-grid .ant-select {
+  width: 100%;
+}
+
+.camera-tuning-panel {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #c9dbd5;
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(248, 253, 251, 0.96), rgba(240, 248, 245, 0.96)),
+    #f3faf7;
+}
+
+.camera-tuning-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.camera-tuning-actions {
+  justify-content: flex-end;
+}
+
+.camera-tuning-grid {
+  display: grid;
+  grid-template-columns: minmax(112px, 0.35fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.camera-toggle-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.camera-slider-stack {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.camera-slider-row {
+  display: grid;
+  grid-template-columns: 72px minmax(150px, 1fr) 96px;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.camera-slider-row .ant-slider {
+  min-width: 0;
+}
+
 .metric-pill {
   display: inline-flex;
   align-items: center;
@@ -1648,6 +1732,11 @@ select {
 .log-line em {
   color: #9fb3c8;
   font-style: normal;
+}
+
+.log-message {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .log-line-warning {
@@ -3287,6 +3376,12 @@ select {
   z-index: 50;
 }
 
+@media (max-width: 1440px) {
+  .camera-settings-panel {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 1200px) {
   .work-area {
     grid-template-columns: 64px minmax(0, 1fr);
@@ -3611,6 +3706,21 @@ select {
   .force-oscilloscope-grid,
   .camera-metric-grid {
     grid-template-columns: 1fr;
+  }
+
+  .camera-settings-panel,
+  .camera-tuning-grid,
+  .camera-slider-row {
+    grid-template-columns: 1fr;
+  }
+
+  .camera-tuning-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .camera-tuning-actions {
+    justify-content: flex-start;
   }
 
   .jog-table-hardware .jog-row {

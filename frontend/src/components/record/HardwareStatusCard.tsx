@@ -22,6 +22,16 @@ function cameraOk(frame: TelemetryFrame, key: 'global' | 'wrist_left' | 'wrist_r
   return (camera?.fps ?? 0) >= 25 && camera?.health === 'ok'
 }
 
+function teleopHandsReady(frame: TelemetryFrame) {
+  return frame.teleopHands.every((hand) => hand.connected && hand.lastReadOk)
+}
+
+function teleopHandsValue(frame: TelemetryFrame, diagnostics: DiagnosticItem[]) {
+  if (!diagnosticOk(diagnostics, 'omega7')) return '待确认'
+  const connected = frame.teleopHands.filter((hand) => hand.connected && hand.lastReadOk).length
+  return connected === 2 ? '逻辑 2/2' : `逻辑 ${connected}/2`
+}
+
 const HW_ITEMS: HwItem[] = [
   {
     name: 'HAL Service',
@@ -55,8 +65,8 @@ const HW_ITEMS: HwItem[] = [
   },
   {
     name: 'Omega.7 左/右',
-    getValue: (_frame, diagnostics) => diagnosticOk(diagnostics, 'omega7') ? '已连接' : '待确认',
-    getOk: (_frame, diagnostics) => diagnosticOk(diagnostics, 'omega7'),
+    getValue: teleopHandsValue,
+    getOk: (frame, diagnostics) => diagnosticOk(diagnostics, 'omega7') && teleopHandsReady(frame),
   },
   {
     name: '夹爪 左/右',

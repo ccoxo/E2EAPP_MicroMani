@@ -15,6 +15,8 @@
 
 #include "LTDMCDriver.h"
 #include "MotionControlThread.h"
+#include "JodellGripperDriver.h"
+#include "NativeTeleopController.h"
 #include "Omega7Driver.h"
 
 namespace {
@@ -456,6 +458,170 @@ std::array<bool, 6> jsonTeleopEnabledAxes(const std::string& body) {
   return enabled;
 }
 
+std::array<double, 6> jsonNumberArray6(
+    const std::string& body,
+    const std::string& key,
+    const std::array<double, 6>& fallback) {
+  auto values = fallback;
+  for (size_t i = 0; i < values.size(); ++i) {
+    double value = values[i];
+    if (jsonNumberArrayValue(body, key, i, &value)) {
+      values[i] = value;
+    }
+  }
+  return values;
+}
+
+std::array<bool, 6> jsonBoolArray6(
+    const std::string& body,
+    const std::string& key,
+    const std::array<bool, 6>& fallback) {
+  auto values = fallback;
+  for (size_t i = 0; i < values.size(); ++i) {
+    bool value = values[i];
+    if (jsonBoolArrayValue(body, key, i, &value)) {
+      values[i] = value;
+    }
+  }
+  return values;
+}
+
+std::array<appstation::hal::AxisLimit, 6> jsonAxisLimits(
+    const std::string& body,
+    const std::string& minKey,
+    const std::string& maxKey,
+    const std::array<appstation::hal::AxisLimit, 6>& fallback) {
+  auto limits = fallback;
+  for (size_t i = 0; i < limits.size(); ++i) {
+    double minValue = limits[i].min;
+    double maxValue = limits[i].max;
+    if (jsonNumberArrayValue(body, minKey, i, &minValue)) {
+      limits[i].min = minValue;
+    }
+    if (jsonNumberArrayValue(body, maxKey, i, &maxValue)) {
+      limits[i].max = maxValue;
+    }
+  }
+  return limits;
+}
+
+std::string jsonStringValueOr(const std::string& body, const std::string& key, const std::string& fallback) {
+  const auto value = jsonStringValue(body, key);
+  return value.empty() ? fallback : value;
+}
+
+appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& body) {
+  using appstation::hal::AxisLimit;
+  using appstation::hal::NativeTeleopConfig;
+  NativeTeleopConfig config;
+  config.controlMode = jsonStringValueOr(body, "controlMode", config.controlMode);
+  config.mappingMode = jsonStringValueOr(body, "mappingMode", config.mappingMode);
+  config.loopHz = static_cast<int>(jsonNumberValue(body, "nativeLoopHz", config.loopHz));
+  config.swapTeleopChannels = jsonBoolValue(body, "swapTeleopChannels", config.swapTeleopChannels);
+  config.requireClutch = jsonBoolValue(body, "requireClutch", config.requireClutch);
+  config.leftGravityCompensation =
+      jsonBoolValue(body, "leftGravityCompensation", config.leftGravityCompensation);
+  config.rightGravityCompensation =
+      jsonBoolValue(body, "rightGravityCompensation", config.rightGravityCompensation);
+  config.translationScale[0] = jsonNumberValue(body, "leftTranslationScale", config.translationScale[0]);
+  config.translationScale[1] = jsonNumberValue(body, "rightTranslationScale", config.translationScale[1]);
+  config.rotationScale[0] = jsonNumberValue(body, "leftRotationScale", config.rotationScale[0]);
+  config.rotationScale[1] = jsonNumberValue(body, "rightRotationScale", config.rotationScale[1]);
+  config.axisOutputScale[0] = jsonNumberArray6(body, "leftAxisOutputScale", config.axisOutputScale[0]);
+  config.axisOutputScale[1] = jsonNumberArray6(body, "rightAxisOutputScale", config.axisOutputScale[1]);
+  config.impulseCoeff[0] = jsonNumberArray6(body, "leftImpulseCoeff", config.impulseCoeff[0]);
+  config.impulseCoeff[1] = jsonNumberArray6(body, "rightImpulseCoeff", config.impulseCoeff[1]);
+  config.enabledAxes[0] = jsonBoolArray6(body, "leftEnabledAxes", config.enabledAxes[0]);
+  config.enabledAxes[1] = jsonBoolArray6(body, "rightEnabledAxes", config.enabledAxes[1]);
+  const std::array<AxisLimit, 6> defaultLimits{
+      AxisLimit{-25000.0, 25000.0},
+      AxisLimit{-37500.0, 37500.0},
+      AxisLimit{-37500.0, 37500.0},
+      AxisLimit{-90.0, 90.0},
+      AxisLimit{-90.0, 90.0},
+      AxisLimit{-7.0, 7.0},
+  };
+  config.softLimits[0] = jsonAxisLimits(body, "leftSoftLimitMin", "leftSoftLimitMax", defaultLimits);
+  config.softLimits[1] = jsonAxisLimits(body, "rightSoftLimitMin", "rightSoftLimitMax", defaultLimits);
+  config.workOriginValid[0] = jsonBoolValue(body, "leftWorkOriginValid", config.workOriginValid[0]);
+  config.workOriginValid[1] = jsonBoolValue(body, "rightWorkOriginValid", config.workOriginValid[1]);
+  config.workOriginPulse[0] = jsonNumberArray6(body, "leftWorkOriginPulse", config.workOriginPulse[0]);
+  config.workOriginPulse[1] = jsonNumberArray6(body, "rightWorkOriginPulse", config.workOriginPulse[1]);
+  config.translationStepLimitPulse =
+      jsonNumberValue(body, "translationStepLimitPulse", config.translationStepLimitPulse);
+  config.rotationStepLimitPulse = jsonNumberValue(body, "rotationStepLimitPulse", config.rotationStepLimitPulse);
+  config.translationPulseDeadband =
+      jsonNumberValue(body, "translationPulseDeadband", config.translationPulseDeadband);
+  config.rotationPulseDeadband = jsonNumberValue(body, "rotationPulseDeadband", config.rotationPulseDeadband);
+  config.translationStartVelocityUmS =
+      jsonNumberValue(body, "translationStartVelocityUmS", config.translationStartVelocityUmS);
+  config.translationMaxVelocityUmS =
+      jsonNumberValue(body, "translationMaxVelocityUmS", config.translationMaxVelocityUmS);
+  config.rotationStartVelocityDegS =
+      jsonNumberValue(body, "rotationStartVelocityDegS", config.rotationStartVelocityDegS);
+  config.rotationMaxVelocityDegS =
+      jsonNumberValue(body, "rotationMaxVelocityDegS", config.rotationMaxVelocityDegS);
+  config.accTimeSec = jsonNumberValue(body, "motionProfileAccSec", config.accTimeSec);
+  config.decTimeSec = jsonNumberValue(body, "motionProfileDecSec", config.decTimeSec);
+  config.nativeTranslationDeadzoneM =
+      jsonNumberValue(body, "nativeTranslationDeadzoneM", config.nativeTranslationDeadzoneM);
+  config.nativeTranslationFullScaleM =
+      jsonNumberValue(body, "nativeTranslationFullScaleM", config.nativeTranslationFullScaleM);
+  config.nativeRotationDeadzoneDeg =
+      jsonNumberValue(body, "nativeRotationDeadzoneDeg", config.nativeRotationDeadzoneDeg);
+  config.nativeRotationFullScaleDeg =
+      jsonNumberValue(body, "nativeRotationFullScaleDeg", config.nativeRotationFullScaleDeg);
+  config.nativeVelocitySmoothingMs =
+      jsonNumberValue(body, "nativeVelocitySmoothingMs", config.nativeVelocitySmoothingMs);
+  config.translationDeadzoneM = jsonNumberValue(body, "translationDeadzone", config.translationDeadzoneM);
+  config.rotationDeadzoneDeg = jsonNumberValue(body, "rotationDeadzone", config.rotationDeadzoneDeg);
+  config.incrementalTranslationMinEffectiveDeltaM = jsonNumberValue(
+      body,
+      "incrementalTranslationMinEffectiveDelta",
+      config.incrementalTranslationMinEffectiveDeltaM);
+  config.incrementalTranslationReverseDeadzoneM = jsonNumberValue(
+      body,
+      "incrementalTranslationReverseDeadzone",
+      config.incrementalTranslationReverseDeadzoneM);
+  config.continuousIncrementMode =
+      jsonBoolValue(body, "continuousIncrementMode", config.continuousIncrementMode);
+  config.translationInputEpsilonM =
+      jsonNumberValue(body, "translationInputEpsilon", config.translationInputEpsilonM);
+  config.rotationInputEpsilonDeg =
+      jsonNumberValue(body, "rotationInputEpsilon", config.rotationInputEpsilonDeg);
+  config.translationMinActivePulse =
+      jsonNumberValue(body, "translationMinActivePulse", config.translationMinActivePulse);
+  config.rotationMinActivePulse =
+      jsonNumberValue(body, "rotationMinActivePulse", config.rotationMinActivePulse);
+  config.continuousMicroConfirmTicks =
+      static_cast<int>(jsonNumberValue(body, "continuousMicroConfirmTicks", config.continuousMicroConfirmTicks));
+
+  config.gripperTeleopEnabled = jsonBoolValue(body, "gripperTeleopEnabled", config.gripperTeleopEnabled);
+  config.gripper.ports[0] = jsonStringValueOr(body, "leftPort", "COM8");
+  config.gripper.ports[1] = jsonStringValueOr(body, "rightPort", "COM9");
+  config.gripper.slaveIds[0] = static_cast<int>(jsonNumberValue(body, "leftSlaveId", 10));
+  config.gripper.slaveIds[1] = static_cast<int>(jsonNumberValue(body, "rightSlaveId", 9));
+  config.gripper.baudrate = static_cast<int>(jsonNumberValue(body, "baudrate", config.gripper.baudrate));
+  config.gripper.strokeMm = jsonNumberValue(body, "strokeMm", config.gripper.strokeMm);
+  config.gripper.speed = static_cast<int>(jsonNumberValue(body, "gripSpeed", config.gripper.speed));
+  config.gripper.torque = static_cast<int>(jsonNumberValue(body, "gripTorque", config.gripper.torque));
+  config.gripper.dllPath = jsonStringValueOr(body, "jodellDllPath", config.gripper.dllPath);
+  config.gripperGapMinMm[0] = jsonNumberValue(body, "leftGapMinMm", config.gripperGapMinMm[0]);
+  config.gripperGapMaxMm[0] = jsonNumberValue(body, "leftGapMaxMm", config.gripperGapMaxMm[0]);
+  config.gripperGapMinMm[1] = jsonNumberValue(body, "rightGapMinMm", config.gripperGapMinMm[1]);
+  config.gripperGapMaxMm[1] = jsonNumberValue(body, "rightGapMaxMm", config.gripperGapMaxMm[1]);
+  config.gripperGapInvert[0] = jsonBoolValue(body, "leftGapInvert", config.gripperGapInvert[0]);
+  config.gripperGapInvert[1] = jsonBoolValue(body, "rightGapInvert", config.gripperGapInvert[1]);
+  config.gripperSourceHand[0] = jsonStringValueOr(body, "leftSourceHand", config.gripperSourceHand[0]);
+  config.gripperSourceHand[1] = jsonStringValueOr(body, "rightSourceHand", config.gripperSourceHand[1]);
+  config.gripperDeadbandCounts =
+      static_cast<int>(jsonNumberValue(body, "positionDeadbandCounts", config.gripperDeadbandCounts));
+  config.gripperMinCommandIntervalMs =
+      jsonNumberValue(body, "minCommandIntervalMs", config.gripperMinCommandIntervalMs);
+  config.gripperButtonFallback = jsonBoolValue(body, "buttonFallback", config.gripperButtonFallback);
+  return config;
+}
+
 appstation::hal::Side parseSide(const std::string& value) {
   // 后端只允许左右两侧，解析失败直接返回 500 给调用方暴露配置错误。
   if (value == "left") {
@@ -515,6 +681,8 @@ void serveConnection(
     SOCKET client,
     appstation::hal::LTDMCDriver& motion,
     appstation::hal::Omega7Driver& omega,
+    appstation::hal::NativeTeleopController& nativeTeleop,
+    appstation::hal::JodellGripperDriver& gripper,
     const std::chrono::steady_clock::time_point& started) {
   // 限制单个 keep-alive socket 的空闲时间，避免长期占用连接资源。
   DWORD recv_timeout_ms = 30000;
@@ -540,6 +708,7 @@ void serveConnection(
       const double uptime =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
       if (request.rfind("GET /health ", 0) == 0) {
+        omega.ensureReady();
         body = jsonHealth(motion.health(uptime), omega.ok(), omega.lastError());
       } else if (request.rfind("GET /motion/state ", 0) == 0) {
         body = jsonMotionState(motion.readState());
@@ -554,15 +723,49 @@ void serveConnection(
       } else if (request.rfind("POST /omega7/zero_force_feedback ", 0) == 0) {
         omega.zeroForceFeedback(static_cast<int>(jsonNumberValue(requestBody(request), "openId", -1)));
         body = "{\"ok\":true}";
+      } else if (request.rfind("POST /teleop/native/configure ", 0) == 0) {
+        nativeTeleop.configure(jsonNativeTeleopConfig(requestBody(request)));
+        body = "{\"ok\":true}";
+      } else if (request.rfind("POST /teleop/native/start ", 0) == 0) {
+        const auto bodyText = requestBody(request);
+        nativeTeleop.configure(jsonNativeTeleopConfig(bodyText));
+        omega.ensureReady();
+        nativeTeleop.start(
+            jsonBoolValue(bodyText, "leftConnected", false),
+            jsonBoolValue(bodyText, "rightConnected", false));
+        body = "{\"ok\":true}";
+      } else if (request.rfind("POST /teleop/native/stop ", 0) == 0) {
+        nativeTeleop.stop();
+        body = "{\"ok\":true}";
+      } else if (request.rfind("GET /teleop/native/status ", 0) == 0) {
+        body = nativeTeleop.statusJson();
+      } else if (request.rfind("POST /gripper/command ", 0) == 0) {
+        const auto bodyText = requestBody(request);
+        const auto config = jsonNativeTeleopConfig(bodyText);
+        gripper.configure(config.gripper);
+        const auto side = parseSide(jsonStringValue(bodyText, "side"));
+        const auto targetMm = jsonNumberValue(bodyText, "targetMm", 0.0);
+        const auto speed = static_cast<int>(jsonNumberValue(bodyText, "gripSpeed", config.gripper.speed));
+        const auto torque = static_cast<int>(jsonNumberValue(bodyText, "gripTorque", config.gripper.torque));
+        std::string message;
+        if (!gripper.commandTarget(side, targetMm, speed, torque, &message)) {
+          throw std::runtime_error(message);
+        }
+        body = "{\"ok\":true,\"message\":\"" + jsonEscape(message) + "\",\"targetMm\":" + std::to_string(targetMm) + "}";
       } else if (request.rfind("POST /motion/emergency_stop ", 0) == 0) {
         motion.emergencyStop();
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/home_all ", 0) == 0) {
+        nativeTeleop.stop();
+        motion.enableSide(appstation::hal::Side::Left, true);
+        motion.enableSide(appstation::hal::Side::Right, true);
         motion.homeAll(jsonWorkOriginPulse(requestBody(request)));
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/home_origin_side ", 0) == 0) {
         const auto bodyText = requestBody(request);
         const auto side = parseSide(jsonStringValue(bodyText, "side"));
+        nativeTeleop.stop();
+        motion.enableSide(side, true);
         motion.homeOriginSide(side, jsonSideWorkOriginPulse(bodyText));
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/enable_side ", 0) == 0) {
@@ -658,11 +861,13 @@ int main() {
   // 驱动对象在主线程创建并长期持有，HTTP 处理线程只通过这些单例访问硬件。
   LTDMCDriver motion;
   Omega7Driver omega;
+  JodellGripperDriver gripper;
   const bool motionOk = motion.initialize();
   const int leftOpenId = envIntValue("APPSTATION_OMEGA7_LEFT_OPEN_ID", 0);
   const int rightOpenId = envIntValue("APPSTATION_OMEGA7_RIGHT_OPEN_ID", 1);
   const bool swapHands = envBoolValue("APPSTATION_OMEGA7_SWAP_HANDS", false);
   omega.initialize(leftOpenId, rightOpenId, swapHands);
+  NativeTeleopController nativeTeleop(motion, omega, gripper);
 
   MotionControlThread motionThread(motion);
   if (motionOk) {
@@ -698,9 +903,9 @@ int main() {
     }
     // 每个 TCP 连接使用独立线程，避免慢速 keep-alive 客户端阻塞其他调用方。
     // WS 桥接层会长期占用一个连接，UI 命令则可能从其他线程发起。
-    std::thread([client, &motion, &omega, &started]() {
+    std::thread([client, &motion, &omega, &nativeTeleop, &gripper, &started]() {
       try {
-        serveConnection(client, motion, omega, started);
+        serveConnection(client, motion, omega, nativeTeleop, gripper, started);
       } catch (...) {
         closesocket(client);
       }
@@ -710,6 +915,7 @@ int main() {
   std::cerr << "HalServer currently supports Windows Winsock only.\n";
 #endif
 
+  nativeTeleop.stop();
   motionThread.stop();
   return 0;
 }

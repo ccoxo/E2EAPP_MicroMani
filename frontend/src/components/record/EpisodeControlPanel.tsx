@@ -30,7 +30,6 @@ const HINTS = [
   { key: '1/2/3', desc: '速度粗/中/细' },
   { key: 'T', desc: '力觉 Tare' },
   { key: 'R', desc: '回工作原点' },
-  { key: 'F12', desc: '硬件急停' },
   { key: 'P', desc: '暂停遥操作' },
 ]
 

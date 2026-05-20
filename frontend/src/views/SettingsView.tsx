@@ -47,6 +47,8 @@ import {
   stopMotionSide,
   fetchGripperTeleopStatus,
   mockMode,
+  type ApiCommandError,
+  type MotionOriginCaptureDrift,
 } from '../api'
 import { refreshCameraStream } from '../hooks/useLiveCameraSnapshot'
 import {
@@ -88,7 +90,7 @@ interface PendingComparison {
   current: ActionCompareItem[]
   proposed: ActionCompareItem[]
   confirmText: string
-  onConfirm: () => void | Promise<void>
+  onConfirm: () => boolean | void | Promise<boolean | void>
 }
 
 const sideOrder: RobotSide[] = ['left', 'right']
@@ -146,6 +148,23 @@ function tabForHardwareHash(focusHash: string) {
 
 function commandErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
+}
+
+function originDriftFromError(error: unknown): MotionOriginCaptureDrift | null {
+  const apiError = error as ApiCommandError
+  return apiError?.code === 'ORIGIN_DRIFT_CONFIRM_REQUIRED' && apiError.drift ? apiError.drift : null
+}
+
+function formatOriginDrift(drift: MotionOriginCaptureDrift) {
+  const items = drift.sides.flatMap((side) =>
+    side.axes.map((axis) => {
+      const sideLabel = side.side === 'left' ? '左' : '右'
+      const precision = axis.unit === 'um' ? 0 : 3
+      return `${sideLabel}.${axis.axis} ${axis.absDeltaUi.toFixed(precision)} ${axis.unit}`
+    }),
+  )
+  if (items.length === 0) return '未超过阈值'
+  return items.length > 4 ? `${items.slice(0, 4).join('；')}；另 ${items.length - 4} 项` : items.join('；')
 }
 
 function stateTone(state: ConnectionState) {
@@ -690,10 +709,10 @@ function MotionCard({
       setPendingMotionAction(null)
     }
   }
-  const handleCaptureOrigin = async () => {
+  const handleCaptureOrigin = async (confirmLargeDrift = false) => {
     setPendingOriginAction('capture')
     try {
-      const response = await captureMotionOrigin(side)
+      const response = await captureMotionOrigin(side, confirmLargeDrift ? { confirmLargeDrift: true } : undefined)
       const nextOrigin = response.data?.origin ?? {
         ...motionOrigin,
         leftValid: side === 'left' ? true : motionOrigin.leftValid,
@@ -704,12 +723,40 @@ function MotionCard({
         updatedAt: Date.now(),
       }
       updateConfig({ motion: { ...config.motion, origin: nextOrigin } })
-      commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel}采集零点已写入`)
+      const drift = response.data?.originCaptureDrift
+      commandLog(
+        injectLog,
+        '[HAL]',
+        drift?.requiresConfirmation
+          ? `${sideSpec.shortLabel}采集零点已确认大漂移并写入`
+          : `${sideSpec.shortLabel}采集零点已写入`,
+      )
     } catch (error) {
+      const drift = originDriftFromError(error)
+      if (!confirmLargeDrift && drift) {
+        requestComparison({
+          title: `${sideSpec.shortLabel}零点漂移过大`,
+          tone: 'danger',
+          impact: '当前位置与已有采集零点差距超过保护阈值。未再次确认前，后端不会写入新的工作原点。',
+          expected: `阈值：平移 ${drift.thresholds.translationUm.toFixed(0)} µm，旋转 ${drift.thresholds.rotationDeg.toFixed(3)}°。`,
+          current: [
+            { label: '当前状态', value: originStatusText },
+            { label: '当前位置', value: sidePositionsText || '--' },
+          ],
+          proposed: [
+            { label: '超限漂移', value: formatOriginDrift(drift) },
+            { label: '写入策略', value: '二次确认后覆盖' },
+          ],
+          confirmText: '确认覆盖零点',
+          onConfirm: () => handleCaptureOrigin(true),
+        })
+        return false
+      }
       injectLog('ERROR', `${sideSpec.shortLabel}采集零点失败：${commandErrorMessage(error)}`, '[HAL]')
     } finally {
       setPendingOriginAction(null)
     }
+    return true
   }
   const handleClearOrigin = async () => {
     setPendingOriginAction('clear')
@@ -1016,16 +1063,6 @@ function CameraCard({
       subtitle={`${previewResolution} @ ${config.cameras.fps}Hz · ${spec.lerobotKey}`}
       state={state}
       badges={<Tag color={stateTone(state)}>{previewResolution}</Tag>}
-      actions={
-        <Space wrap>
-          <Button icon={<Save size={15} />} loading={pendingCameraAction === 'apply'} onClick={requestApplyTuning}>
-            应用参数
-          </Button>
-          <Button icon={<RefreshCw size={15} />} loading={pendingCameraAction === 'reconnect'} onClick={() => void handleReconnect()}>
-            重连预览
-          </Button>
-        </Space>
-      }
     >
       {camera && <CameraPreview camera={camera} compact resolution={previewResolution} onPreviewHealthChange={setPreviewHealth} />}
       <div className="hardware-metric-grid camera-metric-grid">
@@ -1033,7 +1070,19 @@ function CameraCard({
         <MetricBox label="Frame age" value={`${(camera?.frameAgeMs ?? 0).toFixed(0)} ms`} />
         <MetricBox label="Clock skew" value={`${(camera?.timestampSkewMs ?? 0).toFixed(1)} ms`} tone={Math.abs(camera?.timestampSkewMs ?? 0) > 16 ? 'warn' : 'ok'} />
       </div>
-      <Form layout="vertical" className="hardware-form-grid hardware-form-grid-compact">
+      <div className="camera-tuning-panel">
+        <div className="camera-tuning-head">
+          <Typography.Text strong>相机参数</Typography.Text>
+          <Space className="camera-tuning-actions" wrap>
+            <Button icon={<Save size={15} />} loading={pendingCameraAction === 'apply'} onClick={requestApplyTuning}>
+              应用参数
+            </Button>
+            <Button icon={<RefreshCw size={15} />} loading={pendingCameraAction === 'reconnect'} onClick={() => void handleReconnect()}>
+              重连预览
+            </Button>
+          </Space>
+        </div>
+      <Form layout="vertical" className="hardware-form-grid hardware-form-grid-compact camera-tuning-grid">
         <Form.Item label="设备">
           <Input value={config.cameras[configField]} onChange={(event) => updateConfig({ cameras: { ...config.cameras, [configField]: event.target.value } })} />
         </Form.Item>
@@ -1098,6 +1147,7 @@ function CameraCard({
           </Space>
         </Form.Item>
       </Form>
+      </div>
     </HardwareConfigCard>
   )
 }
@@ -1227,6 +1277,7 @@ function GripperCard({
   const slaveKey = side === 'left' ? 'leftSlaveId' : 'rightSlaveId'
   const enabledKey = side === 'left' ? 'leftEnabled' : 'rightEnabled'
   const gripperEnabled = Boolean(config.gripper[enabledKey])
+  const canCommandGripper = gripperEnabled || config.teleop.engine === 'hal_native'
   const gapMinKey = side === 'left' ? 'leftGapMinMm' : 'rightGapMinMm'
   const gapMaxKey = side === 'left' ? 'leftGapMaxMm' : 'rightGapMaxMm'
   const setTarget = (value: number) => updateConfig({ gripper: { ...config.gripper, [targetKey]: value } })
@@ -1266,12 +1317,14 @@ function GripperCard({
       if (teleopRunning) {
         await stopGripperTeleop()
         setTeleopRunning(false)
+        commandLog(injectLog, '[GRIPPER]', `${sideSpec.shortLabel}夹爪遥操作停止请求已发送`)
       } else {
         await startGripperTeleop()
         setTeleopRunning(true)
+        commandLog(injectLog, '[GRIPPER]', `${sideSpec.shortLabel}夹爪遥操作启动请求已发送`)
       }
-    } catch {
-      /* ignore */
+    } catch (error) {
+      injectLog('ERROR', `${sideSpec.shortLabel}夹爪遥操作切换失败：${commandErrorMessage(error)}`, '[GRIPPER]')
     }
   }
   const requestGripperTarget = () =>
@@ -1357,10 +1410,10 @@ function GripperCard({
           >
             {gripperEnabled ? '断使能' : '使能'}
           </Button>
-          <Button disabled={!gripperEnabled} onClick={requestGripperTarget}>执行目标</Button>
-          <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'open')}>打开</Button>
-          <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'close')}>闭合</Button>
-          <Button disabled={!gripperEnabled} icon={<RotateCcw size={15} />} onClick={() => setTargetAndRun('回零', 0)}>
+          <Button disabled={!canCommandGripper} onClick={requestGripperTarget}>执行目标</Button>
+          <Button disabled={!canCommandGripper} onClick={() => issueManualGripperMove(side, 'open')}>打开</Button>
+          <Button disabled={!canCommandGripper} onClick={() => issueManualGripperMove(side, 'close')}>闭合</Button>
+          <Button disabled={!canCommandGripper} icon={<RotateCcw size={15} />} onClick={() => setTargetAndRun('回零', 0)}>
             回零
           </Button>
           <Button icon={<Square size={15} />} onClick={() => issueManualGripperMove(side, 'stop')}>
@@ -1395,7 +1448,7 @@ function GripperCard({
               <InputNumber min={0} max={1} step={0.05} value={gt.closeThreshold} onChange={(v) => setGt({ closeThreshold: Number(v ?? 0.7) })} />
             </Form.Item>
             <Form.Item label="夹持速度">
-              <InputNumber min={1} max={255} value={gt.gripSpeed} onChange={(v) => setGt({ gripSpeed: Number(v ?? 128) })} />
+              <InputNumber min={1} max={255} value={gt.gripSpeed} onChange={(v) => setGt({ gripSpeed: Number(v ?? 255) })} />
             </Form.Item>
             <Form.Item label="夹持力矩">
               <InputNumber min={1} max={255} value={gt.gripTorque} onChange={(v) => setGt({ gripTorque: Number(v ?? 192) })} />
@@ -2112,6 +2165,7 @@ function ManualGripperControl({
   const slaveKey = side === 'left' ? 'leftSlaveId' : 'rightSlaveId'
   const enabledKey = side === 'left' ? 'leftEnabled' : 'rightEnabled'
   const gripperEnabled = Boolean(config.gripper[enabledKey])
+  const canCommandGripper = gripperEnabled || config.teleop.engine === 'hal_native'
   const setTarget = (value: number) => updateConfig({ gripper: { ...config.gripper, [targetKey]: value } })
   const currentText = formatGripperPosition(currentMm)
   const jawMm = safeGripperPosition(currentMm)
@@ -2169,10 +2223,10 @@ function ManualGripperControl({
             <Button type={gripperEnabled ? 'default' : 'primary'} icon={<PlugZap size={15} />} onClick={() => issueManualGripperMove(side, gripperEnabled ? 'disable' : 'enable')}>
               {gripperEnabled ? '断使能' : '使能'}
             </Button>
-            <Button disabled={!gripperEnabled} onClick={requestGripperTarget}>执行目标</Button>
-            <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'open')}>打开</Button>
-            <Button disabled={!gripperEnabled} onClick={() => issueManualGripperMove(side, 'close')}>闭合</Button>
-            <Button disabled={!gripperEnabled} icon={<RotateCcw size={15} />} onClick={() => issueManualGripperMove(side, 'home')}>回零</Button>
+            <Button disabled={!canCommandGripper} onClick={requestGripperTarget}>执行目标</Button>
+            <Button disabled={!canCommandGripper} onClick={() => issueManualGripperMove(side, 'open')}>打开</Button>
+            <Button disabled={!canCommandGripper} onClick={() => issueManualGripperMove(side, 'close')}>闭合</Button>
+            <Button disabled={!canCommandGripper} icon={<RotateCcw size={15} />} onClick={() => issueManualGripperMove(side, 'home')}>回零</Button>
             <Button icon={<Square size={15} />} onClick={() => issueManualGripperMove(side, 'stop')}>停止</Button>
           </div>
         </div>
@@ -2430,8 +2484,10 @@ export function SettingsView() {
     if (!pendingComparison) return
     setComparisonRunning(true)
     try {
-      await pendingComparison.onConfirm()
-      setPendingComparison(null)
+      const result = await pendingComparison.onConfirm()
+      if (result !== false) {
+        setPendingComparison(null)
+      }
     } finally {
       setComparisonRunning(false)
     }

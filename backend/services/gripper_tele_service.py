@@ -111,8 +111,8 @@ class FollowGripper:
     ) -> tuple[float, int] | None:
         now = time.monotonic() * 1000.0 if now_ms is None else now_ms
         raw_position = min(max(int(raw_position), 0), 255)
-        deadband = max(0, int(cfg.get("positionDeadbandCounts", 2)))
-        min_interval_ms = max(0.0, float(cfg.get("minCommandIntervalMs", 50)))
+        deadband = max(0, int(cfg.get("positionDeadbandCounts", 1)))
+        min_interval_ms = max(0.0, float(cfg.get("minCommandIntervalMs", 20)))
         changed = self._last_raw_position is None or abs(raw_position - self._last_raw_position) >= deadband
         interval_elapsed = (
             self._last_raw_position is not None
@@ -245,7 +245,7 @@ class GripperTeleService:
                         config,
                         side,
                         "target",
-                        int(gt_cfg.get("gripSpeed", 128)),
+                        int(gt_cfg.get("gripSpeed", 255)),
                         int(gt_cfg.get("gripTorque", 192)),
                         target_mm,
                     )

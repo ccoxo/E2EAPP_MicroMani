@@ -183,6 +183,8 @@ export type ManualGripperCommand = 'enable' | 'disable' | 'open' | 'close' | 'ho
 export type PicoVisionCameraSource = CameraTelemetry['key']
 export type PicoVisionRotation = 'none' | 'cw90' | 'ccw90' | '180'
 export type Omega7StabilityMode = 'track' | 'hold' | 'off'
+export type TeleopEngine = 'hal_native' | 'python_mapper'
+export type TeleopControlMode = 'velocity_admittance' | 'incremental_position'
 
 export type RecorderPhase = 'idle' | 'recording' | 'resetting' | 'saving' | 'finishing'
 
@@ -449,6 +451,14 @@ export interface AppConfig {
     cameraSource: PicoVisionCameraSource
   }
   teleop: {
+    engine: TeleopEngine
+    controlMode: TeleopControlMode
+    nativeLoopHz: number
+    nativeTranslationDeadzoneM: number
+    nativeTranslationFullScaleM: number
+    nativeRotationDeadzoneDeg: number
+    nativeRotationFullScaleDeg: number
+    nativeVelocitySmoothingMs: number
     coarse: number
     medium: number
     fine: number
@@ -463,6 +473,7 @@ export interface AppConfig {
     leftForceFeedback: boolean
     rightForceFeedback: boolean
     strategyVersion: string
+    mappingMode: 'direct' | 'legacy'
     swapHands: boolean
     swapTeleopChannels: boolean
     leftTranslationScale: number
@@ -488,6 +499,12 @@ export interface AppConfig {
     rotationMaxVelocityDegS: number
     motionProfileAccSec: number
     motionProfileDecSec: number
+    continuousIncrementMode: boolean
+    translationInputEpsilon: number
+    rotationInputEpsilon: number
+    translationMinActivePulse: number
+    rotationMinActivePulse: number
+    continuousMicroConfirmTicks: number
     diagLog: boolean
     leftEnabledAxes: boolean[]
     rightEnabledAxes: boolean[]

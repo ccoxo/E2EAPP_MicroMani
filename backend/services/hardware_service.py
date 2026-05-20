@@ -15,7 +15,7 @@ class HardwareService:
         self.settings = settings
         self.logs = logs
         self.cameras = OpenCVCameraDriver(logs)
-        self.force = NidaqForceDriver()
+        self.force = NidaqForceDriver(logs)
         self.gripper = Rs485GripperDriver()
         self.pico = PicoAdbDriver()
 
@@ -33,7 +33,12 @@ class HardwareService:
             },
             "force": {"ok": force.ok, "message": force.message},
             "gripper": (
-                {"ok": gripper.ok, "message": gripper.message}
+                {
+                    "ok": gripper.ok,
+                    "message": gripper.message,
+                    "details": gripper.details,
+                    "ports": gripper.details.get("ports", []),
+                }
                 if gripper is not None
                 else {"ok": None, "message": "managed by gripper workers"}
             ),

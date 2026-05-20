@@ -64,6 +64,33 @@ def test_gripper_selects_and_closes_configured_port_per_command(monkeypatch: Mon
     ]
 
 
+def test_gripper_probe_releases_each_configured_port(monkeypatch: MonkeyPatch) -> None:
+    config = default_config()
+    driver = Rs485GripperDriver()
+
+    class FakeDll:
+        def __init__(self) -> None:
+            self.serial_calls: list[tuple[int, int, bool]] = []
+
+        def serialOperation(self, port: int, baudrate: int, status: bool) -> int:
+            self.serial_calls.append((port, baudrate, status))
+            return 1
+
+    fake = FakeDll()
+    monkeypatch.setattr(driver, "_load_dll", lambda active_config: fake)
+
+    result = driver.probe(config)
+
+    assert result.ok is True
+    assert fake.serial_calls == [
+        (8, 115200, True),
+        (8, 115200, False),
+        (9, 115200, True),
+        (9, 115200, False),
+    ]
+    assert driver._active_port is None
+
+
 def test_gripper_diagnose_checks_port_enable_and_position_without_motion(monkeypatch: MonkeyPatch) -> None:
     config = default_config()
     driver = Rs485GripperDriver()
