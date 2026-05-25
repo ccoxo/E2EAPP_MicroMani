@@ -65,7 +65,8 @@ bool JodellGripperDriver::commandTarget(
     double targetMm,
     int speed,
     int torque,
-    std::string* message) {
+    std::string* message,
+    bool readPosition) {
   std::scoped_lock lock(mutex_);
   if (!config_.enabled) {
     if (message) {
@@ -117,10 +118,12 @@ bool JodellGripperDriver::commandTarget(
     }
     return false;
   }
-  const int currentRaw = getClawCurrentLocation_(slave);
-  if (currentRaw >= 0) {
-    positionMm_[index] = stroke * (1.0 - std::clamp(currentRaw, 0, 255) / 255.0);
-    out << ", current=" << currentRaw << ", positionMm=" << positionMm_[index];
+  if (readPosition) {
+    const int currentRaw = getClawCurrentLocation_(slave);
+    if (currentRaw >= 0) {
+      positionMm_[index] = stroke * (1.0 - std::clamp(currentRaw, 0, 255) / 255.0);
+      out << ", current=" << currentRaw << ", positionMm=" << positionMm_[index];
+    }
   }
   if (message) {
     *message = out.str();
@@ -135,6 +138,58 @@ bool JodellGripperDriver::commandTarget(
 #endif
 }
 
+bool JodellGripperDriver::readPositionMm(Side side, std::string* message) {
+  std::scoped_lock lock(mutex_);
+  if (!config_.enabled) {
+    if (message) {
+      *message = "native gripper teleop disabled";
+    }
+    return false;
+  }
+  std::string loadMessage;
+  if (!ensureLoadedUnlocked(&loadMessage)) {
+    lastError_ = loadMessage;
+    if (message) {
+      *message = loadMessage;
+    }
+    return false;
+  }
+
+  const int index = sideIndex(side);
+  const int port = portNumber(config_.ports[index]);
+  const int slave = config_.slaveIds[index];
+  if (!selectPortUnlocked(port, message)) {
+    return false;
+  }
+
+#ifdef _WIN32
+  const int currentRaw = getClawCurrentLocation_(slave);
+  if (currentRaw < 0) {
+    std::ostringstream out;
+    out << "getClawCurrentLocation failed " << portLabel(port) << ", slave=" << slave << ", ret=" << currentRaw;
+    lastError_ = out.str();
+    if (message) {
+      *message = lastError_;
+    }
+    return false;
+  }
+  const double stroke = std::max(0.001, config_.strokeMm);
+  positionMm_[index] = stroke * (1.0 - std::clamp(currentRaw, 0, 255) / 255.0);
+  if (message) {
+    std::ostringstream out;
+    out << "position " << portLabel(port) << ", slave=" << slave
+        << ", current=" << currentRaw << ", positionMm=" << positionMm_[index];
+    *message = out.str();
+  }
+  return true;
+#else
+  if (message) {
+    *message = "Jodell gripper position unavailable outside Windows";
+  }
+  return false;
+#endif
+}
+
 std::array<double, 2> JodellGripperDriver::targetMm() const {
   std::scoped_lock lock(mutex_);
   return targetMm_;
@@ -142,6 +197,14 @@ std::array<double, 2> JodellGripperDriver::targetMm() const {
 
 std::array<double, 2> JodellGripperDriver::positionMm() const {
   std::scoped_lock lock(mutex_);
+  return positionMm_;
+}
+
+std::array<double, 2> JodellGripperDriver::positionMmSnapshot(std::array<double, 2> fallback) const {
+  std::unique_lock lock(mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return fallback;
+  }
   return positionMm_;
 }
 

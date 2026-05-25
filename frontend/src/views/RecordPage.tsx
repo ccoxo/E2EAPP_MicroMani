@@ -3,12 +3,13 @@ import CameraPanel from '../components/record/CameraPanel'
 import EpisodeControlPanel from '../components/record/EpisodeControlPanel'
 import EpisodeHistoryCard from '../components/record/EpisodeHistoryCard'
 import HardwareStatusCard from '../components/record/HardwareStatusCard'
+import KalmanFilterCard from '../components/record/KalmanFilterCard'
 import PreCheckModal from '../components/record/PreCheckModal'
 import QualityReportModal from '../components/record/QualityReportModal'
 import RecordTelemetryPanel from '../components/record/RecordTelemetryPanel'
 import SafetyMonitorCard from '../components/record/SafetyMonitorCard'
 import { useTelemetryStore } from '../stores/telemetry'
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export default function RecordPage() {
   const [preCheckVisible, setPreCheckVisible] = useState(false)
 
@@ -34,10 +35,12 @@ export default function RecordPage() {
   const handleSkipReset = useCallback(() => skipRecordReset(), [skipRecordReset])
 
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
+   /** 处理对应的用户交互。 */
+   const handleKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement
       const tag = target.tagName
       if (['INPUT', 'TEXTAREA', 'SELECT'].includes(tag) || target.isContentEditable) return
+      if (e.repeat) return
       if (preCheckVisible || latestReport) return
 
       const phase = useTelemetryStore.getState().recordSession.phase
@@ -115,6 +118,7 @@ export default function RecordPage() {
 
         <div className="record-page-side">
           <SafetyMonitorCard />
+          <KalmanFilterCard />
           <HardwareStatusCard />
           <EpisodeHistoryCard />
         </div>

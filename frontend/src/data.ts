@@ -218,6 +218,20 @@ export const defaultRightSoftLimits = {
   yaw: { min: -7000, max: 7000 },
 }
 
+export const defaultRotationWorkLimits = {
+  enabled: true,
+  left: {
+    roll: { min: -90, max: 90 },
+    pitch: { min: -90, max: 90 },
+    yaw: { min: -7, max: 7 },
+  },
+  right: {
+    roll: { min: -90, max: 90 },
+    pitch: { min: -90, max: 90 },
+    yaw: { min: -7, max: 7 },
+  },
+}
+
 export const defaultKinematics = {
   source: 'QSerialTest/config.ini',
   axisOrder: ['x', 'y', 'z', 'roll', 'pitch', 'yaw'],
@@ -399,7 +413,7 @@ export const defaultConfig: AppConfig = {
     jogStepDeg: 0.05,
     yawSoftLimitDeg: 7,
     positionSource: 'dmc_get_position',
-    workOriginStrategyVersion: 'icf_work_origin_20260519',
+    workOriginStrategyVersion: 'icf_work_origin_20260521_rotation_limit_v2',
     origin: {
       valid: true,
       leftValid: true,
@@ -420,6 +434,7 @@ export const defaultConfig: AppConfig = {
     rightProfile: structuredClone(defaultMotionProfile),
     leftSoftLimits: structuredClone(defaultLeftSoftLimits),
     rightSoftLimits: structuredClone(defaultRightSoftLimits),
+    rotationWorkLimits: structuredClone(defaultRotationWorkLimits),
     kinematics: structuredClone(defaultKinematics),
   },
   gripper: {
@@ -490,6 +505,24 @@ export const defaultConfig: AppConfig = {
     nativeRotationDeadzoneDeg: 2,
     nativeRotationFullScaleDeg: 30,
     nativeVelocitySmoothingMs: 40,
+    kalmanFilterEnabled: false,
+    kalmanBeta: 0.05,
+    kalmanMinVariance: 1e-12,
+    kalmanMaxVariance: 100,
+    kalmanDtMinSec: 0.001,
+    kalmanDtMaxSec: 0.05,
+    kalmanTranslationPositionVariance: 1e-8,
+    kalmanTranslationVelocityVariance: 1e-4,
+    kalmanTranslationMeasurementVariance: 1e-8,
+    kalmanTranslationProcessPositionVariance: 1e-10,
+    kalmanTranslationProcessVelocityVariance: 1e-8,
+    kalmanRotationPositionVariance: 0.25,
+    kalmanRotationVelocityVariance: 4,
+    kalmanRotationMeasurementVariance: 0.04,
+    kalmanRotationProcessPositionVariance: 1e-4,
+    kalmanRotationProcessVelocityVariance: 1e-3,
+    kalmanTranslationIntentVelocityThreshold: 0.0005,
+    kalmanRotationIntentVelocityThreshold: 0.5,
     coarse: 1,
     medium: 0.35,
     fine: 0.08,

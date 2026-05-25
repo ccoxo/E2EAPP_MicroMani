@@ -1,13 +1,13 @@
 import { Progress, Space, Statistic, Tag, Typography } from 'antd'
 import { Activity, AlertTriangle, ShieldCheck } from 'lucide-react'
 import type { ConnectionState } from '../../types'
-
+/** 计算对应的业务值或展示值。 */
 function scoreStatus(score: number): ConnectionState {
   if (score >= 85) return 'ok'
   if (score >= 65) return 'warn'
   return 'error'
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function ReadinessSummary({
   score,
   warningCount,

@@ -3,7 +3,7 @@ import { Database, Network, Settings, Wrench } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import type { CameraTelemetry, ConnectionState, DiagnosticItem, ProcessStatus, TelemetryFrame } from '../../types'
 import { ModuleStatusGrid, type ModuleStatus } from './ModuleStatusGrid'
-
+/** 描述当前方法的功能边界。 */
 function processState(processes: ProcessStatus[], name: ProcessStatus['name']): ConnectionState {
   const item = processes.find((proc) => proc.name === name)
   if (!item) return 'pending'
@@ -12,15 +12,15 @@ function processState(processes: ProcessStatus[], name: ProcessStatus['name']): 
   if (item.status === 'error') return 'error'
   return 'pending'
 }
-
+/** 计算对应的业务值或展示值。 */
 function diagnosticState(diagnostics: DiagnosticItem[], key: string): ConnectionState {
   return diagnostics.find((item) => item.key === key)?.status ?? 'pending'
 }
-
+/** 计算对应的业务值或展示值。 */
 function cameraByKey(cameras: CameraTelemetry[], key: CameraTelemetry['key']) {
   return cameras.find((camera) => camera.key === key)
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function PlatformOverview({
   frame,
   diagnostics,

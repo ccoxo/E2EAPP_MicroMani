@@ -19,6 +19,7 @@ afterEach(() => {
   window.localStorage.clear()
   window.history.pushState({}, '', '/')
   vi.useRealTimers()
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
 })
 
@@ -170,6 +171,56 @@ describe('AppStation M0 frontend', () => {
     expect(document.querySelector('.record-camera-placeholder-wrist_right')).toBeTruthy()
   })
 
+  it('exposes Kalman filter controls on the record page', () => {
+    window.history.pushState({}, '', '/record')
+    render(<App />)
+
+    expect(screen.getByText('卡尔曼滤波')).toBeInTheDocument()
+    expect(screen.getByText('遗忘因子 beta')).toBeInTheDocument()
+    expect(screen.getByText('平移测量方差 R')).toBeInTheDocument()
+    expect(screen.getByText('平移阈值 v_th')).toBeInTheDocument()
+    expect(screen.getByText('旋转测量方差 R')).toBeInTheDocument()
+    expect(screen.getByText('旋转阈值 v_th')).toBeInTheDocument()
+    expect(document.querySelector('.record-page-side')).toContainElement(screen.getByText('卡尔曼滤波'))
+
+    const toggle = screen.getByRole('switch', { name: '卡尔曼滤波开关' })
+    expect(toggle).not.toBeChecked()
+    fireEvent.click(toggle)
+
+    expect(useTelemetryStore.getState().config.teleop.kalmanFilterEnabled).toBe(true)
+  })
+
+  it('returns left and right slave arms to saved origins from the record controls', async () => {
+    const returnOriginSpy = vi.spyOn(api, 'returnMotionOriginSide')
+
+    window.history.pushState({}, '', '/record')
+    render(<App />)
+
+    fireEvent.click(screen.getByRole('button', { name: '左从臂回归原点' }))
+    fireEvent.click(screen.getByRole('button', { name: '右从臂回归原点' }))
+
+    await waitFor(() => expect(returnOriginSpy).toHaveBeenCalledWith('left'))
+    expect(returnOriginSpy).toHaveBeenCalledWith('right')
+  })
+
+  it('shows teleop connection, gripper teleop ports, and camera tuning controls in compact status rows', () => {
+    window.history.pushState({}, '', '/settings')
+    render(<App />)
+
+    const teleopStrips = document.querySelectorAll('.teleop-connection-strip')
+    expect(teleopStrips.length).toBeGreaterThanOrEqual(2)
+    expect(teleopStrips[0].textContent).not.toContain('COM8')
+    expect(teleopStrips[0].textContent).not.toContain('COM9')
+
+    const gripperTeleopStrips = document.querySelectorAll('.gripper-teleop-strip')
+    expect(gripperTeleopStrips.length).toBeGreaterThanOrEqual(2)
+    expect(gripperTeleopStrips[0].textContent).toContain('COM8')
+    expect(gripperTeleopStrips[0].textContent).toContain('slave 10')
+
+    const cameraRows = document.querySelectorAll('.camera-tuning-control-row')
+    expect(cameraRows.length).toBeGreaterThanOrEqual(6)
+  })
+
   it('runs the record precheck, save, and quality report flow', async () => {
     useTelemetryStore.setState((state) => ({
       config: {
@@ -212,6 +263,103 @@ describe('AppStation M0 frontend', () => {
     await waitFor(() => expect(screen.getByText(/Episode #000/)).toBeInTheDocument())
     fireEvent.click(screen.getByText('接受并继续').closest('button')!)
     await waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('resetting'))
+  })
+
+  it('starts the UI record timer only after the backend creates the session', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-05-22T00:00:00.000Z'))
+
+    let resolveCreateSession: (value: api.RecordSessionCommandResponse) => void = () => undefined
+    const createSessionPromise = new Promise<api.RecordSessionCommandResponse>((resolve) => {
+      resolveCreateSession = resolve
+    })
+    vi.spyOn(api, 'fetchRecordStatus').mockResolvedValue({ active: false, recording: false })
+    const createSessionSpy = vi.spyOn(api, 'createSession').mockReturnValue(createSessionPromise)
+
+    useTelemetryStore.getState().startRecordSession('micro_assembly_v1', 'Assemble ICF target component')
+
+    await vi.waitFor(() =>
+      expect(createSessionSpy).toHaveBeenCalledWith('micro_assembly_v1', 'Assemble ICF target component'),
+    )
+    expect(useTelemetryStore.getState().recording).toBe(false)
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('starting')
+    expect(useTelemetryStore.getState().recordSession.phaseStartedAt).toBeNull()
+    expect(useTelemetryStore.getState().recordSession.recorderElapsedS).toBe(0)
+    expect(useTelemetryStore.getState().recordSession.recorderTotalS).toBe(-1)
+
+    vi.setSystemTime(new Date('2026-05-22T00:00:02.000Z'))
+    resolveCreateSession({ ok: true })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(useTelemetryStore.getState().recording).toBe(true)
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('recording')
+    expect(useTelemetryStore.getState().recordSession.phaseStartedAt).toBe(Date.now())
+  })
+
+  it('saves the latest Kalman config before creating a record session', async () => {
+    let resolveConfigSave: (value: typeof defaultConfig) => void = () => undefined
+    const configSavePromise = new Promise<typeof defaultConfig>((resolve) => {
+      resolveConfigSave = resolve
+    })
+    vi.spyOn(api, 'fetchRecordStatus').mockResolvedValue({ active: false, recording: false })
+    const putConfigSpy = vi.spyOn(api, 'putConfig').mockReturnValue(configSavePromise)
+    const createSessionSpy = vi.spyOn(api, 'createSession').mockResolvedValue({ ok: true })
+
+    act(() => {
+      useTelemetryStore.setState((state) => ({
+        config: {
+          ...state.config,
+          teleop: { ...state.config.teleop, kalmanFilterEnabled: true },
+        },
+      }))
+    })
+
+    useTelemetryStore.getState().startRecordSession('micro_assembly_v1', 'Assemble ICF target component')
+
+    await waitFor(() =>
+      expect(putConfigSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          teleop: expect.objectContaining({ kalmanFilterEnabled: true }),
+        }),
+      ),
+    )
+    expect(createSessionSpy).not.toHaveBeenCalled()
+
+    resolveConfigSave(structuredClone(useTelemetryStore.getState().config))
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(createSessionSpy).toHaveBeenCalledWith('micro_assembly_v1', 'Assemble ICF target component')
+  })
+
+  it('aligns the UI record timer to the backend recorder elapsed time', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-05-22T00:00:02.000Z'))
+
+    vi.spyOn(api, 'fetchRecordStatus').mockResolvedValue({ active: false, recording: false })
+    vi.spyOn(api, 'createSession').mockResolvedValue({
+      ok: true,
+      data: {
+        active: true,
+        recording: true,
+        elapsedS: 0.55,
+        frameCount: 16,
+        fps: 30,
+      },
+      ts: Date.now(),
+    })
+
+    useTelemetryStore.getState().startRecordSession('micro_assembly_v1', 'Assemble ICF target component')
+
+    await vi.waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('recording'))
+    const session = useTelemetryStore.getState().recordSession
+    expect(session.phase).toBe('recording')
+    expect(session.recorderElapsedS).toBeCloseTo(0.55, 3)
+    expect(session.recorderFrameCount).toBe(16)
+    expect(session.recorderFps).toBe(30)
+    expect(Date.now() - (session.phaseStartedAt ?? 0)).toBeGreaterThanOrEqual(550)
   })
 
   it('blocks record precheck until Omega.7 and gripper diagnostics are recognized', async () => {
@@ -288,7 +436,7 @@ describe('AppStation M0 frontend', () => {
     expect(confirmButton).toBeDisabled()
   })
 
-  it('finishes the record session after a save finishes when Esc is pressed during saving', async () => {
+  it('keeps the quality report visible when finish is pressed during saving, then finishes after acceptance', async () => {
     useTelemetryStore.setState((state) => ({
       recording: true,
       recordSession: {
@@ -304,7 +452,70 @@ describe('AppStation M0 frontend', () => {
     })
 
     expect(useTelemetryStore.getState().recordSession.phase).toBe('saving')
+    await waitFor(() => expect(useTelemetryStore.getState().recordSession.latestQualityReport).not.toBeNull())
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('reviewing')
+    expect(useTelemetryStore.getState().recording).toBe(false)
+
+    act(() => {
+      useTelemetryStore.getState().acceptRecordQualityReport()
+    })
+
     await waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('idle'))
+    expect(useTelemetryStore.getState().recording).toBe(false)
+  })
+
+  it('ignores reset skip unless the record workflow is resetting', () => {
+    useTelemetryStore.setState((state) => ({
+      recording: false,
+      recordSession: {
+        ...state.recordSession,
+        phase: 'idle',
+        phaseStartedAt: null,
+      },
+    }))
+
+    act(() => {
+      useTelemetryStore.getState().skipRecordReset()
+    })
+
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('idle')
+    expect(useTelemetryStore.getState().recording).toBe(false)
+  })
+
+  it('ignores quality report acceptance when no report is pending', () => {
+    useTelemetryStore.setState((state) => ({
+      recording: false,
+      recordSession: {
+        ...state.recordSession,
+        phase: 'saving',
+        latestQualityReport: null,
+      },
+    }))
+
+    act(() => {
+      useTelemetryStore.getState().acceptRecordQualityReport()
+    })
+
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('saving')
+    expect(useTelemetryStore.getState().recordSession.latestQualityReport).toBeNull()
+  })
+
+  it('does not skip reset from a repeated Space shortcut after saving', () => {
+    window.history.pushState({}, '', '/record')
+    render(<App />)
+    useTelemetryStore.setState((state) => ({
+      recording: false,
+      recordSession: {
+        ...state.recordSession,
+        phase: 'resetting',
+        phaseStartedAt: Date.now(),
+        latestQualityReport: null,
+      },
+    }))
+
+    fireEvent.keyDown(window, { key: ' ', repeat: true })
+
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('resetting')
     expect(useTelemetryStore.getState().recording).toBe(false)
   })
 
@@ -342,7 +553,7 @@ describe('AppStation M0 frontend', () => {
 
   it('formats backend command errors with detail codes and messages', () => {
     expect(formatApiErrorMessage(409, { detail: { code: 'RECORDING_BUSY', message: 'record session already active' } })).toBe(
-      'command failed: 409 RECORDING_BUSY: record session already active',
+      '录制会话已在运行，请先结束当前会话后再开始新的录制。（409 RECORDING_BUSY）',
     )
   })
 

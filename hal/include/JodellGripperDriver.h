@@ -25,9 +25,17 @@ class JodellGripperDriver {
   ~JodellGripperDriver();
 
   void configure(const JodellGripperConfig& config);
-  bool commandTarget(Side side, double targetMm, int speed, int torque, std::string* message = nullptr);
+  bool commandTarget(
+      Side side,
+      double targetMm,
+      int speed,
+      int torque,
+      std::string* message = nullptr,
+      bool readPosition = true);
+  bool readPositionMm(Side side, std::string* message = nullptr);
   std::array<double, 2> targetMm() const;
   std::array<double, 2> positionMm() const;
+  std::array<double, 2> positionMmSnapshot(std::array<double, 2> fallback) const;
   std::string lastError() const;
 
  private:

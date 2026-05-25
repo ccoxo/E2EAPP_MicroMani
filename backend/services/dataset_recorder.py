@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import importlib
@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from backend.core.config import SettingsService
-from backend.core.logging import LogService, now_ms
+from backend.core.logging import LogService, now_ms, stable_config_hash
 from backend.core.units import lerobot_to_ui_state, pulses_to_ui_state
 from backend.hal_client.client import HalClient
 from backend.services.hardware_service import HardwareService
@@ -80,7 +80,7 @@ SOURCE_KEYS: tuple[str, ...] = (
     "omega",
 )
 SOURCE_TIMEOUT_S: dict[str, float] = {
-    "hal": 0.020,
+    "hal": 0.050,
     "force": 0.020,
     "omega": 0.020,
     **{source: 0.035 for source in CAMERA_SOURCE_KEYS.values()},
@@ -112,6 +112,8 @@ ACTION_STALE_S = 1.0
 HAL_NATIVE_SAMPLE_HZ = 1000.0
 OMEGA_NATIVE_SAMPLE_HZ = 100.0
 CRITICAL_ALIGNMENT_SOURCE_KEYS: tuple[str, ...] = ("hal", "force", "gripper", "omega")
+NATIVE_DATA_FILE_SIZE_MB = 10240
+NATIVE_VIDEO_FILE_SIZE_MB = 20480
 
 
 class DatasetSaveError(RuntimeError):
@@ -214,8 +216,6 @@ class LeRobotWriterThread:
                     raise RuntimeError(self._error)
                 if self._dataset is not None:
                     self._dataset.save_episode(parallel_encoding=True)
-                    self._dataset.finalize()
-                    self._dataset = self._recorder._resume_native_dataset_locked()
                 command.future.set_result(self._native_total_frames())
             elif command.kind == "clear_episode":
                 if self._dataset is not None:
@@ -435,6 +435,7 @@ class DatasetRecorderService:
         self._write_enqueue_idle.set()
         self._session_active = False
         self._recording = False
+        self._samplers_paused = False
         self._session_id = ""
         self._dataset_id = ""
         self._dataset_name = ""
@@ -544,6 +545,7 @@ class DatasetRecorderService:
         async with self._lock:
             episode = self._finalize_episode_locked(status="review", deleted=False)
             self._last_saved_episode = episode
+            self._samplers_paused = True
             self.telemetry.episode_count = self._episode_index + 1
         await self.teleop.stop("recording")
         self.logs.info("[LEROBOT]", f"record episode saved: {episode['id']}")
@@ -579,14 +581,8 @@ class DatasetRecorderService:
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
-            was_recording = self._recording
-            if was_recording:
-                self._recording = False
-                self.telemetry.recording = False
-        if was_recording:
-            await self._drain_recording_queues()
-            if self._native_writer_active():
-                await self._clear_native_episode_buffer()
+            if self._recording or self._last_saved_episode is None:
+                raise RuntimeError("record reset is not ready")
         async with self._lock:
             self._last_saved_episode = None
             self._begin_episode_locked()
@@ -1196,6 +1192,9 @@ class DatasetRecorderService:
         sample_index = 0
         while self._session_active and not self._sampler_stop_event.is_set():
             try:
+                if getattr(self, "_samplers_paused", False):
+                    self._sampler_stop_event.wait(0.02)
+                    continue
                 config = self._recording_config()
                 start_s = self._sampler_start_monotonic_s
                 if start_s <= 0.0:
@@ -1987,6 +1986,7 @@ class DatasetRecorderService:
         if not self._native_writer_active():
             raise DatasetSaveError(self._native_required_message())
         self._native_dataset_from_index = self._native_total_frames_cached
+        self._samplers_paused = False
         self._recording = True
 
     def _finalize_episode_locked(self, *, status: str, deleted: bool) -> dict[str, Any]:
@@ -1999,6 +1999,7 @@ class DatasetRecorderService:
         episode_id = f"episode_{self._episode_index:06d}"
         skew = self._skew_stats()
         source_skew = self._source_skew_stats()
+        config_snapshot = self.settings.get_config()
         # 每个 episode 独立统计质量指标，保存或丢弃时可以精确回滚。
         episode = {
             "id": episode_id,
@@ -2029,6 +2030,7 @@ class DatasetRecorderService:
             "maxForceLeft": round(self._max_force_left, 6),
             "maxForceRight": round(self._max_force_right, 6),
             "warnings": self._quality_warnings(),
+            "motionOrigin": self._episode_motion_origin_snapshot(config_snapshot),
         }
         episodes = self._read_episodes(dataset_dir)
         episodes = [item for item in episodes if str(item.get("id")) != episode_id]
@@ -2039,9 +2041,24 @@ class DatasetRecorderService:
         if info:
             if native:
                 info["updatedAt"] = now_ms()
-                self._write_appstation_info(dataset_dir, self.settings.get_config())
+                self._write_appstation_info(dataset_dir, config_snapshot)
         self._episode_index += 1
         return episode
+
+    # 原地位置快照
+    def _episode_motion_origin_snapshot(self, config_snapshot: dict[str, Any]) -> dict[str, Any]:
+        motion = config_snapshot.get("motion", {}) if isinstance(config_snapshot.get("motion"), dict) else {}
+        origin = motion.get("origin", {}) if isinstance(motion.get("origin"), dict) else {}
+        return {
+            "leftValid": bool(origin.get("leftValid", origin.get("valid", False))),
+            "rightValid": bool(origin.get("rightValid", origin.get("valid", False))),
+            "valid": bool(origin.get("valid", False)),
+            "leftPulse": list(origin.get("leftPulse", [0.0] * 6))[:6],
+            "rightPulse": list(origin.get("rightPulse", [0.0] * 6))[:6],
+            "updatedAt": int(origin.get("updatedAt", 0) or 0),
+            "positionSource": motion.get("positionSource", ""),
+            "configHash": stable_config_hash(config_snapshot),
+        }
 
     def _mark_saved_episode_deleted_locked(self, episode: dict[str, Any]) -> None:
         """处理录制服务逻辑：_mark_saved_episode_deleted_locked。"""
@@ -2127,6 +2144,7 @@ class DatasetRecorderService:
                 metadata_buffer_size=1,
                 **self._native_writer_kwargs(),
             )
+            self._configure_native_chunk_settings(dataset)
             dataset.finalize()
             self._write_appstation_info(dataset_dir, config)
             return True
@@ -2196,6 +2214,7 @@ class DatasetRecorderService:
                     metadata_buffer_size=1,
                     **self._native_writer_kwargs(),
                 )
+            self._configure_native_chunk_settings(dataset)
             return dataset
         except Exception as exc:  # noqa: BLE001
             self._native_error = str(exc)
@@ -2281,6 +2300,15 @@ class DatasetRecorderService:
             "encoder_threads": self._native_encoder_threads(),
         }
 
+    def _configure_native_chunk_settings(self, dataset: Any) -> None:
+        meta = getattr(dataset, "meta", None)
+        update_chunk_settings = getattr(meta, "update_chunk_settings", None)
+        if callable(update_chunk_settings):
+            update_chunk_settings(
+                data_files_size_in_mb=NATIVE_DATA_FILE_SIZE_MB,
+                video_files_size_in_mb=NATIVE_VIDEO_FILE_SIZE_MB,
+            )
+
     def _native_encoder_queue_maxsize(self) -> int:
         raw = os.environ.get("APPSTATION_LEROBOT_ENCODER_QUEUE_MAXSIZE", "180").strip()
         try:
@@ -2309,11 +2337,13 @@ class DatasetRecorderService:
         if self._dataset_dir is None:
             raise RuntimeError("record dataset is not initialized")
         LeRobotDataset, _np = imports
-        return LeRobotDataset.resume(
+        dataset = LeRobotDataset.resume(
             repo_id=f"local/{self._dataset_id}",
             root=self._dataset_dir,
             **self._native_writer_kwargs(),
         )
+        self._configure_native_chunk_settings(dataset)
+        return dataset
 
     def _is_native_dataset_info(self, info: dict[str, Any]) -> bool:
         """处理录制服务逻辑：_is_native_dataset_info。"""
@@ -2468,6 +2498,7 @@ class DatasetRecorderService:
             "sourceMaxSkewMs": episode.get("sourceMaxSkewMs", {}),
             "maxForceLeft": float(episode.get("maxForceLeft", 0.0)),
             "maxForceRight": float(episode.get("maxForceRight", 0.0)),
+            "motionOrigin": episode.get("motionOrigin", {}),
             "features": features,
             "featureSummary": features,
             "cameraResolutions": camera_resolutions,

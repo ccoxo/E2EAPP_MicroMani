@@ -10,17 +10,19 @@ const CAMERA_REFRESH_EVENT = 'appstation-camera-refresh'
 interface CameraRefreshEventDetail {
   camera?: CameraTelemetry['key']
 }
-
+/** 描述当前方法的功能边界。 */
 export function useLiveCameraSnapshot(cameraKey: CameraTelemetry['key'], health?: CameraTelemetry['health']) {
   const [snapshotUrl, setSnapshotUrl] = useState<string | null>(null)
   const [failedCamera, setFailedCamera] = useState<CameraTelemetry['key'] | null>(null)
   const [imageLoaded, setImageLoaded] = useState(false)
   const [refreshNonce, setRefreshNonce] = useState(0)
+  const [manualRefreshCamera, setManualRefreshCamera] = useState<CameraTelemetry['key'] | null>(null)
   const frameTimer = useRef<number | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const objectUrls = useRef<Set<string>>(new Set())
-  const liveImageEnabled = !mockMode && health !== 'pending' && health !== 'error'
-  const previewHealth: CameraTelemetry['health'] = !liveImageEnabled
+  const requestSnapshotsEnabled = !mockMode && (health !== 'error' || manualRefreshCamera === cameraKey)
+  const liveImageEnabled = requestSnapshotsEnabled
+  const previewHealth: CameraTelemetry['health'] = !requestSnapshotsEnabled
     ? health === 'error'
       ? 'error'
       : 'pending'
@@ -59,8 +61,9 @@ export function useLiveCameraSnapshot(cameraKey: CameraTelemetry['key'], health?
     clearFrameTimer()
     clearAbort()
     setFailedCamera(null)
+    setManualRefreshCamera(cameraKey)
     setRefreshNonce((nonce) => nonce + 1)
-  }, [clearAbort, clearFrameTimer])
+  }, [cameraKey, clearAbort, clearFrameTimer])
 
   useEffect(() => {
     return () => {
@@ -71,7 +74,8 @@ export function useLiveCameraSnapshot(cameraKey: CameraTelemetry['key'], health?
   }, [clearAbort, clearFrameTimer, clearObjectUrls])
 
   useEffect(() => {
-    const handleRefresh = (event: Event) => {
+   /** 处理对应的用户交互。 */
+   const handleRefresh = (event: Event) => {
       const detail = (event as CustomEvent<CameraRefreshEventDetail>).detail
       if (detail?.camera && detail.camera !== cameraKey) return
       refreshStream()
@@ -83,12 +87,14 @@ export function useLiveCameraSnapshot(cameraKey: CameraTelemetry['key'], health?
   useEffect(() => {
     clearFrameTimer()
     clearAbort()
-    if (!liveImageEnabled) {
+    if (!requestSnapshotsEnabled) {
       return undefined
     }
 
     let cancelled = false
-    const requestSnapshot = async () => {
+    const shouldContinuePolling = health !== 'error'
+   /** 处理对应的用户交互。 */
+   const requestSnapshot = async () => {
       clearFrameTimer()
       clearAbort()
       const controller = new AbortController()
@@ -109,13 +115,17 @@ export function useLiveCameraSnapshot(cameraKey: CameraTelemetry['key'], health?
           return nextUrl
         })
         setFailedCamera(null)
-        setImageLoaded(true)
-        frameTimer.current = window.setTimeout(requestSnapshot, CAMERA_SNAPSHOT_INTERVAL_MS)
+        setImageLoaded(false)
+        if (shouldContinuePolling) {
+          frameTimer.current = window.setTimeout(requestSnapshot, CAMERA_SNAPSHOT_INTERVAL_MS)
+        }
       } catch {
         if (cancelled) return
         setFailedCamera(cameraKey)
         setImageLoaded(false)
-        frameTimer.current = window.setTimeout(requestSnapshot, CAMERA_RETRY_DELAY_MS)
+        if (shouldContinuePolling) {
+          frameTimer.current = window.setTimeout(requestSnapshot, CAMERA_RETRY_DELAY_MS)
+        }
       } finally {
         window.clearTimeout(timeout)
         if (abortRef.current === controller) {
@@ -130,7 +140,7 @@ export function useLiveCameraSnapshot(cameraKey: CameraTelemetry['key'], health?
       clearFrameTimer()
       clearAbort()
     }
-  }, [cameraKey, clearAbort, clearFrameTimer, liveImageEnabled, refreshNonce, revokeObjectUrlSoon])
+  }, [cameraKey, clearAbort, clearFrameTimer, health, requestSnapshotsEnabled, refreshNonce, revokeObjectUrlSoon])
 
   const handleLoad = useCallback(() => {
     setFailedCamera(null)
@@ -150,7 +160,7 @@ export function useLiveCameraSnapshot(cameraKey: CameraTelemetry['key'], health?
     handleError,
   }
 }
-
+/** 从后端读取对应数据。 */
 export function refreshCameraStream(camera?: CameraTelemetry['key']) {
   window.dispatchEvent(new CustomEvent<CameraRefreshEventDetail>(CAMERA_REFRESH_EVENT, { detail: { camera } }))
 }

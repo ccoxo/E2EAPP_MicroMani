@@ -10,6 +10,13 @@ from typing import Any, Literal
 from backend.core.config import SettingsService
 from backend.core.defaults import ICF_KINEMATICS_DEFAULTS, ICF_TELEOP_DEFAULTS
 from backend.core.logging import LogService, now_ms
+from backend.core.motion_limits import (
+    WorkOriginMissing,
+    effective_limit_arrays,
+    mechanical_limit_arrays,
+    rotation_work_limit_arrays,
+    rotation_work_limit_enabled,
+)
 from backend.core.units import motion_pulse_per_unit
 from backend.hal_client.client import HalClient
 
@@ -22,12 +29,13 @@ DEFAULT_ROTATION_STEP_DEG = 0.2
 DEFAULT_AXIS_OUTPUT_SCALE = [1.0] * 6
 DEFAULT_ENABLED_AXES = [True] * 6
 NATIVE_STATUS_SUMMARY_LOG_INTERVAL_MS = 5000
+NATIVE_STATUS_POLL_INTERVAL_S = 0.2
 
 
 class TeleopMappingService:
     """Continuous Omega.7 to slave-arm mapper used during recording."""
 
-    _NATIVE_GRIPPER_SOURCES = {"manual-gripper", "recording", "teleop-connect"}
+    _NATIVE_GRIPPER_SOURCES = {"manual-gripper", "recording"}
 
     def __init__(self, settings: SettingsService, hal: HalClient, logs: LogService) -> None:
         self.settings = settings
@@ -66,8 +74,17 @@ class TeleopMappingService:
         mode = self._hal_mode(config)
         if mode == "real" and self._native_engine(config):
             if self._task is not None and not self._task.done():
+                source_was_present = source in self._arm_sources
                 self._arm_sources.add(source)
-                await self._configure_and_start_native(config)
+                try:
+                    if source == "teleop-connect":
+                        await self._start_native(config)
+                    else:
+                        await self._configure_and_start_native(config)
+                except Exception:
+                    if not source_was_present:
+                        self._arm_sources.discard(source)
+                    raise
                 return self.status()
             if pre_home:
                 await self._return_to_work_origin_before_start(config, home_side)
@@ -84,7 +101,20 @@ class TeleopMappingService:
                 self._last_action = None
                 self._last_native_diag_action_key = ""
                 self._native_status_cache = {}
-            await self._configure_and_start_native(config)
+            try:
+                await self._configure_and_start_native(config)
+            except Exception:
+                self._arm_sources.discard(source)
+                if not self._arm_sources:
+                    self._armed_at_ms = None
+                    self._reset_all_tracking()
+                    self._last_action = None
+                    self._action_history.clear()
+                    self._last_blockers = {}
+                    self._last_error = ""
+                    self._last_native_diag_action_key = ""
+                    self._native_status_cache = {}
+                raise
             self._stop_event = asyncio.Event()
             self._task = asyncio.create_task(self._run_native_status_loop(), name="hal-native-teleop-status")
             self._log_teleop_mode(config, op_id, source, "start", native=True)
@@ -160,12 +190,17 @@ class TeleopMappingService:
         )
         self.logs.info("[HAL]", f"teleop pre-start {side} return-to-work-origin completed")
 
-    async def stop(self, source: str = "recording") -> dict[str, Any]:
+    async def stop(self, source: str = "recording", *, restart_remaining: bool = True) -> dict[str, Any]:
         config = self.settings.get_config() if self.settings is not None else {}
+        source_was_present = source in self._arm_sources
         self._arm_sources.discard(source)
         if self._native_engine(config):
+            task_running = self._task is not None and not self._task.done()
+            if not source_was_present and not self._arm_sources and self._armed_at_ms is None and not task_running:
+                return self.status()
             if self._arm_sources:
-                await self._configure_and_start_native(config)
+                if restart_remaining:
+                    await self._configure_and_start_native(config)
                 return self.status()
             self._armed_at_ms = None
             self._reset_all_tracking()
@@ -264,13 +299,17 @@ class TeleopMappingService:
                     self.logs.error("[HAL]", f"HAL-native teleop status recovered: {message}")
                     self._last_error = message
                     self._last_error_at = now
-            await asyncio.sleep(max(0.01, self._command_interval_s(self.settings.get_config())))
+            await asyncio.sleep(
+                max(NATIVE_STATUS_POLL_INTERVAL_S, self._command_interval_s(self.settings.get_config()))
+            )
 
     async def _configure_and_start_native(self, config: dict[str, Any]) -> None:
         payload = self._native_payload(config)
         await self.hal.command("teleop.native.configure", payload)
         await self.hal.command("teleop.native.start", payload)
-        await self._refresh_native_status()
+
+    async def _start_native(self, config: dict[str, Any]) -> None:
+        await self.hal.command("teleop.native.start", self._native_payload(config))
 
     async def _refresh_native_status(self) -> None:
         hal_result = await self.hal.command("teleop.native.status", {})
@@ -404,7 +443,7 @@ class TeleopMappingService:
             enabled_axes,
         )
         sync_zero_delta_target = True
-        soft_limit_min, soft_limit_max = self._soft_limit_arrays(target_side, config)
+        soft_limit_min, soft_limit_max = self._effective_limit_arrays(target_side, config)
         payload = {
             "side": target_side,
             "deltas": {axis: deltas[idx] for idx, axis in enumerate(AXES)},
@@ -1125,6 +1164,78 @@ class TeleopMappingService:
             "nativeRotationDeadzoneDeg": float(teleop.get("nativeRotationDeadzoneDeg", 2.0)),
             "nativeRotationFullScaleDeg": float(teleop.get("nativeRotationFullScaleDeg", 30.0)),
             "nativeVelocitySmoothingMs": float(teleop.get("nativeVelocitySmoothingMs", 40.0)),
+            "kalmanFilterEnabled": bool(teleop.get("kalmanFilterEnabled", False)),
+            "kalmanBeta": float(teleop.get("kalmanBeta", ICF_TELEOP_DEFAULTS["kalmanBeta"])),
+            "kalmanMinVariance": float(teleop.get("kalmanMinVariance", ICF_TELEOP_DEFAULTS["kalmanMinVariance"])),
+            "kalmanMaxVariance": float(teleop.get("kalmanMaxVariance", ICF_TELEOP_DEFAULTS["kalmanMaxVariance"])),
+            "kalmanDtMinSec": float(teleop.get("kalmanDtMinSec", ICF_TELEOP_DEFAULTS["kalmanDtMinSec"])),
+            "kalmanDtMaxSec": float(teleop.get("kalmanDtMaxSec", ICF_TELEOP_DEFAULTS["kalmanDtMaxSec"])),
+            "kalmanTranslationPositionVariance": float(
+                teleop.get(
+                    "kalmanTranslationPositionVariance",
+                    ICF_TELEOP_DEFAULTS["kalmanTranslationPositionVariance"],
+                )
+            ),
+            "kalmanTranslationVelocityVariance": float(
+                teleop.get(
+                    "kalmanTranslationVelocityVariance",
+                    ICF_TELEOP_DEFAULTS["kalmanTranslationVelocityVariance"],
+                )
+            ),
+            "kalmanTranslationMeasurementVariance": float(
+                teleop.get(
+                    "kalmanTranslationMeasurementVariance",
+                    ICF_TELEOP_DEFAULTS["kalmanTranslationMeasurementVariance"],
+                )
+            ),
+            "kalmanTranslationProcessPositionVariance": float(
+                teleop.get(
+                    "kalmanTranslationProcessPositionVariance",
+                    ICF_TELEOP_DEFAULTS["kalmanTranslationProcessPositionVariance"],
+                )
+            ),
+            "kalmanTranslationProcessVelocityVariance": float(
+                teleop.get(
+                    "kalmanTranslationProcessVelocityVariance",
+                    ICF_TELEOP_DEFAULTS["kalmanTranslationProcessVelocityVariance"],
+                )
+            ),
+            "kalmanRotationPositionVariance": float(
+                teleop.get("kalmanRotationPositionVariance", ICF_TELEOP_DEFAULTS["kalmanRotationPositionVariance"])
+            ),
+            "kalmanRotationVelocityVariance": float(
+                teleop.get("kalmanRotationVelocityVariance", ICF_TELEOP_DEFAULTS["kalmanRotationVelocityVariance"])
+            ),
+            "kalmanRotationMeasurementVariance": float(
+                teleop.get(
+                    "kalmanRotationMeasurementVariance",
+                    ICF_TELEOP_DEFAULTS["kalmanRotationMeasurementVariance"],
+                )
+            ),
+            "kalmanRotationProcessPositionVariance": float(
+                teleop.get(
+                    "kalmanRotationProcessPositionVariance",
+                    ICF_TELEOP_DEFAULTS["kalmanRotationProcessPositionVariance"],
+                )
+            ),
+            "kalmanRotationProcessVelocityVariance": float(
+                teleop.get(
+                    "kalmanRotationProcessVelocityVariance",
+                    ICF_TELEOP_DEFAULTS["kalmanRotationProcessVelocityVariance"],
+                )
+            ),
+            "kalmanTranslationIntentVelocityThreshold": float(
+                teleop.get(
+                    "kalmanTranslationIntentVelocityThreshold",
+                    ICF_TELEOP_DEFAULTS["kalmanTranslationIntentVelocityThreshold"],
+                )
+            ),
+            "kalmanRotationIntentVelocityThreshold": float(
+                teleop.get(
+                    "kalmanRotationIntentVelocityThreshold",
+                    ICF_TELEOP_DEFAULTS["kalmanRotationIntentVelocityThreshold"],
+                )
+            ),
             "translationDeadzone": float(teleop.get("translationDeadzone", 0.00002)),
             "rotationDeadzone": float(teleop.get("rotationDeadzone", ICF_TELEOP_DEFAULTS["rotationDeadzone"])),
             "incrementalTranslationMinEffectiveDelta": self._incremental_translation_min_effective_delta(config),
@@ -1163,6 +1274,11 @@ class TeleopMappingService:
             "leftSoftLimitMax": self._soft_limit_arrays("left", config)[1],
             "rightSoftLimitMin": self._soft_limit_arrays("right", config)[0],
             "rightSoftLimitMax": self._soft_limit_arrays("right", config)[1],
+            "rotationWorkLimitEnabled": rotation_work_limit_enabled(config),
+            "leftRotationWorkLimitMin": self._rotation_work_limit_arrays("left", config)[0],
+            "leftRotationWorkLimitMax": self._rotation_work_limit_arrays("left", config)[1],
+            "rightRotationWorkLimitMin": self._rotation_work_limit_arrays("right", config)[0],
+            "rightRotationWorkLimitMax": self._rotation_work_limit_arrays("right", config)[1],
             "leftWorkOriginValid": self._work_origin_valid("left", config),
             "rightWorkOriginValid": self._work_origin_valid("right", config),
             "leftWorkOriginPulse": self._work_origin_pulse("left", config),
@@ -1449,20 +1565,16 @@ class TeleopMappingService:
         return [bool(value) for value in raw]
 
     def _soft_limit_arrays(self, side: SideName, config: dict[str, Any]) -> tuple[list[float], list[float]]:
-        teleop = config.get("teleop", {})
-        min_key = f"{side}SoftLimitMin"
-        max_key = f"{side}SoftLimitMax"
-        default_mins = [float(value) for value in ICF_TELEOP_DEFAULTS[min_key]]
-        default_maxes = [float(value) for value in ICF_TELEOP_DEFAULTS[max_key]]
-        if not isinstance(teleop, dict):
-            return default_mins, default_maxes
-        mins = self._coerce_teleop_soft_limit_array(teleop.get(min_key))
-        maxes = self._coerce_teleop_soft_limit_array(teleop.get(max_key))
-        if mins is None or maxes is None:
-            return default_mins, default_maxes
-        if any(min_value >= max_value for min_value, max_value in zip(mins, maxes, strict=True)):
-            return default_mins, default_maxes
-        return mins, maxes
+        return mechanical_limit_arrays(config, side)
+
+    def _effective_limit_arrays(self, side: SideName, config: dict[str, Any]) -> tuple[list[float], list[float]]:
+        try:
+            return effective_limit_arrays(config, side)
+        except WorkOriginMissing as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    def _rotation_work_limit_arrays(self, side: SideName, config: dict[str, Any]) -> tuple[list[float], list[float]]:
+        return rotation_work_limit_arrays(config, side)
 
     def _target_side_for_source(self, side: SideName, config: dict[str, Any]) -> SideName:
         teleop = config.get("teleop", {})

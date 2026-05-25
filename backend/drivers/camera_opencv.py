@@ -46,6 +46,7 @@ CAMERA_STALE_FRAME_SEC = 2.0
 CAMERA_INITIAL_FRAME_GRACE_SEC = 1.5
 CAMERA_FRAME_WAIT_SEC = 1.5
 CAMERA_FPS_WINDOW_SEC = 1.0
+CAMERA_RELEASE_JOIN_SEC = 2.0
 CAMERA_TUNING_DEFAULTS: dict[str, dict[str, float | bool]] = {
     "global": {
         "autoExposure": False,
@@ -232,12 +233,23 @@ def _backend_candidates(cv2: Any) -> list[tuple[int, str]]:
     return ordered
 
 
+def _camera_release_join_sec() -> float:
+    raw = os.environ.get("APPSTATION_CAMERA_RELEASE_JOIN_SEC", "").strip()
+    if not raw:
+        return CAMERA_RELEASE_JOIN_SEC
+    try:
+        return max(0.1, float(raw))
+    except ValueError:
+        return CAMERA_RELEASE_JOIN_SEC
+
+
 class OpenCVCameraDriver:
     def __init__(self, logs: Any | None = None) -> None:
         self._logs = logs
         self._last_probe = 0.0
         self._cached: CameraProbeResult | None = None
         self._capture_lock = Lock()
+        self._resolved_lock = Lock()
         self._captures: dict[int, Any] = {}
         self._capture_sizes: dict[int, tuple[int, int, float]] = {}
         self._capture_opened_at: dict[int, float] = {}
@@ -514,7 +526,7 @@ class OpenCVCameraDriver:
         fps_config = float(config["cameras"].get("fps", 30))
         configured = self._resolved_indices(cv2, config, fps_config, max_index=max_index)
         devices: list[dict[str, Any]] = []
-        for index in range(max_index):
+        for index in self._candidate_camera_indices(max_index):
             started = time.perf_counter()
             roles = [role for role, role_index in configured.items() if role_index == index]
             probe_role = roles[0] if roles else "global"
@@ -594,6 +606,20 @@ class OpenCVCameraDriver:
                 return int(token)
         return fallback
 
+    def _candidate_camera_indices(self, max_index: int) -> list[int]:
+        identities = self._camera_identities_by_index()
+        if not identities:
+            return list(range(max_index))
+        return [
+            index
+            for index, identity in sorted(identities.items())
+            if 0 <= index < max_index and not self._is_directshow_software_source(identity)
+        ]
+
+    def _is_directshow_software_source(self, identity: dict[str, str]) -> bool:
+        descriptor = " ".join([identity.get("devicePath", ""), identity.get("displayName", "")]).lower()
+        return "@device:sw:" in descriptor
+
     def _resolved_indices(
         self,
         cv2: Any,
@@ -601,6 +627,17 @@ class OpenCVCameraDriver:
         fps: float,
         *,
         max_index: int = 10,
+    ) -> dict[str, int]:
+        with self._resolved_lock:
+            return self._resolved_indices_locked(cv2, config, fps, max_index=max_index)
+
+    def _resolved_indices_locked(
+        self,
+        cv2: Any,
+        config: dict[str, Any],
+        fps: float,
+        *,
+        max_index: int,
     ) -> dict[str, int]:
         cameras = config["cameras"]
         cache_key = (
@@ -627,6 +664,7 @@ class OpenCVCameraDriver:
             for role, config_key in CAMERA_DESCRIPTOR_KEYS.items()
         }
         resolved.update(self._resolve_indices_by_identity(cameras))
+        resolved = self._remap_software_sources(resolved, max_index)
         wrist_indices = {resolved["wrist_left"], resolved["wrist_right"]}
         if resolved["global"] < 0 or resolved["global"] in wrist_indices:
             readable = self._discover_readable_indices(cv2, *CAMERA_CAPTURE_SIZES["global"], fps, max_index)
@@ -678,11 +716,33 @@ class OpenCVCameraDriver:
             for index, identity in identities.items():
                 if index in used_indices:
                     continue
+                if self._is_directshow_software_source(identity):
+                    continue
                 if _identity_matches(expected, identity):
                     resolved[role] = index
                     used_indices.add(index)
                     break
         return resolved
+
+    def _remap_software_sources(self, resolved: dict[str, int], max_index: int) -> dict[str, int]:
+        identities = self._camera_identities_by_index()
+        if not identities:
+            return resolved
+
+        next_resolved = dict(resolved)
+        available = self._candidate_camera_indices(max_index)
+        for role in ("global", "wrist_left", "wrist_right"):
+            index = next_resolved.get(role, -1)
+            if not self._is_directshow_software_source(identities.get(index, {})):
+                continue
+            used = {
+                other_index
+                for other_role, other_index in next_resolved.items()
+                if other_role != role and other_index >= 0
+            }
+            replacement = next((candidate for candidate in available if candidate not in used), -1)
+            next_resolved[role] = replacement
+        return next_resolved
 
     def _camera_identities_by_index(self) -> dict[int, dict[str, str]]:
         if os.name != "nt":
@@ -743,7 +803,7 @@ class OpenCVCameraDriver:
 
     def _discover_readable_indices(self, cv2: Any, width: int, height: int, fps: float, max_index: int) -> list[int]:
         readable: list[int] = []
-        for index in range(max_index):
+        for index in self._candidate_camera_indices(max_index):
             with self._capture_lock:
                 capture = self._get_capture(cv2, index, width, height, fps)
             if capture is None:
@@ -772,7 +832,8 @@ class OpenCVCameraDriver:
             return capture
         if capture is not None:
             self._log("warning", f"camera index {index} reopening; stale or mismatched capture")
-        self._drop_capture(index)
+        if not self._drop_capture(index):
+            return None
 
         capture = None
         backend_label = ""
@@ -997,17 +1058,31 @@ class OpenCVCameraDriver:
             parsed = fallback
         return min(high, max(low, parsed))
 
-    def _drop_capture(self, index: int) -> None:
+    def _drop_capture(self, index: int) -> bool:
+        for stops in (self._reader_stops, self._encode_stops):
+            stop = stops.get(index)
+            if stop is not None:
+                stop.set()
+        timeout_s = _camera_release_join_sec()
+        reader = self._reader_threads.get(index)
+        encoder = self._encode_threads.get(index)
+        for thread in (reader, encoder):
+            if thread is not None and thread.is_alive() and thread is not current_thread():
+                thread.join(timeout=timeout_s)
+        if reader is not None and reader.is_alive() and reader is not current_thread():
+            self._stale_indices.add(index)
+            self._log("warning", f"camera index {index} release deferred; reader thread did not stop")
+            return False
         for stops, threads in (
             (self._reader_stops, self._reader_threads),
             (self._encode_stops, self._encode_threads),
         ):
-            stop = stops.pop(index, None)
-            if stop is not None:
-                stop.set()
-            thread = threads.pop(index, None)
-            if thread is not None and thread.is_alive() and thread is not current_thread():
-                thread.join(timeout=0.3)
+            stop = stops.get(index)
+            thread = threads.get(index)
+            if stop is not None and (thread is None or not thread.is_alive() or thread is current_thread()):
+                stops.pop(index, None)
+            if thread is not None and (not thread.is_alive() or thread is current_thread()):
+                threads.pop(index, None)
         capture = self._captures.pop(index, None)
         self._capture_sizes.pop(index, None)
         self._capture_opened_at.pop(index, None)
@@ -1027,6 +1102,7 @@ class OpenCVCameraDriver:
         self._frame_events.pop(index, None)
         if capture is not None:
             capture.release()
+        return True
 
     def _start_reader(self, cv2: Any, index: int, capture: Any) -> None:
         if index in self._reader_threads:

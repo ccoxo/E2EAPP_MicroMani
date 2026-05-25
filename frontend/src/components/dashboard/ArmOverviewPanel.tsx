@@ -6,23 +6,23 @@ import { CameraPreview } from '../CameraPreview'
 import { ForceChart } from '../Charts'
 import { MetricPill } from '../MetricPill'
 import { ModuleStatusGrid, type ModuleStatus } from './ModuleStatusGrid'
-
+/** 计算对应的业务值或展示值。 */
 function diagnosticState(diagnostics: DiagnosticItem[], key: string): ConnectionState {
   return diagnostics.find((item) => item.key === key)?.status ?? 'pending'
 }
-
+/** 计算对应的业务值或展示值。 */
 function cameraByKey(cameras: CameraTelemetry[], key: CameraTelemetry['key']) {
   return cameras.find((camera) => camera.key === key)
 }
-
+/** 计算对应的业务值或展示值。 */
 function forceMagnitude(values: number[]) {
   return Math.sqrt(values.slice(0, 3).reduce((sum, value) => sum + value * value, 0))
 }
-
+/** 格式化对应数值用于界面展示。 */
 function formatGripperPosition(value: number | undefined) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? `${value.toFixed(1)} mm` : '不可用'
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function ArmOverviewPanel({
   side,
   frame,

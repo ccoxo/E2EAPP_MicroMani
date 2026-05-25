@@ -92,6 +92,13 @@ std::string jsonMotionState(const appstation::hal::MotionState& state) {
     }
     out << (state.axes[i].enabled ? "true" : "false");
   }
+  out << "],\"moving\":[";
+  for (size_t i = 0; i < state.axes.size(); ++i) {
+    if (i > 0) {
+      out << ",";
+    }
+    out << (state.axes[i].moving ? "true" : "false");
+  }
   out << "]}";
   return out.str();
 }
@@ -543,6 +550,12 @@ appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& bo
   };
   config.softLimits[0] = jsonAxisLimits(body, "leftSoftLimitMin", "leftSoftLimitMax", defaultLimits);
   config.softLimits[1] = jsonAxisLimits(body, "rightSoftLimitMin", "rightSoftLimitMax", defaultLimits);
+  config.rotationWorkLimitEnabled =
+      jsonBoolValue(body, "rotationWorkLimitEnabled", config.rotationWorkLimitEnabled);
+  config.rotationWorkLimits[0] =
+      jsonAxisLimits(body, "leftRotationWorkLimitMin", "leftRotationWorkLimitMax", config.rotationWorkLimits[0]);
+  config.rotationWorkLimits[1] =
+      jsonAxisLimits(body, "rightRotationWorkLimitMin", "rightRotationWorkLimitMax", config.rotationWorkLimits[1]);
   config.workOriginValid[0] = jsonBoolValue(body, "leftWorkOriginValid", config.workOriginValid[0]);
   config.workOriginValid[1] = jsonBoolValue(body, "rightWorkOriginValid", config.workOriginValid[1]);
   config.workOriginPulse[0] = jsonNumberArray6(body, "leftWorkOriginPulse", config.workOriginPulse[0]);
@@ -573,6 +586,60 @@ appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& bo
       jsonNumberValue(body, "nativeRotationFullScaleDeg", config.nativeRotationFullScaleDeg);
   config.nativeVelocitySmoothingMs =
       jsonNumberValue(body, "nativeVelocitySmoothingMs", config.nativeVelocitySmoothingMs);
+  // kalmanFilterEnabled：从 UI/后端 payload 读取滤波开关。
+  config.kalmanFilterEnabled = jsonBoolValue(body, "kalmanFilterEnabled", config.kalmanFilterEnabled);
+  // kalmanBeta：读取遗忘因子 beta，用于 Q/R 自适应更新。
+  config.kalmanBeta = jsonNumberValue(body, "kalmanBeta", config.kalmanBeta);
+  // kalmanMinVariance：读取 P/Q/R 数值下限。
+  config.kalmanMinVariance = jsonNumberValue(body, "kalmanMinVariance", config.kalmanMinVariance);
+  // kalmanMaxVariance：读取 P/Q/R 数值上限。
+  config.kalmanMaxVariance = jsonNumberValue(body, "kalmanMaxVariance", config.kalmanMaxVariance);
+  // kalmanDtMinSec：读取滤波 dt 下限。
+  config.kalmanDtMinSec = jsonNumberValue(body, "kalmanDtMinSec", config.kalmanDtMinSec);
+  // kalmanDtMaxSec：读取滤波 dt 上限。
+  config.kalmanDtMaxSec = jsonNumberValue(body, "kalmanDtMaxSec", config.kalmanDtMaxSec);
+  // kalmanTranslationPositionVariance：读取平移轴 P00 初始方差。
+  config.kalmanTranslationPositionVariance =
+      jsonNumberValue(body, "kalmanTranslationPositionVariance", config.kalmanTranslationPositionVariance);
+  // kalmanTranslationVelocityVariance：读取平移轴 P11 初始方差。
+  config.kalmanTranslationVelocityVariance =
+      jsonNumberValue(body, "kalmanTranslationVelocityVariance", config.kalmanTranslationVelocityVariance);
+  // kalmanTranslationMeasurementVariance：读取平移轴 R 初始方差。
+  config.kalmanTranslationMeasurementVariance =
+      jsonNumberValue(body, "kalmanTranslationMeasurementVariance", config.kalmanTranslationMeasurementVariance);
+  // kalmanTranslationProcessPositionVariance：读取平移轴 Q00 初始方差。
+  config.kalmanTranslationProcessPositionVariance =
+      jsonNumberValue(
+          body,
+          "kalmanTranslationProcessPositionVariance",
+          config.kalmanTranslationProcessPositionVariance);
+  // kalmanTranslationProcessVelocityVariance：读取平移轴 Q11 初始方差。
+  config.kalmanTranslationProcessVelocityVariance =
+      jsonNumberValue(
+          body,
+          "kalmanTranslationProcessVelocityVariance",
+          config.kalmanTranslationProcessVelocityVariance);
+  // kalmanRotationPositionVariance：读取旋转轴 P00 初始方差。
+  config.kalmanRotationPositionVariance =
+      jsonNumberValue(body, "kalmanRotationPositionVariance", config.kalmanRotationPositionVariance);
+  // kalmanRotationVelocityVariance：读取旋转轴 P11 初始方差。
+  config.kalmanRotationVelocityVariance =
+      jsonNumberValue(body, "kalmanRotationVelocityVariance", config.kalmanRotationVelocityVariance);
+  // kalmanRotationMeasurementVariance：读取旋转轴 R 初始方差。
+  config.kalmanRotationMeasurementVariance =
+      jsonNumberValue(body, "kalmanRotationMeasurementVariance", config.kalmanRotationMeasurementVariance);
+  // kalmanRotationProcessPositionVariance：读取旋转轴 Q00 初始方差。
+  config.kalmanRotationProcessPositionVariance =
+      jsonNumberValue(body, "kalmanRotationProcessPositionVariance", config.kalmanRotationProcessPositionVariance);
+  // kalmanRotationProcessVelocityVariance：读取旋转轴 Q11 初始方差。
+  config.kalmanRotationProcessVelocityVariance =
+      jsonNumberValue(body, "kalmanRotationProcessVelocityVariance", config.kalmanRotationProcessVelocityVariance);
+  // kalmanTranslationIntentVelocityThreshold：读取平移轴意图速度阈值 v_th。
+  config.kalmanTranslationIntentVelocityThreshold =
+      jsonNumberValue(body, "kalmanTranslationIntentVelocityThreshold", config.kalmanTranslationIntentVelocityThreshold);
+  // kalmanRotationIntentVelocityThreshold：读取旋转轴意图速度阈值 v_th。
+  config.kalmanRotationIntentVelocityThreshold =
+      jsonNumberValue(body, "kalmanRotationIntentVelocityThreshold", config.kalmanRotationIntentVelocityThreshold);
   config.translationDeadzoneM = jsonNumberValue(body, "translationDeadzone", config.translationDeadzoneM);
   config.rotationDeadzoneDeg = jsonNumberValue(body, "rotationDeadzone", config.rotationDeadzoneDeg);
   config.incrementalTranslationMinEffectiveDeltaM = jsonNumberValue(

@@ -184,7 +184,16 @@ bool ignoreUnsupportedSevonWriteFailure(
   return side == appstation::hal::Side::Right && usesSevonPin(side, axis) && ret == 2;
 }
 
-double clipTeleopTargetToLimit(double targetUi, const AxisLimit& limit) {
+double clipTeleopTargetToLimit(double baseUi, double targetUi, const AxisLimit& limit) {
+  if (limit.min > limit.max) {
+    return baseUi;
+  }
+  if (baseUi < limit.min) {
+    return targetUi > baseUi ? (std::min)(targetUi, limit.max) : baseUi;
+  }
+  if (baseUi > limit.max) {
+    return targetUi < baseUi ? (std::max)(targetUi, limit.min) : baseUi;
+  }
   return std::clamp(targetUi, limit.min, limit.max);
 }
 
@@ -827,7 +836,7 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
     const auto limit = limits[axisIndex];
     const auto unclippedTargetPulse = basePulse + static_cast<double>(deltaPulse);
     const auto unclippedTargetUi = pulseToUi(unclippedTargetPulse, side, axis);
-    const auto targetUi = clipTeleopTargetToLimit(unclippedTargetUi, limit);
+    const auto targetUi = clipTeleopTargetToLimit(baseUi, unclippedTargetUi, limit);
     const auto targetPulse = uiToPulse(targetUi, side, axis);
     const auto updateTargetPulse = static_cast<long>(std::llround(targetPulse));
     const auto appliedTargetPulse = static_cast<double>(updateTargetPulse);

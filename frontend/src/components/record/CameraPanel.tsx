@@ -8,13 +8,13 @@ const cameraSpecs = {
   wrist_left: { label: '左腕', title: '左腕相机', model: 'IMX258' },
   wrist_right: { label: '右腕', title: '右腕相机', model: 'IMX258' },
 } as const
-
+/** 计算对应的业务值或展示值。 */
 const cameraResolution = (config: AppConfig, kind: keyof typeof cameraSpecs) => {
   if (kind === 'global') return config.cameras.globalResolution ?? config.cameras.previewResolution
   if (kind === 'wrist_left') return config.cameras.wristLeftResolution ?? config.cameras.previewResolution
   return config.cameras.wristRightResolution ?? config.cameras.previewResolution
 }
-
+/** 计算对应的业务值或展示值。 */
 const getFpsColor = (hz: number) => {
   if (hz >= 25) return '#52c41a'
   if (hz >= 20) return '#E65100'
@@ -26,7 +26,7 @@ interface CameraSlotProps {
   camera: CameraTelemetry | undefined
   resolution: string
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 function CameraSlot({ kind, camera, resolution }: CameraSlotProps) {
   const spec = cameraSpecs[kind]
   const fps = camera?.fps ?? 0
@@ -60,7 +60,7 @@ function CameraSlot({ kind, camera, resolution }: CameraSlotProps) {
     </div>
   )
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export default function CameraPanel() {
   const cameras = useTelemetryStore((s) => s.frame.cameras)
   const config = useTelemetryStore((s) => s.config)

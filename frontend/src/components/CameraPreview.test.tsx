@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CameraPreview } from './CameraPreview'
 import type { CameraTelemetry } from '../types'
@@ -83,5 +83,46 @@ describe('CameraPreview', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     expect(screen.getByTestId('camera-image-global')).toHaveAttribute('src', 'blob:frame-1')
     expect(screen.queryByText('No signal')).not.toBeInTheDocument()
+  })
+
+  it('requests snapshots while camera telemetry is pending', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(okSnapshotResponse())
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<CameraPreview camera={{ ...camera, health: 'pending' }} compact />)
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    expect(await screen.findByTestId('camera-image-global')).toHaveAttribute('src', 'blob:frame-1')
+  })
+
+  it('allows a manual refresh to probe an errored camera', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(okSnapshotResponse())
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<CameraPreview camera={{ ...camera, health: 'error' }} compact />)
+
+    expect(fetchMock).not.toHaveBeenCalled()
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('appstation-camera-refresh', { detail: { camera: 'global' } }))
+    })
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    expect(await screen.findByTestId('camera-image-global')).toHaveAttribute('src', 'blob:frame-1')
+  })
+
+  it('reports ok only after the image element loads', async () => {
+    const handlePreviewHealthChange = vi.fn()
+    const fetchMock = vi.fn().mockResolvedValueOnce(okSnapshotResponse())
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<CameraPreview camera={camera} compact onPreviewHealthChange={handlePreviewHealthChange} />)
+
+    const image = await screen.findByTestId('camera-image-global')
+    expect(handlePreviewHealthChange).not.toHaveBeenCalledWith('ok')
+
+    fireEvent.load(image)
+
+    await waitFor(() => expect(handlePreviewHealthChange).toHaveBeenCalledWith('ok'))
   })
 })

@@ -1,7 +1,7 @@
 import { Tag, Typography } from 'antd'
 import { useTelemetryStore } from '../stores/telemetry'
 import { MetricPill } from './MetricPill'
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function StatusBar() {
   const halOk = useTelemetryStore((state) => state.frame.halOk)
   const wsOk = useTelemetryStore((state) => state.frame.wsOk)

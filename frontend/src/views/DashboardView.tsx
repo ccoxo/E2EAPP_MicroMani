@@ -11,19 +11,19 @@ import type { CameraTelemetry, ConnectionState, DiagnosticItem, TelemetryFrame, 
 
 const semanticAxes = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']
 const forceChannels = ['Fx', 'Fy', 'Fz', 'Mx', 'My', 'Mz']
-
+/** 计算对应的业务值或展示值。 */
 function diagnosticState(diagnostics: DiagnosticItem[], key: string): ConnectionState {
   return diagnostics.find((item) => item.key === key)?.status ?? 'pending'
 }
-
+/** 计算对应的业务值或展示值。 */
 function cameraByKey(cameras: CameraTelemetry[], key: CameraTelemetry['key']) {
   return cameras.find((camera) => camera.key === key)
 }
-
+/** 计算对应的业务值或展示值。 */
 function forceMagnitude(values: number[]) {
   return Math.sqrt(values.slice(0, 3).reduce((sum, value) => sum + value * value, 0))
 }
-
+/** 格式化对应数值用于界面展示。 */
 function stateText(state: ConnectionState) {
   if (state === 'ok') return '正常'
   if (state === 'warn') return '注意'
@@ -31,7 +31,7 @@ function stateText(state: ConnectionState) {
   if (state === 'checking') return '检查中'
   return '待确认'
 }
-
+/** 格式化对应数值用于界面展示。 */
 function stateTone(state: ConnectionState) {
   if (state === 'ok') return 'success'
   if (state === 'warn') return 'warning'
@@ -39,15 +39,15 @@ function stateTone(state: ConnectionState) {
   if (state === 'checking') return 'processing'
   return 'default'
 }
-
+/** 格式化对应数值用于界面展示。 */
 function formatAxisValue(value: number, index: number) {
   return index < 3 ? `${value.toFixed(1)} µm` : `${value.toFixed(2)}°`
 }
-
+/** 格式化对应数值用于界面展示。 */
 function formatForceValue(value: number, index: number) {
   return index < 3 ? `${(value * 1000).toFixed(0)}` : `${(value * 1000).toFixed(1)}`
 }
-
+/** 格式化对应数值用于界面展示。 */
 function formatGripperValue(value: number | undefined) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? `${value.toFixed(1)}mm` : '不可用'
 }
@@ -61,7 +61,7 @@ const forceReadoutGroups = [
   { key: 'force', label: '力 · mN', channels: forceChannels.slice(0, 3), start: 0 },
   { key: 'moment', label: '力矩 · mN·m', channels: forceChannels.slice(3, 6), start: 3 },
 ]
-
+/** 渲染当前界面单元，并连接所需数据。 */
 function HardwareStatusButton({
   label,
   state,
@@ -88,7 +88,7 @@ function HardwareStatusButton({
     </button>
   )
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 function DeviceChip({
   label,
   state,
@@ -110,7 +110,7 @@ function DeviceChip({
     </button>
   )
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 function GlobalHardwarePanel({
   frame,
   diagnostics,
@@ -123,7 +123,8 @@ function GlobalHardwarePanel({
   const omegaState = diagnosticState(diagnostics, 'omega7')
   const halState: ConnectionState = frame.halOk ? 'ok' : 'error'
   const safetyState: ConnectionState = frame.dangerIndex > 0.85 ? 'error' : frame.dangerIndex > 0.6 ? 'warn' : 'ok'
-  const go = (hash: string) => navigate(`/settings#${hash}`)
+ /** 描述当前方法的功能边界。 */
+ const go = (hash: string) => navigate(`/settings#${hash}`)
 
   return (
     <section className="hardware-panel global-hardware-panel">
@@ -176,7 +177,7 @@ function GlobalHardwarePanel({
     </section>
   )
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 function ArmHardwarePanel({
   side,
   frame,
@@ -204,7 +205,8 @@ function ArmHardwarePanel({
   const forceNorm = forceMagnitude(forceValues)
   const safetyState: ConnectionState = forceNorm > 2.5 || frame.dangerIndex > 0.65 ? 'warn' : 'ok'
   const gripperValue = formatGripperValue(frame.gripperPositions[isLeft ? 0 : 1])
-  const go = (hash: string) => navigate(`/settings#${hash}`)
+ /** 描述当前方法的功能边界。 */
+ const go = (hash: string) => navigate(`/settings#${hash}`)
 
   return (
     <section className="hardware-panel arm-hardware-panel">
@@ -290,7 +292,7 @@ function ArmHardwarePanel({
     </section>
   )
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function DashboardView() {
   const frame = useTelemetryStore((state) => state.frame)
   const history = useTelemetryStore((state) => state.history)

@@ -1,4 +1,5 @@
 import { Button, Card, Divider, Form, Input, Progress, Select, Spin } from 'antd'
+import { Crosshair } from 'lucide-react'
 import React from 'react'
 import { useTelemetryStore } from '../../stores/telemetry'
 
@@ -10,7 +11,9 @@ const PRESET_TASKS = [
 
 const phaseConfig = {
   idle: { label: '就绪', color: '#8c8c8c', barColor: '#d9d9d9' },
+  starting: { label: '启动中', color: '#1677ff', barColor: '#1677ff' },
   recording: { label: '录制中', color: '#cf1322', barColor: '#cf1322' },
+  reviewing: { label: '质检中', color: '#fa8c16', barColor: '#fa8c16' },
   resetting: { label: '复位中', color: '#722ed1', barColor: '#722ed1' },
   saving: { label: '保存中', color: '#1677ff', barColor: '#1677ff' },
   finishing: { label: '结束中', color: '#52c41a', barColor: '#52c41a' },
@@ -32,14 +35,14 @@ const HINTS = [
   { key: 'R', desc: '回工作原点' },
   { key: 'P', desc: '暂停遥操作' },
 ]
-
+/** 格式化对应数值用于界面展示。 */
 const formatTime = (s: number) =>
   `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(Math.floor(s % 60)).padStart(2, '0')}.${Math.floor((s % 1) * 10)}`
 
 interface EpisodeControlPanelProps {
   onStartSession: () => void
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPanelProps) {
   const phase = useTelemetryStore((s) => s.recordSession.phase)
   const elapsedS = useTelemetryStore((s) => s.recordSession.recorderElapsedS)
@@ -58,9 +61,19 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
   const tareRecordForceSensors = useTelemetryStore((s) => s.tareRecordForceSensors)
   const toggleRecordClutch = useTelemetryStore((s) => s.toggleRecordClutch)
   const setRecordSpeedMode = useTelemetryStore((s) => s.setRecordSpeedMode)
+  const returnRecordMotionOrigin = useTelemetryStore((s) => s.returnRecordMotionOrigin)
+  const [pendingOriginSide, setPendingOriginSide] = React.useState<'left' | 'right' | null>(null)
 
   const cfg = phaseConfig[phase]
-  const busy = phase === 'saving' || phase === 'finishing'
+  const busy = phase === 'starting' || phase === 'saving' || phase === 'finishing'
+  const handleReturnOrigin = async (side: 'left' | 'right') => {
+    setPendingOriginSide(side)
+    try {
+      await returnRecordMotionOrigin(side)
+    } finally {
+      setPendingOriginSide(null)
+    }
+  }
 
   return (
     <Card size="small" title="录制控制" styles={{ body: { padding: '10px 12px' } }}>
@@ -87,7 +100,7 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
 
       <Divider style={{ margin: '10px 0' }} />
 
-      <div className="record-episode-progress-head">
+      <div className="record-??-progress-head">
         <span>#{String(currentEpisode).padStart(3, '0')}</span>
         <small>
           目标 {targetEpisodes} 条 / 已完成 {savedEpisodes}
@@ -189,6 +202,28 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
           <Button size="small" onClick={() => setRecordSpeedMode('fine')}>细</Button>
         </div>
       )}
+      <Divider style={{ margin: '10px 0' }} />
+
+      <div className="record-origin-actions">
+        <Button
+          size="small"
+          icon={<Crosshair size={13} />}
+          loading={pendingOriginSide === 'left'}
+          disabled={busy}
+          onClick={() => void handleReturnOrigin('left')}
+        >
+          左从臂回归原点
+        </Button>
+        <Button
+          size="small"
+          icon={<Crosshair size={13} />}
+          loading={pendingOriginSide === 'right'}
+          disabled={busy}
+          onClick={() => void handleReturnOrigin('right')}
+        >
+          右从臂回归原点
+        </Button>
+      </div>
     </Card>
   )
 }

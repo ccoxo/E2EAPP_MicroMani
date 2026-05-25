@@ -9,6 +9,7 @@ from backend.core.defaults import default_config
 from backend.core.logging import LogService
 from backend.core.schemas import GripperCommandRequest, ManualAxisMoveRequest
 from backend.drivers.gripper_rs485 import GripperResult
+from backend.services import command_service as command_service_module
 from backend.services.command_service import CommandService
 from backend.services.gripper_worker_service import GripperWorkerService
 from backend.services.telemetry_hub import TelemetryHub
@@ -51,20 +52,33 @@ class FakeTelemetry:
 
 
 class FakeHal:
-    def __init__(self, enabled: bool = True, enabled_values: list[bool] | None = None) -> None:
+    def __init__(
+        self,
+        enabled: bool = True,
+        enabled_values: list[bool] | None = None,
+        motion_states: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.enabled = enabled
         self.enabled_values = enabled_values
+        self.motion_states = list(motion_states or [])
+        self.motion_state_calls = 0
         self.commands: list[tuple[str, dict[str, Any]]] = []
 
     async def motion_state(self) -> dict[str, Any]:
+        self.motion_state_calls += 1
         base_state = {
             "positions": [0.0] * 12,
             "pulses": [0.0] * 12,
             "estop_active": False,
+            "moving": [False] * 12,
         }
         if self.enabled_values is not None:
-            return {**base_state, "enabled": self.enabled_values}
-        return {**base_state, "enabled": [self.enabled] * 12}
+            state = {**base_state, "enabled": self.enabled_values}
+        else:
+            state = {**base_state, "enabled": [self.enabled] * 12}
+        if self.motion_states:
+            return {**state, **self.motion_states.pop(0)}
+        return state
 
     async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         self.commands.append((name, payload or {}))
@@ -75,6 +89,16 @@ class FailingHal(FakeHal):
     async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         self.commands.append((name, payload or {}))
         raise RuntimeError("serialOperation open failed COM9, ret=-1")
+
+
+class MovingAfterFirstCommandHal(FakeHal):
+    async def motion_state(self) -> dict[str, Any]:
+        state = await super().motion_state()
+        if self.commands:
+            moving = [False] * 12
+            moving[11] = True
+            return {**state, "moving": moving}
+        return state
 
 
 class FakeLogs:
@@ -292,24 +316,251 @@ def test_manual_axis_move_allows_enabled_motion_side() -> None:
     assert hal.commands[0][1]["direction"] == 1
 
 
-def test_manual_axis_move_allows_icf_single_step_pulse_limit() -> None:
+def test_manual_axis_move_uses_faster_coarse_rotation_profile() -> None:
     config = default_config()
     config["motion"]["origin"]["rightValid"] = False
+    config["motion"]["rotationWorkLimits"]["enabled"] = False
+    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -20000, "max": 20000}
     settings = FakeSettings(config)
     hal = FakeHal(enabled=True)
     service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
 
     result = asyncio.run(
         service.manual_axis_move(
-            ManualAxisMoveRequest(side="right", axis="Y", direction=1, step=10000, speedMode="fine")
+            ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=1, speedMode="coarse")
+        )
+    )
+
+    assert result["hal"]["payload"]["maxVelocityUiPerSec"] == 12
+    assert hal.commands[0][1]["maxVelocityUiPerSec"] == 12
+
+
+def test_manual_axis_move_caps_faster_coarse_rotation_profile() -> None:
+    config = default_config()
+    config["motion"]["origin"]["rightValid"] = False
+    config["motion"]["rotationWorkLimits"]["enabled"] = False
+    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -20000, "max": 20000}
+    config["motion"]["rightProfile"]["rotation"]["maxSpeed"] = 30
+    settings = FakeSettings(config)
+    hal = FakeHal(enabled=True)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    result = asyncio.run(
+        service.manual_axis_move(
+            ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=1, speedMode="coarse")
+        )
+    )
+
+    assert result["hal"]["payload"]["maxVelocityUiPerSec"] == 30
+    assert hal.commands[0][1]["maxVelocityUiPerSec"] == 30
+
+
+def test_manual_axis_move_allows_hal_translation_single_step_limit() -> None:
+    config = default_config()
+    config["motion"]["origin"]["rightValid"] = False
+    config["motion"]["rotationWorkLimits"]["enabled"] = False
+    settings = FakeSettings(config)
+    hal = FakeHal(enabled=True)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    result = asyncio.run(
+        service.manual_axis_move(
+            ManualAxisMoveRequest(side="right", axis="Y", direction=1, step=5000, speedMode="fine")
         )
     )
 
     assert result["hal"]["command"] == "motion.manual_axis_move"
-    assert result["hal"]["payload"]["step"] == 10000
+    assert result["hal"]["payload"]["step"] == 5000
 
 
-def test_manual_axis_move_rejects_step_above_icf_single_step_pulse_limit() -> None:
+def test_manual_axis_move_chunks_coarse_rotation_above_hal_single_step_limit() -> None:
+    config = default_config()
+    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -20000, "max": 20000}
+    config["motion"]["rotationWorkLimits"]["enabled"] = False
+    config["motion"]["rightProfile"]["rotation"]["maxSpeed"] = 30
+    config["motion"]["rightProfile"]["rotation"]["accTimeSec"] = 0.001
+    config["motion"]["rightProfile"]["rotation"]["decTimeSec"] = 0.001
+    config["motion"]["rotationWorkLimits"]["right"]["yaw"] = {"min": -20, "max": 20}
+    settings = FakeSettings(config)
+    hal = FakeHal(enabled=True)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    result = asyncio.run(
+        service.manual_axis_move(
+            ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=10, speedMode="coarse")
+        )
+    )
+
+    assert result["chunkCount"] == 5
+    assert result["chunkSteps"] == [2, 2, 2, 2, 2]
+    assert [payload["step"] for command, payload in hal.commands if command == "motion.manual_axis_move"] == [
+        2,
+        2,
+        2,
+        2,
+        2,
+    ]
+
+
+def test_manual_axis_move_rejects_coarse_rotation_above_chunked_limit() -> None:
+    config = default_config()
+    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -20000, "max": 20000}
+    config["motion"]["rotationWorkLimits"]["enabled"] = False
+    config["motion"]["rotationWorkLimits"]["right"]["yaw"] = {"min": -20, "max": 20}
+    settings = FakeSettings(config)
+    hal = FakeHal(enabled=True)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    try:
+        asyncio.run(
+            service.manual_axis_move(
+                ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=10.1, speedMode="coarse")
+            )
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected coarse rotation step above chunked cap to fail")
+
+    assert "manual Yaw step must be <= 10.000 degree" in message
+    assert hal.commands == []
+
+
+def test_manual_axis_move_rejects_medium_rotation_step_above_hal_single_step_limit() -> None:
+    config = default_config()
+    config["motion"]["origin"]["rightValid"] = False
+    settings = FakeSettings(config)
+    hal = FakeHal(enabled=True)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    try:
+        asyncio.run(
+            service.manual_axis_move(
+                ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=2.1, speedMode="medium")
+            )
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected medium rotation step above HAL cap to fail")
+
+    assert "manual Yaw step must be <= 2.000 degree" in message
+    assert hal.commands == []
+
+
+def test_manual_axis_move_waits_for_axis_idle_between_rotation_chunks() -> None:
+    moving = [False] * 12
+    moving[11] = True
+    config = default_config()
+    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -20000, "max": 20000}
+    config["motion"]["rotationWorkLimits"]["enabled"] = False
+    config["motion"]["rotationWorkLimits"]["right"]["yaw"] = {"min": -20, "max": 20}
+    settings = FakeSettings(config)
+    hal = FakeHal(
+        enabled=True,
+        motion_states=[
+            {},
+            {},
+            {"moving": moving},
+            {"moving": [False] * 12},
+        ],
+    )
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    result = asyncio.run(
+        service.manual_axis_move(
+            ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=4, speedMode="coarse")
+        )
+    )
+
+    assert result["chunkCount"] == 2
+    assert [payload["step"] for command, payload in hal.commands if command == "motion.manual_axis_move"] == [2, 2]
+    assert hal.motion_state_calls > len(hal.commands) + 1
+
+
+def test_manual_axis_move_aborts_remaining_rotation_chunks_on_estop() -> None:
+    moving = [False] * 12
+    moving[11] = True
+    config = default_config()
+    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -20000, "max": 20000}
+    config["motion"]["rotationWorkLimits"]["enabled"] = False
+    config["motion"]["rotationWorkLimits"]["right"]["yaw"] = {"min": -20, "max": 20}
+    settings = FakeSettings(config)
+    hal = FakeHal(enabled=True, motion_states=[{}, {}, {"moving": moving, "estop_active": True}])
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    try:
+        asyncio.run(
+            service.manual_axis_move(
+                ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=4, speedMode="coarse")
+            )
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected estop during chunk wait to fail")
+
+    assert "emergency stop" in message
+    assert [payload["step"] for command, payload in hal.commands if command == "motion.manual_axis_move"] == [2]
+
+
+def test_manual_axis_move_aborts_remaining_rotation_chunks_on_idle_timeout() -> None:
+    config = default_config()
+    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -20000, "max": 20000}
+    config["motion"]["rotationWorkLimits"]["enabled"] = False
+    settings = FakeSettings(config)
+    hal = MovingAfterFirstCommandHal(enabled=True)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+    previous_timeout = command_service_module.MANUAL_AXIS_CHUNK_WAIT_MIN_TIMEOUT_SEC
+    previous_poll = command_service_module.MANUAL_AXIS_CHUNK_WAIT_POLL_SEC
+    previous_margin = command_service_module.MANUAL_AXIS_CHUNK_WAIT_TIMEOUT_MARGIN_SEC
+    command_service_module.MANUAL_AXIS_CHUNK_WAIT_MIN_TIMEOUT_SEC = 0.001
+    command_service_module.MANUAL_AXIS_CHUNK_WAIT_POLL_SEC = 0.001
+    command_service_module.MANUAL_AXIS_CHUNK_WAIT_TIMEOUT_MARGIN_SEC = 0.0
+
+    try:
+        try:
+            asyncio.run(
+                service.manual_axis_move(
+                    ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=4, speedMode="coarse")
+                )
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("expected moving axis timeout during chunk wait to fail")
+    finally:
+        command_service_module.MANUAL_AXIS_CHUNK_WAIT_MIN_TIMEOUT_SEC = previous_timeout
+        command_service_module.MANUAL_AXIS_CHUNK_WAIT_POLL_SEC = previous_poll
+        command_service_module.MANUAL_AXIS_CHUNK_WAIT_TIMEOUT_MARGIN_SEC = previous_margin
+
+    assert "chunk wait timed out" in message
+    assert [payload["step"] for command, payload in hal.commands if command == "motion.manual_axis_move"] == [2]
+
+
+def test_manual_axis_move_rejects_translation_step_above_hal_single_step_limit() -> None:
+    config = default_config()
+    config["motion"]["origin"]["leftValid"] = False
+    settings = FakeSettings(config)
+    hal = FakeHal(enabled=True)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    try:
+        asyncio.run(
+            service.manual_axis_move(
+                ManualAxisMoveRequest(side="left", axis="X", direction=1, step=5000.1, speedMode="coarse")
+            )
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected translation step above HAL cap to fail")
+
+    assert "manual X step must be <= 5000.000 um" in message
+    assert hal.commands == []
+
+
+def test_manual_axis_move_rejects_step_above_effective_single_step_limit() -> None:
     config = default_config()
     settings = FakeSettings(config)
     service = CommandService(
@@ -332,8 +583,8 @@ def test_manual_axis_move_rejects_step_above_icf_single_step_pulse_limit() -> No
     else:
         raise AssertionError("expected manual axis step above pulse cap to fail")
 
-    assert "100000 pulse cap" in message
-    assert "20000.000 um" in message
+    assert "HAL single-step / 100000 pulse cap" in message
+    assert "5000.000 um" in message
 
 
 def test_motion_enabled_refresh_reports_card0_dmc5c10_feedback_as_unknown() -> None:

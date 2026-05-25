@@ -12,11 +12,11 @@ interface StepDef {
   required?: boolean
   actionButton?: { label: string; apiCall: () => void }
 }
-
+/** 计算对应的业务值或展示值。 */
 function diagnosticReady(diagnostics: DiagnosticItem[], key: string) {
   return diagnostics.find((item) => item.key === key)?.status === 'ok'
 }
-
+/** 计算对应的业务值或展示值。 */
 function teleopHandsReady(frame: TelemetryFrame) {
   return frame.teleopHands.every((hand) => hand.connected && hand.lastReadOk)
 }
@@ -67,7 +67,7 @@ interface PreCheckModalProps {
   onConfirm: () => void
   onCancel: () => void
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckModalProps) {
   const frame = useTelemetryStore((s) => s.frame)
   const diagnostics = useTelemetryStore((s) => s.diagnostics)
@@ -91,11 +91,13 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
   const currentStep = STEPS.findIndex((step, i) => step.required !== false && !stepStatuses[i])
   const activeStep = currentStep === -1 ? STEPS.length : currentStep
 
+  /** 处理对应的用户交互。 */
   const handleClose = () => {
     setManualChecked({})
     onCancel()
   }
 
+  /** 处理对应的用户交互。 */
   const handleConfirm = () => {
     setManualChecked({})
     onConfirm()

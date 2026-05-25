@@ -898,6 +898,74 @@ select {
   width: auto;
 }
 
+.record-kalman-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: #526070;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.record-kalman-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.record-kalman-groups section {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.record-kalman-groups b {
+  color: #334155;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.record-kalman-param-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.record-kalman-param {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.record-kalman-param span {
+  overflow: hidden;
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-kalman-param .ant-input-number {
+  width: 100%;
+}
+
+.record-kalman-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  color: #64748b;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+}
+
 .record-camera-layout {
   display: grid;
   grid-template-columns: minmax(0, 1.22fr) repeat(2, minmax(0, 1fr));
@@ -1344,6 +1412,16 @@ select {
   margin-top: 8px;
 }
 
+.record-origin-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.record-origin-actions .ant-btn {
+  min-width: 0;
+}
+
 .record-force-meter-ok i {
   background: #0f9f6e;
 }
@@ -1545,6 +1623,43 @@ select {
   grid-template-columns: minmax(112px, 0.35fr) minmax(0, 1fr);
   gap: 10px;
   align-items: start;
+}
+
+.camera-tuning-span {
+  grid-column: 1 / -1;
+}
+
+.camera-tuning-control-stack {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.camera-tuning-toggle-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.camera-tuning-control-row {
+  display: grid;
+  grid-template-columns: 86px minmax(180px, 1fr) 92px;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+
+.camera-tuning-control-row .ant-slider {
+  margin: 0;
+}
+
+.camera-tuning-control-row .ant-input-number {
+  width: 100%;
+}
+
+.camera-tuning-control-label {
+  font-weight: 700;
 }
 
 .camera-toggle-stack {
@@ -2533,6 +2648,43 @@ select {
   margin-top: 8px;
 }
 
+.rotation-work-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  overflow-x: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.rotation-work-panel .hardware-subtitle-row {
+  padding: 8px 10px 0;
+}
+
+.rotation-work-table {
+  width: 100%;
+  min-width: 780px;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 12px;
+}
+
+.rotation-work-table th,
+.rotation-work-table td {
+  padding: 8px 9px;
+  border-top: 1px solid #e5e9f0;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.rotation-work-table th {
+  color: #526070;
+  font-weight: 700;
+  background: #f4f7fb;
+}
+
 .hardware-metric-box {
   display: flex;
   flex-direction: column;
@@ -2819,6 +2971,52 @@ select {
 
 .teleop-switch-row .ant-input-number {
   width: 108px;
+}
+
+.teleop-connection-strip,
+.gripper-teleop-strip {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.teleop-connection-strip > div,
+.gripper-teleop-strip > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid #d7e3ee;
+  border-radius: 8px;
+  background: #f8fbfd;
+}
+
+.teleop-connection-strip b,
+.gripper-teleop-strip b {
+  color: #17324d;
+  font-size: 12px;
+}
+
+.teleop-connection-strip span,
+.teleop-connection-strip small,
+.gripper-teleop-strip span,
+.gripper-teleop-strip small {
+  overflow-wrap: anywhere;
+}
+
+.teleop-connection-strip span,
+.gripper-teleop-strip span {
+  color: #1f344b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.teleop-connection-strip small,
+.gripper-teleop-strip small {
+  color: #667085;
+  line-height: 1.35;
 }
 
 .hardware-subtitle-row {
@@ -3710,7 +3908,10 @@ select {
 
   .camera-settings-panel,
   .camera-tuning-grid,
-  .camera-slider-row {
+  .camera-slider-row,
+  .camera-tuning-control-row,
+  .teleop-connection-strip,
+  .gripper-teleop-strip {
     grid-template-columns: 1fr;
   }
 

@@ -9,13 +9,18 @@ from backend.core.defaults import (
     DEFAULT_SOFT_LIMITS,
     ICF_CAMERA_DEFAULTS,
     ICF_KINEMATICS_DEFAULTS,
+    ICF_LEFT_MOTION_MECHANICAL_LIMITS,
     ICF_LEFT_MOTION_SOFT_LIMITS,
+    ICF_RIGHT_MOTION_MECHANICAL_LIMITS,
     ICF_RIGHT_MOTION_SOFT_LIMITS,
+    ICF_ROTATION_WORK_LIMIT_DEFAULTS,
     ICF_TELEOP_DEFAULTS,
     ICF_TELEOP_STRATEGY_VERSION,
     ICF_WORK_ORIGIN_DEFAULTS,
     ICF_WORK_ORIGIN_VERSION,
+    anchored_mechanical_soft_limits,
     default_config,
+    rotation_work_limits_from_soft_limits,
 )
 from backend.core.logging import LogService, now_ms, stable_config_hash
 from backend.core.schemas import (
@@ -417,7 +422,40 @@ class SettingsService:
             origin_valid = isinstance(origin, dict) and bool(origin.get("valid", False))
             if not origin_valid:
                 motion["origin"] = json.loads(json.dumps(ICF_WORK_ORIGIN_DEFAULTS))
+                origin = motion["origin"]
+            kinematics = motion.get("kinematics", {})
+            if not isinstance(kinematics, dict):
+                kinematics = ICF_KINEMATICS_DEFAULTS
+            left_limits = motion.get("leftSoftLimits")
+            right_limits = motion.get("rightSoftLimits")
+            left_limits = left_limits if isinstance(left_limits, dict) else ICF_LEFT_MOTION_SOFT_LIMITS
+            right_limits = right_limits if isinstance(right_limits, dict) else ICF_RIGHT_MOTION_SOFT_LIMITS
+            left_origin = origin.get("leftPulse") if isinstance(origin, dict) else None
+            right_origin = origin.get("rightPulse") if isinstance(origin, dict) else None
+            left_signed = kinematics.get("leftSignedPulsePerUnit") if isinstance(kinematics, dict) else None
+            right_signed = kinematics.get("rightSignedPulsePerUnit") if isinstance(kinematics, dict) else None
+            motion["rotationWorkLimits"] = rotation_work_limits_from_soft_limits(left_limits, right_limits)
+            if (
+                isinstance(left_origin, list)
+                and len(left_origin) >= 6
+                and isinstance(left_signed, list)
+                and len(left_signed) >= 6
+            ):
+                motion["leftSoftLimits"] = anchored_mechanical_soft_limits(left_limits, left_origin, left_signed)
+            else:
+                motion["leftSoftLimits"] = json.loads(json.dumps(ICF_LEFT_MOTION_MECHANICAL_LIMITS))
+            if (
+                isinstance(right_origin, list)
+                and len(right_origin) >= 6
+                and isinstance(right_signed, list)
+                and len(right_signed) >= 6
+            ):
+                motion["rightSoftLimits"] = anchored_mechanical_soft_limits(right_limits, right_origin, right_signed)
+            else:
+                motion["rightSoftLimits"] = json.loads(json.dumps(ICF_RIGHT_MOTION_MECHANICAL_LIMITS))
             motion["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
+        if isinstance(motion, dict):
+            motion.setdefault("rotationWorkLimits", json.loads(json.dumps(ICF_ROTATION_WORK_LIMIT_DEFAULTS)))
         gripper_teleop = teleop.get("gripperTeleop", {})
         if isinstance(gripper_teleop, dict):
             default_thresholds = (

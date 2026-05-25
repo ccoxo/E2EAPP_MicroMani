@@ -29,7 +29,7 @@ const stateText = {
   checking: '检查中',
   pending: '待确认',
 } satisfies Record<ConnectionState, string>
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function ModuleStatusGrid({ modules, compact = false }: { modules: ModuleStatus[]; compact?: boolean }) {
   return (
     <div className={`module-status-grid ${compact ? 'module-status-grid-compact' : ''}`}>

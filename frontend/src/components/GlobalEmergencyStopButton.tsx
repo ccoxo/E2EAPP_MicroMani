@@ -1,7 +1,7 @@
 import { Button, Tooltip } from 'antd'
 import { RotateCcw, ShieldAlert } from 'lucide-react'
 import { useTelemetryStore } from '../stores/telemetry'
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function GlobalEmergencyStopButton() {
   const dangerIndex = useTelemetryStore((state) => state.frame.dangerIndex)
   const triggerEmergencyStop = useTelemetryStore((state) => state.triggerEmergencyStop)

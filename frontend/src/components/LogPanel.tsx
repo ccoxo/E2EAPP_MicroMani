@@ -7,12 +7,12 @@ import { useTelemetryStore } from '../stores/telemetry'
 import type { LogLevel } from '../types'
 
 const levelOptions: Array<LogLevel | 'ALL'> = ['ALL', 'DEBUG', 'INFO', 'WARNING', 'ERROR']
-
+/** 格式化对应数值用于界面展示。 */
 function formatLogTime(ts: number) {
   const date = new Date(ts)
   return `${date.toLocaleTimeString()}.${String(date.getMilliseconds()).padStart(3, '0')}`
 }
-
+/** 描述当前方法的功能边界。 */
 function matchesSearch(text: string, search: string) {
   if (!search.trim()) return true
   try {
@@ -21,7 +21,7 @@ function matchesSearch(text: string, search: string) {
     return text.toLowerCase().includes(search.toLowerCase())
   }
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function LogPanel() {
   const logs = useTelemetryStore((state) => state.logs)
   const open = useTelemetryStore((state) => state.logPanelOpen)
@@ -40,7 +40,7 @@ export function LogPanel() {
     [level, logs, search, selectedChannels],
   )
 
-  // TanStack Virtual is intentionally used here; the returned instance is not passed to memoized children.
+  // 说明当前代码块的功能用途。
   // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
     count: filtered.length,
@@ -53,7 +53,8 @@ export function LogPanel() {
     ? virtualItems
     : filtered.map((_, index) => ({ index, start: index * 24, key: index }))
 
-  function exportLogs() {
+ /** 描述当前方法的功能边界。 */
+ function exportLogs() {
     const body = filtered.map((entry) => `${new Date(entry.ts).toISOString()} ${entry.channel} ${entry.level} ${entry.msg}`).join('\n')
     const url = URL.createObjectURL(new Blob([body], { type: 'text/plain;charset=utf-8' }))
     const anchor = document.createElement('a')
@@ -63,7 +64,8 @@ export function LogPanel() {
     URL.revokeObjectURL(url)
   }
 
-  function jumpNextError() {
+ /** 处理对应的用户交互。 */
+ function jumpNextError() {
     const index = filtered.findIndex((entry) => entry.level === 'ERROR')
     if (index >= 0) virtualizer.scrollToIndex(index, { align: 'center' })
   }

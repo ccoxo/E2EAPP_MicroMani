@@ -19,7 +19,7 @@ DEFAULT_MOTION_PROFILE: dict[str, Any] = {
 }
 
 ICF_TELEOP_STRATEGY_VERSION = "e2e_omega7_native_v27_right_yaw333_com9_20260520"
-ICF_WORK_ORIGIN_VERSION = "icf_work_origin_20260519"
+ICF_WORK_ORIGIN_VERSION = "icf_work_origin_20260521_rotation_limit_v2"
 
 ICF_CAMERA_DEFAULTS: dict[str, Any] = {
     "global": "AR0234 / index 1",
@@ -36,13 +36,13 @@ ICF_CAMERA_DEFAULTS: dict[str, Any] = {
     "tuning": {
         "global": {
             "autoExposure": False,
-            "exposure": -5.5,
+            "exposure": -4,
             "gain": 0.0,
             "autoWhiteBalance": False,
         },
         "wrist_left": {
             "autoExposure": False,
-            "exposure": -6.0,
+            "exposure": -4,
             "gain": 0.0,
             "autoWhiteBalance": False,
         },
@@ -115,6 +115,24 @@ ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "nativeRotationDeadzoneDeg": 2.0,
     "nativeRotationFullScaleDeg": 30.0,
     "nativeVelocitySmoothingMs": 40.0,
+    "kalmanFilterEnabled": False,
+    "kalmanBeta": 0.05,
+    "kalmanMinVariance": 1e-12,
+    "kalmanMaxVariance": 100.0,
+    "kalmanDtMinSec": 0.001,
+    "kalmanDtMaxSec": 0.05,
+    "kalmanTranslationPositionVariance": 1e-8,
+    "kalmanTranslationVelocityVariance": 1e-4,
+    "kalmanTranslationMeasurementVariance": 1e-8,
+    "kalmanTranslationProcessPositionVariance": 1e-10,
+    "kalmanTranslationProcessVelocityVariance": 1e-8,
+    "kalmanRotationPositionVariance": 0.25,
+    "kalmanRotationVelocityVariance": 4.0,
+    "kalmanRotationMeasurementVariance": 0.04,
+    "kalmanRotationProcessPositionVariance": 1e-4,
+    "kalmanRotationProcessVelocityVariance": 1e-3,
+    "kalmanTranslationIntentVelocityThreshold": 0.0005,
+    "kalmanRotationIntentVelocityThreshold": 0.5,
     "strategyVersion": ICF_TELEOP_STRATEGY_VERSION,
     "mappingMode": "direct",
     "swapHands": False,
@@ -177,6 +195,72 @@ ICF_WORK_ORIGIN_DEFAULTS: dict[str, Any] = {
     "previousUpdatedAt": 1779190104000,
 }
 
+
+def _axis_limit_to_ui(limit: dict[str, Any], axis_index: int) -> dict[str, float]:
+    scale = 1000.0 if axis_index >= 3 else 1.0
+    return {"min": float(limit["min"]) / scale, "max": float(limit["max"]) / scale}
+
+
+def _ui_limit_to_config(limit: dict[str, float], axis_index: int) -> dict[str, float]:
+    scale = 1000.0 if axis_index >= 3 else 1.0
+    return {"min": limit["min"] * scale, "max": limit["max"] * scale}
+
+
+def _pulse_to_ui(pulse: float, signed_pulse_per_unit: float, axis_index: int) -> float:
+    value = float(pulse) / float(signed_pulse_per_unit)
+    return value if axis_index >= 3 else value * 1000.0
+
+
+def anchored_mechanical_soft_limits(
+    relative_limits: dict[str, Any],
+    origin_pulse: list[float],
+    signed_pulse_per_unit: list[float],
+) -> dict[str, Any]:
+    anchored: dict[str, Any] = {}
+    for axis_index, axis_key in enumerate(("x", "y", "z", "roll", "pitch", "yaw")):
+        relative = _axis_limit_to_ui(relative_limits[axis_key], axis_index)
+        origin_ui = _pulse_to_ui(origin_pulse[axis_index], signed_pulse_per_unit[axis_index], axis_index)
+        anchored[axis_key] = _ui_limit_to_config(
+            {
+                "min": origin_ui + relative["min"],
+                "max": origin_ui + relative["max"],
+            },
+            axis_index,
+        )
+    return anchored
+
+
+def rotation_work_limits_from_soft_limits(left_limits: dict[str, Any], right_limits: dict[str, Any]) -> dict[str, Any]:
+    def side(limits: dict[str, Any]) -> dict[str, dict[str, float]]:
+        return {
+            axis: _axis_limit_to_ui(limits[axis], index)
+            for index, axis in ((3, "roll"), (4, "pitch"), (5, "yaw"))
+        }
+
+    return {
+        "enabled": True,
+        "left": side(left_limits),
+        "right": side(right_limits),
+    }
+
+
+ICF_LEFT_MOTION_MECHANICAL_LIMITS: dict[str, Any] = anchored_mechanical_soft_limits(
+    ICF_LEFT_MOTION_SOFT_LIMITS,
+    ICF_WORK_ORIGIN_DEFAULTS["leftPulse"],
+    ICF_KINEMATICS_DEFAULTS["leftSignedPulsePerUnit"],
+)
+
+ICF_RIGHT_MOTION_MECHANICAL_LIMITS: dict[str, Any] = anchored_mechanical_soft_limits(
+    ICF_RIGHT_MOTION_SOFT_LIMITS,
+    ICF_WORK_ORIGIN_DEFAULTS["rightPulse"],
+    ICF_KINEMATICS_DEFAULTS["rightSignedPulsePerUnit"],
+)
+
+ICF_ROTATION_WORK_LIMIT_DEFAULTS: dict[str, Any] = rotation_work_limits_from_soft_limits(
+    ICF_LEFT_MOTION_SOFT_LIMITS,
+    ICF_RIGHT_MOTION_SOFT_LIMITS,
+)
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "hal": {
         "baseUrl": "http://localhost:8091",
@@ -224,8 +308,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "leftProfile": deepcopy(DEFAULT_MOTION_PROFILE),
         "rightProfile": deepcopy(DEFAULT_MOTION_PROFILE),
-        "leftSoftLimits": deepcopy(ICF_LEFT_MOTION_SOFT_LIMITS),
-        "rightSoftLimits": deepcopy(ICF_RIGHT_MOTION_SOFT_LIMITS),
+        "leftSoftLimits": deepcopy(ICF_LEFT_MOTION_MECHANICAL_LIMITS),
+        "rightSoftLimits": deepcopy(ICF_RIGHT_MOTION_MECHANICAL_LIMITS),
+        "rotationWorkLimits": deepcopy(ICF_ROTATION_WORK_LIMIT_DEFAULTS),
         "kinematics": deepcopy(ICF_KINEMATICS_DEFAULTS),
     },
     "gripper": {

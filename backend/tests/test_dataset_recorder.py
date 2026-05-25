@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 import time
+from concurrent.futures import Future
 from pathlib import Path
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
 
-from backend.services.dataset_recorder import DatasetRecorderService, FrameAssemblyJob, TimedRingBuffer, TimedSample
+from backend.services.dataset_recorder import (
+    DatasetRecorderService,
+    FrameAssemblyJob,
+    LeRobotWriterThread,
+    TimedRingBuffer,
+    TimedSample,
+    WriterCommand,
+)
 
 
 def hal_motion_fixture(timestamp_ms: int = 1234) -> dict[str, object]:
@@ -70,6 +80,14 @@ def test_dataset_recorder_declares_and_writes_motion_pulses() -> None:
     assert '"observation.pulses": {"dtype": "float32", "shape": (12,)' in source
 
 
+def test_dataset_recorder_persists_episode_origin_and_config_snapshot() -> None:
+    source = (Path(__file__).resolve().parents[1] / "services" / "dataset_recorder.py").read_text(encoding="utf-8")
+
+    assert '"motionOrigin": self._episode_motion_origin_snapshot(config_snapshot)' in source
+    assert '"configHash": stable_config_hash(config_snapshot)' in source
+    assert '"positionSource": motion.get("positionSource", "")' in source
+
+
 def test_dataset_recorder_declares_v3_state_and_action_shapes() -> None:
     source = (Path(__file__).resolve().parents[1] / "services" / "dataset_recorder.py").read_text(encoding="utf-8")
 
@@ -115,6 +133,67 @@ def test_dataset_recorder_saves_episode_with_parallel_encoding() -> None:
     assert "save_episode(parallel_encoding=True)" in source
 
 
+def test_lerobot_writer_keeps_dataset_open_after_saved_episode() -> None:
+    class FakeDataset:
+        def __init__(self) -> None:
+            self.meta = SimpleNamespace(total_frames=3)
+            self.save_calls = 0
+            self.finalize_calls = 0
+
+        def save_episode(self, *, parallel_encoding: bool) -> None:
+            assert parallel_encoding is True
+            self.save_calls += 1
+
+        def finalize(self) -> None:
+            self.finalize_calls += 1
+
+    fake_dataset = FakeDataset()
+    recorder = SimpleNamespace(
+        _episode_index=0,
+        _resume_native_dataset_locked=lambda: pytest.fail("save_episode should not resume the dataset"),
+        logs=SimpleNamespace(error=lambda *_args: None),
+    )
+    writer = LeRobotWriterThread(recorder, queue.SimpleQueue())  # type: ignore[arg-type]
+    writer._dataset = fake_dataset
+    future: Future[object] = Future()
+
+    writer._handle_command(WriterCommand("save_episode", future))
+
+    assert future.result() == 3
+    assert fake_dataset.save_calls == 1
+    assert fake_dataset.finalize_calls == 0
+    assert writer._dataset is fake_dataset
+
+
+def test_dataset_recorder_configures_native_chunk_settings_for_single_session_files() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    calls: list[dict[str, int]] = []
+    dataset = SimpleNamespace(
+        meta=SimpleNamespace(update_chunk_settings=lambda **kwargs: calls.append(kwargs)),
+    )
+
+    recorder._configure_native_chunk_settings(dataset)
+
+    assert calls == [
+        {
+            "data_files_size_in_mb": 10240,
+            "video_files_size_in_mb": 20480,
+        }
+    ]
+
+
+def test_dataset_recorder_skip_reset_requires_saved_episode_waiting() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._session_active = True
+    recorder._recording = True
+    recorder._last_saved_episode = None
+    recorder._lock = asyncio.Lock()
+    recorder.telemetry = SimpleNamespace(recording=True)
+
+    with pytest.raises(RuntimeError, match="record reset is not ready"):
+        asyncio.run(recorder.skip_reset())
+
+
 def test_timed_ring_buffer_nearest_respects_skew_and_prunes() -> None:
     buffer = TimedRingBuffer(retention_s=1.0, maxlen=3)
     buffer.append(TimedSample("hal", 10.0, {"value": 10}))
@@ -146,6 +225,38 @@ def test_dataset_recorder_collect_frame_uses_timed_buffers() -> None:
     assert 'recorder._aligned_sample("hal", target_monotonic_s)' in source
     assert 'recorder._aligned_sample("force", target_monotonic_s)' in source
     assert "CAMERA_SOURCE_KEYS" in source
+
+
+def test_dataset_sampler_pauses_hardware_sampling_between_episodes() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    sampled = Event()
+    recorder._session_active = True
+    recorder._recording = False
+    recorder._samplers_paused = True
+    recorder._sampler_stop_event = Event()
+    recorder._sampler_start_monotonic_s = time.monotonic() - 0.1
+    recorder._recording_config_snapshot = {"force": {"sampleHz": 100}}
+    recorder._source_sample_indices = {"force": 0}
+    recorder._sample_buffers = {"force": TimedRingBuffer()}
+    recorder.logs = SimpleNamespace(warning=lambda *_args: None)
+    recorder._source_sample_rate_hz = lambda _source, _config: 100.0
+
+    def sample_once(source: str, _config: dict[str, object], target_s: float) -> TimedSample:
+        sampled.set()
+        return TimedSample(source, target_s, {"ok": True})
+
+    recorder._sample_source_once_sync = sample_once
+
+    thread = Thread(target=recorder._sample_source_loop, args=("force",), daemon=True)
+    thread.start()
+    try:
+        assert sampled.wait(0.05) is False
+        recorder._samplers_paused = False
+        assert sampled.wait(0.3) is True
+    finally:
+        recorder._sampler_stop_event.set()
+        recorder._session_active = False
+        thread.join(1.0)
 
 
 def test_dataset_recorder_record_loop_delegates_frame_assembly() -> None:
@@ -257,9 +368,15 @@ def test_dataset_recorder_source_sample_time_uses_source_frequency() -> None:
     ) == pytest.approx(0.1)
 
 
+def test_dataset_recorder_uses_50ms_hal_timeout() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+
+    assert recorder._source_timeout_s("hal") == pytest.approx(0.050)
+
+
 def test_dataset_recorder_timed_source_records_timeout_drop() -> None:
     async def slow_source() -> dict[str, object]:
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.08)
         return {}
 
     recorder = object.__new__(DatasetRecorderService)

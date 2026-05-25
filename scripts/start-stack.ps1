@@ -51,7 +51,7 @@ $backend = Start-Process `
   -WindowStyle Hidden `
   -PassThru
 
-$frontendCommand = "`$env:VITE_MOCK_MODE='false'; `$env:VITE_AUTO_SHUTDOWN_ON_CLOSE='true'; `$env:VITE_API_BASE='http://127.0.0.1:$BackendPort'; `$env:VITE_WS_URL='ws://127.0.0.1:$BackendPort/ws'; npm run dev -- --host 127.0.0.1 --port $FrontendPort"
+$frontendCommand = "`$env:VITE_MOCK_MODE='false'; `$env:VITE_API_BASE='http://127.0.0.1:$BackendPort'; `$env:VITE_WS_URL='ws://127.0.0.1:$BackendPort/ws'; npm run dev -- --host 127.0.0.1 --port $FrontendPort"
 $frontend = Start-Process `
   -FilePath "powershell.exe" `
   -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $frontendCommand) `

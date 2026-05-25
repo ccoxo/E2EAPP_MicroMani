@@ -1,6 +1,6 @@
 import { Card } from 'antd'
 import { useTelemetryStore } from '../../stores/telemetry'
-
+/** 计算对应的业务值或展示值。 */
 const getDangerColor = (d: number) => {
   if (d < 0.3) return '#3B6D11'
   if (d < 0.5) return '#7cb305'
@@ -13,7 +13,7 @@ interface DangerBarProps {
   side: '左' | '右'
   danger: number
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 function DangerBar({ side, danger }: DangerBarProps) {
   const pct = Math.min((danger / 1.5) * 100, 100)
   const color = getDangerColor(danger)
@@ -42,7 +42,7 @@ interface ForceValueSummaryProps {
   forceLeft: number[]
   forceRight: number[]
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 function ForceValueSummary({ forceLeft, forceRight }: ForceValueSummaryProps) {
   const fzLeft = forceLeft[2] ?? 0
   const fzRight = forceRight[2] ?? 0
@@ -57,12 +57,12 @@ function ForceValueSummary({ forceLeft, forceRight }: ForceValueSummaryProps) {
     </div>
   )
 }
-
+/** 计算对应的业务值或展示值。 */
 function forceDanger(values: number[]) {
   const thresholds = [4, 4, 5, 0.04, 0.04, 0.04]
   return values.reduce((max, value, index) => Math.max(max, Math.abs(value) / (thresholds[index] ?? 1)), 0)
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export default function SafetyMonitorCard() {
   const dangerIndex = useTelemetryStore((s) => s.frame.dangerIndex)
   const forceLeft = useTelemetryStore((s) => s.frame.forceLeft)

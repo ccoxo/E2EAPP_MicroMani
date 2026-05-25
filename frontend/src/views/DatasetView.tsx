@@ -93,6 +93,7 @@ const cameras: ReviewCamera[] = [
 const axisLabels = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']
 const forceLabels = ['Fx', 'Fy', 'Fz', 'Mx', 'My', 'Mz']
 
+/** 构建当前流程需要的数据结构。 */
 function makeSamples(frames: number, seed: number): EpisodeSample[] {
   return Array.from({ length: frames }, (_, frame) => {
     const t = frame / 30
@@ -118,6 +119,7 @@ function makeSamples(frames: number, seed: number): EpisodeSample[] {
   })
 }
 
+/** 构建当前流程需要的数据结构。 */
 function makeEpisode(id: string, index: number, quality: number, status: EpisodeStatus, task: string): ReviewEpisode {
   const frames = 180 + index * 24
   return {
@@ -135,6 +137,7 @@ function makeEpisode(id: string, index: number, quality: number, status: Episode
   }
 }
 
+/** 将后端或录制数据转换为复核页可用的数据模型。 */
 function episodeFromRecord(record: EpisodeRecord, datasetName: string): ReviewEpisode {
   const frames = Math.max(90, record.frameCount || 150)
   const quality = Math.max(60, Math.min(99, 96 - record.lateFrames * 3 - Math.max(record.cameraDrops.global, record.cameraDrops.wristLeft, record.cameraDrops.wristRight) * 4))
@@ -153,11 +156,13 @@ function episodeFromRecord(record: EpisodeRecord, datasetName: string): ReviewEp
   }
 }
 
+/** 格式化对应数值用于界面展示。 */
 function formatCreatedAt(value: number) {
   if (!value) return ''
   return new Date(value).toLocaleString('zh-CN', { hour12: false })
 }
 
+/** 将后端或录制数据转换为复核页可用的数据模型。 */
 function episodeFromApi(episode: DatasetEpisodeApi): ReviewEpisode {
   return {
     id: episode.id,
@@ -179,6 +184,7 @@ function episodeFromApi(episode: DatasetEpisodeApi): ReviewEpisode {
   }
 }
 
+/** 将后端或录制数据转换为复核页可用的数据模型。 */
 function datasetFromApi(dataset: DatasetApi): ReviewDataset {
   return {
     id: dataset.id,
@@ -193,6 +199,7 @@ function datasetFromApi(dataset: DatasetApi): ReviewDataset {
   }
 }
 
+/** 选择当前复核流程需要的数据。 */
 function camerasForReview(dataset: ReviewDataset, episode: ReviewEpisode): ReviewCamera[] {
   const resolutions = episode.cameraResolutions ?? dataset.cameraResolutions ?? {}
   return cameras.map((camera) => {
@@ -208,6 +215,7 @@ function camerasForReview(dataset: ReviewDataset, episode: ReviewEpisode): Revie
   })
 }
 
+/** 格式化对应数值用于界面展示。 */
 function featureShapeText(features?: DatasetFeatureSummaryApi) {
   if (!features) return 'features unavailable'
   const state = features['observation.state']?.shape?.join('x') || '?'
@@ -247,22 +255,26 @@ const baseDatasets: ReviewDataset[] = [
   },
 ]
 
+/** 格式化对应数值用于界面展示。 */
 function statusTag(status: EpisodeStatus) {
   if (status === 'valid') return <Tag color="success">有效</Tag>
   if (status === 'invalid') return <Tag color="error">无效</Tag>
   return <Tag color="warning">待复核</Tag>
 }
 
+/** 格式化对应数值用于界面展示。 */
 function qualityTone(quality: number) {
   if (quality >= 90) return '#12a06f'
   if (quality >= 80) return '#d98400'
   return '#d83a52'
 }
 
+/** 格式化对应数值用于界面展示。 */
 function clampFrame(value: number, frames: number) {
   return Math.max(0, Math.min(frames - 1, Math.round(value)))
 }
 
+/** 构建当前流程需要的数据结构。 */
 function linePoints(samples: EpisodeSample[], side: 'left' | 'right', axisIndex: number, width: number, height: number) {
   const values = samples.map((sample) => (side === 'left' ? sample.leftJoints : sample.rightJoints)[axisIndex] ?? 0)
   const maxAbs = Math.max(1, ...values.map((value) => Math.abs(value)))
@@ -275,6 +287,7 @@ function linePoints(samples: EpisodeSample[], side: 'left' | 'right', axisIndex:
     .join(' ')
 }
 
+/** 构建当前流程需要的数据结构。 */
 function forcePoints(samples: EpisodeSample[], side: 'left' | 'right', channelIndex: number, width: number, height: number) {
   const values = samples.map((sample) => (side === 'left' ? sample.forceLeft : sample.forceRight)[channelIndex] ?? 0)
   const maxAbs = Math.max(0.05, ...values.map((value) => Math.abs(value)))
@@ -287,6 +300,7 @@ function forcePoints(samples: EpisodeSample[], side: 'left' | 'right', channelIn
     .join(' ')
 }
 
+/** 选择当前复核流程需要的数据。 */
 function currentSample(episode: ReviewEpisode, frameIndex: number) {
   if (episode.samples.length === 0) {
     return { frame: 0, leftJoints: [0, 0, 0, 0, 0, 0], rightJoints: [0, 0, 0, 0, 0, 0], forceLeft: [0, 0, 0, 0, 0, 0], forceRight: [0, 0, 0, 0, 0, 0] }
@@ -296,6 +310,7 @@ function currentSample(episode: ReviewEpisode, frameIndex: number) {
   return episode.samples[sampleIndex] ?? episode.samples[0]
 }
 
+/** 渲染当前界面单元，并连接所需数据。 */
 function DatasetVideoPane({
   camera,
   episode,
@@ -336,6 +351,7 @@ function DatasetVideoPane({
   )
 }
 
+/** 渲染当前界面单元，并连接所需数据。 */
 function TrajectoryPanel({
   title,
   side,
@@ -378,6 +394,7 @@ function TrajectoryPanel({
   )
 }
 
+/** 渲染当前界面单元，并连接所需数据。 */
 function ForcePanel({
   title,
   side,
@@ -415,6 +432,7 @@ function ForcePanel({
   )
 }
 
+/** 构建当前流程需要的数据结构。 */
 function applyEpisodeOverrides(episode: ReviewEpisode, nameOverrides: Record<string, string>, statusOverrides: Record<string, EpisodeStatus>) {
   return {
     ...episode,
@@ -426,10 +444,10 @@ function applyEpisodeOverrides(episode: ReviewEpisode, nameOverrides: Record<str
 /**
  * 渲染数据集复核工作台。
  *
- * 业务背景：复核人员需要在同一页面检查 episode 轨迹、力觉曲线、
- * 三路相机样本和 LeRobot v3 feature shape，并对样本做有效性标记。
+ * 业务背景：复核人员需要在同一页面检查片段轨迹、力觉曲线、
+ * 三路相机样本和数据特征形状，并对样本做有效性标记。
  *
- * @returns 数据集复核页面的 React 组件。
+ * 返回数据集复核页面组件。
  */
 export function DatasetView() {
   const recordSession = useTelemetryStore((state) => state.recordSession)
@@ -506,20 +524,23 @@ export function DatasetView() {
     return () => window.clearInterval(timer)
   }, [playing, playbackRate, selectedEpisode])
 
-  const chooseEpisode = (episodeId: string) => {
+    /** 选择当前复核流程需要的数据。 */
+const chooseEpisode = (episodeId: string) => {
     setSelectedEpisodeId(episodeId)
     setFrameIndex(0)
     setPlaying(false)
   }
 
-  const chooseDataset = (datasetId: string) => {
+    /** 选择当前复核流程需要的数据。 */
+const chooseDataset = (datasetId: string) => {
     setSelectedDatasetId(datasetId)
     setSelectedEpisodeId(null)
     setFrameIndex(0)
     setPlaying(false)
   }
 
-  const commitRename = () => {
+    /** 更新当前复核流程的本地状态。 */
+const commitRename = () => {
     if (!renameTarget) return
     if (renameTarget.type === 'dataset') {
       setDatasetNameOverrides((current) => ({ ...current, [renameTarget.id]: renameTarget.value.trim() || renameTarget.id }))
@@ -539,7 +560,8 @@ export function DatasetView() {
     setRenameTarget(null)
   }
 
-  const deleteDataset = (datasetId: string) => {
+    /** 调用数据集后端接口并同步界面状态。 */
+const deleteDataset = (datasetId: string) => {
     setDeletedDatasetIds((current) => [...current, datasetId])
     if (!mockMode) {
       void deleteDatasetApi(datasetId)
@@ -552,7 +574,8 @@ export function DatasetView() {
     }
   }
 
-  const deleteEpisode = (episodeId: string) => {
+    /** 调用数据集后端接口并同步界面状态。 */
+const deleteEpisode = (episodeId: string) => {
     setDeletedEpisodeIds((current) => [...current, episodeId])
     if (!mockMode && selectedDataset) {
       void deleteDatasetEpisodeApi(selectedDataset.id, episodeId)
@@ -562,7 +585,8 @@ export function DatasetView() {
     if (selectedEpisodeId === episodeId) setSelectedEpisodeId(null)
   }
 
-  const setEpisodeStatus = (episodeId: string, status: EpisodeStatus) => {
+    /** 更新当前复核流程的本地状态。 */
+const setEpisodeStatus = (episodeId: string, status: EpisodeStatus) => {
     setEpisodeStatusOverrides((current) => ({ ...current, [episodeId]: status }))
     if (!mockMode && selectedDataset) {
       void updateDatasetEpisodeApi(selectedDataset.id, episodeId, { status })
@@ -571,7 +595,8 @@ export function DatasetView() {
     }
   }
 
-  const createDataset = () => {
+    /** 调用数据集后端接口并同步界面状态。 */
+const createDataset = () => {
     const name = `dataset_${Date.now()}`
     if (!mockMode) {
       void createDatasetApi(name)
@@ -580,14 +605,16 @@ export function DatasetView() {
     }
   }
 
-  const saveReview = () => {
+    /** 调用数据集后端接口并同步界面状态。 */
+const saveReview = () => {
     if (!selectedDataset || mockMode) return
     void saveDatasetReviewApi(selectedDataset.id)
       .then(() => setRefreshToken((value) => value + 1))
       .catch((error) => setBackendLoadError(String(error)))
   }
 
-  const exportDataset = () => {
+    /** 调用数据集后端接口并同步界面状态。 */
+const exportDataset = () => {
     if (!selectedDataset || mockMode) return
     void exportDatasetApi(selectedDataset.id)
       .then(() => setRefreshToken((value) => value + 1))

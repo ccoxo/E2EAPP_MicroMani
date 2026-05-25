@@ -18,7 +18,6 @@ import type {
 export const apiBase = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:18082'
 export const wsUrl = import.meta.env.VITE_WS_URL || 'ws://127.0.0.1:18082/ws'
 export const mockMode = import.meta.env.MODE === 'test'
-export const autoShutdownOnClose = import.meta.env.VITE_AUTO_SHUTDOWN_ON_CLOSE === 'true'
 
 type ApiErrorPayload = {
   detail?: {
@@ -90,59 +89,20 @@ export interface FineTuneJobApi {
   message: string
 }
 
-export function installAutoShutdownOnClose() {
-  if (!autoShutdownOnClose || mockMode || typeof window === 'undefined') return
-  let sent = false
-  const requestShutdown = () => {
-    // pagehide 阶段不能依赖普通 fetch 完成，优先使用 sendBeacon 请求后端延迟停栈。
-    if (sent) return
-    sent = true
-    const url = `${apiBase}/api/runtime/shutdown`
-    const body = JSON.stringify({ reason: 'browser-close' })
-    if (navigator.sendBeacon) {
-      navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }))
-      return
-    }
-    void fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
-      keepalive: true,
-    }).catch(() => undefined)
-  }
-  window.addEventListener('pagehide', requestShutdown, { once: true })
+const localizedApiErrorMessages: Record<string, string> = {
+  RECORDING_BUSY: '录制会话已在运行，请先结束当前会话后再开始新的录制。',
 }
-
-export function installRuntimeReleaseOnClose() {
-  if (mockMode || typeof window === 'undefined') return
-  let sent = false
-  const requestRelease = () => {
-    if (sent) return
-    sent = true
-    const url = `${apiBase}/api/runtime/release_handles`
-    const body = JSON.stringify({ reason: 'browser-close' })
-    if (navigator.sendBeacon) {
-      navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }))
-      return
-    }
-    void fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
-      keepalive: true,
-    }).catch(() => undefined)
-  }
-  window.addEventListener('pagehide', requestRelease, { once: true })
-}
-
+/** 格式化对应数值用于界面展示。 */
 export function formatApiErrorMessage(status: number, payload?: unknown, fallback = 'command failed') {
   const detail = (payload as ApiErrorPayload | undefined)?.detail
   const code = typeof detail?.code === 'string' ? detail.code : ''
   const message = typeof detail?.message === 'string' ? detail.message : ''
+  const localizedMessage = code ? localizedApiErrorMessages[code] : ''
+  if (localizedMessage) return `${localizedMessage}（${status} ${code}）`
   const suffix = [code, message].filter(Boolean).join(': ')
   return suffix ? `${fallback}: ${status} ${suffix}` : `${fallback}: ${status}`
 }
-
+/** 描述当前方法的功能边界。 */
 async function commandErrorFromResponse(response: Response, fallback = 'command failed') {
   let payload: unknown
   try {
@@ -158,7 +118,7 @@ async function commandErrorFromResponse(response: Response, fallback = 'command 
   if (isMotionOriginCaptureDrift(detail?.drift)) error.drift = detail.drift
   return error
 }
-
+/** 描述当前方法的功能边界。 */
 function isMotionOriginCaptureDrift(value: unknown): value is MotionOriginCaptureDrift {
   if (!value || typeof value !== 'object') return false
   const drift = value as MotionOriginCaptureDrift
@@ -170,7 +130,7 @@ function isMotionOriginCaptureDrift(value: unknown): value is MotionOriginCaptur
     Array.isArray(drift.sides)
   )
 }
-
+/** 从后端读取对应数据。 */
 export async function fetchConfig(): Promise<AppConfig> {
   if (mockMode) return structuredClone(defaultConfig)
   const response = await fetch(`${apiBase}/api/settings`)
@@ -200,7 +160,7 @@ export interface HardwareProbeStatus {
   }
   pico?: { ok: boolean; message: string }
 }
-
+/** 从后端读取对应数据。 */
 export async function fetchHardwareStatus(): Promise<HardwareProbeStatus> {
   if (mockMode) return {}
   const response = await fetch(`${apiBase}/api/hardware/status`)
@@ -208,9 +168,10 @@ export async function fetchHardwareStatus(): Promise<HardwareProbeStatus> {
   return response.json() as Promise<HardwareProbeStatus>
 }
 
+/** 发送或封装对应的后端命令。 */
 export async function postCommand(path: string, body?: unknown) {
   if (mockMode) return { ok: true, path, body, ts: Date.now() }
-  // 调用方可以传 `/api/foo` 或 `foo`，这里统一规范成后端路由。
+  // 调用方可以传完整接口路径或短路径，这里统一规范成后端路由。
   const apiPath = path.startsWith('/api/') ? path : `/api${path.startsWith('/') ? path : `/${path}`}`
   const response = await fetch(`${apiBase}${apiPath}`, {
     method: 'POST',
@@ -221,6 +182,7 @@ export async function postCommand(path: string, body?: unknown) {
   return response.json() as Promise<unknown>
 }
 
+/** 描述当前方法的功能边界。 */
 export async function putConfig(config: AppConfig): Promise<AppConfig> {
   if (mockMode) return structuredClone(config)
   const response = await fetch(`${apiBase}/api/settings`, {
@@ -231,7 +193,7 @@ export async function putConfig(config: AppConfig): Promise<AppConfig> {
   if (!response.ok) throw new Error(`settings save failed: ${response.status}`)
   return response.json() as Promise<AppConfig>
 }
-
+/** 应用对应配置或状态。 */
 export async function applyConfig(config?: AppConfig) {
   if (mockMode) return { ok: true, data: { config }, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/settings/apply`, {
@@ -242,7 +204,7 @@ export async function applyConfig(config?: AppConfig) {
   if (!response.ok) throw new Error(`settings apply failed: ${response.status}`)
   return response.json() as Promise<unknown>
 }
-
+/** 从后端读取对应数据。 */
 export async function fetchParameterSnapshots(scope?: ParameterSnapshotScope): Promise<ParameterSnapshot[]> {
   if (mockMode) return []
   const suffix = scope ? `?scope=${encodeURIComponent(scope)}` : ''
@@ -250,7 +212,7 @@ export async function fetchParameterSnapshots(scope?: ParameterSnapshotScope): P
   if (!response.ok) throw new Error(`snapshots fetch failed: ${response.status}`)
   return response.json() as Promise<ParameterSnapshot[]>
 }
-
+/** 描述当前方法的功能边界。 */
 export async function createParameterSnapshot(scope: ParameterSnapshotScope, name: string, config?: unknown) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/settings/snapshots`, {
@@ -261,36 +223,36 @@ export async function createParameterSnapshot(scope: ParameterSnapshotScope, nam
   if (!response.ok) throw new Error(`snapshot create failed: ${response.status}`)
   return response.json() as Promise<{ ok: boolean; data?: { snapshot?: ParameterSnapshot; snapshots?: ParameterSnapshot[] } }>
 }
-
+/** 应用对应配置或状态。 */
 export async function applyParameterSnapshotApi(id: string) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/settings/snapshots/${encodeURIComponent(id)}/apply`, { method: 'POST' })
   if (!response.ok) throw new Error(`snapshot apply failed: ${response.status}`)
   return response.json() as Promise<{ ok: boolean; data?: { config?: AppConfig; snapshots?: ParameterSnapshot[] } }>
 }
-
+/** 删除对应数据并同步界面状态。 */
 export async function deleteParameterSnapshotApi(id: string) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/settings/snapshots/${encodeURIComponent(id)}`, { method: 'DELETE' })
   if (!response.ok) throw new Error(`snapshot delete failed: ${response.status}`)
   return response.json() as Promise<{ ok: boolean; data?: { snapshots?: ParameterSnapshot[] } }>
 }
-
+/** 发送或封装对应的后端命令。 */
 export async function sendSettingsLogCommand(channel: LogEntry['channel'], msg: string, level: LogEntry['level'] = 'INFO') {
   return postCommand('/settings/log_command', { channel, msg, level })
 }
-
+/** 发送或封装对应的后端命令。 */
 export const reconnectHal = () => postCommand('/hal/reconnect')
-
+/** 发送或封装对应的后端命令。 */
 export const enumerateCamera = (camera: CameraTelemetry['key']) =>
   postCommand(`/cameras/${camera}/enumerate`)
-
+/** 发送或封装对应的后端命令。 */
 export const reconnectCamera = (camera: CameraTelemetry['key']) =>
   postCommand(`/cameras/${camera}/reconnect`)
-
+/** 应用对应配置或状态。 */
 export const applyCameraTuning = (camera: CameraTelemetry['key'], config?: AppConfig) =>
   postCommand(`/cameras/${camera}/tuning/apply`, config)
-
+/** 计算或执行手动控制的对应逻辑。 */
 export async function manualAxisMove(
   side: ManualControlSide,
   axis: ManualControlAxis,
@@ -300,19 +262,19 @@ export async function manualAxisMove(
 ) {
   return postCommand('/motion/manual_axis_move', { side, axis, direction, step, speedMode })
 }
-
+/** 发送或封装对应的后端命令。 */
 export const enableMotionSide = (side: ManualControlSide) =>
   postCommand(`/motion/${side}/enable_all`)
-
+/** 发送或封装对应的后端命令。 */
 export const disableMotionSide = (side: ManualControlSide) =>
   postCommand(`/motion/${side}/disable_all`)
-
+/** 停止对应流程。 */
 export const stopMotionSide = (side: ManualControlSide) =>
   postCommand(`/motion/${side}/stop`)
-
+/** 发送或封装对应的后端命令。 */
 export const homeMotionSide = (side: ManualControlSide) =>
   postCommand(`/motion/${side}/home`)
-
+/** 发送或封装对应的后端命令。 */
 export const returnMotionOriginSide = (side: ManualControlSide) =>
   postCommand(`/motion/${side}/return_origin`)
 
@@ -325,44 +287,60 @@ export interface MotionOriginResponse {
   }
 }
 
+/** 从后端读取对应数据。 */
 export async function fetchMotionOrigin(): Promise<MotionOriginResponse> {
   if (mockMode) return { ok: true, data: { origin: structuredClone(defaultConfig.motion.origin) } }
   const response = await fetch(`${apiBase}/api/motion/origin`)
   if (!response.ok) throw new Error(`motion origin fetch failed: ${response.status}`)
   return response.json() as Promise<MotionOriginResponse>
 }
-
+/** 发送或封装对应的后端命令。 */
 export const captureMotionOrigin = (side?: ManualControlSide, options?: { confirmLargeDrift?: boolean }) =>
   postCommand(
     side ? `/motion/${side}/origin/capture` : '/motion/origin/capture',
     options?.confirmLargeDrift ? { confirmLargeDrift: true } : undefined,
   ) as Promise<MotionOriginResponse>
 
+/** 删除对应数据并同步界面状态。 */
 export const clearMotionOrigin = (side?: ManualControlSide) =>
   postCommand(side ? `/motion/${side}/origin/clear` : '/motion/origin/clear') as Promise<MotionOriginResponse>
-
+/** 应用对应配置或状态。 */
 export const restorePreviousMotionOrigin = () =>
   postCommand('/motion/origin/restore_previous') as Promise<MotionOriginResponse>
-
+/** 发送或封装对应的后端命令。 */
 export async function gripperCommand(side: ManualControlSide, command: ManualGripperCommand, targetMm?: number, forceLimitN?: number) {
   return postCommand(`/gripper/${side}/command`, { side, command, targetMm, forceLimitN })
 }
 
+/** 启动对应流程。 */
 export const startGripperTeleop = () => postCommand('/teleop/gripper/start')
+/** 停止对应流程。 */
 export const stopGripperTeleop = () => postCommand('/teleop/gripper/stop')
+/** 从后端读取对应数据。 */
 export const fetchGripperTeleopStatus = () => fetch(`${apiBase}/api/teleop/gripper/status`).then((r) => r.json())
 
-// Session control
+// 说明当前代码块的功能用途。
+/** 描述当前方法的功能边界。 */
 export const createSession = (datasetName: string, task: string) =>
-  postCommand('/record/session/create', { dataset_name: datasetName, task })
+  postCommand('/record/session/create', { dataset_name: datasetName, task }) as Promise<RecordSessionCommandResponse>
 
 export interface RecordStatusApi {
   active?: boolean
   recording?: boolean
   datasetName?: string
   task?: string
+  episodeIndex?: number
+  frameCount?: number
+  elapsedS?: number
+  fps?: number
 }
 
+export interface RecordSessionCommandResponse {
+  ok?: boolean
+  data?: RecordStatusApi
+  ts?: number
+}
+/** 从后端读取对应数据。 */
 export async function fetchRecordStatus(): Promise<RecordStatusApi> {
   if (mockMode) return { active: false, recording: false }
   const response = await fetch(`${apiBase}/api/record/status`)
@@ -391,23 +369,24 @@ export interface SaveEpisodeResponse {
   }
   ts?: number
 }
-
+/** 描述当前方法的功能边界。 */
 export const saveEpisode = () =>
   postCommand('/record/episode/save') as Promise<SaveEpisodeResponse>
-
+/** 删除对应数据并同步界面状态。 */
 export const discardEpisode = () => postCommand('/record/episode/discard')
 
+/** 描述当前方法的功能边界。 */
 export const finishSession = () => postCommand('/record/session/finish')
-
+/** 描述当前方法的功能边界。 */
 export const skipReset = () => postCommand('/record/reset/skip')
 
 /**
  * 读取本地数据集列表。
  *
- * 业务背景：复核页依赖该列表展示可见 episode、schema 摘要和本地数据集状态。
+ * 业务背景：复核页依赖该列表展示可见片段、结构摘要和本地数据集状态。
  *
- * @returns 数据集摘要数组；mock 模式下返回空数组。
- * @throws 当 HTTP 状态非 2xx 时抛出 Error。
+ * 返回数据集摘要数组；模拟模式下返回空数组。
+ * 当响应状态非成功状态时抛出错误。
  */
 export async function fetchDatasets(): Promise<DatasetApi[]> {
   if (mockMode) return []
@@ -418,15 +397,15 @@ export async function fetchDatasets(): Promise<DatasetApi[]> {
 }
 
 /**
- * 读取指定 episode 的复核详情。
+ * 读取指定片段的复核详情。
  *
- * 业务背景：复核页需要按需查看 feature shape、抽样轨迹和相机分辨率来源，
- * 该函数保留后端 ok/data/ts envelope，只向调用方暴露 data.episode。
+ * 业务背景：复核页需要按需查看特征形状、抽样轨迹和相机分辨率来源，
+ * 该函数保留后端响应外层结构，只向调用方暴露数据里的片段。
  *
- * @param datasetId 本地数据集 ID，必须是后端可解析的安全目录名。
- * @param episodeId episode ID，例如 episode_000001。
- * @returns 后端返回的 episode 详情；mock 模式下返回 null。
- * @throws 当 HTTP 状态非 2xx 时抛出 Error。
+ * 第一个参数是本地数据集编号，必须是后端可解析的安全目录名。
+ * 第二个参数是片段编号，例如“片段_000001”。
+ * 返回后端片段详情；模拟模式下返回空值。
+ * 当响应状态非成功状态时抛出错误。
  */
 export async function fetchDatasetEpisodeApi(datasetId: string, episodeId: string): Promise<DatasetEpisodeApi | null> {
   if (mockMode) return null
@@ -435,7 +414,7 @@ export async function fetchDatasetEpisodeApi(datasetId: string, episodeId: strin
   const payload = await response.json() as { data?: { episode?: DatasetEpisodeApi } }
   return payload.data?.episode ?? null
 }
-
+/** 描述当前方法的功能边界。 */
 export async function createDatasetApi(name: string) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/datasets`, {
@@ -446,7 +425,7 @@ export async function createDatasetApi(name: string) {
   if (!response.ok) throw new Error(`dataset create failed: ${response.status}`)
   return response.json() as Promise<unknown>
 }
-
+/** 描述当前方法的功能边界。 */
 export async function renameDatasetApi(datasetId: string, name: string) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/datasets/${encodeURIComponent(datasetId)}`, {
@@ -457,28 +436,28 @@ export async function renameDatasetApi(datasetId: string, name: string) {
   if (!response.ok) throw new Error(`dataset rename failed: ${response.status}`)
   return response.json() as Promise<unknown>
 }
-
+/** 描述当前方法的功能边界。 */
 export async function saveDatasetReviewApi(datasetId: string) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/datasets/${encodeURIComponent(datasetId)}/review/save`, { method: 'POST' })
   if (!response.ok) throw new Error(`dataset review save failed: ${response.status}`)
   return response.json() as Promise<unknown>
 }
-
+/** 描述当前方法的功能边界。 */
 export async function exportDatasetApi(datasetId: string) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/datasets/${encodeURIComponent(datasetId)}/export`, { method: 'POST' })
   if (!response.ok) throw new Error(`dataset export failed: ${response.status}`)
   return response.json() as Promise<unknown>
 }
-
+/** 从后端读取对应数据。 */
 export async function fetchDatasetStatsApi(datasetId: string) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/datasets/${encodeURIComponent(datasetId)}/stats`)
   if (!response.ok) throw new Error(`dataset stats failed: ${response.status}`)
   return response.json() as Promise<unknown>
 }
-
+/** 描述当前方法的功能边界。 */
 export async function splitDatasetApi(datasetId: string, ratios: { train: number; val: number; test: number }) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/datasets/${encodeURIComponent(datasetId)}/split`, {
@@ -489,7 +468,7 @@ export async function splitDatasetApi(datasetId: string, ratios: { train: number
   if (!response.ok) throw new Error(`dataset split failed: ${response.status}`)
   return response.json() as Promise<unknown>
 }
-
+/** 描述当前方法的功能边界。 */
 export async function cleanDatasetApi(datasetId: string, apply = false) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/datasets/${encodeURIComponent(datasetId)}/clean`, {
@@ -500,7 +479,7 @@ export async function cleanDatasetApi(datasetId: string, apply = false) {
   if (!response.ok) throw new Error(`dataset clean failed: ${response.status}`)
   return response.json() as Promise<unknown>
 }
-
+/** 描述当前方法的功能边界。 */
 export async function pushDatasetApi(datasetId: string, repoId: string, dryRun = true) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/datasets/${encodeURIComponent(datasetId)}/push`, {
@@ -511,14 +490,14 @@ export async function pushDatasetApi(datasetId: string, repoId: string, dryRun =
   if (!response.ok) throw new Error(`dataset push failed: ${response.status}`)
   return response.json() as Promise<unknown>
 }
-
+/** 删除对应数据并同步界面状态。 */
 export async function deleteDatasetApi(datasetId: string) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/datasets/${encodeURIComponent(datasetId)}`, { method: 'DELETE' })
   if (!response.ok) throw new Error(`dataset delete failed: ${response.status}`)
   return response.json() as Promise<unknown>
 }
-
+/** 描述当前方法的功能边界。 */
 export async function updateDatasetEpisodeApi(datasetId: string, episodeId: string, patch: { name?: string; status?: DatasetEpisodeStatusApi }) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/datasets/${encodeURIComponent(datasetId)}/episodes/${encodeURIComponent(episodeId)}`, {
@@ -529,7 +508,7 @@ export async function updateDatasetEpisodeApi(datasetId: string, episodeId: stri
   if (!response.ok) throw new Error(`episode update failed: ${response.status}`)
   return response.json() as Promise<unknown>
 }
-
+/** 删除对应数据并同步界面状态。 */
 export async function deleteDatasetEpisodeApi(datasetId: string, episodeId: string) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/datasets/${encodeURIComponent(datasetId)}/episodes/${encodeURIComponent(episodeId)}`, { method: 'DELETE' })
@@ -537,38 +516,42 @@ export async function deleteDatasetEpisodeApi(datasetId: string, episodeId: stri
   return response.json() as Promise<unknown>
 }
 
-// Sensors
+// 说明当前代码块的功能用途。
+/** 发送或封装对应的后端命令。 */
 export const tareForceSensors = () => postCommand('/sensors/tare')
-
+/** 发送或封装对应的后端命令。 */
 export const tareForceSensor = (side: ManualControlSide) => postCommand(`/force/${side}/tare`)
 
-// Teleop
+// 说明当前代码块的功能用途。
+/** 发送或封装对应的后端命令。 */
 export const toggleClutch = () => postCommand('/teleop/clutch_toggle')
-
+/** 设置当前流程的对应状态。 */
 export const setSpeedMode = (mode: 'coarse' | 'medium' | 'fine') =>
   postCommand('/teleop/speed', { mode })
-
+/** 发送或封装对应的后端命令。 */
 export const connectTeleopHand = (side: ManualControlSide) =>
   postCommand(`/teleop/${side}/connect`)
-
+/** 发送或封装对应的后端命令。 */
 export const disconnectTeleopHand = (side: ManualControlSide) =>
   postCommand(`/teleop/${side}/disconnect`)
-
+/** 从后端读取对应数据。 */
 export const fetchTeleopMappingStatus = () => fetch(`${apiBase}/api/teleop/mapping/status`).then((r) => r.json())
-
+/** 设置当前流程的对应状态。 */
 export const setTeleopGravityCompensation = (side: ManualControlSide, enabled: boolean) =>
   postCommand(`/teleop/${side}/gravity_compensation`, { enabled })
 
+/** 发送或封装对应的后端命令。 */
 export const zeroTeleopForceFeedback = (side: ManualControlSide) =>
   postCommand(`/teleop/${side}/zero_force_feedback`)
 
-// Emergency
+// 说明当前代码块的功能用途。
+/** 发送或封装对应的后端命令。 */
 export const emergencyStop = () => postCommand('/motion/emergency_stop')
-
+/** 应用对应配置或状态。 */
 export const acknowledgeSafety = () => postCommand('/motion/safety/acknowledge')
-
+/** 发送或封装对应的后端命令。 */
 export const homeAll = () => postCommand('/motion/home_all')
-
+/** 从后端读取对应数据。 */
 export async function fetchModels(): Promise<{ models: PolicyModelApi[]; activeModelId: string }> {
   if (mockMode) return { models: [], activeModelId: '' }
   const response = await fetch(`${apiBase}/api/models`)
@@ -576,28 +559,28 @@ export async function fetchModels(): Promise<{ models: PolicyModelApi[]; activeM
   const payload = await response.json() as { data?: { models?: PolicyModelApi[]; activeModelId?: string } }
   return { models: payload.data?.models ?? [], activeModelId: payload.data?.activeModelId ?? '' }
 }
-
+/** 发送或封装对应的后端命令。 */
 export const importModelApi = (name: string, path = '') =>
   postCommand('/models/import', { name, path })
-
+/** 启动对应流程。 */
 export const startModelApi = (modelId: string) =>
   postCommand(`/models/${encodeURIComponent(modelId)}/start`)
-
+/** 停止对应流程。 */
 export const stopModelApi = (modelId: string) =>
   postCommand(`/models/${encodeURIComponent(modelId)}/stop`)
-
+/** 启动对应流程。 */
 export const startAutoExecution = (modelId?: string) =>
   postCommand('/auto/start', { modelId })
-
+/** 停止对应流程。 */
 export const stopAutoExecution = () =>
   postCommand('/auto/stop')
-
+/** 发送或封装对应的后端命令。 */
 export const queueAutoAction = (payload: unknown) =>
   postCommand('/auto/action', payload)
-
+/** 发送或封装对应的后端命令。 */
 export const dispatchNextAutoAction = () =>
   postCommand('/auto/dispatch_next')
-
+/** 从后端读取对应数据。 */
 export async function fetchFineTuneJobs(): Promise<FineTuneJobApi[]> {
   if (mockMode) return []
   const response = await fetch(`${apiBase}/api/fine_tune/jobs`)
@@ -605,9 +588,9 @@ export async function fetchFineTuneJobs(): Promise<FineTuneJobApi[]> {
   const payload = await response.json() as { data?: { jobs?: FineTuneJobApi[] } }
   return payload.data?.jobs ?? []
 }
-
+/** 启动对应流程。 */
 export const startFineTuneJobApi = (datasetId: string, baseModel: string, outputDir?: string) =>
   postCommand('/fine_tune/jobs', { datasetId, baseModel, outputDir })
-
+/** 停止对应流程。 */
 export const cancelFineTuneJobApi = (jobId: string) =>
   postCommand(`/fine_tune/jobs/${encodeURIComponent(jobId)}/cancel`)

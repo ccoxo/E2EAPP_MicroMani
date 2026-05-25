@@ -6,23 +6,23 @@ import type { TelemetrySample } from '../../types'
 
 const axes = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'] as const
 const forceLabels = ['Fx', 'Fy', 'Fz', 'Mx', 'My', 'Mz'] as const
-
+/** 格式化对应数值用于界面展示。 */
 function formatAxisValue(value: number, index: number) {
   const unit = index < 3 ? 'um' : 'deg'
   const display = index < 3 ? Math.round(value) : value.toFixed(1)
   return `${value >= 0 ? '+' : ''}${display} ${unit}`
 }
-
+/** 计算对应的业务值或展示值。 */
 function axisRatio(value: number, index: number) {
   const max = index < 3 ? 700 : index === 5 ? 90 : 110
   return Math.min(100, Math.abs(value) / max * 100)
 }
-
+/** 计算对应的业务值或展示值。 */
 function forceRatio(value: number, index: number) {
   const max = index < 3 ? 5 : 0.04
   return Math.min(100, Math.abs(value) / max * 100)
 }
-
+/** 计算对应的业务值或展示值。 */
 function forceTone(value: number, index: number) {
   const abs = Math.abs(value)
   if (index < 3) {
@@ -34,7 +34,7 @@ function forceTone(value: number, index: number) {
   }
   return 'ok'
 }
-
+/** 描述当前方法的功能边界。 */
 function poseStyle(values: number[]) {
   const x = Math.max(-42, Math.min(42, (values[0] ?? 0) / 14))
   const y = Math.max(-32, Math.min(32, (values[1] ?? 0) / 16))
@@ -45,7 +45,7 @@ function poseStyle(values: number[]) {
     '--pose-rotate': `${yaw}deg`,
   } as CSSProperties
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 const ArmMonitor = memo(function ArmMonitor({
   side,
   title,
@@ -62,7 +62,8 @@ const ArmMonitor = memo(function ArmMonitor({
   history: TelemetrySample[]
 }) {
   const forcePeak = Math.max(...force.map((value) => Math.abs(value)))
-  const valueAt = (index: number) => positions[axisOffset + index] ?? 0
+ /** 描述当前方法的功能边界。 */
+ const valueAt = (index: number) => positions[axisOffset + index] ?? 0
   const poseValues = [
     valueAt(0),
     valueAt(1),
@@ -145,7 +146,7 @@ const ArmMonitor = memo(function ArmMonitor({
     </section>
   )
 })
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export default function RecordTelemetryPanel() {
   const positions = useTelemetryStore((state) => state.frame.jointPositions)
   const forceLeft = useTelemetryStore((state) => state.frame.forceLeft)

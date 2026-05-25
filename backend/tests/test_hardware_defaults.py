@@ -37,6 +37,24 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["nativeRotationDeadzoneDeg"] == 2.0
     assert teleop["nativeRotationFullScaleDeg"] == 30.0
     assert teleop["nativeVelocitySmoothingMs"] == 40.0
+    assert teleop["kalmanFilterEnabled"] is False
+    assert teleop["kalmanBeta"] == 0.05
+    assert teleop["kalmanMinVariance"] == 1e-12
+    assert teleop["kalmanMaxVariance"] == 100.0
+    assert teleop["kalmanDtMinSec"] == 0.001
+    assert teleop["kalmanDtMaxSec"] == 0.05
+    assert teleop["kalmanTranslationPositionVariance"] == 1e-8
+    assert teleop["kalmanTranslationVelocityVariance"] == 1e-4
+    assert teleop["kalmanTranslationMeasurementVariance"] == 1e-8
+    assert teleop["kalmanTranslationProcessPositionVariance"] == 1e-10
+    assert teleop["kalmanTranslationProcessVelocityVariance"] == 1e-8
+    assert teleop["kalmanRotationPositionVariance"] == 0.25
+    assert teleop["kalmanRotationVelocityVariance"] == 4.0
+    assert teleop["kalmanRotationMeasurementVariance"] == 0.04
+    assert teleop["kalmanRotationProcessPositionVariance"] == 1e-4
+    assert teleop["kalmanRotationProcessVelocityVariance"] == 1e-3
+    assert teleop["kalmanTranslationIntentVelocityThreshold"] == 0.0005
+    assert teleop["kalmanRotationIntentVelocityThreshold"] == 0.5
     assert teleop["strategyVersion"] == "e2e_omega7_native_v27_right_yaw333_com9_20260520"
     assert teleop["mappingMode"] == "direct"
     assert teleop["swapHands"] is False

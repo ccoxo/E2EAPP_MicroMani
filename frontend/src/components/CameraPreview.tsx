@@ -20,7 +20,7 @@ const cameraResolution: Record<CameraTelemetry['key'], string> = {
   wrist_left: '640x480',
   wrist_right: '640x480',
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function CameraPreview({
   camera,
   compact,

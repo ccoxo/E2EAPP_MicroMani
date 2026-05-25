@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import time
 from typing import Any, cast
 
 from backend.core.config import SettingsService
 from backend.core.logging import LogService, now_ms
+from backend.core.motion_limits import (
+    WorkOriginMissing,
+    effective_limits_ui,
+    side_origin_ui,
+    side_positions_ui,
+    target_allowed_with_recovery,
+)
 from backend.core.schemas import GripperCommandRequest, ManualAxisMoveRequest, SettingsCommandRequest
-from backend.core.units import motion_pulse_per_unit, pulse_to_ui, pulses_to_ui_state
+from backend.core.units import motion_pulse_per_unit, pulse_to_ui
 from backend.hal_client.client import HalClient
 from backend.services.hardware_service import HardwareService
 from backend.services.telemetry_hub import TelemetryHub
@@ -14,6 +23,12 @@ from backend.services.telemetry_hub import TelemetryHub
 AXIS_ORDER = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
 AXIS_LABELS = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
 MANUAL_AXIS_STEP_LIMIT_PULSE = 100000.0
+MANUAL_TRANSLATION_STEP_LIMIT_UM = 5000.0
+MANUAL_ROTATION_STEP_LIMIT_DEG = 2.0
+MANUAL_COARSE_ROTATION_STEP_LIMIT_DEG = 10.0
+MANUAL_AXIS_CHUNK_WAIT_POLL_SEC = 0.02
+MANUAL_AXIS_CHUNK_WAIT_MIN_TIMEOUT_SEC = 3.0
+MANUAL_AXIS_CHUNK_WAIT_TIMEOUT_MARGIN_SEC = 1.0
 ORIGIN_DRIFT_TRANSLATION_CONFIRM_UM = 5000.0
 ORIGIN_DRIFT_ROTATION_CONFIRM_DEG = 1.0
 UNREADABLE_SEVON_FEEDBACK_AXES: set[tuple[str, str]] = {("right", axis) for axis in AXIS_ORDER}
@@ -91,6 +106,8 @@ class CommandService:
             raise RuntimeError("motion work origin is not captured")
         left_pulse = cast(list[float], origin["leftPulse"])
         right_pulse = cast(list[float], origin["rightPulse"])
+        self._validate_work_origin_target(config, "left")
+        self._validate_work_origin_target(config, "right")
         await self.enable_motion_side("left")
         await self.enable_motion_side("right")
         result = await self.hal.command(
@@ -135,6 +152,7 @@ class CommandService:
         if not bool(origin[valid_key]):
             raise RuntimeError(f"{side} motion work origin is not captured")
         pulse = cast(list[float], origin[pulse_key])
+        self._validate_work_origin_target(config, side)
         await self.enable_motion_side(side)
         result = await self.hal.command(
             "motion.home_origin_side",
@@ -295,42 +313,61 @@ class CommandService:
         self._validate_manual_axis_safety(config, request)
         effective_direction = self._manual_axis_effective_direction(request.side, request.axis, request.direction)
         op_id = self.logs.new_op_id("manual")
-        safe_delta = effective_direction * request.step
+        safe_delta = effective_direction * abs(float(request.step))
         if self._real_hardware_mode(config):
             await self._validate_motion_axis_enabled(request.side, request.axis)
             await self._validate_manual_axis_soft_limit(config, request, effective_direction)
             profile = self._axis_profile(config, request)
-            hal_result = await self.hal.command(
-                "motion.manual_axis_move",
-                {
-                    "side": request.side,
-                    "axis": request.axis,
-                    "direction": effective_direction,
-                    "requestedDirection": request.direction,
-                    "step": request.step,
-                    "speedMode": request.speedMode,
-                    "maxVelocityUiPerSec": profile["maxVelocity"],
-                    "startVelocityUiPerSec": profile["startVelocity"],
-                    "accTimeSec": profile["accTime"],
-                    "decTimeSec": profile["decTime"],
-                },
-            )
+            chunk_steps = self._manual_axis_chunk_steps(request)
+            hal_result: dict[str, object] = {}
+            for index, chunk_step in enumerate(chunk_steps):
+                chunk_request = request.model_copy(update={"step": chunk_step})
+                if index > 0:
+                    current_config = self.settings.get_config()
+                    remaining_step = sum(chunk_steps[index:])
+                    remaining_request = request.model_copy(update={"step": remaining_step})
+                    await self._validate_manual_axis_soft_limit(
+                        current_config,
+                        remaining_request,
+                        effective_direction,
+                    )
+                hal_result = await self.hal.command(
+                    "motion.manual_axis_move",
+                    {
+                        "side": request.side,
+                        "axis": request.axis,
+                        "direction": effective_direction,
+                        "requestedDirection": request.direction,
+                        "step": chunk_request.step,
+                        "speedMode": request.speedMode,
+                        "maxVelocityUiPerSec": profile["maxVelocity"],
+                        "startVelocityUiPerSec": profile["startVelocity"],
+                        "accTimeSec": profile["accTime"],
+                        "decTimeSec": profile["decTime"],
+                    },
+                )
+                if len(chunk_steps) > 1:
+                    await self._wait_manual_axis_idle(request.side, request.axis, profile, chunk_step)
             self.logs.event(
                 "[HAL]",
                 "INFO",
                 "manual_move",
                 component="MOTION",
                 op_id=op_id,
-                **self._manual_axis_log_fields(
-                    config,
-                    request,
-                    effective_direction,
-                    safe_delta,
-                    backend="hal",
-                    dmc_ret=self._hal_response_message(hal_result) or "accepted",
-                ),
+                **{
+                    **self._manual_axis_log_fields(
+                        config,
+                        request,
+                        effective_direction,
+                        safe_delta,
+                        backend="hal",
+                        dmc_ret=self._hal_response_message(hal_result) or "accepted",
+                    ),
+                    "chunkCount": len(chunk_steps),
+                    "chunkSteps": chunk_steps,
+                },
             )
-            return {"hal": hal_result}
+            return {"hal": hal_result, "chunkCount": len(chunk_steps), "chunkSteps": chunk_steps}
         applied = self.telemetry.apply_axis_move(request.side, request.axis, effective_direction, request.step)
         self.logs.event(
             "[HAL]",
@@ -669,13 +706,12 @@ class CommandService:
             raise RuntimeError(f"{request.side} gripper is disabled; enable it before motion commands")
 
     def _validate_manual_axis_safety(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> None:
-        step_pulse = self._manual_axis_step_pulse(config, request)
-        if step_pulse > MANUAL_AXIS_STEP_LIMIT_PULSE:
-            limit = self._manual_axis_step_ui_limit(config, request.side, request.axis)
+        limit = self._manual_axis_step_ui_limit(config, request.side, request.axis, request.speedMode)
+        if abs(float(request.step)) > limit:
             unit = "um" if request.axis in {"X", "Y", "Z"} else "degree"
             raise RuntimeError(
                 f"manual {request.axis} step must be <= {limit:.3f} {unit} "
-                f"({MANUAL_AXIS_STEP_LIMIT_PULSE:.0f} pulse cap)"
+                f"(HAL single-step / {MANUAL_AXIS_STEP_LIMIT_PULSE:.0f} pulse cap)"
             )
         if self._axis_profile(config, request)["maxVelocity"] <= 0:
             raise RuntimeError("manual axis velocity must be positive")
@@ -683,11 +719,43 @@ class CommandService:
     def _manual_axis_step_pulse(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> float:
         return abs(float(request.step)) * self._manual_axis_pulse_per_ui_unit(config, request.side, request.axis)
 
-    def _manual_axis_step_ui_limit(self, config: dict[str, Any], side: str, axis: str) -> float:
+    def _manual_axis_step_ui_limit(
+        self,
+        config: dict[str, Any],
+        side: str,
+        axis: str,
+        speed_mode: str | None = None,
+    ) -> float:
         pulse_per_ui_unit = self._manual_axis_pulse_per_ui_unit(config, side, axis)
         if pulse_per_ui_unit <= 0:
             return 0.0
-        return MANUAL_AXIS_STEP_LIMIT_PULSE / pulse_per_ui_unit
+        pulse_limit = MANUAL_AXIS_STEP_LIMIT_PULSE / pulse_per_ui_unit
+        return min(pulse_limit, self._manual_axis_request_step_limit(axis, speed_mode))
+
+    def _manual_axis_request_step_limit(self, axis: str, speed_mode: str | None = None) -> float:
+        if axis in {"X", "Y", "Z"}:
+            return MANUAL_TRANSLATION_STEP_LIMIT_UM
+        if speed_mode == "coarse":
+            return MANUAL_COARSE_ROTATION_STEP_LIMIT_DEG
+        return MANUAL_ROTATION_STEP_LIMIT_DEG
+
+    def _manual_axis_hal_step_limit(self, axis: str) -> float:
+        return MANUAL_TRANSLATION_STEP_LIMIT_UM if axis in {"X", "Y", "Z"} else MANUAL_ROTATION_STEP_LIMIT_DEG
+
+    def _manual_axis_chunk_steps(self, request: ManualAxisMoveRequest) -> list[float]:
+        total_step = abs(float(request.step))
+        hal_step_limit = self._manual_axis_hal_step_limit(request.axis)
+        if request.axis in {"X", "Y", "Z"} or request.speedMode != "coarse" or total_step <= hal_step_limit:
+            return [total_step]
+        chunks: list[float] = []
+        remaining = total_step
+        epsilon = 1e-9
+        while remaining > hal_step_limit + epsilon:
+            chunks.append(hal_step_limit)
+            remaining -= hal_step_limit
+        if remaining > epsilon:
+            chunks.append(round(remaining, 9))
+        return chunks
 
     def _manual_axis_pulse_per_ui_unit(self, config: dict[str, Any], side: str, axis: str) -> float:
         axis_index = AXIS_ORDER.index(axis)
@@ -732,35 +800,69 @@ class CommandService:
         request: ManualAxisMoveRequest,
         effective_direction: int,
     ) -> None:
-        origin = self._normalized_motion_origin(config)
-        origin_valid = bool(origin["leftValid"] if request.side == "left" else origin["rightValid"])
-        if not origin_valid:
-            return
         state = await self.hal.motion_state()
         pulses = self._motion_state_pulses(state)
-        side_offset = 0 if request.side == "left" else 6
-        origin_pulses = cast(list[float], origin["leftPulse"] if request.side == "left" else origin["rightPulse"])
-        relative_pulses = list(pulses)
-        for index in range(6):
-            relative_pulses[side_offset + index] = float(pulses[side_offset + index]) - origin_pulses[index]
-        axis_order = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
-        axis_index = axis_order.index(request.axis)
-        state_index = side_offset + axis_index
-        current = pulses_to_ui_state(relative_pulses, config)[state_index]
+        axis_index = AXIS_ORDER.index(request.axis)
+        try:
+            limits = effective_limits_ui(config, request.side)
+        except WorkOriginMissing as exc:
+            raise RuntimeError(str(exc)) from exc
+        current = side_positions_ui(config, request.side, pulses)[axis_index]
         target = current + request.step * effective_direction
-        limit_key = request.axis.lower()
-        limits_key = "leftSoftLimits" if request.side == "left" else "rightSoftLimits"
-        limits = config["motion"][limits_key][limit_key]
-        min_limit = float(limits["min"])
-        max_limit = float(limits["max"])
-        if axis_index >= 3:
-            min_limit /= 1000.0
-            max_limit /= 1000.0
-        if target < min_limit or target > max_limit:
+        limit = limits[axis_index]
+        if not target_allowed_with_recovery(current, target, limit):
             raise RuntimeError(
                 f"{request.side} {request.axis} target exceeds soft limit: "
-                f"{target:.3f} not in [{min_limit:.3f}, {max_limit:.3f}]"
+                f"{target:.3f} not allowed from {current:.3f} with [{limit.min:.3f}, {limit.max:.3f}]"
             )
+
+    async def _wait_manual_axis_idle(
+        self,
+        side: str,
+        axis: str,
+        profile: dict[str, float],
+        chunk_step: float,
+    ) -> None:
+        axis_index = AXIS_ORDER.index(axis)
+        state_index = (0 if side == "left" else 6) + axis_index
+        max_velocity = max(float(profile.get("maxVelocity", 0.0)), 0.001)
+        timeout_sec = max(
+            MANUAL_AXIS_CHUNK_WAIT_MIN_TIMEOUT_SEC,
+            abs(float(chunk_step)) / max_velocity
+            + float(profile.get("accTime", 0.0))
+            + float(profile.get("decTime", 0.0))
+            + MANUAL_AXIS_CHUNK_WAIT_TIMEOUT_MARGIN_SEC,
+        )
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            state = await self.hal.motion_state()
+            if bool(state.get("estop_active", False)):
+                raise RuntimeError(f"manual {side} {axis} chunk aborted: emergency stop active")
+            moving = state.get("moving")
+            if not isinstance(moving, list) or len(moving) != 12:
+                raise RuntimeError("HAL motion state does not include 12 moving values")
+            if not bool(moving[state_index]):
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"manual {side} {axis} chunk wait timed out")
+            await asyncio.sleep(MANUAL_AXIS_CHUNK_WAIT_POLL_SEC)
+
+    def _validate_work_origin_target(self, config: dict[str, Any], side: str) -> None:
+        origin = side_origin_ui(config, side)
+        if origin is None:
+            raise RuntimeError(f"{side} motion work origin is not captured")
+        try:
+            limits = effective_limits_ui(config, side)
+        except WorkOriginMissing as exc:
+            raise RuntimeError(str(exc)) from exc
+        for axis_index, axis_name in enumerate(AXIS_ORDER):
+            limit = limits[axis_index]
+            target = origin[axis_index]
+            if limit.min > limit.max or target < limit.min or target > limit.max:
+                raise RuntimeError(
+                    f"{side} {axis_name} work origin exceeds soft limit: "
+                    f"{target:.3f} not in [{limit.min:.3f}, {limit.max:.3f}]"
+                )
 
     def _normalize_motion_axis_enabled(self, side: str, values: list[Any]) -> list[bool | None]:
         return normalize_motion_axis_enabled(side, values)
@@ -780,8 +882,8 @@ class CommandService:
         max_velocity = min(float(group_profile.get("maxSpeed", 1000.0)), max_velocity_cap)
         # speedMode scales the configured max velocity so the UI buttons can
         # still pick "fine" without re-editing settings every time.
-        speed_scale = {"coarse": 1.0, "medium": 0.5, "fine": 0.2}.get(request.speedMode, 0.5)
-        max_velocity = max(0.001, max_velocity * speed_scale)
+        speed_scale = {"coarse": 2.0, "medium": 0.5, "fine": 0.2}.get(request.speedMode, 0.5)
+        max_velocity = min(max_velocity_cap, max(0.001, max_velocity * speed_scale))
         start_velocity = min(float(group_profile.get("startSpeed", 0.0)), max_velocity)
         if start_velocity <= 0:
             start_velocity = max(0.0, max_velocity * 0.2)

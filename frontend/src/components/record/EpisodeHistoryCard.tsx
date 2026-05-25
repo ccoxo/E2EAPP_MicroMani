@@ -1,7 +1,7 @@
 import { Button, Card, Tag } from 'antd'
 import { useNavigate } from 'react-router-dom'
 import { useTelemetryStore } from '../../stores/telemetry'
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export default function EpisodeHistoryCard() {
   const history = useTelemetryStore((s) => s.recordSession.episodeHistory)
   const navigate = useNavigate()
