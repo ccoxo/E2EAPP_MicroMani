@@ -411,10 +411,6 @@ void NativeTeleopController::startGripperWorker() {
   if (!gripperWorkerRunning_.compare_exchange_strong(expected, true)) {
     return;
   }
-  {
-    std::scoped_lock lock(gripperMutex_);
-    nextGripperSampleIndex_ = 0;
-  }
   gripperWorker_ = std::thread(&NativeTeleopController::gripperLoop, this);
 }
 
@@ -434,7 +430,6 @@ void NativeTeleopController::gripperLoop() {
   while (gripperWorkerRunning_.load()) {
     std::array<PendingGripperCommand, 2> commands{};
     bool shouldSample = false;
-    int sampleIndex = 0;
     {
       std::unique_lock lock(gripperMutex_);
       gripperCv_.wait_until(lock, nextSampleAt, [&] {
@@ -450,8 +445,6 @@ void NativeTeleopController::gripperLoop() {
       const auto now = std::chrono::steady_clock::now();
       if (now >= nextSampleAt) {
         shouldSample = true;
-        sampleIndex = nextGripperSampleIndex_;
-        nextGripperSampleIndex_ = (nextGripperSampleIndex_ + 1) % 2;
         nextSampleAt = now + kGripperPositionSampleInterval;
       }
     }
@@ -480,7 +473,8 @@ void NativeTeleopController::gripperLoop() {
       }
     }
     if (shouldSample) {
-      sampleGripperPosition(sideFromIndex(sampleIndex));
+      sampleGripperPosition(Side::Left);
+      sampleGripperPosition(Side::Right);
     }
   }
 }

@@ -94,6 +94,27 @@ class NativeStartTimeoutHal(FakeHal):
         return {"mode": "real", "command": name, "response": {}}
 
 
+class SlowNativeTransitionHal(FakeHal):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_transition_commands = 0
+        self.max_active_transition_commands = 0
+
+    async def command(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if name in {"teleop.native.configure", "teleop.native.start", "teleop.native.stop"}:
+            self.active_transition_commands += 1
+            self.max_active_transition_commands = max(
+                self.max_active_transition_commands,
+                self.active_transition_commands,
+            )
+            try:
+                await asyncio.sleep(0.01)
+                return await super().command(name, payload)
+            finally:
+                self.active_transition_commands -= 1
+        return await super().command(name, payload)
+
+
 def base_hand(clutch: bool = False) -> dict[str, Any]:
     return {
         "connected": True,
@@ -238,7 +259,7 @@ def test_native_teleop_start_configures_and_starts_hal_controller(monkeypatch: p
     asyncio.run(run())
 
 
-def test_native_teleop_connect_does_not_enable_gripper_follow(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_native_teleop_connect_enables_hal_gripper_follow(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
 
     async def run() -> None:
@@ -250,12 +271,12 @@ def test_native_teleop_connect_does_not_enable_gripper_follow(monkeypatch: pytes
         await mapper.start("teleop-connect", pre_home=False)
 
         configure_payloads = [payload for name, payload in hal.commands if name == "teleop.native.configure"]
-        assert configure_payloads[-1]["gripperTeleopEnabled"] is False
+        assert configure_payloads[-1]["gripperTeleopEnabled"] is True
 
     asyncio.run(run())
 
 
-def test_native_gripper_teleop_start_enables_gripper_follow(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_native_gripper_teleop_start_enables_hal_gripper_follow(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
 
     async def run() -> None:
@@ -353,6 +374,29 @@ def test_native_teleop_start_does_not_wait_for_initial_status(monkeypatch: pytes
             assert mapper.status()["armed"] is True
         finally:
             await mapper.stop("teleop-connect")
+
+    asyncio.run(run())
+
+
+def test_native_teleop_start_and_stop_transitions_are_serialized(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def run() -> None:
+        hal = SlowNativeTransitionHal()
+        config = start_config(engine="hal_native", home_before_start=False)
+        mapper = TeleopMappingService(settings=FakeSettings(config), hal=hal, logs=LogService())
+
+        await asyncio.gather(
+            mapper.start("teleop-connect", pre_home=False),
+            mapper.start("manual-gripper", pre_home=False),
+        )
+        await asyncio.gather(
+            mapper.stop("teleop-connect", restart_remaining=False),
+            mapper.stop("manual-gripper"),
+        )
+
+        assert hal.max_active_transition_commands == 1
+        assert mapper.status()["armed"] is False
 
     asyncio.run(run())
 

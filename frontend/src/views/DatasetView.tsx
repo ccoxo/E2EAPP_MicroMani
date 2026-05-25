@@ -1,4 +1,4 @@
-import { Button, Card, Empty, Input, Modal, Popconfirm, Progress, Segmented, Slider, Space, Tag, Typography } from 'antd'
+import { Button, Card, Checkbox, Empty, Form, Input, Modal, Popconfirm, Progress, Segmented, Slider, Space, Switch, Tag, Typography } from 'antd'
 import {
   CheckCircle2,
   Database,
@@ -13,16 +13,19 @@ import {
   XCircle,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
+import { CameraPreview } from '../components/CameraPreview'
 import {
   apiBase,
   createDatasetApi,
   deleteDatasetApi,
   deleteDatasetEpisodeApi,
-  exportDatasetApi,
+  fetchDatasetEpisodeApi,
   fetchDatasets,
   mockMode,
+  pushDatasetApi,
   renameDatasetApi,
   saveDatasetReviewApi,
+  updateDatasetHubApi,
   updateDatasetEpisodeApi,
   type DatasetApi,
   type DatasetCameraResolutionApi,
@@ -451,6 +454,8 @@ function applyEpisodeOverrides(episode: ReviewEpisode, nameOverrides: Record<str
  */
 export function DatasetView() {
   const recordSession = useTelemetryStore((state) => state.recordSession)
+  const config = useTelemetryStore((state) => state.config)
+  const frame = useTelemetryStore((state) => state.frame)
   const [selectedDatasetId, setSelectedDatasetId] = useState('micro_assembly_v1')
   const [selectedEpisodeId, setSelectedEpisodeId] = useState<string | null>(null)
   const [frameIndex, setFrameIndex] = useState(0)
@@ -465,6 +470,20 @@ export function DatasetView() {
   const [episodeNameOverrides, setEpisodeNameOverrides] = useState<Record<string, string>>({})
   const [episodeStatusOverrides, setEpisodeStatusOverrides] = useState<Record<string, EpisodeStatus>>({})
   const [renameTarget, setRenameTarget] = useState<{ type: 'dataset' | 'episode'; id: string; value: string } | null>(null)
+  const [hubUploadOpen, setHubUploadOpen] = useState(false)
+  const [hubPushToHub, setHubPushToHub] = useState(Boolean(config.storage.pushToHub))
+  const [hubRepoId, setHubRepoId] = useState('')
+  const [hubToken, setHubToken] = useState('')
+  const [hubPrivate, setHubPrivate] = useState(false)
+  const [hubDryRun, setHubDryRun] = useState(true)
+  const [hubUploading, setHubUploading] = useState(false)
+  const [hubMessage, setHubMessage] = useState('')
+  const [episodeDetailLoadingKey, setEpisodeDetailLoadingKey] = useState('')
+  const [episodeDetailRequestedKeys, setEpisodeDetailRequestedKeys] = useState<string[]>([])
+
+  useEffect(() => {
+    setHubPushToHub(Boolean(config.storage.pushToHub))
+  }, [config.storage.pushToHub])
 
   useEffect(() => {
     if (mockMode) return
@@ -511,10 +530,46 @@ export function DatasetView() {
     ?? datasets[0]
   const selectedEpisode = selectedDataset?.episodes.find((episode) => episode.id === selectedEpisodeId) ?? selectedDataset?.episodes[0]
   const selectedCameras = selectedDataset && selectedEpisode ? camerasForReview(selectedDataset, selectedEpisode) : cameras
+  const livePreviewCameras = cameras
+    .map(({ key }) => frame.cameras.find((camera) => camera.key === key))
+    .filter((camera): camera is NonNullable<typeof camera> => Boolean(camera))
   const validEpisodes = selectedDataset?.episodes.filter((episode) => episode.status === 'valid').length ?? 0
   const avgQuality = selectedDataset && selectedDataset.episodes.length > 0
     ? Math.round(selectedDataset.episodes.reduce((sum, episode) => sum + episode.quality, 0) / selectedDataset.episodes.length)
     : 0
+
+  useEffect(() => {
+    if (mockMode || !selectedDataset || !selectedEpisode || selectedEpisode.samples.length > 0) return
+    const detailKey = `${selectedDataset.id}:${selectedEpisode.id}`
+    if (episodeDetailLoadingKey === detailKey || episodeDetailRequestedKeys.includes(detailKey)) return
+    setEpisodeDetailLoadingKey(detailKey)
+    void fetchDatasetEpisodeApi(selectedDataset.id, selectedEpisode.id)
+      .then((episode) => {
+        if (!episode) return
+        setServerDatasets((items) =>
+          items.map((dataset) =>
+            dataset.id === selectedDataset.id
+              ? {
+                  ...dataset,
+                  episodes: dataset.episodes.map((item) =>
+                    item.id === episode.id ? episodeFromApi(episode) : item,
+                  ),
+                }
+              : dataset,
+          ),
+        )
+        setBackendLoadError('')
+      })
+      .catch((error) => setBackendLoadError(String(error)))
+      .finally(() => {
+        setEpisodeDetailRequestedKeys((keys) => (keys.includes(detailKey) ? keys : [...keys, detailKey]))
+        setEpisodeDetailLoadingKey((current) => (current === detailKey ? '' : current))
+      })
+  }, [episodeDetailLoadingKey, episodeDetailRequestedKeys, selectedDataset, selectedEpisode])
+
+  useEffect(() => {
+    if (hubUploadOpen && selectedDataset && !hubRepoId) setHubRepoId(selectedDataset.id)
+  }, [hubRepoId, hubUploadOpen, selectedDataset])
 
   useEffect(() => {
     if (!playing || !selectedEpisode) return
@@ -614,11 +669,47 @@ const saveReview = () => {
   }
 
     /** 调用数据集后端接口并同步界面状态。 */
-const exportDataset = () => {
-    if (!selectedDataset || mockMode) return
-    void exportDatasetApi(selectedDataset.id)
-      .then(() => setRefreshToken((value) => value + 1))
+const openHubUpload = () => {
+    if (!selectedDataset) return
+    setHubMessage('')
+    setHubRepoId((current) => current || selectedDataset.id)
+    setHubUploadOpen(true)
+  }
+
+  const updateHubSwitch = (enabled: boolean) => {
+    const previous = hubPushToHub
+    setHubPushToHub(enabled)
+    setHubMessage('')
+    void updateDatasetHubApi(enabled)
+      .then((response) => {
+        const data = (response as { data?: { pushToHub?: boolean } }).data
+        if (typeof data?.pushToHub === 'boolean') setHubPushToHub(data.pushToHub)
+      })
+      .catch((error) => {
+        setHubPushToHub(previous)
+        setBackendLoadError(String(error))
+      })
+  }
+
+  const uploadToHub = () => {
+    if (!selectedDataset) return
+    const transientToken = hubToken.trim()
+    setHubToken('')
+    setHubUploading(true)
+    setHubMessage('')
+    void pushDatasetApi(selectedDataset.id, {
+      repoId: hubRepoId.trim(),
+      token: transientToken,
+      private: hubPrivate,
+      dryRun: hubDryRun,
+    })
+      .then(() => {
+        setHubUploadOpen(false)
+        setHubMessage(hubDryRun ? 'Hub dry-run complete' : 'Hub upload complete')
+        setRefreshToken((value) => value + 1)
+      })
       .catch((error) => setBackendLoadError(String(error)))
+      .finally(() => setHubUploading(false))
   }
 
   return (
@@ -631,7 +722,9 @@ const exportDataset = () => {
         <Space wrap>
           {!mockMode && <Tag color={backendLoadError ? 'error' : 'processing'}>{backendLoadError ? '后端数据异常' : '后端数据'}</Tag>}
           <Button type="primary" icon={<Database size={16} />} onClick={createDataset}>新建数据集</Button>
-          <Button icon={<Upload size={16} />} onClick={exportDataset} disabled={!selectedDataset}>Hub 导出</Button>
+          {hubMessage && <Tag color="success">{hubMessage}</Tag>}
+          <Tag color={hubPushToHub ? 'success' : 'default'}>{hubPushToHub ? 'Hub enabled' : 'Hub disabled'}</Tag>
+          <Button icon={<Upload size={16} />} onClick={openHubUpload} disabled={!selectedDataset}>Hub 上传</Button>
           <Button icon={<Save size={16} />} onClick={saveReview} disabled={!selectedDataset}>保存审核结果</Button>
         </Space>
       </section>
@@ -732,6 +825,18 @@ const exportDataset = () => {
                 </Space>
               </section>
 
+              <section className="panel-surface dataset-live-preview-strip">
+                <div className="section-title">
+                  <span>实时相机预览</span>
+                  <Tag color="processing">Live</Tag>
+                </div>
+                <div className="dataset-live-preview-grid">
+                  {livePreviewCameras.map((camera) => (
+                    <CameraPreview camera={camera} compact key={camera.key} />
+                  ))}
+                </div>
+              </section>
+
               <section className="panel-surface dataset-quality-workbench">
                 <div className="section-title">
                   <span>同步视频检查</span>
@@ -807,6 +912,54 @@ const exportDataset = () => {
           )}
         </main>
       </section>
+
+      <Modal
+        title="Hugging Face Hub 上传"
+        open={hubUploadOpen}
+        onCancel={() => {
+          setHubToken('')
+          setHubUploadOpen(false)
+        }}
+        onOk={uploadToHub}
+        okText="开始上传"
+        cancelText="取消"
+        confirmLoading={hubUploading}
+        okButtonProps={{ disabled: !hubRepoId.trim() || (!hubDryRun && !hubPushToHub) }}
+      >
+        <Form layout="vertical">
+          <Form.Item label="上传开关">
+            <Switch
+              aria-label="Hub 上传开关"
+              checked={hubPushToHub}
+              checkedChildren="On"
+              unCheckedChildren="Off"
+              onChange={updateHubSwitch}
+            />
+          </Form.Item>
+          <Form.Item label="Repo ID">
+            <Input
+              value={hubRepoId}
+              placeholder="org/dataset-name"
+              onChange={(event) => setHubRepoId(event.target.value)}
+            />
+          </Form.Item>
+          <Form.Item label="HF Token">
+            <Input.Password
+              value={hubToken}
+              placeholder="hf_xxx"
+              autoComplete="off"
+              onChange={(event) => setHubToken(event.target.value)}
+            />
+          </Form.Item>
+          <Space wrap>
+            <Checkbox checked={hubPrivate} onChange={(event) => setHubPrivate(event.target.checked)}>Private</Checkbox>
+            <Checkbox checked={hubDryRun} onChange={(event) => setHubDryRun(event.target.checked)}>Dry-run</Checkbox>
+          </Space>
+          {!hubDryRun && !hubPushToHub && (
+            <Typography.Text type="warning">关闭 Dry-run 前需要先打开 Hub 上传开关。</Typography.Text>
+          )}
+        </Form>
+      </Modal>
 
       <Modal
         title={renameTarget?.type === 'dataset' ? '重命名数据集' : '重命名 Episode'}

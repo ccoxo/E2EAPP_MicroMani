@@ -19,6 +19,72 @@ export const apiBase = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:18082'
 export const wsUrl = import.meta.env.VITE_WS_URL || 'ws://127.0.0.1:18082/ws'
 export const mockMode = import.meta.env.MODE === 'test'
 
+const runtimeReleasePath = '/api/runtime/release_handles'
+const runtimeShutdownPath = '/api/runtime/shutdown'
+let runtimeReleaseListenerInstalled = false
+let runtimeShutdownListenerInstalled = false
+
+function sendRuntimeLifecycleCommand(path: string, reason: string) {
+  if (mockMode || typeof window === 'undefined') return
+  const url = `${apiBase}${path}`
+  const body = JSON.stringify({ reason })
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+      const blob = new Blob([body], { type: 'application/json' })
+      if (navigator.sendBeacon(url, blob)) return
+    }
+  } catch {
+    // Keep page teardown best-effort; fetch keepalive below is the fallback.
+  }
+  if (typeof fetch !== 'function') return
+  void fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    keepalive: true,
+  }).catch(() => undefined)
+}
+
+function installRuntimeLifecycleOnClose(
+  path: string,
+  reason: string,
+  installed: () => boolean,
+  markInstalled: () => void,
+) {
+  if (mockMode || typeof window === 'undefined' || installed()) return
+  markInstalled()
+  let sent = false
+  const release = () => {
+    if (sent) return
+    sent = true
+    sendRuntimeLifecycleCommand(path, reason)
+  }
+  window.addEventListener('pagehide', release, { capture: true })
+  window.addEventListener('beforeunload', release, { capture: true })
+}
+
+export function installRuntimeReleaseOnClose(reason = 'browser-close') {
+  installRuntimeLifecycleOnClose(
+    runtimeReleasePath,
+    reason,
+    () => runtimeReleaseListenerInstalled,
+    () => {
+      runtimeReleaseListenerInstalled = true
+    },
+  )
+}
+
+export function installAutoShutdownOnClose(reason = 'browser-close') {
+  installRuntimeLifecycleOnClose(
+    runtimeShutdownPath,
+    reason,
+    () => runtimeShutdownListenerInstalled,
+    () => {
+      runtimeShutdownListenerInstalled = true
+    },
+  )
+}
+
 type ApiErrorPayload = {
   detail?: {
     code?: unknown
@@ -450,6 +516,17 @@ export async function exportDatasetApi(datasetId: string) {
   if (!response.ok) throw new Error(`dataset export failed: ${response.status}`)
   return response.json() as Promise<unknown>
 }
+
+export async function updateDatasetHubApi(pushToHub: boolean) {
+  if (mockMode) return { ok: true, data: { pushToHub }, ts: Date.now() }
+  const response = await fetch(`${apiBase}/api/datasets/hub`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pushToHub }),
+  })
+  if (!response.ok) throw new Error(`dataset hub update failed: ${response.status}`)
+  return response.json() as Promise<unknown>
+}
 /** 从后端读取对应数据。 */
 export async function fetchDatasetStatsApi(datasetId: string) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
@@ -480,12 +557,19 @@ export async function cleanDatasetApi(datasetId: string, apply = false) {
   return response.json() as Promise<unknown>
 }
 /** 描述当前方法的功能边界。 */
-export async function pushDatasetApi(datasetId: string, repoId: string, dryRun = true) {
+export interface DatasetHubUploadRequest {
+  repoId: string
+  token?: string
+  private?: boolean
+  dryRun?: boolean
+}
+
+export async function pushDatasetApi(datasetId: string, request: DatasetHubUploadRequest) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/datasets/${encodeURIComponent(datasetId)}/push`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ repoId, dryRun }),
+    body: JSON.stringify(request),
   })
   if (!response.ok) throw new Error(`dataset push failed: ${response.status}`)
   return response.json() as Promise<unknown>

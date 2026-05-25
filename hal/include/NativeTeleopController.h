@@ -277,7 +277,6 @@ class NativeTeleopController {
   std::thread gripperWorker_;
   std::atomic<bool> gripperWorkerRunning_{false};
   std::array<PendingGripperCommand, 2> pendingGripperCommands_{};
-  int nextGripperSampleIndex_{0};
 };
 
 }  // namespace appstation::hal

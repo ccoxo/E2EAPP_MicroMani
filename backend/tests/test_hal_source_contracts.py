@@ -1117,12 +1117,28 @@ def test_hal_native_gripper_worker_samples_positions_without_commands() -> None:
     assert "bool JodellGripperDriver::readPositionMm(" in gripper_source
     assert "getClawCurrentLocation_(slave)" in gripper_source
     assert "void sampleGripperPosition(Side side);" in controller_header
-    assert "int nextGripperSampleIndex_{0};" in controller_header
+    assert "nextGripperSampleIndex_" not in controller_header
     assert "constexpr auto kGripperPositionSampleInterval = std::chrono::microseconds(33333);" in controller_source
     assert "gripperCv_.wait_until(lock, nextSampleAt, [&]" in normalized_loop
-    assert "sampleGripperPosition(sideFromIndex(sampleIndex));" in normalized_loop
+    assert "sampleGripperPosition(Side::Left);" in normalized_loop
+    assert "sampleGripperPosition(Side::Right);" in normalized_loop
+    assert "sampleGripperPosition(sideFromIndex(sampleIndex));" not in normalized_loop
     assert "const bool ok = gripper_.readPositionMm(side, &message);" in normalized_sample
     assert "gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);" in normalized_sample
+
+
+def test_hal_native_jodell_driver_keeps_dual_ports_open_per_side() -> None:
+    gripper_header = (REPO_ROOT / "hal" / "include" / "JodellGripperDriver.h").read_text(encoding="utf-8")
+    gripper_source = (REPO_ROOT / "hal" / "src" / "JodellGripperDriver.cpp").read_text(encoding="utf-8")
+    normalized = " ".join(gripper_source.split())
+
+    assert "bool ensurePortOpenUnlocked(int index, int port, std::string* message);" in gripper_header
+    assert "std::array<int, 2> activePorts_" in gripper_header
+    assert "selectPortUnlocked" not in gripper_header
+    assert "selectPortUnlocked" not in gripper_source
+    assert "if (activePorts_[index] == port)" in normalized
+    assert "activePorts_[index] = port;" in normalized
+    assert "(void)serialOperation_(activePorts_[index], config_.baudrate, 0);" in normalized
 
 
 def test_hal_native_gripper_teleop_throttles_background_jodell_commands() -> None:

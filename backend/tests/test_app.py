@@ -57,6 +57,36 @@ def _avoid_camera_index_conflicts(config: dict) -> None:
     config["cameras"]["wristRight"] = "IMX258 / index 2"
 
 
+def _write_dataset_fixture(dataset_root: Path, dataset_id: str = "unit_dataset") -> Path:
+    dataset_dir = dataset_root / dataset_id
+    (dataset_dir / "meta").mkdir(parents=True)
+    (dataset_dir / "meta" / "info.json").write_text(
+        json.dumps(
+            {
+                "name": "Unit Dataset",
+                "format": "lerobot-v3-native",
+                "fps": 30,
+                "createdAt": 1000,
+                "updatedAt": 2000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    episode = {
+        "id": "episode_000001",
+        "name": "Episode 1",
+        "task": "assembly",
+        "status": "review",
+        "frames": 12,
+        "fps": 30,
+        "durationS": 0.4,
+        "createdAt": 1500,
+        "native": True,
+    }
+    (dataset_dir / "meta" / "episodes.jsonl").write_text(json.dumps(episode) + "\n", encoding="utf-8")
+    return dataset_dir
+
+
 def test_backend_app_import_does_not_create_runtime_services(tmp_path: Path) -> None:
     import os
     import subprocess
@@ -121,6 +151,131 @@ def test_settings_round_trip(tmp_path: Path) -> None:
     assert put_response.json()["hal"]["apiConfirmed"] is True
 
     assert client.get("/api/settings").json()["hal"]["apiConfirmed"] is True
+
+
+def test_dataset_hub_toggle_updates_upload_switch(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path))
+
+    response = client.patch("/api/datasets/hub", json={"pushToHub": True})
+
+    assert response.status_code == 200
+    assert response.json()["data"]["pushToHub"] is True
+    assert client.get("/api/settings").json()["storage"]["pushToHub"] is True
+
+
+def test_dataset_push_uses_request_token_without_persisting(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    client = TestClient(create_app(tmp_path / "runtime"))
+    dataset_root = tmp_path / "datasets"
+    dataset_dir = dataset_root / "unit_dataset"
+    (dataset_dir / "meta").mkdir(parents=True)
+    (dataset_dir / "meta" / "info.json").write_text(json.dumps({"codebase_version": "v3.0"}), encoding="utf-8")
+    config = client.get("/api/settings").json()
+    config["storage"]["datasetRoot"] = str(dataset_root)
+    config["storage"]["pushToHub"] = True
+    assert client.put("/api/settings", json=config).status_code == 200
+    calls: list[dict[str, Any]] = []
+
+    class FakeLeRobotDataset:
+        def __init__(self, repo_id: str, root: Path) -> None:
+            calls.append({"constructorRepoId": repo_id, "root": str(root)})
+
+        def push_to_hub(self, **kwargs: Any) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(client.app.state.recorder, "_native_imports", lambda: (FakeLeRobotDataset, object()))
+
+    response = client.post(
+        "/api/datasets/unit_dataset/push",
+        json={"repoId": "org/unit_dataset", "token": "hf_transient_secret", "private": True, "dryRun": False},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["data"]["pushed"] is True
+    assert "hf_transient_secret" not in json.dumps(payload)
+    assert calls[-1] == {"repo_id": "org/unit_dataset", "token": "hf_transient_secret", "private": True}
+    assert "hf_transient_secret" not in (tmp_path / "runtime" / "config.json").read_text(encoding="utf-8")
+
+
+def test_dataset_list_returns_metadata_without_loading_episode_samples(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    client = TestClient(create_app(tmp_path / "runtime"))
+    dataset_root = tmp_path / "datasets"
+    _write_dataset_fixture(dataset_root)
+    config = client.get("/api/settings").json()
+    config["storage"]["datasetRoot"] = str(dataset_root)
+    assert client.put("/api/settings", json=config).status_code == 200
+
+    def fail_if_samples_are_loaded(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+        raise AssertionError("dataset list must not load episode samples")
+
+    monkeypatch.setattr(client.app.state.recorder, "_episode_samples", fail_if_samples_are_loaded)
+
+    response = client.get("/api/datasets")
+
+    assert response.status_code == 200
+    episode = response.json()["data"]["datasets"][0]["episodes"][0]
+    assert episode["id"] == "episode_000001"
+    assert episode["samples"] == []
+
+
+def test_dataset_episode_detail_loads_samples_on_demand(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    client = TestClient(create_app(tmp_path / "runtime"))
+    dataset_root = tmp_path / "datasets"
+    _write_dataset_fixture(dataset_root)
+    config = client.get("/api/settings").json()
+    config["storage"]["datasetRoot"] = str(dataset_root)
+    assert client.put("/api/settings", json=config).status_code == 200
+    calls: list[str] = []
+
+    def fake_samples(_dataset_dir: Path, dataset_id: str, episode: dict[str, Any]) -> list[dict[str, Any]]:
+        calls.append(f"{dataset_id}:{episode['id']}")
+        return [{"frame": 0}]
+
+    monkeypatch.setattr(client.app.state.recorder, "_episode_samples", fake_samples)
+
+    response = client.get("/api/datasets/unit_dataset/episodes/episode_000001")
+
+    assert response.status_code == 200
+    episode = response.json()["data"]["episode"]
+    assert episode["samples"] == [{"frame": 0}]
+    assert calls == ["unit_dataset:episode_000001"]
+
+
+def test_dataset_heavy_read_routes_use_worker_thread(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    client = TestClient(create_app(tmp_path / "runtime"))
+    calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def fake_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append((func.__name__, args))
+        return func(*args, **kwargs)
+
+    def list_datasets() -> list[dict[str, Any]]:
+        return []
+
+    def episode_detail(dataset_id: str, episode_id: str) -> dict[str, Any]:
+        return {"id": episode_id, "datasetId": dataset_id}
+
+    def resolve_frame_image(dataset_id: str, episode_id: str, camera: str, frame: int) -> bytes:
+        return f"{dataset_id}:{episode_id}:{camera}:{frame}".encode("utf-8")
+
+    monkeypatch.setattr(client.app.state.recorder, "list_datasets", list_datasets)
+    monkeypatch.setattr(client.app.state.recorder, "episode_detail", episode_detail)
+    monkeypatch.setattr(client.app.state.recorder, "resolve_frame_image", resolve_frame_image)
+    monkeypatch.setattr("backend.app.asyncio.to_thread", fake_to_thread)
+
+    assert client.get("/api/datasets").status_code == 200
+    assert client.get("/api/datasets/unit_dataset/episodes/episode_000001").status_code == 200
+    image_response = client.get(
+        "/api/datasets/unit_dataset/frame_image",
+        params={"episode_id": "episode_000001", "camera": "global", "frame": 3},
+    )
+
+    assert image_response.status_code == 200
+    assert [name for name, _ in calls] == ["list_datasets", "episode_detail", "resolve_frame_image"]
+    assert calls[1][1] == ("unit_dataset", "episode_000001")
+    assert calls[2][1] == ("unit_dataset", "episode_000001", "global", 3)
 
 
 def test_startup_emits_session_and_axis_config_logs(tmp_path: Path) -> None:
@@ -1226,6 +1381,7 @@ def test_record_session_controls_gripper_teleop_recording_source(tmp_path: Path,
         "stop",
         lambda source="manual", force=False: stop_calls.append("force" if force else source),
     )
+    monkeypatch.setattr(client.app.state.gripper_tele, "get_status", lambda: {"running": True})
 
     start_response = client.post(
         "/api/record/session/create",
@@ -1306,6 +1462,7 @@ def test_native_gripper_teleop_start_is_hal_managed(tmp_path: Path, monkeypatch:
         "stop",
         lambda source="manual", force=False: stop_calls.append("force" if force else source),
     )
+    monkeypatch.setattr(client.app.state.gripper_tele, "get_status", lambda: {"running": True})
     monkeypatch.setattr(client.app.state.gripper_workers, "stop_all", lambda: worker_stops.append("stop_all"))
     monkeypatch.setattr(client.app.state.teleop_mapper, "start", fake_native_start)
 
@@ -1314,11 +1471,48 @@ def test_native_gripper_teleop_start_is_hal_managed(tmp_path: Path, monkeypatch:
     assert response.status_code == 200
     assert response.json()["data"]["nativeManaged"] is True
     assert response.json()["data"]["message"] == "managed by HAL-native teleop"
-    assert response.json()["data"]["running"] is True
+    assert response.json()["data"]["running"] is False
+    assert response.json()["data"]["requestedRunning"] is True
     assert start_calls == []
     assert stop_calls == ["force"]
     assert worker_stops == ["stop_all"]
     assert native_start_calls == [("manual-gripper", False)]
+
+
+def test_native_teleop_connect_does_not_start_python_dual_worker_gripper_follow(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    config = client.get("/api/settings").json()
+    config["teleop"]["engine"] = "hal_native"
+    config["teleop"]["gripperTeleop"]["enabled"] = True
+    config["gripper"]["sampleMode"] = "dual_worker"
+    assert client.put("/api/settings", json=config).status_code == 200
+    gripper_start_calls: list[str] = []
+    worker_stop_calls: list[str] = []
+    native_start_calls: list[str] = []
+
+    async def fake_native_start(source: str = "recording", home_side: str | None = None, *, pre_home: bool = True):
+        native_start_calls.append(source)
+        return {"running": True}
+
+    monkeypatch.setattr(client.app.state.teleop_mapper, "start", fake_native_start)
+    monkeypatch.setattr(
+        client.app.state.gripper_tele,
+        "start",
+        lambda source="manual": gripper_start_calls.append(source),
+    )
+    monkeypatch.setattr(client.app.state.gripper_workers, "stop_all", lambda: worker_stop_calls.append("stop_all"))
+
+    response = client.post("/api/teleop/left/connect")
+
+    assert response.status_code == 200
+    time.sleep(0.1)
+    assert native_start_calls == ["teleop-connect"]
+    assert gripper_start_calls == []
+    assert worker_stop_calls == ["stop_all"]
 
 
 def test_native_gripper_teleop_stop_releases_hal_source(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -1413,8 +1607,8 @@ def test_native_record_session_does_not_start_python_gripper_teleop(
 
     assert response.status_code == 200
     assert start_calls == []
-    assert stop_calls == ["force", "force"]
-    assert worker_stops == ["stop_all", "stop_all"]
+    assert stop_calls == ["force"]
+    assert worker_stops == ["stop_all"]
 
 
 def test_real_record_session_requires_hardware_recognition_before_start(
@@ -1521,6 +1715,7 @@ def test_native_gripper_teleop_start_does_not_probe_python_gripper_serial(
     config["teleop"]["engine"] = "hal_native"
     assert client.put("/api/settings", json=config).status_code == 200
     start_calls: list[str] = []
+    gripper_start_calls: list[str] = []
     include_gripper_values: list[bool] = []
 
     async def fake_native_start(source: str = "recording", home_side: str | None = None, *, pre_home: bool = True):
@@ -1529,6 +1724,12 @@ def test_native_gripper_teleop_start_does_not_probe_python_gripper_serial(
         return {"running": True}
 
     monkeypatch.setattr(client.app.state.teleop_mapper, "start", fake_native_start)
+    monkeypatch.setattr(
+        client.app.state.gripper_tele,
+        "start",
+        lambda source="manual": gripper_start_calls.append(source),
+    )
+    monkeypatch.setattr(client.app.state.gripper_tele, "get_status", lambda: {"running": True})
 
     def fake_hardware_status(*, include_gripper: bool = True) -> dict[str, Any]:
         include_gripper_values.append(include_gripper)
@@ -1550,6 +1751,7 @@ def test_native_gripper_teleop_start_does_not_probe_python_gripper_serial(
     assert response.status_code == 200
     assert response.json()["data"]["nativeManaged"] is True
     assert start_calls == ["manual-gripper"]
+    assert gripper_start_calls == []
     assert include_gripper_values == [False]
 
 
@@ -1607,7 +1809,7 @@ def test_native_teleop_connect_does_not_require_gripper_probe_before_start(
     assert client.app.state.settings.get_config()["teleop"]["leftConnected"] is True
     configure_payloads = [payload for name, payload in fake_hal.commands if name == "teleop.native.configure"]
     assert configure_payloads
-    assert configure_payloads[-1]["gripperTeleopEnabled"] is False
+    assert configure_payloads[-1]["gripperTeleopEnabled"] is True
 
 
 def test_teleop_connect_accepts_physical_hand_when_last_read_timed_out(
@@ -2596,6 +2798,295 @@ def test_camera_drop_defers_release_while_reader_is_still_reading(monkeypatch: M
 
     assert release_observed.is_set()
     assert capture.released_during_read is False
+
+
+def test_camera_process_capture_reopens_after_worker_exit(monkeypatch: MonkeyPatch) -> None:
+    driver = OpenCVCameraDriver()
+    captures: list[FakeProcessCapture] = []
+
+    class FakeProcessCapture:
+        is_process_capture = True
+
+        def __init__(self) -> None:
+            self.alive = True
+            self.released = False
+            captures.append(self)
+
+        def isOpened(self) -> bool:
+            return self.alive
+
+        def get(self, prop: int) -> float:
+            _ = prop
+            return 30.0
+
+        def release(self) -> None:
+            self.released = True
+
+    class FakeCv2:
+        CAP_ANY = 0
+        CAP_MSMF = 1400
+        CAP_DSHOW = 700
+        CAP_PROP_FRAME_WIDTH = 3
+        CAP_PROP_FRAME_HEIGHT = 4
+        CAP_PROP_FPS = 5
+        CAP_PROP_FOURCC = 6
+        CAP_PROP_BUFFERSIZE = 7
+        IMWRITE_JPEG_QUALITY = 1
+
+        @staticmethod
+        def VideoCapture(index: int, backend: int) -> object:
+            raise AssertionError(f"in-process VideoCapture should not be used for {index}/{backend}")
+
+        @staticmethod
+        def VideoWriter_fourcc(a: str, b: str, c: str, d: str) -> int:
+            _ = (a, b, c, d)
+            return 1
+
+    monkeypatch.setattr(driver, "_process_capture_enabled", lambda cv2, candidates: True, raising=False)
+    monkeypatch.setattr(
+        driver,
+        "_start_process_capture",
+        lambda cv2, index, width, height, fps, camera, profile, candidates: FakeProcessCapture(),
+        raising=False,
+    )
+
+    first = driver._get_capture(FakeCv2, 0, 640, 480, 30, "global", default_config())  # noqa: SLF001
+    assert first is captures[0]
+    captures[0].alive = False
+
+    second = driver._get_capture(FakeCv2, 0, 640, 480, 30, "global", default_config())  # noqa: SLF001
+
+    assert second is captures[1]
+    assert captures[0].released is True
+
+
+def test_camera_process_capture_falls_back_when_worker_unavailable(monkeypatch: MonkeyPatch) -> None:
+    driver = OpenCVCameraDriver()
+    captures: list[FakeCapture] = []
+    attempts: list[tuple[int, int]] = []
+
+    class FakeCapture:
+        def __init__(self, index: int, backend: int) -> None:
+            self.index = index
+            self.backend = backend
+            captures.append(self)
+
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, prop: int, value: int | float) -> None:
+            _ = (prop, value)
+
+        def get(self, prop: int) -> float:
+            if prop == FakeCv2.CAP_PROP_FRAME_WIDTH:
+                return 640.0
+            if prop == FakeCv2.CAP_PROP_FRAME_HEIGHT:
+                return 480.0
+            if prop == FakeCv2.CAP_PROP_FPS:
+                return 30.0
+            return 0.0
+
+        def read(self) -> tuple[bool, object | None]:
+            return False, None
+
+        def release(self) -> None:
+            return None
+
+    class FakeCv2:
+        CAP_ANY = 0
+        CAP_MSMF = 1400
+        CAP_DSHOW = 700
+        CAP_PROP_FRAME_WIDTH = 3
+        CAP_PROP_FRAME_HEIGHT = 4
+        CAP_PROP_FPS = 5
+        CAP_PROP_FOURCC = 6
+        CAP_PROP_BUFFERSIZE = 7
+        IMWRITE_JPEG_QUALITY = 1
+
+        @staticmethod
+        def VideoCapture(index: int, backend: int) -> FakeCapture:
+            attempts.append((index, backend))
+            return FakeCapture(index, backend)
+
+        @staticmethod
+        def VideoWriter_fourcc(a: str, b: str, c: str, d: str) -> int:
+            _ = (a, b, c, d)
+            return 1
+
+        @staticmethod
+        def imencode(ext: str, frame: object, options: list[int]) -> tuple[bool, bytes]:
+            _ = (ext, frame, options)
+            return True, b"\xff\xd8fake-jpeg\xff\xd9"
+
+    monkeypatch.setattr(driver, "_process_capture_enabled", lambda cv2, candidates: True, raising=False)
+    monkeypatch.setattr(
+        driver,
+        "_start_process_capture",
+        lambda cv2, index, width, height, fps, camera, profile, candidates: None,
+        raising=False,
+    )
+
+    capture = driver._get_capture(FakeCv2, 0, 640, 480, 30, "global", default_config())  # noqa: SLF001
+
+    assert capture is captures[0]
+    assert attempts[0] == (0, FakeCv2.CAP_DSHOW)
+    driver._drop_capture(0)  # noqa: SLF001
+
+
+def test_camera_process_capture_starts_module_subprocess(monkeypatch: MonkeyPatch) -> None:
+    driver = OpenCVCameraDriver()
+    popen_calls: list[dict[str, Any]] = []
+    stdin_writes: list[str] = []
+
+    class FakeStdin:
+        def write(self, text: str) -> None:
+            stdin_writes.append(text)
+
+        def flush(self) -> None:
+            return None
+
+    class FakeStdout:
+        def __iter__(self) -> object:
+            yield json.dumps(
+                {
+                    "type": "status",
+                    "ok": True,
+                    "opened": True,
+                    "backend": "CAP_DSHOW",
+                    "actualWidth": 640,
+                    "actualHeight": 480,
+                    "actualFps": 30,
+                }
+            ) + "\n"
+
+        def close(self) -> None:
+            return None
+
+    class FakePopen:
+        def __init__(self, args: list[str], **kwargs: Any) -> None:
+            popen_calls.append({"args": args, "kwargs": kwargs})
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = object()
+            self.pid = 12345
+            self._alive = True
+
+        def poll(self) -> int | None:
+            return None if self._alive else 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            _ = timeout
+            self._alive = False
+            return 0
+
+        def terminate(self) -> None:
+            self._alive = False
+
+    class FakeCv2:
+        CAP_PROP_FRAME_WIDTH = 3
+        CAP_PROP_FRAME_HEIGHT = 4
+        CAP_PROP_FPS = 5
+
+    monkeypatch.setattr("backend.drivers.camera_opencv.subprocess.Popen", FakePopen)
+
+    capture = driver._start_process_capture(  # noqa: SLF001
+        FakeCv2,
+        1,
+        640,
+        480,
+        30.0,
+        "global",
+        None,
+        [(700, "CAP_DSHOW")],
+    )
+
+    assert capture is not None
+    args = popen_calls[0]["args"]
+    assert args[1:3] == ["-m", "backend.workers.camera_capture_worker"]
+    startup = json.loads(args[3])
+    assert startup["index"] == 1
+    assert startup["backendCandidates"] == [[700, "CAP_DSHOW"]]
+    capture.release()
+    assert stdin_writes == ["stop\n"]
+
+
+def test_camera_reader_initializes_com_around_directshow_reads(monkeypatch: MonkeyPatch) -> None:
+    driver = OpenCVCameraDriver()
+    events: list[str] = []
+    read_observed = Event()
+    uninit_observed = Event()
+
+    def fake_com_init() -> str:
+        events.append("init")
+        return "token"
+
+    def fake_com_uninit(token: object) -> None:
+        events.append(f"uninit:{token}")
+        uninit_observed.set()
+
+    class FakeCapture:
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, prop: int, value: int) -> None:
+            _ = (prop, value)
+
+        def get(self, prop: int) -> float:
+            _ = prop
+            return 30.0
+
+        def read(self) -> tuple[bool, object]:
+            read_observed.set()
+            time.sleep(0.01)
+            return True, object()
+
+        def release(self) -> None:
+            return None
+
+    class FakeCv2:
+        CAP_ANY = 0
+        CAP_MSMF = 1400
+        CAP_DSHOW = 700
+        CAP_PROP_FRAME_WIDTH = 3
+        CAP_PROP_FRAME_HEIGHT = 4
+        CAP_PROP_FPS = 5
+        CAP_PROP_FOURCC = 6
+        CAP_PROP_BUFFERSIZE = 7
+        IMWRITE_JPEG_QUALITY = 1
+
+        @staticmethod
+        def VideoCapture(index: int, backend: int) -> FakeCapture:
+            _ = (index, backend)
+            return FakeCapture()
+
+        @staticmethod
+        def VideoWriter_fourcc(a: str, b: str, c: str, d: str) -> int:
+            _ = (a, b, c, d)
+            return 1
+
+        @staticmethod
+        def imencode(ext: str, frame: object, options: list[int]) -> tuple[bool, bytes]:
+            _ = (ext, frame, options)
+            return True, b"\xff\xd8fake-jpeg\xff\xd9"
+
+    monkeypatch.setattr(
+        "backend.drivers.camera_opencv._co_initialize_for_capture_thread",
+        fake_com_init,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "backend.drivers.camera_opencv._co_uninitialize_for_capture_thread",
+        fake_com_uninit,
+        raising=False,
+    )
+
+    assert driver._get_capture(FakeCv2, 0, 640, 480, 30) is not None  # noqa: SLF001
+    assert read_observed.wait(timeout=1.0)
+
+    assert driver._drop_capture(0) is True  # noqa: SLF001
+    assert uninit_observed.wait(timeout=1.0)
+    assert events[0] == "init"
+    assert events[-1] == "uninit:token"
 
 
 def test_camera_auto_discovery_requires_encoded_frame() -> None:

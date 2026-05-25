@@ -537,6 +537,31 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getByText('右力传感器实时曲线')).toBeInTheDocument()
   })
 
+  it('submits transient Hugging Face upload settings from the dataset page', async () => {
+    const hubToggleSpy = vi.spyOn(api, 'updateDatasetHubApi').mockResolvedValue({ ok: true, data: { pushToHub: true }, ts: Date.now() })
+    const pushSpy = vi.spyOn(api, 'pushDatasetApi').mockResolvedValue({ ok: true, data: { pushed: true }, ts: Date.now() })
+
+    useTelemetryStore.setState({ config: structuredClone(defaultConfig) })
+    render(<App />)
+    fireEvent.click(screen.getByRole('link', { name: '数据集' }))
+    fireEvent.click(screen.getByRole('button', { name: /Hub 上传/ }))
+    fireEvent.click(screen.getByRole('switch', { name: 'Hub 上传开关' }))
+    fireEvent.change(screen.getByPlaceholderText('org/dataset-name'), { target: { value: 'lab/micro_assembly_v1' } })
+    fireEvent.change(screen.getByPlaceholderText('hf_xxx'), { target: { value: 'hf_transient_secret' } })
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Private' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Dry-run' }))
+    fireEvent.click(screen.getByRole('button', { name: '开始上传' }))
+
+    await waitFor(() => expect(hubToggleSpy).toHaveBeenCalledWith(true))
+    await waitFor(() => expect(pushSpy).toHaveBeenCalledWith('micro_assembly_v1', {
+      repoId: 'lab/micro_assembly_v1',
+      token: 'hf_transient_secret',
+      private: true,
+      dryRun: false,
+    }))
+    expect(screen.queryByDisplayValue('hf_transient_secret')).not.toBeInTheDocument()
+  })
+
   it('opens focused hardware settings from dashboard module buttons', () => {
     render(<App />)
     const motionButton = document.querySelector<HTMLButtonElement>('.arm-hardware-panel .device-chip-row button')

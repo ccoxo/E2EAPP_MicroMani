@@ -35,7 +35,7 @@ NATIVE_STATUS_POLL_INTERVAL_S = 0.2
 class TeleopMappingService:
     """Continuous Omega.7 to slave-arm mapper used during recording."""
 
-    _NATIVE_GRIPPER_SOURCES = {"manual-gripper", "recording"}
+    _NATIVE_GRIPPER_SOURCES = {"teleop-connect", "manual-gripper", "recording"}
 
     def __init__(self, settings: SettingsService, hal: HalClient, logs: LogService) -> None:
         self.settings = settings
@@ -61,6 +61,7 @@ class TeleopMappingService:
         self._last_native_status_summary = ""
         self._last_native_status_summary_ms = 0
         self._native_status_cache: dict[str, Any] = {}
+        self._native_transition_lock = asyncio.Lock()
 
     async def start(
         self,
@@ -73,54 +74,8 @@ class TeleopMappingService:
         op_id = self.logs.new_op_id("teleop") if self.logs is not None else None
         mode = self._hal_mode(config)
         if mode == "real" and self._native_engine(config):
-            if self._task is not None and not self._task.done():
-                source_was_present = source in self._arm_sources
-                self._arm_sources.add(source)
-                try:
-                    if source == "teleop-connect":
-                        await self._start_native(config)
-                    else:
-                        await self._configure_and_start_native(config)
-                except Exception:
-                    if not source_was_present:
-                        self._arm_sources.discard(source)
-                    raise
-                return self.status()
-            if pre_home:
-                await self._return_to_work_origin_before_start(config, home_side)
-            self._arm_sources.add(source)
-            if self._armed_at_ms is None:
-                self._armed_at_ms = now_ms()
-                self._references.clear()
-                self._translation_carry.clear()
-                self._translation_direction.clear()
-                self._continuous_direction.clear()
-                self._continuous_streak.clear()
-                self._active_sides.clear()
-                self._action_history.clear()
-                self._last_action = None
-                self._last_native_diag_action_key = ""
-                self._native_status_cache = {}
-            try:
-                await self._configure_and_start_native(config)
-            except Exception:
-                self._arm_sources.discard(source)
-                if not self._arm_sources:
-                    self._armed_at_ms = None
-                    self._reset_all_tracking()
-                    self._last_action = None
-                    self._action_history.clear()
-                    self._last_blockers = {}
-                    self._last_error = ""
-                    self._last_native_diag_action_key = ""
-                    self._native_status_cache = {}
-                raise
-            self._stop_event = asyncio.Event()
-            self._task = asyncio.create_task(self._run_native_status_loop(), name="hal-native-teleop-status")
-            self._log_teleop_mode(config, op_id, source, "start", native=True)
-            self._log_teleop_profiles(config, op_id)
-            self.logs.warning("[HAL]", "HAL-native teleop controller armed")
-            return self.status()
+            async with self._native_transition_lock:
+                return await self._start_native_locked(config, op_id, source, home_side, pre_home)
         if self._task is not None and not self._task.done():
             self._arm_sources.add(source)
             return self.status()
@@ -152,6 +107,63 @@ class TeleopMappingService:
                 f"max step {translation_step:g}um / {rotation_step:g}deg"
             ),
         )
+        return self.status()
+
+    async def _start_native_locked(
+        self,
+        config: dict[str, Any],
+        op_id: str | None,
+        source: str,
+        home_side: SideName | None,
+        pre_home: bool,
+    ) -> dict[str, Any]:
+        if self._task is not None and not self._task.done():
+            source_was_present = source in self._arm_sources
+            self._arm_sources.add(source)
+            try:
+                if source == "teleop-connect":
+                    await self._start_native(config)
+                else:
+                    await self._configure_and_start_native(config)
+            except Exception:
+                if not source_was_present:
+                    self._arm_sources.discard(source)
+                raise
+            return self.status()
+        if pre_home:
+            await self._return_to_work_origin_before_start(config, home_side)
+        self._arm_sources.add(source)
+        if self._armed_at_ms is None:
+            self._armed_at_ms = now_ms()
+            self._references.clear()
+            self._translation_carry.clear()
+            self._translation_direction.clear()
+            self._continuous_direction.clear()
+            self._continuous_streak.clear()
+            self._active_sides.clear()
+            self._action_history.clear()
+            self._last_action = None
+            self._last_native_diag_action_key = ""
+            self._native_status_cache = {}
+        try:
+            await self._configure_and_start_native(config)
+        except Exception:
+            self._arm_sources.discard(source)
+            if not self._arm_sources:
+                self._armed_at_ms = None
+                self._reset_all_tracking()
+                self._last_action = None
+                self._action_history.clear()
+                self._last_blockers = {}
+                self._last_error = ""
+                self._last_native_diag_action_key = ""
+                self._native_status_cache = {}
+            raise
+        self._stop_event = asyncio.Event()
+        self._task = asyncio.create_task(self._run_native_status_loop(), name="hal-native-teleop-status")
+        self._log_teleop_mode(config, op_id, source, "start", native=True)
+        self._log_teleop_profiles(config, op_id)
+        self.logs.warning("[HAL]", "HAL-native teleop controller armed")
         return self.status()
 
     async def _return_to_work_origin_before_start(self, config: dict[str, Any], side: SideName | None = None) -> None:
@@ -192,43 +204,10 @@ class TeleopMappingService:
 
     async def stop(self, source: str = "recording", *, restart_remaining: bool = True) -> dict[str, Any]:
         config = self.settings.get_config() if self.settings is not None else {}
-        source_was_present = source in self._arm_sources
-        self._arm_sources.discard(source)
         if self._native_engine(config):
-            task_running = self._task is not None and not self._task.done()
-            if not source_was_present and not self._arm_sources and self._armed_at_ms is None and not task_running:
-                return self.status()
-            if self._arm_sources:
-                if restart_remaining:
-                    await self._configure_and_start_native(config)
-                return self.status()
-            self._armed_at_ms = None
-            self._reset_all_tracking()
-            stop_event = self._stop_event
-            task = self._task
-            if stop_event is not None:
-                stop_event.set()
-            if task is not None and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-            await self.hal.command("teleop.native.stop", {})
-            self._task = None
-            self._stop_event = None
-            self._last_action = None
-            self._action_history.clear()
-            self._last_blockers = {}
-            self._last_error = ""
-            self._last_native_diag_action_key = ""
-            self._last_native_status_summary = ""
-            self._last_native_status_summary_ms = 0
-            self._native_status_cache = {}
-            if self.logs is not None:
-                self._log_teleop_mode(config, None, source, "stop", native=True)
-                self.logs.info("[HAL]", "HAL-native teleop controller stopped")
-            return self.status()
+            async with self._native_transition_lock:
+                return await self._stop_native_locked(config, source, restart_remaining)
+        self._arm_sources.discard(source)
         if self._arm_sources:
             self._reset_all_tracking()
             return self.status()
@@ -251,6 +230,49 @@ class TeleopMappingService:
             self.logs.info("[HAL]", "teleop mapper stopped")
         return self.status()
 
+    async def _stop_native_locked(
+        self,
+        config: dict[str, Any],
+        source: str,
+        restart_remaining: bool,
+    ) -> dict[str, Any]:
+        source_was_present = source in self._arm_sources
+        self._arm_sources.discard(source)
+        task_running = self._task is not None and not self._task.done()
+        if not source_was_present and not self._arm_sources and self._armed_at_ms is None and not task_running:
+            return self.status()
+        if self._arm_sources:
+            if restart_remaining:
+                await self._configure_and_start_native(config)
+            return self.status()
+        self._armed_at_ms = None
+        self._reset_all_tracking()
+        stop_event = self._stop_event
+        task = self._task
+        if stop_event is not None:
+            stop_event.set()
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await self.hal.command("teleop.native.stop", {})
+        self._task = None
+        self._stop_event = None
+        self._last_action = None
+        self._action_history.clear()
+        self._last_blockers = {}
+        self._last_error = ""
+        self._last_native_diag_action_key = ""
+        self._last_native_status_summary = ""
+        self._last_native_status_summary_ms = 0
+        self._native_status_cache = {}
+        if self.logs is not None:
+            self._log_teleop_mode(config, None, source, "stop", native=True)
+            self.logs.info("[HAL]", "HAL-native teleop controller stopped")
+        return self.status()
+
     def status(self) -> dict[str, Any]:
         running = self._task is not None and not self._task.done()
         config = self.settings.get_config() if self.settings is not None else {}
@@ -260,6 +282,7 @@ class TeleopMappingService:
         return {
             "armed": self._armed_at_ms is not None,
             "running": running,
+            "transitioning": self._native_transition_lock.locked() if native_engine else False,
             "armedAt": self._armed_at_ms,
             "sources": sorted(self._arm_sources),
             "lastAction": self._last_action,

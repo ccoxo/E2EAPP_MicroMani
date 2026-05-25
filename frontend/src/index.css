@@ -2091,6 +2091,25 @@ select {
   padding: 10px;
 }
 
+.dataset-live-preview-strip {
+  padding: 10px;
+}
+
+.dataset-live-preview-strip .section-title {
+  min-height: 24px;
+  margin-bottom: 6px;
+}
+
+.dataset-live-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.dataset-live-preview-grid .camera-preview {
+  min-width: 0;
+}
+
 .dataset-quality-workbench .section-title {
   min-height: 24px;
   margin-bottom: 6px;
@@ -3599,6 +3618,7 @@ select {
   .dataset-review-layout,
   .dataset-summary-strip,
   .dataset-cockpit-grid,
+  .dataset-live-preview-grid,
   .arm-overview-grid,
   .arm-data-layout,
   .global-hardware-layout,
@@ -3839,6 +3859,7 @@ select {
     .dataset-summary-strip,
     .dataset-summary-metrics,
     .dataset-cockpit-grid,
+    .dataset-live-preview-grid,
     .dataset-video-grid,
     .dataset-quality-grid,
     .dataset-player-controls,

@@ -28,10 +28,10 @@ describe('frontend bootstrap runtime lifecycle', () => {
     mocks.createRoot.mockReturnValue({ render: mocks.render })
   })
 
-  it('does not install pagehide runtime lifecycle listeners', async () => {
+  it('installs pagehide runtime release listener', async () => {
     await import('./main')
 
-    expect(mocks.installRuntimeReleaseOnClose).not.toHaveBeenCalled()
+    expect(mocks.installRuntimeReleaseOnClose).toHaveBeenCalledTimes(1)
     expect(mocks.installAutoShutdownOnClose).not.toHaveBeenCalled()
   })
 })

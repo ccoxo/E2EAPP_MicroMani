@@ -40,7 +40,7 @@ class JodellGripperDriver {
 
  private:
   bool ensureLoadedUnlocked(std::string* message);
-  bool selectPortUnlocked(int port, std::string* message);
+  bool ensurePortOpenUnlocked(int index, int port, std::string* message);
   int portNumber(const std::string& value) const;
   int sideIndex(Side side) const;
 
@@ -57,7 +57,7 @@ class JodellGripperDriver {
   int(__stdcall* clawEnable_)(int, int) = nullptr;
   int(__stdcall* runWithParam_)(int, int, int, int) = nullptr;
   int(__stdcall* getClawCurrentLocation_)(int) = nullptr;
-  int activePort_{-1};
+  std::array<int, 2> activePorts_{{-1, -1}};
 #endif
 };
 

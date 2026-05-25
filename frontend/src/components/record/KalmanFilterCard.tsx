@@ -74,7 +74,7 @@ export default function KalmanFilterCard() {
       extra={<Tag color={teleop.kalmanFilterEnabled ? 'processing' : 'default'}>{teleop.kalmanFilterEnabled ? '开启' : '关闭'}</Tag>}
     >
       <div className="record-kalman-head">
-        <span>原生主从控制</span>
+        <span></span>
         <Switch
           aria-label="卡尔曼滤波开关"
           checked={teleop.kalmanFilterEnabled}

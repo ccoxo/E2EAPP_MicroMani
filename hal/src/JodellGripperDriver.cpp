@@ -86,7 +86,7 @@ bool JodellGripperDriver::commandTarget(
   const int index = sideIndex(side);
   const int port = portNumber(config_.ports[index]);
   const int slave = config_.slaveIds[index];
-  if (!selectPortUnlocked(port, message)) {
+  if (!ensurePortOpenUnlocked(index, port, message)) {
     return false;
   }
 
@@ -158,7 +158,7 @@ bool JodellGripperDriver::readPositionMm(Side side, std::string* message) {
   const int index = sideIndex(side);
   const int port = portNumber(config_.ports[index]);
   const int slave = config_.slaveIds[index];
-  if (!selectPortUnlocked(port, message)) {
+  if (!ensurePortOpenUnlocked(index, port, message)) {
     return false;
   }
 
@@ -254,7 +254,7 @@ bool JodellGripperDriver::ensureLoadedUnlocked(std::string* message) {
 #endif
 }
 
-bool JodellGripperDriver::selectPortUnlocked(int port, std::string* message) {
+bool JodellGripperDriver::ensurePortOpenUnlocked(int index, int port, std::string* message) {
 #ifdef _WIN32
   if (!serialOperation_) {
     if (message) {
@@ -262,19 +262,25 @@ bool JodellGripperDriver::selectPortUnlocked(int port, std::string* message) {
     }
     return false;
   }
-  if (activePort_ == port) {
+  if (index < 0 || index >= static_cast<int>(activePorts_.size())) {
+    if (message) {
+      *message = "invalid native gripper side index";
+    }
+    return false;
+  }
+  if (activePorts_[index] == port) {
     return true;
   }
-  if (activePort_ > 0) {
-    (void)serialOperation_(activePort_, config_.baudrate, 0);
-    activePort_ = -1;
+  if (activePorts_[index] > 0) {
+    (void)serialOperation_(activePorts_[index], config_.baudrate, 0);
+    activePorts_[index] = -1;
     std::this_thread::sleep_for(kPortSwitchSettleMs);
   }
   int ret = -999;
   for (int attempt = 0; attempt < 5; ++attempt) {
     ret = serialOperation_(port, config_.baudrate, 1);
     if (ret == 0 || ret == 1) {
-      activePort_ = port;
+      activePorts_[index] = port;
       return true;
     }
     (void)serialOperation_(port, config_.baudrate, 0);
@@ -291,6 +297,7 @@ bool JodellGripperDriver::selectPortUnlocked(int port, std::string* message) {
   }
   return false;
 #else
+  (void)index;
   (void)port;
   if (message) {
     *message = "serialOperation unavailable outside Windows";
@@ -318,10 +325,22 @@ int JodellGripperDriver::sideIndex(Side side) const {
 
 #ifdef _WIN32
 void JodellGripperDriver::closeUnlocked() {
-  if (serialOperation_ && activePort_ > 0) {
-    (void)serialOperation_(activePort_, config_.baudrate, 0);
+  if (serialOperation_) {
+    for (size_t i = 0; i < activePorts_.size(); ++i) {
+      const int port = activePorts_[i];
+      if (port <= 0) {
+        continue;
+      }
+      bool alreadyClosed = false;
+      for (size_t j = 0; j < i; ++j) {
+        alreadyClosed = alreadyClosed || activePorts_[j] == port;
+      }
+      if (!alreadyClosed) {
+        (void)serialOperation_(port, config_.baudrate, 0);
+      }
+    }
   }
-  activePort_ = -1;
+  activePorts_ = {{-1, -1}};
   if (module_) {
     FreeLibrary(static_cast<HMODULE>(module_));
   }

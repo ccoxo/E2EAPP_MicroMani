@@ -22,7 +22,7 @@ import {
   Usb,
   Waves,
 } from 'lucide-react'
-import { useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { useLocation } from 'react-router-dom'
 import { ActionCompareModal, type ActionCompareItem } from '../components/ActionCompareModal'
 import { CameraPreview } from '../components/CameraPreview'
@@ -95,6 +95,7 @@ interface GripperPortHint {
 
 interface GripperTeleopStatusHint {
   running?: boolean
+  requestedRunning?: boolean
   message?: string
   ports?: GripperPortHint[]
   leftObjectDetected?: boolean
@@ -1522,41 +1523,41 @@ function GripperCard({
   const [teleopRunning, setTeleopRunning] = useState(false)
   const [objectDetected, setObjectDetected] = useState(false)
   const [gripperTeleopStatus, setGripperTeleopStatus] = useState<GripperTeleopStatusHint | null>(null)
+  const applyGripperTeleopStatus = useCallback((status: GripperTeleopStatusHint | null) => {
+    const d = status ?? {}
+    setGripperTeleopStatus(status)
+    setTeleopRunning(Boolean(d.running))
+    setObjectDetected(Boolean(side === 'left' ? d.leftObjectDetected : d.rightObjectDetected))
+  }, [side])
   useEffect(() => {
     fetchGripperTeleopStatus()
       .then((r: { data?: GripperTeleopStatusHint }) => {
-        const d = r?.data ?? {}
-        setGripperTeleopStatus(d)
-        setTeleopRunning(Boolean(d.running))
-        setObjectDetected(Boolean(side === 'left' ? d.leftObjectDetected : d.rightObjectDetected))
+        applyGripperTeleopStatus(r?.data ?? null)
       })
       .catch(() => {})
     const timer = setInterval(() => {
       fetchGripperTeleopStatus()
         .then((r: { data?: GripperTeleopStatusHint }) => {
-          const d = r?.data ?? {}
-          setGripperTeleopStatus(d)
-          setTeleopRunning(Boolean(d.running))
-          setObjectDetected(Boolean(side === 'left' ? d.leftObjectDetected : d.rightObjectDetected))
+          applyGripperTeleopStatus(r?.data ?? null)
         })
         .catch(() => {})
     }, 1000)
     return () => clearInterval(timer)
-  }, [side])
+  }, [applyGripperTeleopStatus])
  /** 处理对应的用户交互。 */
  const handleTeleopToggle = async () => {
     try {
       if (teleopRunning) {
-        await stopGripperTeleop()
-        setTeleopRunning(false)
+        const result = await stopGripperTeleop()
+        applyGripperTeleopStatus((result as { data?: GripperTeleopStatusHint })?.data ?? null)
         commandLog(injectLog, '[GRIPPER]', `${sideSpec.shortLabel}夹爪遥操作停止请求已发送`)
       } else {
-        await startGripperTeleop()
-        setTeleopRunning(true)
+        const result = await startGripperTeleop()
+        applyGripperTeleopStatus((result as { data?: GripperTeleopStatusHint })?.data ?? null)
         commandLog(injectLog, '[GRIPPER]', `${sideSpec.shortLabel}夹爪遥操作启动请求已发送`)
       }
       void fetchGripperTeleopStatus()
-        .then((r: { data?: GripperTeleopStatusHint }) => setGripperTeleopStatus(r?.data ?? null))
+        .then((r: { data?: GripperTeleopStatusHint }) => applyGripperTeleopStatus(r?.data ?? null))
         .catch(() => {})
     } catch (error) {
       injectLog('ERROR', `${sideSpec.shortLabel}夹爪遥操作切换失败：${commandErrorMessage(error)}`, '[GRIPPER]')
@@ -1571,7 +1572,11 @@ function GripperCard({
   const teleopPort = gripperTeleopStatus?.ports?.find((port) => port.side === side) ?? fallbackTeleopPort
   const teleopPortSummary = `${teleopPort.port ?? '-'} / slave ${teleopPort.slaveId ?? '-'}`
   const teleopPortDetail = `${teleopPort.baudrate ?? config.gripper.baudrate} baud · ${teleopPort.message || (config.teleop.engine === 'hal_native' ? 'HAL-native 夹爪遥操作串口' : 'Python 夹爪 worker 串口')}`
-  const teleopRunSummary = teleopRunning ? '遥操作运行中' : '遥操作未启动'
+  const teleopRunSummary = teleopRunning
+    ? '遥操作运行中'
+    : gripperTeleopStatus?.requestedRunning
+      ? '遥操作等待 HAL 回报'
+      : '遥操作未启动'
   const teleopRunDetail = gripperTeleopStatus?.message || (objectDetected ? '检测到夹持物体' : '等待 Omega.7 夹爪输入')
   /** 处理对应的用户交互。 */
   const requestGripperTarget = () =>

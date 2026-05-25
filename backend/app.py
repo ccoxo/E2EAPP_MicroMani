@@ -371,7 +371,13 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         active = config if config is not None else settings.get_config()
         targets = active.get("gripper", {}) if isinstance(active.get("gripper"), dict) else {}
-        native_status = teleop_mapper.status().get("nativeStatus", {})
+        mapper_status = teleop_mapper.status()
+        native_status = mapper_status.get("nativeStatus", {})
+        sources = mapper_status.get("sources", [])
+        requested_running = bool(
+            isinstance(sources, list)
+            and any(source in {"teleop-connect", "manual-gripper", "recording"} for source in sources)
+        )
         raw_targets = native_status.get("gripperTargets") if isinstance(native_status, dict) else None
         raw_grippers = native_status.get("grippers") if isinstance(native_status, dict) else None
         serial_probe = serial_probe if isinstance(serial_probe, dict) else None
@@ -422,6 +428,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             "message": "; ".join(messages) if messages else serial_message or "managed by HAL-native teleop",
             "nativeManaged": True,
             "running": bool(native_status.get("running", False)) if isinstance(native_status, dict) else False,
+            "requestedRunning": requested_running,
             "positionMm": positions,
             "sides": sides,
             "ports": serial_ports or gripper_serial_ports(active),
@@ -570,7 +577,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         return True
 
     def start_gripper_teleop_source(source: str) -> None:
-        if stop_python_gripper_teleop_for_native(source):
+        if native_teleop_enabled():
             return
         if gripper_teleop_enabled():
             gripper_tele.start(source)
@@ -1156,7 +1163,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     detail={"code": "GRIPPER_UNAVAILABLE", "message": str(exc)},
                 ) from exc
             status = native_gripper_status()
-            status["running"] = bool(mapper_status.get("running", status.get("running", False)))
+            status["requestedRunning"] = bool(mapper_status.get("running", status.get("requestedRunning", False)))
             return envelope(status)
         gripper_tele.start("manual")
         return envelope(gripper_tele.get_status())
@@ -1167,7 +1174,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if stop_python_gripper_teleop_for_native("manual stop"):
             mapper_status = await teleop_mapper.stop("manual-gripper")
             status = native_gripper_status()
-            status["running"] = bool(mapper_status.get("running", status.get("running", False)))
+            status["requestedRunning"] = bool(mapper_status.get("running", status.get("requestedRunning", False)))
             return envelope(status)
         gripper_tele.stop("manual")
         return envelope(gripper_tele.get_status())
@@ -1479,7 +1486,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 列出数据集。
     @app.get("/api/datasets")
     async def list_datasets() -> ApiEnvelope:
-        return envelope({"datasets": recorder.list_datasets()})
+        datasets = await asyncio.to_thread(recorder.list_datasets)
+        return envelope({"datasets": datasets})
 
     # 创建数据集。
     @app.post("/api/datasets")
@@ -1491,6 +1499,11 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 status_code=503,
                 detail={"code": "NATIVE_DATASET_UNAVAILABLE", "message": str(exc)},
             ) from exc
+
+    # 更新 Hugging Face Hub 上传开关，不接收或保存 token。
+    @app.patch("/api/datasets/hub")
+    async def update_dataset_hub(payload: dict[str, Any]) -> ApiEnvelope:
+        return envelope(recorder.update_hub_settings(payload))
 
     # 更新指定数据集元信息。
     @app.patch("/api/datasets/{dataset_id}")
@@ -1568,7 +1581,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def dataset_episode_detail(dataset_id: str, episode_id: str) -> ApiEnvelope:
         """Return one episode review detail in the standard envelope."""
         try:
-            return envelope(recorder.episode_detail(dataset_id, episode_id))
+            return envelope(await asyncio.to_thread(recorder.episode_detail, dataset_id, episode_id))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "EPISODE_NOT_FOUND", "message": episode_id}) from exc
 
@@ -1603,7 +1616,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.get("/api/datasets/{dataset_id}/frame_image")
     async def dataset_frame_image(dataset_id: str, episode_id: str, camera: str, frame: int) -> Response:
         try:
-            jpeg = recorder.resolve_frame_image(dataset_id, episode_id, camera, frame)
+            jpeg = await asyncio.to_thread(recorder.resolve_frame_image, dataset_id, episode_id, camera, frame)
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=404,
