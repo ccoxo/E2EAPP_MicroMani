@@ -259,6 +259,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     teleop_mapper = TeleopMappingService(settings, hal, logs)
     gripper_tele = GripperTeleService(settings, hal, hardware, logs, gripper_workers)
     recorder = DatasetRecorderService(settings, hardware, hal, telemetry, logs, teleop_mapper)
+    commands.set_origin_mutation_lock_checker(recorder.origin_mutation_locked)
     stability = StabilityMonitorService(settings, hardware, hal, logs)
     policy = PolicyService(settings, hal, logs)
 
@@ -944,7 +945,11 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 清除双侧运动工作原点。
     @app.post("/api/motion/origin/clear")
     async def clear_motion_origin_all() -> ApiEnvelope:
-        return envelope(commands.clear_motion_origin())
+        try:
+            return envelope(commands.clear_motion_origin())
+        except RuntimeError as exc:
+            logs.error("[HAL]", f"clear_motion_origin failed: {exc}")
+            raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
 
     # 恢复上一次运动工作原点。
     @app.post("/api/motion/origin/restore_previous")
@@ -984,7 +989,11 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def clear_motion_origin_side(side: str) -> ApiEnvelope:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
-        return envelope(commands.clear_motion_origin(side))
+        try:
+            return envelope(commands.clear_motion_origin(side))
+        except RuntimeError as exc:
+            logs.error("[HAL]", f"clear_motion_origin failed: {exc}")
+            raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
 
     # 使能指定侧全部运动轴。
     @app.post("/api/motion/{side}/enable_all")

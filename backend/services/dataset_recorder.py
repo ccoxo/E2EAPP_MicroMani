@@ -13,6 +13,7 @@ import time
 from bisect import bisect_left
 from collections import deque
 from concurrent.futures import Future
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -497,7 +498,7 @@ class DatasetRecorderService:
             if self._session_active:
                 raise RuntimeError("record session already active")
             config = self.settings.get_config()
-            self._recording_config_snapshot = dict(config)
+            self._recording_config_snapshot = deepcopy(config)
             self._dataset_name = dataset_name.strip() or "micro_assembly_v1"
             self._dataset_id = self._safe_id(self._dataset_name)
             self._task = task.strip() or "unspecified task"
@@ -656,6 +657,10 @@ class DatasetRecorderService:
             "nativeError": self._native_error,
             "teleop": self.teleop.status(),
         }
+
+    def origin_mutation_locked(self) -> bool:
+        """???????????????????? episode ???????"""
+        return bool(self._session_active or self._recording)
 
     def list_datasets(self) -> list[dict[str, Any]]:
         """扫描数据集根目录，返回按更新时间排序的本地数据集摘要。"""
@@ -2059,7 +2064,7 @@ class DatasetRecorderService:
         episode_id = f"episode_{self._episode_index:06d}"
         skew = self._skew_stats()
         source_skew = self._source_skew_stats()
-        config_snapshot = self.settings.get_config()
+        config_snapshot = self._recording_config()
         # 每个 episode 独立统计质量指标，保存或丢弃时可以精确回滚。
         episode = {
             "id": episode_id,
@@ -2158,6 +2163,7 @@ class DatasetRecorderService:
                 "alignmentDelayMs": round(self._alignment_delay_s(config) * 1000.0, 3),
                 "settleTimeoutMs": round(self._settle_timeout_s(config) * 1000.0, 3),
             },
+            "sessionOrigin": self._episode_motion_origin_snapshot(config),
             "createdAt": int(info.get("createdAt", now_ms())) if info else now_ms(),
             "updatedAt": now_ms(),
             "hardware": {

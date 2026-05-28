@@ -897,6 +897,47 @@ def test_motion_origin_capture_clear_and_per_side_config(tmp_path: Path, monkeyp
     assert left_origin["valid"] is False
 
 
+def test_motion_origin_mutations_are_blocked_during_record_session(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    settings = client.app.state.settings
+    config = settings.get_config()
+    original_origin = {
+        "valid": True,
+        "leftValid": True,
+        "rightValid": True,
+        "leftPulse": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "rightPulse": [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        "updatedAt": 100,
+        "previousValid": True,
+        "previousLeftPulse": [101.0, 102.0, 103.0, 104.0, 105.0, 106.0],
+        "previousRightPulse": [107.0, 108.0, 109.0, 110.0, 111.0, 112.0],
+        "previousUpdatedAt": 50,
+    }
+    config["motion"]["origin"] = original_origin
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+    config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
+    settings.save_config(config, emit_log=False)
+    client.app.state.recorder._session_active = True
+
+    responses = [
+        client.post("/api/motion/origin/capture"),
+        client.post("/api/motion/left/origin/capture"),
+        client.post("/api/motion/origin/clear"),
+        client.post("/api/motion/right/origin/clear"),
+        client.post("/api/motion/origin/restore_previous"),
+    ]
+
+    for response in responses:
+        assert response.status_code == 503
+        assert response.json()["detail"]["message"] == (
+            "motion work origin cannot be changed while recording session is active"
+        )
+    assert settings.get_config()["motion"]["origin"] == original_origin
+
+
 def test_home_all_requires_and_sends_captured_work_origin(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     client = TestClient(create_app(tmp_path))

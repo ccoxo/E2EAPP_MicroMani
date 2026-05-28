@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import queue
 import time
 from concurrent.futures import Future
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from backend.core.defaults import default_config
 from backend.services.dataset_recorder import (
     DatasetRecorderService,
     FrameAssemblyJob,
@@ -86,6 +88,67 @@ def test_dataset_recorder_persists_episode_origin_and_config_snapshot() -> None:
     assert '"motionOrigin": self._episode_motion_origin_snapshot(config_snapshot)' in source
     assert '"configHash": stable_config_hash(config_snapshot)' in source
     assert '"positionSource": motion.get("positionSource", "")' in source
+
+
+def test_dataset_recorder_appstation_info_writes_session_origin(tmp_path: Path) -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._dataset_name = "unit"
+    recorder._native_use_videos = True
+    recorder._record_fps_hz = 30
+    recorder._force_sample_hz = 200.0
+    dataset_dir = tmp_path / "dataset"
+    config = default_config()
+    config["motion"]["origin"]["leftPulse"] = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+    config["motion"]["origin"]["rightPulse"] = [70.0, 80.0, 90.0, 100.0, 110.0, 120.0]
+
+    recorder._write_appstation_info(dataset_dir, config)
+
+    payload = json.loads((dataset_dir / "meta" / "appstation_info.json").read_text(encoding="utf-8"))
+    assert payload["sessionOrigin"]["leftPulse"] == [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+    assert payload["sessionOrigin"]["rightPulse"] == [70.0, 80.0, 90.0, 100.0, 110.0, 120.0]
+
+
+def test_dataset_recorder_episode_origin_uses_recording_config_snapshot(tmp_path: Path) -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    dataset_dir = tmp_path / "dataset"
+    (dataset_dir / "meta").mkdir(parents=True)
+    (dataset_dir / "meta" / "info.json").write_text('{"format":"lerobot-v3-native"}', encoding="utf-8")
+    session_config = default_config()
+    session_config["motion"]["origin"]["leftPulse"] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    session_config["motion"]["origin"]["rightPulse"] = [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+    current_config = default_config()
+    current_config["motion"]["origin"]["leftPulse"] = [101.0, 102.0, 103.0, 104.0, 105.0, 106.0]
+    current_config["motion"]["origin"]["rightPulse"] = [107.0, 108.0, 109.0, 110.0, 111.0, 112.0]
+    recorder.settings = SimpleNamespace(get_config=lambda: current_config)
+    recorder._recording_config_snapshot = session_config
+    recorder._dataset_dir = dataset_dir
+    recorder._dataset_name = "unit"
+    recorder._task = "task"
+    recorder._episode_index = 0
+    recorder._episode_frames = 1
+    recorder._episode_started_at = time.monotonic()
+    recorder._native_dataset_from_index = 0
+    recorder._record_fps_hz = 30
+    recorder._force_sample_hz = 200.0
+    recorder._native_use_videos = False
+    recorder._episode_late_frames = 0
+    recorder._camera_drops = {"global": 0, "wrist_left": 0, "wrist_right": 0}
+    recorder._drop_counts = {}
+    recorder._stale_counts = {}
+    recorder._cache_counts = {}
+    recorder._source_warnings = []
+    recorder._tick_skews_ms = []
+    recorder._source_skews_ms = {}
+    recorder._max_force_left = 0.0
+    recorder._max_force_right = 0.0
+    recorder._native_writer_active = lambda: True
+
+    episode = recorder._finalize_episode_locked(status="review", deleted=False)
+
+    assert episode["motionOrigin"]["leftPulse"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert episode["motionOrigin"]["rightPulse"] == [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+    app_info = json.loads((dataset_dir / "meta" / "appstation_info.json").read_text(encoding="utf-8"))
+    assert app_info["sessionOrigin"]["leftPulse"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
 
 
 def test_dataset_recorder_declares_v3_state_and_action_shapes() -> None:

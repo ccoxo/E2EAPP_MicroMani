@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from collections.abc import Callable
 from typing import Any, cast
 
 from backend.core.config import SettingsService
@@ -31,6 +32,7 @@ MANUAL_AXIS_CHUNK_WAIT_MIN_TIMEOUT_SEC = 3.0
 MANUAL_AXIS_CHUNK_WAIT_TIMEOUT_MARGIN_SEC = 1.0
 ORIGIN_DRIFT_TRANSLATION_CONFIRM_UM = 5000.0
 ORIGIN_DRIFT_ROTATION_CONFIRM_DEG = 1.0
+ORIGIN_MUTATION_LOCKED_MESSAGE = "motion work origin cannot be changed while recording session is active"
 UNREADABLE_SEVON_FEEDBACK_AXES: set[tuple[str, str]] = {("right", axis) for axis in AXIS_ORDER}
 MANUAL_AXIS_DIRECTION_SIGN: dict[str, list[int]] = {
     "left": [1, -1, 1, 1, 1, 1],
@@ -65,6 +67,7 @@ class CommandService:
         logs: LogService,
         hardware: HardwareService | None = None,
         gripper_workers: Any | None = None,
+        origin_mutation_locked: Callable[[], bool] | None = None,
     ) -> None:
         self.settings = settings
         self.telemetry = telemetry
@@ -72,6 +75,14 @@ class CommandService:
         self.logs = logs
         self.hardware = hardware
         self.gripper_workers = gripper_workers
+        self._origin_mutation_locked = origin_mutation_locked or (lambda: False)
+
+    def set_origin_mutation_lock_checker(self, checker: Callable[[], bool]) -> None:
+        self._origin_mutation_locked = checker
+
+    def _ensure_origin_mutation_allowed(self) -> None:
+        if self._origin_mutation_locked():
+            raise RuntimeError(ORIGIN_MUTATION_LOCKED_MESSAGE)
 
     async def generic_command(self, request: SettingsCommandRequest) -> dict[str, object]:
         self.logs.append(request.channel, request.level, request.msg)
@@ -219,6 +230,7 @@ class CommandService:
     ) -> dict[str, object]:
         if side is not None:
             self._validate_side(side)
+        self._ensure_origin_mutation_allowed()
         state = await self.hal.motion_state()
         pulses = self._motion_state_pulses(state)
         config = self.settings.get_config()
@@ -248,6 +260,7 @@ class CommandService:
         return {"origin": saved["motion"]["origin"], "config": saved, "originCaptureDrift": drift}
 
     def restore_previous_motion_origin(self) -> dict[str, object]:
+        self._ensure_origin_mutation_allowed()
         config = self.settings.get_config()
         origin = self._normalized_motion_origin(config)
         if not bool(origin["previousValid"]):
@@ -274,6 +287,7 @@ class CommandService:
     def clear_motion_origin(self, side: str | None = None) -> dict[str, object]:
         if side is not None:
             self._validate_side(side)
+        self._ensure_origin_mutation_allowed()
         config = self.settings.get_config()
         origin = self._normalized_motion_origin(config)
         if side in {None, "left"}:
