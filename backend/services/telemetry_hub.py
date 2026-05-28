@@ -81,6 +81,7 @@ class TelemetryHub:
         motion_enabled: dict[str, bool | None] | None = None,
         motion_axis_enabled: dict[str, list[bool | None]] | None = None,
         omega_hands: list[dict[str, Any]] | None = None,
+        native_gripper_status: dict[str, Any] | None = None,
         hal_ok: bool = True,
     ) -> TelemetryFrame:
         # 每一帧都合并 HAL、硬件轮询和测试夹具数据，给前端提供单一遥测快照。
@@ -122,7 +123,10 @@ class TelemetryHub:
         if self.hardware is not None and real_mode:
             # 真机传感器用缓存值出帧，采样频率由后台 future 控制。
             self._refresh_force_values(config, now)
-            self.refresh_gripper_positions(config, now)
+            if native_gripper_status is not None:
+                self.apply_native_gripper_status(native_gripper_status, now)
+            else:
+                self.refresh_gripper_positions(config, now)
             force_left = list(self.force_left)
             force_right = list(self.force_right)
         if real_mode:
@@ -271,6 +275,8 @@ class TelemetryHub:
         )
 
     def _cameras(self, elapsed: float, config: dict[str, Any]) -> list[CameraTelemetry]:
+        if os.environ.get("APPSTATION_DISABLE_CAMERA_PROBE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            return self._offline_cameras("pending")
         if self.hardware is not None and self._real_hardware_mode(config):
             self._refresh_cameras(config, time.monotonic())
             return list(self._cached_cameras)
@@ -616,6 +622,41 @@ class TelemetryHub:
 
     def _refresh_gripper_positions(self, config: dict[str, Any], now: float) -> None:
         self.refresh_gripper_positions(config, now)
+
+    def apply_native_gripper_status(self, status: dict[str, Any], now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        raw_positions = status.get("positionMm")
+        sides = status.get("sides")
+        updated = False
+        for side, idx in (("left", 0), ("right", 1)):
+            value: Any = None
+            if isinstance(raw_positions, dict):
+                value = raw_positions.get(side)
+            if value is None and isinstance(sides, dict):
+                detail = sides.get(side)
+                if isinstance(detail, dict):
+                    value = detail.get("positionMm")
+            if value is None:
+                continue
+            try:
+                position_mm = float(value)
+            except (TypeError, ValueError):
+                continue
+            self.gripper_positions[idx] = position_mm
+            detail = sides.get(side, {}) if isinstance(sides, dict) else {}
+            self.gripper_samples[side] = {
+                "ok": detail.get("ok") if isinstance(detail, dict) else None,
+                "positionMm": position_mm,
+                "targetMm": detail.get("targetMm") if isinstance(detail, dict) else None,
+                "sampleHz": 0.0,
+                "ageMs": 0.0,
+                "tsMs": int(time.time() * 1000),
+                "monotonicMs": int(now * 1000),
+                "message": str(detail.get("message", "") or "") if isinstance(detail, dict) else "",
+            }
+            updated = True
+        if updated:
+            self._last_gripper_sample_at = now
 
     def _sample_gripper_positions(self, config: dict[str, Any]) -> list[float | None]:
         if self.hardware is None or getattr(self, "_shutdown", False):

@@ -8,10 +8,12 @@ from backend.core.units import motion_pulse_per_unit, pulse_to_ui
 AXIS_KEYS = ("x", "y", "z", "roll", "pitch", "yaw")
 AXIS_NAMES = ("X", "Y", "Z", "Roll", "Pitch", "Yaw")
 ROTATION_WORK_DEFAULTS = {
-    "roll": {"min": -90.0, "max": 90.0},
-    "pitch": {"min": -90.0, "max": 90.0},
+    "roll": {"min": -100.0, "max": 100.0},
+    "pitch": {"min": -100.0, "max": 100.0},
     "yaw": {"min": -7.0, "max": 7.0},
 }
+TRANSLATION_SOFT_LIMIT_DISABLED_MIN = -1_000_000_000.0
+TRANSLATION_SOFT_LIMIT_DISABLED_MAX = 1_000_000_000.0
 
 
 @dataclass(frozen=True)
@@ -98,6 +100,8 @@ def rotation_work_limits_ui(config: dict[str, Any], side: str) -> list[AxisLimit
     for axis_key in AXIS_KEYS[3:]:
         raw_axis = raw_side.get(axis_key, {}) if isinstance(raw_side, dict) else {}
         default_axis = ROTATION_WORK_DEFAULTS[axis_key]
+        if side == "right" and axis_key == "roll":
+            default_axis = {"min": -100.0, "max": 0.0}
         min_value = raw_axis.get("min", default_axis["min"]) if isinstance(raw_axis, dict) else default_axis["min"]
         max_value = raw_axis.get("max", default_axis["max"]) if isinstance(raw_axis, dict) else default_axis["max"]
         limits.append(AxisLimit(float(min_value), float(max_value)))
@@ -106,6 +110,11 @@ def rotation_work_limits_ui(config: dict[str, Any], side: str) -> list[AxisLimit
 
 def effective_limits_ui(config: dict[str, Any], side: str) -> list[AxisLimit]:
     limits = mechanical_limits_ui(config, side)
+    for axis_index in range(3):
+        limits[axis_index] = AxisLimit(
+            TRANSLATION_SOFT_LIMIT_DISABLED_MIN,
+            TRANSLATION_SOFT_LIMIT_DISABLED_MAX,
+        )
     if not rotation_work_limit_enabled(config):
         return limits
     origin = side_origin_ui(config, side)
@@ -127,8 +136,28 @@ def mechanical_limit_arrays(config: dict[str, Any], side: str) -> tuple[list[flo
     return [limit.min for limit in limits], [limit.max for limit in limits]
 
 
+def manual_axis_limits_ui(config: dict[str, Any], side: str) -> list[AxisLimit]:
+    limits = mechanical_limits_ui(config, side)
+    for axis_index in range(3):
+        limits[axis_index] = AxisLimit(
+            TRANSLATION_SOFT_LIMIT_DISABLED_MIN,
+            TRANSLATION_SOFT_LIMIT_DISABLED_MAX,
+        )
+    return limits
+
+
 def effective_limit_arrays(config: dict[str, Any], side: str) -> tuple[list[float], list[float]]:
     limits = effective_limits_ui(config, side)
+    return [limit.min for limit in limits], [limit.max for limit in limits]
+
+
+def native_teleop_limit_arrays(config: dict[str, Any], side: str) -> tuple[list[float], list[float]]:
+    limits = mechanical_limits_ui(config, side)
+    for axis_index in range(3):
+        limits[axis_index] = AxisLimit(
+            TRANSLATION_SOFT_LIMIT_DISABLED_MIN,
+            TRANSLATION_SOFT_LIMIT_DISABLED_MAX,
+        )
     return [limit.min for limit in limits], [limit.max for limit in limits]
 
 

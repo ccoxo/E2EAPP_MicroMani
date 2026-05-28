@@ -55,3 +55,27 @@ def test_hal_native_gripper_positions_do_not_fall_back_to_targets_when_feedback_
         assert telemetry.gripper_samples == {}
     finally:
         telemetry.shutdown()
+
+
+def test_hal_native_gripper_positions_use_native_status_feedback() -> None:
+    settings = FakeSettings()
+    settings.config["gripper"]["targetLeftMm"] = 26.0
+    settings.config["gripper"]["targetRightMm"] = 4.5
+    telemetry = TelemetryHub(settings, FakeHardware())
+    try:
+        frame = telemetry.next_frame(
+            hal_ok=True,
+            native_gripper_status={
+                "positionMm": {"left": 2.25, "right": 9.5},
+                "sides": {
+                    "left": {"ok": True, "positionMm": 2.25, "targetMm": 26.0, "message": "", "lastCommandTs": 10},
+                    "right": {"ok": True, "positionMm": 9.5, "targetMm": 4.5, "message": "", "lastCommandTs": 11},
+                },
+            },
+        )
+
+        assert frame.gripperPositions == [2.25, 9.5]
+        assert telemetry.gripper_samples["left"]["positionMm"] == 2.25
+        assert telemetry.gripper_samples["right"]["positionMm"] == 9.5
+    finally:
+        telemetry.shutdown()

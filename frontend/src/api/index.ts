@@ -559,6 +559,7 @@ export async function cleanDatasetApi(datasetId: string, apply = false) {
 /** 描述当前方法的功能边界。 */
 export interface DatasetHubUploadRequest {
   repoId: string
+  localPath?: string
   token?: string
   private?: boolean
   dryRun?: boolean

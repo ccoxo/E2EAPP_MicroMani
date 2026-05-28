@@ -23,6 +23,7 @@ from backend.core.defaults import (
     rotation_work_limits_from_soft_limits,
 )
 from backend.core.logging import LogService, now_ms, stable_config_hash
+from backend.core.motion_limits import ui_limit_to_config
 from backend.core.schemas import (
     AppConfig,
     MotionCardSnapshotConfig,
@@ -32,6 +33,7 @@ from backend.core.schemas import (
 )
 
 SNAPSHOT_ID_SAFE = re.compile(r"[^a-zA-Z0-9_.-]+")
+AXIS_KEYS = ("x", "y", "z", "roll", "pitch", "yaw")
 
 
 def _compact_config_value(value: Any) -> Any:
@@ -52,6 +54,141 @@ def _changed_config_leaves(old: Any, new: Any, prefix: str = "") -> list[tuple[s
     if old != new:
         return [(prefix or "config", _compact_config_value(old), _compact_config_value(new))]
     return []
+
+
+def _relative_soft_limits_from_teleop(config: dict[str, Any], side: str) -> dict[str, Any]:
+    teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
+    mins = teleop.get(f"{side}SoftLimitMin")
+    maxes = teleop.get(f"{side}SoftLimitMax")
+    fallback = ICF_LEFT_MOTION_SOFT_LIMITS if side == "left" else ICF_RIGHT_MOTION_SOFT_LIMITS
+    if not isinstance(mins, list) or not isinstance(maxes, list) or len(mins) < 6 or len(maxes) < 6:
+        return json.loads(json.dumps(fallback))
+    try:
+        return {
+            axis: {
+                "min": ui_limit_to_config(float(mins[index]), index),
+                "max": ui_limit_to_config(float(maxes[index]), index),
+            }
+            for index, axis in enumerate(AXIS_KEYS)
+        }
+    except (TypeError, ValueError):
+        return json.loads(json.dumps(fallback))
+
+
+def reanchor_motion_soft_limits_to_current_origin(config: dict[str, Any], side: str | None = None) -> None:
+    motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+    origin = motion.get("origin", {}) if isinstance(motion, dict) else {}
+    kinematics = motion.get("kinematics", {}) if isinstance(motion, dict) else {}
+    if not isinstance(origin, dict) or not isinstance(kinematics, dict):
+        return
+    sides = ("left", "right") if side is None else (side,)
+    for active_side in sides:
+        valid_key = "leftValid" if active_side == "left" else "rightValid"
+        pulse_key = "leftPulse" if active_side == "left" else "rightPulse"
+        signed_key = "leftSignedPulsePerUnit" if active_side == "left" else "rightSignedPulsePerUnit"
+        origin_pulse = origin.get(pulse_key)
+        signed_pulse_per_unit = kinematics.get(signed_key)
+        if (
+            not bool(origin.get(valid_key, origin.get("valid", False)))
+            or not isinstance(origin_pulse, list)
+            or len(origin_pulse) < 6
+            or not isinstance(signed_pulse_per_unit, list)
+            or len(signed_pulse_per_unit) < 6
+        ):
+            continue
+        try:
+            next_limits = anchored_mechanical_soft_limits(
+                _relative_soft_limits_from_teleop(config, active_side),
+                [float(value) for value in origin_pulse[:6]],
+                [float(value) for value in signed_pulse_per_unit[:6]],
+            )
+            current_limits = motion.get(f"{active_side}SoftLimits")
+            if isinstance(current_limits, dict):
+                for axis_key in AXIS_KEYS[:3]:
+                    current_axis = current_limits.get(axis_key)
+                    if isinstance(current_axis, dict):
+                        next_limits[axis_key] = {
+                            "min": float(current_axis["min"]),
+                            "max": float(current_axis["max"]),
+                        }
+            motion[f"{active_side}SoftLimits"] = next_limits
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+
+
+def _float_close(value: Any, expected: float, tolerance: float = 1e-6) -> bool:
+    try:
+        return abs(float(value) - expected) <= tolerance
+    except (TypeError, ValueError):
+        return False
+
+
+def _right_roll_limits_for_current_origin(config: dict[str, Any], max_deg: float) -> dict[str, float] | None:
+    motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+    origin = motion.get("origin", {}) if isinstance(motion, dict) else {}
+    kinematics = motion.get("kinematics", {}) if isinstance(motion, dict) else {}
+    right_pulse = origin.get("rightPulse") if isinstance(origin, dict) else None
+    right_signed = kinematics.get("rightSignedPulsePerUnit") if isinstance(kinematics, dict) else None
+    if (
+        not isinstance(origin, dict)
+        or not bool(origin.get("rightValid", origin.get("valid", False)))
+        or not isinstance(right_pulse, list)
+        or len(right_pulse) < 4
+        or not isinstance(right_signed, list)
+        or len(right_signed) < 4
+    ):
+        return None
+    try:
+        origin_roll_deg = float(right_pulse[3]) / float(right_signed[3])
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return {
+        "min": ui_limit_to_config(origin_roll_deg - 100.0, 3),
+        "max": ui_limit_to_config(origin_roll_deg + max_deg, 3),
+    }
+
+
+def _normalize_right_roll_negative_limit(config: dict[str, Any]) -> None:
+    changed = False
+    teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
+    mins = teleop.get("rightSoftLimitMin") if isinstance(teleop, dict) else None
+    maxes = teleop.get("rightSoftLimitMax") if isinstance(teleop, dict) else None
+    if (
+        isinstance(mins, list)
+        and isinstance(maxes, list)
+        and len(mins) >= 4
+        and len(maxes) >= 4
+        and _float_close(mins[3], -100.0)
+        and _float_close(maxes[3], 100.0)
+    ):
+        maxes[3] = 0.0
+        changed = True
+
+    motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+    work_limits = motion.get("rotationWorkLimits", {}) if isinstance(motion, dict) else {}
+    right_work = work_limits.get("right", {}) if isinstance(work_limits, dict) else {}
+    right_roll_work = right_work.get("roll", {}) if isinstance(right_work, dict) else {}
+    if (
+        isinstance(right_roll_work, dict)
+        and _float_close(right_roll_work.get("min"), -100.0)
+        and _float_close(right_roll_work.get("max"), 100.0)
+    ):
+        right_roll_work["max"] = 0.0
+        changed = True
+
+    right_soft_limits = motion.get("rightSoftLimits", {}) if isinstance(motion, dict) else {}
+    right_roll_soft = right_soft_limits.get("roll", {}) if isinstance(right_soft_limits, dict) else {}
+    legacy_limits = _right_roll_limits_for_current_origin(config, 100.0)
+    next_limits = _right_roll_limits_for_current_origin(config, 0.0)
+    if (
+        changed
+        and isinstance(right_roll_soft, dict)
+        and legacy_limits is not None
+        and next_limits is not None
+        and _float_close(right_roll_soft.get("min"), legacy_limits["min"], 1e-3)
+        and _float_close(right_roll_soft.get("max"), legacy_limits["max"], 1e-3)
+    ):
+        right_soft_limits["roll"] = next_limits
 
 
 class SettingsService:
@@ -456,6 +593,7 @@ class SettingsService:
             motion["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
         if isinstance(motion, dict):
             motion.setdefault("rotationWorkLimits", json.loads(json.dumps(ICF_ROTATION_WORK_LIMIT_DEFAULTS)))
+        _normalize_right_roll_negative_limit(config)
         gripper_teleop = teleop.get("gripperTeleop", {})
         if isinstance(gripper_teleop, dict):
             default_thresholds = (
@@ -466,9 +604,9 @@ class SettingsService:
                 for key in ("leftGapMaxMm", "rightGapMaxMm"):
                     if float(gripper_teleop.get(key, 25.0)) == 50.0:
                         gripper_teleop[key] = 25.0
-            if gripper_teleop.get("leftSourceHand") == "PhysicalLeft":
+            if gripper_teleop.get("leftSourceHand") != "PhysicalRight":
                 gripper_teleop["leftSourceHand"] = "PhysicalRight"
-            if gripper_teleop.get("rightSourceHand") == "PhysicalRight":
+            if gripper_teleop.get("rightSourceHand") != "PhysicalLeft":
                 gripper_teleop["rightSourceHand"] = "PhysicalLeft"
             gripper_teleop.setdefault("leftGapInvert", False)
             if teleop.get("engine") == "hal_native" and gripper_teleop.get("rightGapInvert") is True:

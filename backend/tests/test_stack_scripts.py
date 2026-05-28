@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -30,3 +31,12 @@ def test_launch_app_can_monitor_an_existing_app_window_without_opening_a_duplica
 
     assert "Using existing App window" in script
     assert "if ($processes.Count -eq 0)" in script
+
+
+def test_launch_app_uses_cache_busting_url_before_the_hash_fragment() -> None:
+    script = (REPO_ROOT / "scripts" / "launch-app.ps1").read_text(encoding="utf-8")
+
+    assert re.search(
+        r'\$appUrl\s*=\s*"http://127\.0\.0\.1:\$FrontendPort/settings\?[^"#]+#manual"',
+        script,
+    )

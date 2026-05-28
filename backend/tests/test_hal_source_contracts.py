@@ -16,6 +16,30 @@ def test_hal_motion_state_json_exposes_axis_moving_flags() -> None:
     assert 'state.axes[i].moving ? "true" : "false"' in body
 
 
+def test_hal_axis_diagnostics_exposes_read_only_ltdmc_io() -> None:
+    driver_source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
+    header_source = (REPO_ROOT / "hal" / "include" / "LTDMCDriver.h").read_text(encoding="utf-8")
+    server_source = (REPO_ROOT / "hal" / "src" / "HalServer.cpp").read_text(encoding="utf-8")
+
+    assert "std::string axisDiagnosticsJson();" in header_source
+    assert "std::string LTDMCDriver::axisDiagnosticsJson()" in driver_source
+    body = driver_source.split("std::string LTDMCDriver::axisDiagnosticsJson()", 1)[1].split(
+        "void LTDMCDriver::emergencyStop",
+        1,
+    )[0]
+
+    assert '"GET /motion/axis_diagnostics "' in server_source
+    assert "dmc_axis_io_status" in driver_source
+    assert "dmc_read_rdy_pin" in driver_source
+    assert "dmc_read_erc_pin" in driver_source
+    assert "dmc_read_sevrst_pin" in driver_source
+    assert "dmc_get_stop_reason" in driver_source
+    assert "dmc_get_el_mode" in driver_source
+    assert "dmcPMove" not in body
+    assert "dmcHomeMove" not in body
+    assert "dmcStop" not in body
+
+
 def test_ltdmc_manual_jog_keeps_single_step_hard_limits() -> None:
     source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
     body = source.split("void LTDMCDriver::moveRelativeUi(", 1)[1].split(
@@ -275,8 +299,8 @@ def test_hal_stage_axis_and_direction_signs_match_icf_mapping() -> None:
 
     assert "kLeftPhysicalAxis{0, 1, 3, 5, 4, 2}" in normalized
     assert "kRightPhysicalAxis{2, 0, 5, 8, 1, 7}" in normalized
-    assert "-5000.0, 10000.0, -10000.0, 1666.666667, -2500.0, -3333.333" in normalized
-    assert "-5000.0, -10000.0, -10000.0, 1666.666667, 2500.0, 333.3333" in normalized
+    assert "-5000.0, 5000.0, -10000.0, 1666.666667, -2500.0, -3333.333" in normalized
+    assert "-5000.0, -10000.0, -5000.0, 1666.666667, 2500.0, 333.3333" in normalized
 
 
 def test_runtime_launch_disables_pagehide_auto_shutdown_and_stop_stack_kills_all_listener_trees() -> None:
@@ -297,7 +321,7 @@ def test_runtime_launch_disables_pagehide_auto_shutdown_and_stop_stack_kills_all
     assert "Stop-BackendProcessTrees" in stop_stack
 
 
-def test_hal_native_soft_limits_add_work_origin_only_in_hal() -> None:
+def test_hal_native_translation_soft_limits_are_relative_until_hal_reanchors_them() -> None:
     backend_source = (REPO_ROOT / "backend" / "services" / "teleop_mapping.py").read_text(encoding="utf-8")
     hal_source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
     soft_limit_body = backend_source.split("def _soft_limit_arrays(", 1)[1].split(
@@ -312,8 +336,10 @@ def test_hal_native_soft_limits_add_work_origin_only_in_hal() -> None:
         1,
     )[0]
 
-    assert "origin_ui" not in soft_limit_body
+    assert "native_teleop_limit_arrays(config, side)" in soft_limit_body
     assert "pulseToUi(config_.workOriginPulse[targetIndex][axisIndex], targetSide, axis)" in effective_body
+    assert "limits[axisIndex].min += originUi" in effective_body
+    assert "limits[axisIndex].max += originUi" in effective_body
     assert "std::max(limits[axisIndex].min, originUi + workLimit.min)" in effective_body
     assert "std::min(limits[axisIndex].max, originUi + workLimit.max)" in effective_body
     assert "axisIndex < 3" in effective_body
@@ -354,8 +380,8 @@ def test_hal_native_controller_defaults_match_site_corrected_output_and_xy_signs
     assert "std::array<double, 2> translationScale{{1.0, 1.0}}" in normalized
     assert "std::array<double, 2> rotationScale{{1.0, 1.0}}" in normalized
     assert "{0.40, 0.25, 0.25, 0.40, 0.20, 0.20}" in normalized
-    assert "{-5000000.0, 10000000.0, -10000000.0, 1667.0, -2500.0, -333.3333}" in normalized
-    assert "{-5000000.0, -10000000.0, -10000000.0, 1667.0, 2500.0, 3333.333}" in normalized
+    assert "{-5000000.0, 5000000.0, -10000000.0, 1667.0, -2500.0, -333.3333}" in normalized
+    assert "{-5000000.0, -10000000.0, -5000000.0, 1667.0, 2500.0, 3333.333}" in normalized
 
 
 def test_hal_native_home_stops_controller_and_waits_for_motion_done() -> None:
@@ -397,6 +423,8 @@ def test_hal_native_home_origin_moves_to_absolute_work_origin_like_icf() -> None
         assert "const auto deltaPulse = targetPulse - currentPulse;" in body
         assert "startWorkOriginMoveOrThrow(card, axisNo, targetPulse, deltaPulse, currentPulse)" in body
 
+    assert "constexpr long kWorkOriginSettledPulseTolerance = 10;" in motion
+    assert "std::abs(deltaPulse) <= kWorkOriginSettledPulseTolerance" in motion
     assert "const auto absoluteRet = dmcPMove(card, axisNo, targetPulse, 1);" in motion
     assert "const auto relativeRet = dmcPMove(card, axisNo, deltaPulse, 0);" in motion
     assert (
@@ -406,19 +434,24 @@ def test_hal_native_home_origin_moves_to_absolute_work_origin_like_icf() -> None
     assert "relative fallback ret=" in motion
 
 
-def test_hal_native_gripper_manual_endpoint_uses_hal_jodell_driver() -> None:
+def test_hal_native_gripper_manual_endpoint_uses_native_controller_queue() -> None:
     server = (REPO_ROOT / "hal" / "src" / "HalServer.cpp").read_text(encoding="utf-8")
     client = (REPO_ROOT / "backend" / "hal_client" / "client.py").read_text(encoding="utf-8")
     command_service = (REPO_ROOT / "backend" / "services" / "command_service.py").read_text(encoding="utf-8")
+    controller_header = (REPO_ROOT / "hal" / "include" / "NativeTeleopController.h").read_text(encoding="utf-8")
     branch = server.split('POST /gripper/command ', 1)[1].split(
         'POST /motion/emergency_stop ',
         1,
     )[0]
 
-    assert '"gripper.command": "/gripper/command"' in client
-    assert 'await self.hal.command("gripper.command", payload)' in command_service
-    assert "gripper.configure(config.gripper)" in branch
-    assert "gripper.commandTarget(side, targetMm, speed, torque, &message)" in branch
+    assert '"teleop.native.gripper_command": "/teleop/native/gripper_command"' in client
+    assert 'await self.hal.command("teleop.native.gripper_command", payload)' in command_service
+    assert "void configureGripper(const JodellGripperConfig& config);" in controller_header
+    assert "bool commandGripperTarget(Side side, double targetMm, int speed, int torque, std::string* message = nullptr);" in controller_header
+    assert "nativeTeleop.configureGripper(config.gripper)" in branch
+    assert "nativeTeleop.configure(config)" not in branch
+    assert "nativeTeleop.commandGripperTarget(side, targetMm, speed, torque, &message)" in branch
+    assert "gripper.commandTarget(side, targetMm, speed, torque, &message)" not in branch
     assert "jsonNativeTeleopConfig(bodyText)" in branch
 
 
@@ -559,6 +592,8 @@ def test_hal_native_teleop_soft_limits_are_relative_to_work_origin() -> None:
     assert "std::array<std::array<AxisLimit, 6>, 2> rotationWorkLimits" in header
     assert "std::array<AxisLimit, 6> effectiveSoftLimits(Side targetSide, int targetIndex) const" in header
     assert "pulseToUi(config_.workOriginPulse[targetIndex][axisIndex], targetSide, axis)" in source
+    assert "limits[axisIndex].min += originUi" in source
+    assert "limits[axisIndex].max += originUi" in source
     assert "std::max(limits[axisIndex].min, originUi + workLimit.min)" in source
     assert "std::min(limits[axisIndex].max, originUi + workLimit.max)" in source
     assert "const auto limits = effectiveSoftLimits(targetSide, targetIndex);" in normalized_source
@@ -1127,7 +1162,7 @@ def test_hal_native_gripper_worker_samples_positions_without_commands() -> None:
     assert "gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);" in normalized_sample
 
 
-def test_hal_native_jodell_driver_keeps_dual_ports_open_per_side() -> None:
+def test_hal_native_jodell_driver_closes_other_active_port_before_switching() -> None:
     gripper_header = (REPO_ROOT / "hal" / "include" / "JodellGripperDriver.h").read_text(encoding="utf-8")
     gripper_source = (REPO_ROOT / "hal" / "src" / "JodellGripperDriver.cpp").read_text(encoding="utf-8")
     normalized = " ".join(gripper_source.split())
@@ -1136,9 +1171,22 @@ def test_hal_native_jodell_driver_keeps_dual_ports_open_per_side() -> None:
     assert "std::array<int, 2> activePorts_" in gripper_header
     assert "selectPortUnlocked" not in gripper_header
     assert "selectPortUnlocked" not in gripper_source
+    assert "for (int& activePort : activePorts_)" in normalized
+    assert "activePort > 0 && activePort != port" in normalized
+    assert "(void)serialOperation_(activePort, config_.baudrate, 0);" in normalized
     assert "if (activePorts_[index] == port)" in normalized
     assert "activePorts_[index] = port;" in normalized
-    assert "(void)serialOperation_(activePorts_[index], config_.baudrate, 0);" in normalized
+
+
+def test_hal_native_stop_clears_logical_connection_state() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
+    stop_body = source.split("void NativeTeleopController::stop() {", 1)[1].split(
+        "void NativeTeleopController::startGripperWorker()",
+        1,
+    )[0]
+    normalized = " ".join(stop_body.split())
+
+    assert "logicalConnected_ = {false, false};" in normalized
 
 
 def test_hal_native_gripper_teleop_throttles_background_jodell_commands() -> None:

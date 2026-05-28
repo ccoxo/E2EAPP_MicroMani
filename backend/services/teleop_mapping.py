@@ -13,7 +13,7 @@ from backend.core.logging import LogService, now_ms
 from backend.core.motion_limits import (
     WorkOriginMissing,
     effective_limit_arrays,
-    mechanical_limit_arrays,
+    native_teleop_limit_arrays,
     rotation_work_limit_arrays,
     rotation_work_limit_enabled,
 )
@@ -61,6 +61,7 @@ class TeleopMappingService:
         self._last_native_status_summary = ""
         self._last_native_status_summary_ms = 0
         self._native_status_cache: dict[str, Any] = {}
+        self._last_native_payload: dict[str, Any] | None = None
         self._native_transition_lock = asyncio.Lock()
 
     async def start(
@@ -121,10 +122,13 @@ class TeleopMappingService:
             source_was_present = source in self._arm_sources
             self._arm_sources.add(source)
             try:
+                payload = self._native_payload(config)
+                if source_was_present and payload == self._last_native_payload:
+                    return self.status()
                 if source == "teleop-connect":
-                    await self._start_native(config)
+                    await self._start_native_payload(payload)
                 else:
-                    await self._configure_and_start_native(config)
+                    await self._configure_and_start_native_payload(payload)
             except Exception:
                 if not source_was_present:
                     self._arm_sources.discard(source)
@@ -158,6 +162,7 @@ class TeleopMappingService:
                 self._last_error = ""
                 self._last_native_diag_action_key = ""
                 self._native_status_cache = {}
+                self._last_native_payload = None
             raise
         self._stop_event = asyncio.Event()
         self._task = asyncio.create_task(self._run_native_status_loop(), name="hal-native-teleop-status")
@@ -257,17 +262,20 @@ class TeleopMappingService:
                 await task
             except asyncio.CancelledError:
                 pass
-        await self.hal.command("teleop.native.stop", {})
-        self._task = None
-        self._stop_event = None
-        self._last_action = None
-        self._action_history.clear()
-        self._last_blockers = {}
-        self._last_error = ""
-        self._last_native_diag_action_key = ""
-        self._last_native_status_summary = ""
-        self._last_native_status_summary_ms = 0
-        self._native_status_cache = {}
+        try:
+            await self.hal.command("teleop.native.stop", {})
+        finally:
+            self._task = None
+            self._stop_event = None
+            self._last_action = None
+            self._action_history.clear()
+            self._last_blockers = {}
+            self._last_error = ""
+            self._last_native_diag_action_key = ""
+            self._last_native_status_summary = ""
+            self._last_native_status_summary_ms = 0
+            self._native_status_cache = {}
+            self._last_native_payload = None
         if self.logs is not None:
             self._log_teleop_mode(config, None, source, "stop", native=True)
             self.logs.info("[HAL]", "HAL-native teleop controller stopped")
@@ -328,11 +336,19 @@ class TeleopMappingService:
 
     async def _configure_and_start_native(self, config: dict[str, Any]) -> None:
         payload = self._native_payload(config)
+        await self._configure_and_start_native_payload(payload)
+
+    async def _configure_and_start_native_payload(self, payload: dict[str, Any]) -> None:
         await self.hal.command("teleop.native.configure", payload)
         await self.hal.command("teleop.native.start", payload)
+        self._last_native_payload = dict(payload)
 
     async def _start_native(self, config: dict[str, Any]) -> None:
-        await self.hal.command("teleop.native.start", self._native_payload(config))
+        await self._start_native_payload(self._native_payload(config))
+
+    async def _start_native_payload(self, payload: dict[str, Any]) -> None:
+        await self.hal.command("teleop.native.start", payload)
+        self._last_native_payload = dict(payload)
 
     async def _refresh_native_status(self) -> None:
         hal_result = await self.hal.command("teleop.native.status", {})
@@ -1588,7 +1604,7 @@ class TeleopMappingService:
         return [bool(value) for value in raw]
 
     def _soft_limit_arrays(self, side: SideName, config: dict[str, Any]) -> tuple[list[float], list[float]]:
-        return mechanical_limit_arrays(config, side)
+        return native_teleop_limit_arrays(config, side)
 
     def _effective_limit_arrays(self, side: SideName, config: dict[str, Any]) -> tuple[list[float], list[float]]:
         try:

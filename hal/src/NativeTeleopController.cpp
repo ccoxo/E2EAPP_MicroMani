@@ -196,8 +196,8 @@ NativeTeleopController::NativeTeleopController(
         AxisLimit{-25000.0, 25000.0},
         AxisLimit{-37500.0, 37500.0},
         AxisLimit{-37500.0, 37500.0},
-        AxisLimit{-90.0, 90.0},
-        AxisLimit{-90.0, 90.0},
+        AxisLimit{-100.0, 100.0},
+        AxisLimit{-100.0, 100.0},
         AxisLimit{-7.0, 7.0},
     };
   }
@@ -206,8 +206,8 @@ NativeTeleopController::NativeTeleopController(
         AxisLimit{0.0, 0.0},
         AxisLimit{0.0, 0.0},
         AxisLimit{0.0, 0.0},
-        AxisLimit{-90.0, 90.0},
-        AxisLimit{-90.0, 90.0},
+        AxisLimit{-100.0, 100.0},
+        AxisLimit{-100.0, 100.0},
         AxisLimit{-7.0, 7.0},
     };
   }
@@ -305,7 +305,7 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config) {
     for (int axisIndex = 3; axisIndex < 6; ++axisIndex) {
       auto& limit = sideLimits[axisIndex];
       if (limit.min >= limit.max) {
-        limit = axisIndex == 5 ? AxisLimit{-7.0, 7.0} : AxisLimit{-90.0, 90.0};
+        limit = axisIndex == 5 ? AxisLimit{-7.0, 7.0} : AxisLimit{-100.0, 100.0};
       }
     }
   }
@@ -322,6 +322,14 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config) {
   }
   gripper_.configure(normalized.gripper);
   omega_.setGravityCompensation(normalized.leftGravityCompensation, normalized.rightGravityCompensation);
+}
+
+void NativeTeleopController::configureGripper(const JodellGripperConfig& config) {
+  {
+    std::scoped_lock lock(mutex_);
+    config_.gripper = config;
+  }
+  gripper_.configure(config);
 }
 
 void NativeTeleopController::start(bool leftConnected, bool rightConnected) {
@@ -383,6 +391,7 @@ void NativeTeleopController::stop() {
   }
   stopGripperWorker();
   std::scoped_lock lock(mutex_);
+  logicalConnected_ = {false, false};
   referenceValid_ = {false, false};
   targetActive_ = {false, false};
   velocityUiPerSec_ = {};
@@ -491,6 +500,53 @@ void NativeTeleopController::sampleGripperPosition(Side side) {
 
 bool NativeTeleopController::running() const {
   return running_.load();
+}
+
+bool NativeTeleopController::commandGripperTarget(
+    Side side,
+    double targetMm,
+    int speed,
+    int torque,
+    std::string* message) {
+  const int index = sideIndex(side);
+  double stroke = 26.0;
+  {
+    std::scoped_lock lock(mutex_);
+    stroke = std::max(0.001, config_.gripper.strokeMm);
+  }
+  const double bounded = std::clamp(targetMm, 0.0, stroke);
+  if (gripperWorkerRunning_.load()) {
+    {
+      std::scoped_lock lock(mutex_);
+      gripperTargetsMm_[index] = bounded;
+      gripperLastCommandOk_[index] = true;
+      gripperLastMessage_[index] = "queued native gripper command";
+      gripperLastCommandTs_[index] = unixTimeMs();
+    }
+    enqueueGripperCommand(index, side, bounded, speed, torque);
+    if (message) {
+      *message = "queued native gripper command";
+    }
+    return true;
+  }
+
+  std::string driverMessage;
+  const bool ok = gripper_.commandTarget(side, bounded, speed, torque, &driverMessage);
+  {
+    std::scoped_lock lock(mutex_);
+    gripperTargetsMm_[index] = bounded;
+    gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);
+    gripperLastCommandOk_[index] = ok;
+    gripperLastMessage_[index] = driverMessage;
+    gripperLastCommandTs_[index] = unixTimeMs();
+    if (!ok) {
+      lastError_ = std::string("native gripper ") + sideName(side) + ": " + driverMessage;
+    }
+  }
+  if (message) {
+    *message = driverMessage;
+  }
+  return ok;
 }
 
 std::string NativeTeleopController::statusJson() const {
@@ -1013,6 +1069,14 @@ void NativeTeleopController::resetKalmanSideUnlocked(int sourceIndex) {
 
 std::array<AxisLimit, 6> NativeTeleopController::effectiveSoftLimits(Side targetSide, int targetIndex) const {
   auto limits = config_.softLimits[targetIndex];
+  if (config_.workOriginValid[targetIndex]) {
+    for (int axisIndex = 0; axisIndex < 3; ++axisIndex) {
+      const auto axis = static_cast<SemanticAxis>(axisIndex);
+      const double originUi = pulseToUi(config_.workOriginPulse[targetIndex][axisIndex], targetSide, axis);
+      limits[axisIndex].min += originUi;
+      limits[axisIndex].max += originUi;
+    }
+  }
   if (!config_.rotationWorkLimitEnabled) {
     return limits;
   }

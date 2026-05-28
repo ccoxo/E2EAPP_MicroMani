@@ -9,7 +9,10 @@ import os
 import queue
 import re
 import shutil
+import subprocess
+import sys
 import time
+import uuid
 from bisect import bisect_left
 from collections import deque
 from concurrent.futures import Future
@@ -21,8 +24,9 @@ from types import SimpleNamespace
 from typing import Any
 
 from backend.core.config import SettingsService
+from backend.core.defaults import ICF_KINEMATICS_DEFAULTS, ICF_TELEOP_DEFAULTS
 from backend.core.logging import LogService, now_ms, stable_config_hash
-from backend.core.units import lerobot_to_ui_state, pulses_to_ui_state
+from backend.core.units import lerobot_to_ui_state, motion_pulse_per_unit, pulses_to_ui_state
 from backend.hal_client.client import HalClient
 from backend.services.hardware_service import HardwareService
 from backend.services.telemetry_hub import TelemetryHub
@@ -71,6 +75,8 @@ PULSE_FEATURE_NAMES: tuple[str, ...] = (
     "right_pitch_pulse",
     "right_yaw_pulse",
 )
+MOTION_AXIS_NAMES: tuple[str, ...] = ("x", "y", "z", "roll", "pitch", "yaw")
+LEROBOT_STATE_UNIT_SPEC: tuple[str, ...] = ("um", "um", "um", "mdeg", "mdeg", "mdeg")
 FORCE_FEATURE_NAMES: tuple[str, ...] = ("fx", "fy", "fz", "mx", "my", "mz")
 CAMERA_SOURCE_KEYS: dict[str, str] = {key: f"camera_{key}" for key in CAMERA_KEYS}
 CAMERA_KEY_BY_SOURCE: dict[str, str] = {source: key for key, source in CAMERA_SOURCE_KEYS.items()}
@@ -491,6 +497,9 @@ class DatasetRecorderService:
         self._frame_assembler = FrameAssembler(self)
         self._quality_tracker = RecordingQualityTracker(self)
         self._last_saved_episode: dict[str, Any] | None = None
+        self._reset_pending = False
+        self._hub_push_jobs: dict[str, dict[str, Any]] = {}
+        self._hub_push_jobs_lock = Lock()
 
     async def start_session(self, dataset_name: str, task: str) -> dict[str, Any]:
         """创建录制会话，初始化 native 写入路径、采样线程和组帧任务。"""
@@ -504,6 +513,7 @@ class DatasetRecorderService:
             self._task = task.strip() or "unspecified task"
             self._session_id = f"session-{now_ms()}"
             self._last_saved_episode = None
+            self._reset_pending = False
             self._record_fps_hz = self._record_fps_from_config(config)
             self._force_sample_hz = self._force_sample_hz_from_config(config)
             dataset_root = self._dataset_root(config)
@@ -555,6 +565,7 @@ class DatasetRecorderService:
         async with self._lock:
             episode = self._finalize_episode_locked(status="review", deleted=False)
             self._last_saved_episode = episode
+            self._reset_pending = True
             self._samplers_paused = True
             self.telemetry.episode_count = self._episode_index + 1
         await self.teleop.stop("recording")
@@ -562,7 +573,7 @@ class DatasetRecorderService:
         return {"episode": episode, "status": self.status()}
 
     async def discard_episode(self) -> dict[str, Any]:
-        """丢弃正在录制或刚保存的 episode，并使用原序号重新开始录制。"""
+        """丢弃正在录制或刚保存的 episode，并暂停到复位等待。"""
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
@@ -576,14 +587,17 @@ class DatasetRecorderService:
                 await self._clear_native_episode_buffer()
         async with self._lock:
             if not was_recording and self._last_saved_episode is not None:
+                episode_index = int(self._last_saved_episode.get("episodeIndex", self._episode_index))
                 self._mark_saved_episode_deleted_locked(self._last_saved_episode)
+                if episode_index < self._episode_index:
+                    self._episode_index = episode_index
+                    self.telemetry.episode_count = episode_index
                 self._last_saved_episode = None
-            self._begin_episode_locked()
-            self.telemetry.recording = True
-            self.telemetry.frame_count = 0
-        await self.teleop.start("recording")
-        await self._wait_for_episode_warmup()
-        self.logs.warning("[LEROBOT]", f"record episode discarded; rerecording episode={self._episode_index:06d}")
+            self._reset_pending = True
+            self._samplers_paused = True
+            self.telemetry.recording = False
+        await self.teleop.stop("recording")
+        self.logs.warning("[LEROBOT]", f"record episode discarded; waiting for reset episode={self._episode_index:06d}")
         return self.status()
 
     async def skip_reset(self) -> dict[str, Any]:
@@ -591,10 +605,12 @@ class DatasetRecorderService:
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
-            if self._recording or self._last_saved_episode is None:
+            reset_pending = getattr(self, "_reset_pending", self._last_saved_episode is not None)
+            if self._recording or not reset_pending:
                 raise RuntimeError("record reset is not ready")
         async with self._lock:
             self._last_saved_episode = None
+            self._reset_pending = False
             self._begin_episode_locked()
             self.telemetry.recording = True
             self.telemetry.frame_count = 0
@@ -618,6 +634,7 @@ class DatasetRecorderService:
             self._recording = False
             self._session_active = False
             self._last_saved_episode = None
+            self._reset_pending = False
             self.telemetry.recording = False
             self.telemetry.frame_count = 0
         await self.teleop.stop("recording")
@@ -659,7 +676,7 @@ class DatasetRecorderService:
         }
 
     def origin_mutation_locked(self) -> bool:
-        """???????????????????? episode ???????"""
+        """录制会话存在时禁止修改硬件零点记录，保持 episode 坐标系可追溯。"""
         return bool(self._session_active or self._recording)
 
     def list_datasets(self) -> list[dict[str, Any]]:
@@ -942,10 +959,11 @@ class DatasetRecorderService:
 
     def push_dataset(self, dataset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """根据配置以 dry-run 或 LeRobot push_to_hub 方式处理数据集上传。"""
-        dataset_dir = self._dataset_path(dataset_id)
+        requested_local_path = str(payload.get("localPath") or "").strip()
+        dataset_dir = Path(requested_local_path).expanduser() if requested_local_path else self._dataset_path(dataset_id)
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
-            raise FileNotFoundError(dataset_id)
+            raise RuntimeError(f"local dataset path is invalid or missing meta/info.json: {dataset_dir}")
         config = self.settings.get_config()
         repo_id = str(payload.get("repoId") or "").strip()
         token = str(payload.get("token") or "").strip()
@@ -955,6 +973,7 @@ class DatasetRecorderService:
         if not push_enabled or dry_run:
             return {
                 "dataset": dataset_id,
+                "localPath": str(dataset_dir),
                 "repoId": repo_id,
                 "pushed": False,
                 "dryRun": True,
@@ -962,18 +981,108 @@ class DatasetRecorderService:
             }
         if not repo_id:
             raise RuntimeError("repoId is required when pushToHub is enabled")
-        imports = self._native_imports()
-        if imports is None:
-            raise RuntimeError("lerobot[dataset] is not installed in backend runtime")
-        LeRobotDataset, _np = imports
-        dataset = LeRobotDataset(f"local/{dataset_id}", root=dataset_dir)
-        self._push_native_dataset_to_hub(dataset, repo_id, token=token, private=private)
-        return {"dataset": dataset_id, "repoId": repo_id, "pushed": True, "dryRun": False, "private": private}
+        job_id = self._start_hub_push_job(dataset_id, repo_id, dataset_dir, token=token, private=private)
+        return {
+            "dataset": dataset_id,
+            "localPath": str(dataset_dir),
+            "repoId": repo_id,
+            "queued": True,
+            "jobId": job_id,
+            "pushed": False,
+            "dryRun": False,
+            "private": private,
+            "message": "Hub upload queued",
+        }
+
+    def _start_hub_push_job(self, dataset_id: str, repo_id: str, dataset_dir: Path, *, token: str, private: bool) -> str:
+        job_id = uuid.uuid4().hex
+        with self._hub_push_jobs_lock:
+            self._hub_push_jobs[job_id] = {
+                "status": "queued",
+                "dataset": dataset_id,
+                "repoId": repo_id,
+                "localPath": str(dataset_dir),
+                "private": private,
+                "createdAt": now_ms(),
+            }
+        thread = Thread(
+            target=self._run_hub_push_script,
+            args=(job_id, dataset_id, repo_id, dataset_dir),
+            kwargs={"token": token, "private": private},
+            name=f"hf-upload-{dataset_id}",
+            daemon=True,
+        )
+        thread.start()
+        return job_id
+
+    def _update_hub_push_job(self, job_id: str, **fields: Any) -> None:
+        with self._hub_push_jobs_lock:
+            current = self._hub_push_jobs.setdefault(job_id, {})
+            current.update(fields)
+
+    def _run_hub_push_script(
+        self,
+        job_id: str,
+        dataset_id: str,
+        repo_id: str,
+        dataset_dir: Path,
+        *,
+        token: str,
+        private: bool,
+    ) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        script_path = repo_root / "scripts" / "push_dataset_to_hub.py"
+        command = [
+            sys.executable,
+            str(script_path),
+            "--repo-id",
+            repo_id,
+            "--local-path",
+            str(dataset_dir),
+        ]
+        if private:
+            command.append("--private")
+        env = os.environ.copy()
+        if token:
+            env["HF_TOKEN"] = token
+            env["HUGGING_FACE_HUB_TOKEN"] = token
+        self._update_hub_push_job(job_id, status="running", startedAt=now_ms())
+        try:
+            result = subprocess.run(command, cwd=str(repo_root), env=env, capture_output=True, text=True)
+        except Exception as exc:  # noqa: BLE001
+            self._update_hub_push_job(job_id, status="failed", finishedAt=now_ms(), error=str(exc))
+            self.logs.error("[LEROBOT]", f"hub upload job failed before script exit dataset={dataset_id} job={job_id}: {exc}")
+            return
+        stdout = result.stdout[-4000:] if result.stdout else ""
+        stderr = result.stderr[-4000:] if result.stderr else ""
+        if result.returncode == 0:
+            self._update_hub_push_job(
+                job_id,
+                status="succeeded",
+                finishedAt=now_ms(),
+                returncode=result.returncode,
+                stdout=stdout,
+                stderr=stderr,
+            )
+            self.logs.info("[LEROBOT]", f"hub upload job succeeded dataset={dataset_id} repo={repo_id} job={job_id}")
+            return
+        self._update_hub_push_job(
+            job_id,
+            status="failed",
+            finishedAt=now_ms(),
+            returncode=result.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        self.logs.error(
+            "[LEROBOT]",
+            f"hub upload job failed dataset={dataset_id} repo={repo_id} job={job_id} returncode={result.returncode}",
+        )
 
     # Keep request tokens transient by scoping them to this upload call.
     def _push_native_dataset_to_hub(self, dataset: Any, repo_id: str, *, token: str, private: bool) -> None:
         push_to_hub = dataset.push_to_hub
-        kwargs: dict[str, Any] = {"repo_id": repo_id}
+        kwargs: dict[str, Any] = {}
         accepts_any = True
         parameters: dict[str, inspect.Parameter] = {}
         try:
@@ -983,12 +1092,10 @@ class DatasetRecorderService:
             parameters = {}
 
         def accepts(name: str) -> bool:
-            return accepts_any or name in parameters
+            return name in parameters or (not parameters and accepts_any)
 
         if accepts("private"):
             kwargs["private"] = private
-        if token and accepts("token"):
-            kwargs["token"] = token
 
         token_env_keys = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
         previous_env = {key: os.environ.get(key) for key in token_env_keys}
@@ -1084,13 +1191,24 @@ class DatasetRecorderService:
         if imports is None:
             raise FileNotFoundError("lerobot")
         LeRobotDataset, np = imports
-        dataset = self._open_native_dataset_for_read(dataset_id, dataset_dir, LeRobotDataset)
+        try:
+            dataset = self._open_native_dataset_for_read(dataset_id, dataset_dir, LeRobotDataset)
+        except Exception:
+            return self._native_video_frame_to_jpeg(dataset_dir, camera, frame)
         absolute_index = int(episode.get("datasetFromIndex") or 0) + max(0, int(frame))
         if absolute_index >= len(dataset):
             raise FileNotFoundError(str(frame))
         item = dataset[absolute_index]
         image = item.get(CAMERA_FEATURE_KEYS[camera])
         return self._encode_rgb_tensor_to_jpeg(image, np)
+
+    def _native_video_frame_to_jpeg(self, dataset_dir: Path, camera: str, frame: int) -> bytes:
+        feature_key = CAMERA_FEATURE_KEYS[camera]
+        video_dir = dataset_dir / "videos" / feature_key
+        videos = sorted(video_dir.glob("chunk-*/*.mp4"))
+        if not videos:
+            raise FileNotFoundError(camera)
+        return self._decode_video_frame_to_jpeg(videos[0], frame)
 
     # 内部说明。
     def _new_sample_buffers(self, config: dict[str, Any]) -> dict[str, TimedRingBuffer]:
@@ -2096,6 +2214,7 @@ class DatasetRecorderService:
             "maxForceRight": round(self._max_force_right, 6),
             "warnings": self._quality_warnings(),
             "motionOrigin": self._episode_motion_origin_snapshot(config_snapshot),
+            "motionCalibration": self._motion_calibration_snapshot(config_snapshot),
         }
         episodes = self._read_episodes(dataset_dir)
         episodes = [item for item in episodes if str(item.get("id")) != episode_id]
@@ -2123,6 +2242,107 @@ class DatasetRecorderService:
             "rightPulse": list(origin.get("rightPulse", [0.0] * 6))[:6],
             "updatedAt": int(origin.get("updatedAt", 0) or 0),
             "positionSource": motion.get("positionSource", ""),
+            "configHash": stable_config_hash(config_snapshot),
+        }
+
+    def _motion_calibration_snapshot(self, config_snapshot: dict[str, Any]) -> dict[str, Any]:
+        """截取位姿换算和手动控制会用到的运动标定。"""
+        motion = config_snapshot.get("motion", {}) if isinstance(config_snapshot.get("motion"), dict) else {}
+        kinematics = motion.get("kinematics", {}) if isinstance(motion.get("kinematics"), dict) else {}
+        teleop = config_snapshot.get("teleop", {}) if isinstance(config_snapshot.get("teleop"), dict) else {}
+        signed_pulse_per_unit = motion_pulse_per_unit(config_snapshot)
+        left_signed = [float(value) for value in signed_pulse_per_unit[:6]]
+        right_signed = [float(value) for value in signed_pulse_per_unit[6:]]
+
+        def float_axis_array(raw: Any, fallback: list[float] | tuple[float, ...]) -> list[float]:
+            values = raw if isinstance(raw, list) and len(raw) >= 6 else fallback
+            try:
+                return [float(values[index]) for index in range(6)]
+            except (TypeError, ValueError, IndexError):
+                return [float(fallback[index]) for index in range(6)]
+
+        def int_axis_array(raw: Any, fallback: list[int] | tuple[int, ...]) -> list[int]:
+            values = raw if isinstance(raw, list) and len(raw) >= 6 else fallback
+            try:
+                return [int(values[index]) for index in range(6)]
+            except (TypeError, ValueError, IndexError):
+                return [int(fallback[index]) for index in range(6)]
+
+        def text_axis_array(raw: Any, fallback: list[str] | tuple[str, ...]) -> list[str]:
+            values = raw if isinstance(raw, list) and len(raw) >= 6 else fallback
+            return [str(values[index]) for index in range(6)]
+
+        return {
+            "kinematics": {
+                "source": str(kinematics.get("source", ICF_KINEMATICS_DEFAULTS.get("source", ""))),
+                "axisOrder": text_axis_array(kinematics.get("axisOrder"), MOTION_AXIS_NAMES),
+                "axisUnitSpec": text_axis_array(
+                    kinematics.get("axisUnitSpec"),
+                    ICF_KINEMATICS_DEFAULTS["axisUnitSpec"],
+                ),
+                "leftAxisMap": int_axis_array(kinematics.get("leftAxisMap"), ICF_KINEMATICS_DEFAULTS["leftAxisMap"]),
+                "rightAxisMap": int_axis_array(
+                    kinematics.get("rightAxisMap"),
+                    ICF_KINEMATICS_DEFAULTS["rightAxisMap"],
+                ),
+                "leftPhysicalAxis": int_axis_array(
+                    kinematics.get("leftPhysicalAxis"),
+                    ICF_KINEMATICS_DEFAULTS["leftPhysicalAxis"],
+                ),
+                "rightPhysicalAxis": int_axis_array(
+                    kinematics.get("rightPhysicalAxis"),
+                    ICF_KINEMATICS_DEFAULTS["rightPhysicalAxis"],
+                ),
+                "leftPulsePerUnit": float_axis_array(
+                    kinematics.get("leftPulsePerUnit"),
+                    [abs(value) for value in left_signed],
+                ),
+                "rightPulsePerUnit": float_axis_array(
+                    kinematics.get("rightPulsePerUnit"),
+                    [abs(value) for value in right_signed],
+                ),
+                "leftDirectionSign": int_axis_array(
+                    kinematics.get("leftDirectionSign"),
+                    ICF_KINEMATICS_DEFAULTS["leftDirectionSign"],
+                ),
+                "rightDirectionSign": int_axis_array(
+                    kinematics.get("rightDirectionSign"),
+                    ICF_KINEMATICS_DEFAULTS["rightDirectionSign"],
+                ),
+                "leftSignedPulsePerUnit": left_signed,
+                "rightSignedPulsePerUnit": right_signed,
+                "syncActionPulseCoeff": bool(
+                    kinematics.get("syncActionPulseCoeff", ICF_KINEMATICS_DEFAULTS.get("syncActionPulseCoeff", False))
+                ),
+                "updatedAt": str(kinematics.get("updatedAt", ICF_KINEMATICS_DEFAULTS.get("updatedAt", ""))),
+            },
+            "teleop": {
+                "strategyVersion": str(teleop.get("strategyVersion", ICF_TELEOP_DEFAULTS.get("strategyVersion", ""))),
+                "mappingMode": str(teleop.get("mappingMode", ICF_TELEOP_DEFAULTS.get("mappingMode", ""))),
+                "leftImpulseCoeff": float_axis_array(
+                    teleop.get("leftImpulseCoeff"),
+                    ICF_TELEOP_DEFAULTS["leftImpulseCoeff"],
+                ),
+                "rightImpulseCoeff": float_axis_array(
+                    teleop.get("rightImpulseCoeff"),
+                    ICF_TELEOP_DEFAULTS["rightImpulseCoeff"],
+                ),
+                "leftDirectionSign": int_axis_array(
+                    teleop.get("leftDirectionSign"),
+                    ICF_TELEOP_DEFAULTS["leftDirectionSign"],
+                ),
+                "rightDirectionSign": int_axis_array(
+                    teleop.get("rightDirectionSign"),
+                    ICF_TELEOP_DEFAULTS["rightDirectionSign"],
+                ),
+                "syncImpulseCoeffFromKinematics": bool(
+                    teleop.get(
+                        "syncImpulseCoeffFromKinematics",
+                        ICF_TELEOP_DEFAULTS.get("syncImpulseCoeffFromKinematics", False),
+                    )
+                ),
+            },
+            "stateUnitSpec": list(LEROBOT_STATE_UNIT_SPEC),
             "configHash": stable_config_hash(config_snapshot),
         }
 
@@ -2174,6 +2394,7 @@ class DatasetRecorderService:
                     "rightIp": config.get("force", {}).get("rightIp"),
                     "sampleHz": config.get("force", {}).get("sampleHz"),
                 },
+                "motion": self._motion_calibration_snapshot(config),
             },
         }
         self._write_json(path, payload)
@@ -2577,6 +2798,7 @@ class DatasetRecorderService:
             "maxForceLeft": float(episode.get("maxForceLeft", 0.0)),
             "maxForceRight": float(episode.get("maxForceRight", 0.0)),
             "motionOrigin": episode.get("motionOrigin", {}),
+            "motionCalibration": episode.get("motionCalibration", {}),
             "features": features,
             "featureSummary": features,
             "cameraResolutions": camera_resolutions,
@@ -2759,12 +2981,12 @@ class DatasetRecorderService:
         try:
             dataset = self._open_native_dataset_for_read(dataset_id, dataset_dir, LeRobotDataset)
         except Exception:
-            return []
+            return self._native_placeholder_episode_samples(dataset_id, episode, max_samples)
         start = int(episode.get("datasetFromIndex") or 0)
         stop = int(episode.get("datasetToIndex") or min(len(dataset), start + int(episode.get("frames", 0))))
         stop = min(stop, len(dataset))
         if stop <= start:
-            return []
+            return self._native_placeholder_episode_samples(dataset_id, episode, max_samples)
         stride = max(1, (stop - start) // max_samples)
         samples: list[dict[str, Any]] = []
         episode_id = str(episode.get("id", ""))
@@ -2794,6 +3016,41 @@ class DatasetRecorderService:
                     "rightPulses": pulses[6:12],
                     "forceLeft": force_left,
                     "forceRight": force_right,
+                    "images": images,
+                }
+            )
+        return samples or self._native_placeholder_episode_samples(dataset_id, episode, max_samples)
+
+    def _native_placeholder_episode_samples(
+        self,
+        dataset_id: str,
+        episode: dict[str, Any],
+        max_samples: int,
+    ) -> list[dict[str, Any]]:
+        """Return lightweight preview rows when the native dataset is not readable yet."""
+        frames = max(0, int(episode.get("frames", 0) or 0))
+        if frames <= 0:
+            return []
+        stride = max(1, frames // max_samples)
+        episode_id = str(episode.get("id", ""))
+        samples: list[dict[str, Any]] = []
+        for frame in range(0, frames, stride):
+            images = {
+                key: (
+                    f"/api/datasets/{dataset_id}/frame_image"
+                    f"?episode_id={episode_id}&camera={key}&frame={frame}"
+                )
+                for key in CAMERA_KEYS
+            }
+            samples.append(
+                {
+                    "frame": frame,
+                    "leftJoints": [0.0] * 6,
+                    "rightJoints": [0.0] * 6,
+                    "leftPulses": [0.0] * 6,
+                    "rightPulses": [0.0] * 6,
+                    "forceLeft": [0.0] * 6,
+                    "forceRight": [0.0] * 6,
                     "images": images,
                 }
             )

@@ -37,6 +37,13 @@ using DmcSetHomePinLogic = short(__stdcall*)(unsigned short, unsigned short, uns
 using DmcHomeMove = short(__stdcall*)(unsigned short, unsigned short);
 using DmcWriteSevonPin = short(__stdcall*)(unsigned short, unsigned short, unsigned short);
 using DmcReadSevonPin = short(__stdcall*)(unsigned short, unsigned short);
+using DmcAxisIoStatus = unsigned long(__stdcall*)(unsigned short, unsigned short);
+using DmcReadRdyPin = short(__stdcall*)(unsigned short, unsigned short);
+using DmcReadErcPin = short(__stdcall*)(unsigned short, unsigned short);
+using DmcReadSevrstPin = short(__stdcall*)(unsigned short, unsigned short);
+using DmcGetStopReason = short(__stdcall*)(unsigned short, unsigned short, long*);
+using DmcGetElMode =
+    short(__stdcall*)(unsigned short, unsigned short, unsigned short*, unsigned short*, unsigned short*);
 
 HMODULE ltdmcModule = nullptr;
 DmcBoardInit dmcBoardInit = nullptr;
@@ -54,6 +61,12 @@ DmcSetHomePinLogic dmcSetHomePinLogic = nullptr;
 DmcHomeMove dmcHomeMove = nullptr;
 DmcWriteSevonPin dmcWriteSevonPin = nullptr;
 DmcReadSevonPin dmcReadSevonPin = nullptr;
+DmcAxisIoStatus dmcAxisIoStatus = nullptr;
+DmcReadRdyPin dmcReadRdyPin = nullptr;
+DmcReadErcPin dmcReadErcPin = nullptr;
+DmcReadSevrstPin dmcReadSevrstPin = nullptr;
+DmcGetStopReason dmcGetStopReason = nullptr;
+DmcGetElMode dmcGetElMode = nullptr;
 #endif
 
 std::string dmcAxisFailureMessage(const char* operation, short ret, unsigned short card, unsigned short axis) {
@@ -100,13 +113,15 @@ std::string dmcAbsoluteFailureMessage(
 }
 
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
+constexpr long kWorkOriginSettledPulseTolerance = 10;
+
 void startWorkOriginMoveOrThrow(
     unsigned short card,
     unsigned short axisNo,
     long targetPulse,
     long deltaPulse,
     long currentPulse) {
-  if (deltaPulse == 0) {
+  if (std::abs(deltaPulse) <= kWorkOriginSettledPulseTolerance) {
     return;
   }
   const auto absoluteRet = dmcPMove(card, axisNo, targetPulse, 1);
@@ -160,6 +175,64 @@ std::string dmcBusyMessage(unsigned short card, unsigned short axis, long deltaP
 
 unsigned short cardForSide(appstation::hal::Side side) {
   return side == appstation::hal::Side::Left ? static_cast<unsigned short>(1) : static_cast<unsigned short>(0);
+}
+
+const char* sideName(appstation::hal::Side side) {
+  return side == appstation::hal::Side::Left ? "left" : "right";
+}
+
+const char* axisName(appstation::hal::SemanticAxis axis) {
+  switch (axis) {
+    case appstation::hal::SemanticAxis::X:
+      return "X";
+    case appstation::hal::SemanticAxis::Y:
+      return "Y";
+    case appstation::hal::SemanticAxis::Z:
+      return "Z";
+    case appstation::hal::SemanticAxis::Roll:
+      return "Roll";
+    case appstation::hal::SemanticAxis::Pitch:
+      return "Pitch";
+    case appstation::hal::SemanticAxis::Yaw:
+      return "Yaw";
+  }
+  return "Unknown";
+}
+
+void appendNullableShort(std::ostringstream& out, const char* key, bool available, short value) {
+  out << ",\"" << key << "\":";
+  if (available) {
+    out << value;
+  } else {
+    out << "null";
+  }
+}
+
+void appendNullableUnsignedLong(std::ostringstream& out, const char* key, bool available, unsigned long value) {
+  out << ",\"" << key << "\":";
+  if (available) {
+    out << value;
+  } else {
+    out << "null";
+  }
+}
+
+void appendNullableLong(std::ostringstream& out, const char* key, bool available, long value) {
+  out << ",\"" << key << "\":";
+  if (available) {
+    out << value;
+  } else {
+    out << "null";
+  }
+}
+
+void appendNullableHex(std::ostringstream& out, const char* key, bool available, unsigned long value) {
+  out << ",\"" << key << "\":";
+  if (available) {
+    out << "\"0x" << std::uppercase << std::hex << value << std::dec << std::nouppercase << "\"";
+  } else {
+    out << "null";
+  }
 }
 
 int stageAxisCount(appstation::hal::Side side) {
@@ -290,6 +363,12 @@ bool LTDMCDriver::initialize() {
   dmcHomeMove = reinterpret_cast<DmcHomeMove>(GetProcAddress(ltdmcModule, "dmc_home_move"));
   dmcWriteSevonPin = reinterpret_cast<DmcWriteSevonPin>(GetProcAddress(ltdmcModule, "dmc_write_sevon_pin"));
   dmcReadSevonPin = reinterpret_cast<DmcReadSevonPin>(GetProcAddress(ltdmcModule, "dmc_read_sevon_pin"));
+  dmcAxisIoStatus = reinterpret_cast<DmcAxisIoStatus>(GetProcAddress(ltdmcModule, "dmc_axis_io_status"));
+  dmcReadRdyPin = reinterpret_cast<DmcReadRdyPin>(GetProcAddress(ltdmcModule, "dmc_read_rdy_pin"));
+  dmcReadErcPin = reinterpret_cast<DmcReadErcPin>(GetProcAddress(ltdmcModule, "dmc_read_erc_pin"));
+  dmcReadSevrstPin = reinterpret_cast<DmcReadSevrstPin>(GetProcAddress(ltdmcModule, "dmc_read_sevrst_pin"));
+  dmcGetStopReason = reinterpret_cast<DmcGetStopReason>(GetProcAddress(ltdmcModule, "dmc_get_stop_reason"));
+  dmcGetElMode = reinterpret_cast<DmcGetElMode>(GetProcAddress(ltdmcModule, "dmc_get_el_mode"));
   if (!dmcBoardInit || !dmcGetPosition || !dmcSetProfile || !dmcPMove || !dmcCheckDone) {
     lastError_ = "required LTDMC exports missing: board_init/get_position/set_profile/pmove/check_done";
     initialized_ = false;
@@ -362,6 +441,109 @@ MotionState LTDMCDriver::readState() {
     }
   }
   return state;
+}
+
+std::string LTDMCDriver::axisDiagnosticsJson() {
+  std::scoped_lock lock(mutex_);
+  ensureInitialized();
+  std::ostringstream out;
+  out << "{\"timestamp_ms\":" << unixTimeMs() << ",\"axes\":[";
+  bool first = true;
+  for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
+    const auto side = sideIndex == 0 ? Side::Left : Side::Right;
+    const auto card = cardForSide(side);
+    for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+      const auto axis = static_cast<SemanticAxis>(axisIndex);
+      const auto index = stateIndex(side, axis);
+      const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
+      auto pulse = static_cast<long>(std::llround(pulse_[index]));
+      short done = -1;
+      short sevon = -1;
+      short rdy = -1;
+      short erc = -1;
+      short sevrst = -1;
+      short stopReasonRet = -1;
+      short elModeRet = -1;
+      long stopReason = 0;
+      unsigned short elEnable = 0;
+      unsigned short elLogic = 0;
+      unsigned short elMode = 0;
+      unsigned long axisIo = 0;
+      bool axisIoAvailable = false;
+      bool sevonAvailable = false;
+      bool rdyAvailable = false;
+      bool ercAvailable = false;
+      bool sevrstAvailable = false;
+      bool stopReasonFunctionAvailable = false;
+      bool stopReasonAvailable = false;
+      bool elModeFunctionAvailable = false;
+      bool elModeAvailable = false;
+#if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
+      pulse = dmcGetPosition(card, axisNo);
+      done = dmcCheckDone(card, axisNo);
+      if (dmcAxisIoStatus) {
+        axisIo = dmcAxisIoStatus(card, axisNo);
+        axisIoAvailable = true;
+      }
+      if (dmcReadSevonPin && usesSevonPin(side, axis)) {
+        sevon = dmcReadSevonPin(card, axisNo);
+        sevonAvailable = true;
+      }
+      if (dmcReadRdyPin) {
+        rdy = dmcReadRdyPin(card, axisNo);
+        rdyAvailable = true;
+      }
+      if (dmcReadErcPin) {
+        erc = dmcReadErcPin(card, axisNo);
+        ercAvailable = true;
+      }
+      if (dmcReadSevrstPin) {
+        sevrst = dmcReadSevrstPin(card, axisNo);
+        sevrstAvailable = true;
+      }
+      if (dmcGetStopReason) {
+        stopReasonFunctionAvailable = true;
+        stopReasonRet = dmcGetStopReason(card, axisNo, &stopReason);
+        stopReasonAvailable = stopReasonRet == 0;
+      }
+      if (dmcGetElMode) {
+        elModeFunctionAvailable = true;
+        elModeRet = dmcGetElMode(card, axisNo, &elEnable, &elLogic, &elMode);
+        elModeAvailable = elModeRet == 0;
+      }
+#endif
+      pulse_[index] = static_cast<double>(pulse);
+      if (!first) {
+        out << ",";
+      }
+      first = false;
+      out << "{\"side\":\"" << sideName(side) << "\""
+          << ",\"axis\":\"" << axisName(axis) << "\""
+          << ",\"semanticIndex\":" << axisIndex
+          << ",\"card\":" << card
+          << ",\"physicalAxis\":" << axisNo
+          << ",\"pulse\":" << pulse
+          << ",\"uiPosition\":" << pulseToUi(pulse, side, axis)
+          << ",\"enabled\":" << (enabled_[index] ? "true" : "false")
+          << ",\"commandedEnabled\":" << (commandedEnabled_[index] ? "true" : "false");
+      appendNullableShort(out, "checkDone", true, done);
+      appendNullableUnsignedLong(out, "axisIoStatus", axisIoAvailable, axisIo);
+      appendNullableHex(out, "axisIoStatusHex", axisIoAvailable, axisIo);
+      appendNullableShort(out, "sevon", sevonAvailable, sevon);
+      appendNullableShort(out, "rdy", rdyAvailable, rdy);
+      appendNullableShort(out, "erc", ercAvailable, erc);
+      appendNullableShort(out, "sevrst", sevrstAvailable, sevrst);
+      appendNullableShort(out, "getStopReasonRet", stopReasonFunctionAvailable, stopReasonRet);
+      appendNullableLong(out, "stopReason", stopReasonAvailable, stopReason);
+      appendNullableShort(out, "getElModeRet", elModeFunctionAvailable, elModeRet);
+      appendNullableShort(out, "elEnable", elModeAvailable, static_cast<short>(elEnable));
+      appendNullableShort(out, "elLogic", elModeAvailable, static_cast<short>(elLogic));
+      appendNullableShort(out, "elMode", elModeAvailable, static_cast<short>(elMode));
+      out << "}";
+    }
+  }
+  out << "]}";
+  return out.str();
 }
 
 void LTDMCDriver::emergencyStop() {

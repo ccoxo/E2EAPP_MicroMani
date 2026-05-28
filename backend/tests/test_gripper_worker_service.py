@@ -258,7 +258,7 @@ def test_hal_native_gripper_motion_command_auto_enables_disabled_side() -> None:
     assert result["targetMm"] == config["gripper"]["strokeMm"]
     assert hal.commands == [
         (
-            "gripper.command",
+            "teleop.native.gripper_command",
             {
                 "side": "right",
                 "targetMm": config["gripper"]["strokeMm"],
@@ -688,7 +688,7 @@ def test_hal_native_gripper_command_routes_manual_target_through_hal() -> None:
     assert result["targetMm"] == 26
     assert hal.commands == [
         (
-            "gripper.command",
+            "teleop.native.gripper_command",
             {
                 "side": "left",
                 "targetMm": 26.0,
@@ -777,7 +777,7 @@ def test_hal_native_gripper_enable_updates_state_without_python_com() -> None:
     assert result["nativeManaged"] is True
     assert hal.commands == [
         (
-            "gripper.command",
+            "teleop.native.gripper_command",
             {
                 "side": "left",
                 "targetMm": 13.0,

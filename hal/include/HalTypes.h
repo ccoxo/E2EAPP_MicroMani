@@ -59,11 +59,11 @@ struct HalHealth {
 
 constexpr std::array<int, 6> kLeftPhysicalAxis{0, 1, 3, 5, 4, 2};
 constexpr std::array<int, 6> kRightPhysicalAxis{2, 0, 5, 8, 1, 7};
-constexpr std::array<double, 6> kLeftPulsePerUnit{-5000.0, 10000.0, -10000.0, 1666.666667, -2500.0, -3333.333};
+constexpr std::array<double, 6> kLeftPulsePerUnit{-5000.0, 5000.0, -10000.0, 1666.666667, -2500.0, -3333.333};
 constexpr std::array<double, 6> kRightPulsePerUnit{
     -5000.0,
     -10000.0,
-    -10000.0,
+    -5000.0,
     1666.666667,
     2500.0,
     333.3333};

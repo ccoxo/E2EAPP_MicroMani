@@ -544,8 +544,8 @@ appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& bo
       AxisLimit{-25000.0, 25000.0},
       AxisLimit{-37500.0, 37500.0},
       AxisLimit{-37500.0, 37500.0},
-      AxisLimit{-90.0, 90.0},
-      AxisLimit{-90.0, 90.0},
+      AxisLimit{-100.0, 100.0},
+      AxisLimit{-100.0, 100.0},
       AxisLimit{-7.0, 7.0},
   };
   config.softLimits[0] = jsonAxisLimits(body, "leftSoftLimitMin", "leftSoftLimitMax", defaultLimits);
@@ -779,6 +779,8 @@ void serveConnection(
         body = jsonHealth(motion.health(uptime), omega.ok(), omega.lastError());
       } else if (request.rfind("GET /motion/state ", 0) == 0) {
         body = jsonMotionState(motion.readState());
+      } else if (request.rfind("GET /motion/axis_diagnostics ", 0) == 0) {
+        body = motion.axisDiagnosticsJson();
       } else if (request.rfind("GET /omega/state ", 0) == 0) {
         body = jsonOmegaState(omega.readState());
       } else if (request.rfind("POST /omega7/gravity_compensation ", 0) == 0) {
@@ -806,16 +808,18 @@ void serveConnection(
         body = "{\"ok\":true}";
       } else if (request.rfind("GET /teleop/native/status ", 0) == 0) {
         body = nativeTeleop.statusJson();
-      } else if (request.rfind("POST /gripper/command ", 0) == 0) {
+      } else if (
+          request.rfind("POST /teleop/native/gripper_command ", 0) == 0
+          || request.rfind("POST /gripper/command ", 0) == 0) {
         const auto bodyText = requestBody(request);
         const auto config = jsonNativeTeleopConfig(bodyText);
-        gripper.configure(config.gripper);
+        nativeTeleop.configureGripper(config.gripper);
         const auto side = parseSide(jsonStringValue(bodyText, "side"));
         const auto targetMm = jsonNumberValue(bodyText, "targetMm", 0.0);
         const auto speed = static_cast<int>(jsonNumberValue(bodyText, "gripSpeed", config.gripper.speed));
         const auto torque = static_cast<int>(jsonNumberValue(bodyText, "gripTorque", config.gripper.torque));
         std::string message;
-        if (!gripper.commandTarget(side, targetMm, speed, torque, &message)) {
+        if (!nativeTeleop.commandGripperTarget(side, targetMm, speed, torque, &message)) {
           throw std::runtime_error(message);
         }
         body = "{\"ok\":true,\"message\":\"" + jsonEscape(message) + "\",\"targetMm\":" + std::to_string(targetMm) + "}";

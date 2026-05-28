@@ -16,10 +16,10 @@ def test_translation_ui_uses_micrometers() -> None:
 def test_motion_pulse_per_unit_uses_runtime_kinematics_config() -> None:
     config = default_config()
     config["motion"]["kinematics"]["leftSignedPulsePerUnit"][0] = -5000.0
-    config["motion"]["kinematics"]["rightSignedPulsePerUnit"][2] = -10000.0
+    config["motion"]["kinematics"]["rightSignedPulsePerUnit"][2] = -5000.0
 
     values = motion_pulse_per_unit(config)
 
     assert values[0] == -5000.0
-    assert values[8] == -10000.0
+    assert values[8] == -5000.0
     assert pulses_to_ui_state([-5000.0] + [0.0] * 11, config)[0] == 1000.0

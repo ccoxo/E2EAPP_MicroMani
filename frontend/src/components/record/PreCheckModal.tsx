@@ -35,8 +35,8 @@ const STEPS: StepDef[] = [
       diagnosticReady(diagnostics, 'gripper'),
   },
   {
-    title: '自动回到工作原点',
-    description: '点击自动回零，将左右从臂移动到已采集的工作原点；确认停止后勾选完成。',
+    title: '自动回到硬件零点',
+    description: '点击自动回零，将左右从臂移动到已记录的硬件零点；确认停止后勾选完成。',
     autoCheck: false,
     check: null,
     actionButton: { label: '自动回零', apiCall: () => { void homeAll().catch(() => undefined) } },

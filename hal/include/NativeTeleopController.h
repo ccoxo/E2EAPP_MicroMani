@@ -32,8 +32,8 @@ struct NativeTeleopConfig {
       {0.40, 0.25, 0.25, 0.40, 0.20, 0.20},
   }};
   std::array<std::array<double, 6>, 2> impulseCoeff{{
-      {-5000000.0, 10000000.0, -10000000.0, 1667.0, -2500.0, -333.3333},
-      {-5000000.0, -10000000.0, -10000000.0, 1667.0, 2500.0, 3333.333},
+      {-5000000.0, 5000000.0, -10000000.0, 1667.0, -2500.0, -333.3333},
+      {-5000000.0, -10000000.0, -5000000.0, 1667.0, 2500.0, 3333.333},
   }};
   std::array<std::array<bool, 6>, 2> enabledAxes{{
       {true, true, true, true, true, true},
@@ -146,10 +146,12 @@ class NativeTeleopController {
   ~NativeTeleopController();
 
   void configure(const NativeTeleopConfig& config);
+  void configureGripper(const JodellGripperConfig& config);
   void start(bool leftConnected, bool rightConnected);
   void stop();
   std::string statusJson() const;
   bool running() const;
+  bool commandGripperTarget(Side side, double targetMm, int speed, int torque, std::string* message = nullptr);
 
  private:
   struct PendingGripperCommand {

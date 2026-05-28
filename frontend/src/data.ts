@@ -61,7 +61,7 @@ export const axisHardwareSpecs = [
     model: 'KXL0605-C1-C',
     leftPulsePerUnit: 5000,
     rightPulsePerUnit: 5000,
-    softLimit: '按标定工作原点配置',
+    softLimit: '机械行程 50 mm',
     warning: false,
   },
   {
@@ -71,7 +71,7 @@ export const axisHardwareSpecs = [
     model: 'KXL06075-C1-G4',
     leftPulsePerUnit: 10000,
     rightPulsePerUnit: 10000,
-    softLimit: '按标定工作原点配置',
+    softLimit: '机械行程 75 mm',
     warning: false,
   },
   {
@@ -81,7 +81,7 @@ export const axisHardwareSpecs = [
     model: 'KXL06075-C1-G4',
     leftPulsePerUnit: 10000,
     rightPulsePerUnit: 10000,
-    softLimit: '按标定工作原点配置',
+    softLimit: '机械行程 75 mm',
     warning: false,
   },
   {
@@ -91,7 +91,7 @@ export const axisHardwareSpecs = [
     model: 'KRW04360M-LC',
     leftPulsePerUnit: 1666.6667,
     rightPulsePerUnit: 1666.6667,
-    softLimit: '按标定工作原点配置',
+    softLimit: '硬件零点 ±100°',
     warning: false,
   },
   {
@@ -101,7 +101,7 @@ export const axisHardwareSpecs = [
     model: 'KRW06360M-LC',
     leftPulsePerUnit: 2500,
     rightPulsePerUnit: 2500,
-    softLimit: '建议 ±70° 起步验证',
+    softLimit: '硬件零点 ±100°',
     warning: false,
   },
   {
@@ -111,7 +111,7 @@ export const axisHardwareSpecs = [
     model: 'KGW04040M-LC',
     leftPulsePerUnit: 3333.333,
     rightPulsePerUnit: 333.3333,
-    softLimit: '必须 ≤ ±7.5°',
+    softLimit: '硬件零点 ±7°（机械 ±8°）',
     warning: true,
   },
 ] as const
@@ -192,42 +192,42 @@ export const defaultMotionProfile = {
 }
 
 export const defaultSoftLimits = {
-  x: { min: -25000, max: 25000 },
-  y: { min: -37500, max: 37500 },
-  z: { min: -37500, max: 37500 },
-  roll: { min: -90000, max: 90000 },
-  pitch: { min: -90000, max: 90000 },
+  x: { min: -1000000000, max: 1000000000 },
+  y: { min: -1000000000, max: 1000000000 },
+  z: { min: -1000000000, max: 1000000000 },
+  roll: { min: -100000, max: 100000 },
+  pitch: { min: -100000, max: 100000 },
   yaw: { min: -7000, max: 7000 },
 }
 
 export const defaultLeftSoftLimits = {
-  x: { min: -25000, max: 25000 },
-  y: { min: -37500, max: 37500 },
-  z: { min: -37500, max: 37500 },
-  roll: { min: -90000, max: 90000 },
-  pitch: { min: -90000, max: 90000 },
+  x: { min: -1000000000, max: 1000000000 },
+  y: { min: -1000000000, max: 1000000000 },
+  z: { min: -1000000000, max: 1000000000 },
+  roll: { min: -100000, max: 100000 },
+  pitch: { min: -100000, max: 100000 },
   yaw: { min: -7000, max: 7000 },
 }
 
 export const defaultRightSoftLimits = {
-  x: { min: -25000, max: 25000 },
-  y: { min: -37500, max: 37500 },
-  z: { min: -37500, max: 37500 },
-  roll: { min: -90000, max: 90000 },
-  pitch: { min: -90000, max: 90000 },
+  x: { min: -1000000000, max: 1000000000 },
+  y: { min: -1000000000, max: 1000000000 },
+  z: { min: -1000000000, max: 1000000000 },
+  roll: { min: -100000, max: 0 },
+  pitch: { min: -100000, max: 100000 },
   yaw: { min: -7000, max: 7000 },
 }
 
 export const defaultRotationWorkLimits = {
   enabled: true,
   left: {
-    roll: { min: -90, max: 90 },
-    pitch: { min: -90, max: 90 },
+    roll: { min: -100, max: 100 },
+    pitch: { min: -100, max: 100 },
     yaw: { min: -7, max: 7 },
   },
   right: {
-    roll: { min: -90, max: 90 },
-    pitch: { min: -90, max: 90 },
+    roll: { min: -100, max: 0 },
+    pitch: { min: -100, max: 100 },
     yaw: { min: -7, max: 7 },
   },
 }
@@ -573,10 +573,10 @@ export const defaultConfig: AppConfig = {
     leftEnabledAxes: [true, true, true, true, true, true],
     rightEnabledAxes: [true, true, true, true, true, true],
     softLimitUnitSpec: ['um', 'um', 'um', 'deg', 'deg', 'deg'],
-    leftSoftLimitMin: [-25000, -37500, -37500, -90, -90, -7],
-    leftSoftLimitMax: [25000, 37500, 37500, 90, 90, 7],
-    rightSoftLimitMin: [-25000, -37500, -37500, -90, -90, -7],
-    rightSoftLimitMax: [25000, 37500, 37500, 90, 90, 7],
+    leftSoftLimitMin: [-25000, -37500, -37500, -100, -100, -7],
+    leftSoftLimitMax: [25000, 37500, 37500, 100, 100, 7],
+    rightSoftLimitMin: [-25000, -37500, -37500, -100, -100, -7],
+    rightSoftLimitMax: [25000, 37500, 37500, 0, 100, 7],
     leftImpulseCoeff: [-5000000, 10000000, -10000000, 1667, -2500, -333.3333],
     rightImpulseCoeff: [-5000000, -10000000, -10000000, 1667, 2500, 3333.333],
     leftDirectionSign: [1, -1, -1, 1, -1, -1],

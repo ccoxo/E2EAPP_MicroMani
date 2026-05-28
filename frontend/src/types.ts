@@ -277,6 +277,21 @@ export interface DatasetEpisodeMotionOriginApi {
   configHash?: string
 }
 
+export interface DatasetEpisodeMotionCalibrationApi {
+  kinematics?: Partial<MotionKinematicsConfig>
+  teleop?: {
+    strategyVersion?: string
+    mappingMode?: string
+    leftImpulseCoeff?: number[]
+    rightImpulseCoeff?: number[]
+    leftDirectionSign?: number[]
+    rightDirectionSign?: number[]
+    syncImpulseCoeffFromKinematics?: boolean
+  }
+  stateUnitSpec?: string[]
+  configHash?: string
+}
+
 export interface DatasetEpisodeApi {
   id: string
   name: string
@@ -297,6 +312,7 @@ export interface DatasetEpisodeApi {
   featureSummary?: DatasetFeatureSummaryApi
   cameraResolutions?: Partial<Record<DatasetCameraKeyApi, DatasetCameraResolutionApi>>
   motionOrigin?: DatasetEpisodeMotionOriginApi
+  motionCalibration?: DatasetEpisodeMotionCalibrationApi
 }
 
 export interface DatasetApi {

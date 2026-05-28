@@ -6,11 +6,12 @@ import time
 from collections.abc import Callable
 from typing import Any, cast
 
-from backend.core.config import SettingsService
+from backend.core.config import SettingsService, reanchor_motion_soft_limits_to_current_origin
 from backend.core.logging import LogService, now_ms
 from backend.core.motion_limits import (
     WorkOriginMissing,
     effective_limits_ui,
+    manual_axis_limits_ui,
     side_origin_ui,
     side_positions_ui,
     target_allowed_with_recovery,
@@ -231,6 +232,8 @@ class CommandService:
         if side is not None:
             self._validate_side(side)
         self._ensure_origin_mutation_allowed()
+        for home_side in (("left", "right") if side is None else (side,)):
+            await self.hal.command("motion.home_side", {"side": home_side})
         state = await self.hal.motion_state()
         pulses = self._motion_state_pulses(state)
         config = self.settings.get_config()
@@ -238,7 +241,7 @@ class CommandService:
         drift = self._motion_origin_capture_drift(config, origin, pulses, side)
         if bool(drift["requiresConfirmation"]) and not confirm_large_drift:
             label = side or "both"
-            self.logs.warning("[HAL]", f"{label} motion software origin capture blocked by large drift")
+            self.logs.warning("[HAL]", f"{label} motion hardware zero recording blocked by large drift")
             raise MotionOriginDriftConfirmationRequired(drift)
         if bool(origin["valid"]):
             origin["previousValid"] = True
@@ -254,9 +257,10 @@ class CommandService:
         origin["valid"] = bool(origin["leftValid"] and origin["rightValid"])
         origin["updatedAt"] = now_ms()
         config["motion"]["origin"] = origin
+        reanchor_motion_soft_limits_to_current_origin(config, side)
         saved = self.settings.save_config(config, emit_log=False)
         label = side or "both"
-        self.logs.info("[HAL]", f"{label} motion software origin captured")
+        self.logs.info("[HAL]", f"{label} motion hardware zero recorded")
         return {"origin": saved["motion"]["origin"], "config": saved, "originCaptureDrift": drift}
 
     def restore_previous_motion_origin(self) -> dict[str, object]:
@@ -280,6 +284,7 @@ class CommandService:
         origin["previousRightPulse"] = current_right
         origin["previousUpdatedAt"] = current_updated_at if current_valid else 0
         config["motion"]["origin"] = origin
+        reanchor_motion_soft_limits_to_current_origin(config)
         saved = self.settings.save_config(config, emit_log=False)
         self.logs.info("[HAL]", "previous motion work origin restored")
         return {"origin": saved["motion"]["origin"], "config": saved}
@@ -301,7 +306,7 @@ class CommandService:
         config["motion"]["origin"] = origin
         saved = self.settings.save_config(config, emit_log=False)
         label = side or "both"
-        self.logs.info("[HAL]", f"{label} motion software origin cleared")
+        self.logs.info("[HAL]", f"{label} motion hardware zero record cleared")
         return {"origin": saved["motion"]["origin"], "config": saved}
 
     async def acknowledge_safety(self) -> dict[str, object]:
@@ -414,7 +419,7 @@ class CommandService:
                     )
                     payload = self._native_gripper_payload(config, request.side, target)
                     try:
-                        hal_result = await self.hal.command("gripper.command", payload)
+                        hal_result = await self.hal.command("teleop.native.gripper_command", payload)
                     except Exception as exc:
                         self._log_gripper_command(
                             config,
@@ -457,7 +462,7 @@ class CommandService:
                 return {"message": message, "nativeManaged": True}
             payload = self._native_gripper_payload(config, request.side, target)
             try:
-                hal_result = await self.hal.command("gripper.command", payload)
+                hal_result = await self.hal.command("teleop.native.gripper_command", payload)
             except Exception as exc:
                 self._log_gripper_command(
                     config,
@@ -817,10 +822,7 @@ class CommandService:
         state = await self.hal.motion_state()
         pulses = self._motion_state_pulses(state)
         axis_index = AXIS_ORDER.index(request.axis)
-        try:
-            limits = effective_limits_ui(config, request.side)
-        except WorkOriginMissing as exc:
-            raise RuntimeError(str(exc)) from exc
+        limits = manual_axis_limits_ui(config, request.side)
         current = side_positions_ui(config, request.side, pulses)[axis_index]
         target = current + request.step * effective_direction
         limit = limits[axis_index]

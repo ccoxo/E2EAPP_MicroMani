@@ -198,8 +198,8 @@ function isParameterSnapshotScope(value: unknown): value is ParameterSnapshotSco
 function makeMotionCardSnapshotConfig(config: AppConfig, scope: Exclude<ParameterSnapshotScope, 'all'>): MotionCardSnapshotConfig {
   const side = scope === 'motion-left' ? 'left' : 'right'
   const fallbackRotationWorkLimits = {
-    roll: { min: -90, max: 90 },
-    pitch: { min: -90, max: 90 },
+    roll: { min: -100, max: 100 },
+    pitch: { min: -100, max: 100 },
     yaw: { min: -7, max: 7 },
   }
   return {
@@ -1458,20 +1458,20 @@ discardRecordEpisode: () => {
     set((state) => {
       const record = makeDiscardedEpisodeRecord(state.recordSession)
       return {
-        recording: true,
+        recording: false,
         recordSession: {
           ...state.recordSession,
-          phase: 'recording',
+          phase: 'resetting',
           phaseStartedAt: Date.now(),
-          recorderFps: 30,
+          recorderFps: 0,
           recorderFrameCount: 0,
           recorderLateFrames: 0,
           recorderElapsedS: 0,
-          recorderTotalS: state.recordSession.episodeTimeS,
+          recorderTotalS: state.recordSession.resetTimeS,
           latestQualityReport: null,
           episodeHistory: [record, ...state.recordSession.episodeHistory].slice(0, 20),
         },
-        logs: appendLog(state.logs, makeLog('WARNING', `Episode #${record.index} 已丢弃，重新录制`, '[LEROBOT]')),
+        logs: appendLog(state.logs, makeLog('WARNING', `Episode #${record.index} 已丢弃，等待复位`, '[LEROBOT]')),
       }
     })
   },
@@ -1520,22 +1520,22 @@ rejectRecordQualityReport: () => {
       finishRecordSessionAfterReview = false
       const savedEpisodes = Math.max(0, state.recordSession.savedEpisodes - 1)
       return {
-        recording: true,
+        recording: false,
         recordSession: {
           ...state.recordSession,
           currentEpisode: report.index,
           savedEpisodes,
           latestQualityReport: null,
-          phase: 'recording',
+          phase: 'resetting',
           phaseStartedAt: Date.now(),
-          recorderFps: 30,
+          recorderFps: 0,
           recorderFrameCount: 0,
           recorderLateFrames: 0,
           recorderElapsedS: 0,
-          recorderTotalS: state.recordSession.episodeTimeS,
+          recorderTotalS: state.recordSession.resetTimeS,
           episodeHistory: state.recordSession.episodeHistory.filter((item) => item.index !== report.index),
         },
-        logs: appendLog(state.logs, makeLog('WARNING', `Episode #${report.index} 已退回重录`, '[LEROBOT]')),
+        logs: appendLog(state.logs, makeLog('WARNING', `Episode #${report.index} 已退回，等待复位`, '[LEROBOT]')),
       }
     })
   },
@@ -1634,7 +1634,7 @@ homeRecordArms: () => {
         ...state.manualControl,
         axisOffsets: {},
       },
-      logs: appendLog(state.logs, makeLog('INFO', '双臂已回工作原点', '[HAL]')),
+      logs: appendLog(state.logs, makeLog('INFO', '双臂已回硬件零点', '[HAL]')),
     }))
   },
 
@@ -1643,7 +1643,7 @@ returnRecordMotionOrigin: async (side) => {
     try {
       await returnMotionOriginSideApi(side)
       set((state) => ({
-        logs: appendLog(state.logs, makeLog('INFO', `${side} slave arm returned to work origin`, '[HAL]')),
+        logs: appendLog(state.logs, makeLog('INFO', `${side} slave arm returned to hardware zero`, '[HAL]')),
       }))
     } catch (error) {
       set((state) => ({

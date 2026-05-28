@@ -32,7 +32,7 @@ const HINTS = [
   { key: 'Ctrl', desc: '离合器切换' },
   { key: '1/2/3', desc: '速度粗/中/细' },
   { key: 'T', desc: '力觉 Tare' },
-  { key: 'R', desc: '回工作原点' },
+  { key: 'R', desc: '回硬件零点' },
   { key: 'P', desc: '暂停遥操作' },
 ]
 /** 格式化对应数值用于界面展示。 */
@@ -212,7 +212,7 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
           disabled={busy}
           onClick={() => void handleReturnOrigin('left')}
         >
-          左从臂回归原点
+          左从臂回硬件零点
         </Button>
         <Button
           size="small"
@@ -221,7 +221,7 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
           disabled={busy}
           onClick={() => void handleReturnOrigin('right')}
         >
-          右从臂回归原点
+          右从臂回硬件零点
         </Button>
       </div>
     </Card>

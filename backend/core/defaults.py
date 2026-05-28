@@ -36,13 +36,13 @@ ICF_CAMERA_DEFAULTS: dict[str, Any] = {
     "tuning": {
         "global": {
             "autoExposure": False,
-            "exposure": -4,
+            "exposure": -5.5,
             "gain": 0.0,
             "autoWhiteBalance": False,
         },
         "wrist_left": {
             "autoExposure": False,
-            "exposure": -4,
+            "exposure": -6.0,
             "gain": 0.0,
             "autoWhiteBalance": False,
         },
@@ -68,8 +68,8 @@ ICF_LEFT_MOTION_SOFT_LIMITS: dict[str, Any] = {
     "x": {"min": -25000, "max": 25000},
     "y": {"min": -37500, "max": 37500},
     "z": {"min": -37500, "max": 37500},
-    "roll": {"min": -90000, "max": 90000},
-    "pitch": {"min": -90000, "max": 90000},
+    "roll": {"min": -100000, "max": 100000},
+    "pitch": {"min": -100000, "max": 100000},
     "yaw": {"min": -7000, "max": 7000},
 }
 
@@ -77,8 +77,8 @@ ICF_RIGHT_MOTION_SOFT_LIMITS: dict[str, Any] = {
     "x": {"min": -25000, "max": 25000},
     "y": {"min": -37500, "max": 37500},
     "z": {"min": -37500, "max": 37500},
-    "roll": {"min": -90000, "max": 90000},
-    "pitch": {"min": -90000, "max": 90000},
+    "roll": {"min": -100000, "max": 0},
+    "pitch": {"min": -100000, "max": 100000},
     "yaw": {"min": -7000, "max": 7000},
 }
 
@@ -90,21 +90,21 @@ ICF_KINEMATICS_DEFAULTS: dict[str, Any] = {
     "leftPhysicalAxis": [0, 1, 3, 5, 4, 2],
     "rightPhysicalAxis": [2, 0, 5, 8, 1, 7],
     "axisUnitSpec": ["mm", "mm", "mm", "deg", "deg", "deg"],
-    "leftPulsePerUnit": [5000.0, 10000.0, 10000.0, 1666.666667, 2500.0, 3333.333],
-    "rightPulsePerUnit": [5000.0, 10000.0, 10000.0, 1666.666667, 2500.0, 333.3333],
+    "leftPulsePerUnit": [5000.0, 5000.0, 10000.0, 1666.666667, 2500.0, 3333.333],
+    "rightPulsePerUnit": [5000.0, 10000.0, 5000.0, 1666.666667, 2500.0, 333.3333],
     "leftDirectionSign": [-1, 1, -1, 1, -1, -1],
     "rightDirectionSign": [-1, -1, -1, 1, 1, 1],
-    "leftSignedPulsePerUnit": [-5000.0, 10000.0, -10000.0, 1666.666667, -2500.0, -3333.333],
-    "rightSignedPulsePerUnit": [-5000.0, -10000.0, -10000.0, 1666.666667, 2500.0, 333.3333],
+    "leftSignedPulsePerUnit": [-5000.0, 5000.0, -10000.0, 1666.666667, -2500.0, -3333.333],
+    "rightSignedPulsePerUnit": [-5000.0, -10000.0, -5000.0, 1666.666667, 2500.0, 333.3333],
     "syncActionPulseCoeff": True,
     "updatedAt": "2026-04-17T00:00:00",
 }
 
 ICF_TELEOP_SOFT_LIMIT_UNIT_SPEC = ["um", "um", "um", "deg", "deg", "deg"]
-ICF_LEFT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -90.0, -90.0, -7.0]
-ICF_LEFT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 90.0, 90.0, 7.0]
-ICF_RIGHT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -90.0, -90.0, -7.0]
-ICF_RIGHT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 90.0, 90.0, 7.0]
+ICF_LEFT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -100.0, -100.0, -7.0]
+ICF_LEFT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 100.0, 100.0, 7.0]
+ICF_RIGHT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -100.0, -100.0, -7.0]
+ICF_RIGHT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 0.0, 100.0, 7.0]
 
 ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "engine": "hal_native",
@@ -175,8 +175,8 @@ ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "leftSoftLimitMax": list(ICF_LEFT_TELEOP_SOFT_LIMIT_MAX),
     "rightSoftLimitMin": list(ICF_RIGHT_TELEOP_SOFT_LIMIT_MIN),
     "rightSoftLimitMax": list(ICF_RIGHT_TELEOP_SOFT_LIMIT_MAX),
-    "leftImpulseCoeff": [-5000000, 10000000, -10000000, 1667, -2500, -333.3333],
-    "rightImpulseCoeff": [-5000000, -10000000, -10000000, 1667, 2500, 3333.333],
+    "leftImpulseCoeff": [-5000000, 5000000, -10000000, 1667, -2500, -333.3333],
+    "rightImpulseCoeff": [-5000000, -10000000, -5000000, 1667, 2500, 3333.333],
     "leftDirectionSign": [1, -1, -1, 1, -1, -1],
     "rightDirectionSign": [1, 1, -1, 1, 1, 1],
     "syncImpulseCoeffFromKinematics": False,
@@ -218,6 +218,12 @@ def anchored_mechanical_soft_limits(
 ) -> dict[str, Any]:
     anchored: dict[str, Any] = {}
     for axis_index, axis_key in enumerate(("x", "y", "z", "roll", "pitch", "yaw")):
+        if axis_index < 3:
+            anchored[axis_key] = {
+                "min": float(relative_limits[axis_key]["min"]),
+                "max": float(relative_limits[axis_key]["max"]),
+            }
+            continue
         relative = _axis_limit_to_ui(relative_limits[axis_key], axis_index)
         origin_ui = _pulse_to_ui(origin_pulse[axis_index], signed_pulse_per_unit[axis_index], axis_index)
         anchored[axis_key] = _ui_limit_to_config(

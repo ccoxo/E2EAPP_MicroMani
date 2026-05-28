@@ -5,7 +5,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$appUrl = "http://127.0.0.1:$FrontendPort/settings#manual"
+$cacheBust = [DateTime]::UtcNow.Ticks
+$appUrl = "http://127.0.0.1:$FrontendPort/settings?appver=$cacheBust#manual"
 $profileDir = Join-Path $repo ".app-browser-profile"
 
 function Find-Browser {

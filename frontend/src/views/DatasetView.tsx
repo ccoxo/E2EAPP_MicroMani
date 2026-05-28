@@ -473,6 +473,7 @@ export function DatasetView() {
   const [hubUploadOpen, setHubUploadOpen] = useState(false)
   const [hubPushToHub, setHubPushToHub] = useState(Boolean(config.storage.pushToHub))
   const [hubRepoId, setHubRepoId] = useState('')
+  const [hubLocalPath, setHubLocalPath] = useState('')
   const [hubToken, setHubToken] = useState('')
   const [hubPrivate, setHubPrivate] = useState(false)
   const [hubDryRun, setHubDryRun] = useState(true)
@@ -670,11 +671,12 @@ const saveReview = () => {
 
     /** 调用数据集后端接口并同步界面状态。 */
 const openHubUpload = () => {
-    if (!selectedDataset) return
-    setHubMessage('')
-    setHubRepoId((current) => current || selectedDataset.id)
-    setHubUploadOpen(true)
-  }
+  if (!selectedDataset) return
+  setHubMessage('')
+  setHubRepoId((current) => current || selectedDataset.id)
+  setHubLocalPath(selectedDataset.root ?? '')
+  setHubUploadOpen(true)
+}
 
   const updateHubSwitch = (enabled: boolean) => {
     const previous = hubPushToHub
@@ -699,13 +701,15 @@ const openHubUpload = () => {
     setHubMessage('')
     void pushDatasetApi(selectedDataset.id, {
       repoId: hubRepoId.trim(),
+      localPath: hubLocalPath.trim() || undefined,
       token: transientToken,
       private: hubPrivate,
       dryRun: hubDryRun,
     })
-      .then(() => {
+      .then((response) => {
+        const data = (response as { data?: { queued?: boolean } }).data
         setHubUploadOpen(false)
-        setHubMessage(hubDryRun ? 'Hub dry-run complete' : 'Hub upload complete')
+        setHubMessage(hubDryRun ? 'Hub dry-run complete' : data?.queued ? 'Hub upload queued' : 'Hub upload complete')
         setRefreshToken((value) => value + 1)
       })
       .catch((error) => setBackendLoadError(String(error)))
@@ -941,6 +945,14 @@ const openHubUpload = () => {
               value={hubRepoId}
               placeholder="org/dataset-name"
               onChange={(event) => setHubRepoId(event.target.value)}
+            />
+          </Form.Item>
+          <Form.Item label="Local path">
+            <Input
+              aria-label="Local path"
+              value={hubLocalPath}
+              placeholder="E:\\data group\\text50"
+              onChange={(event) => setHubLocalPath(event.target.value)}
             />
           </Form.Item>
           <Form.Item label="HF Token">

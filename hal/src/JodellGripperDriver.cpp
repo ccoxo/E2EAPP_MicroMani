@@ -268,13 +268,19 @@ bool JodellGripperDriver::ensurePortOpenUnlocked(int index, int port, std::strin
     }
     return false;
   }
+  bool closedOtherPort = false;
+  for (int& activePort : activePorts_) {
+    if (activePort > 0 && activePort != port) {
+      (void)serialOperation_(activePort, config_.baudrate, 0);
+      activePort = -1;
+      closedOtherPort = true;
+    }
+  }
+  if (closedOtherPort) {
+    std::this_thread::sleep_for(kPortSwitchSettleMs);
+  }
   if (activePorts_[index] == port) {
     return true;
-  }
-  if (activePorts_[index] > 0) {
-    (void)serialOperation_(activePorts_[index], config_.baudrate, 0);
-    activePorts_[index] = -1;
-    std::this_thread::sleep_for(kPortSwitchSettleMs);
   }
   int ret = -999;
   for (int attempt = 0; attempt < 5; ++attempt) {

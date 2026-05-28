@@ -13,6 +13,7 @@ class LTDMCDriver {
   bool initialize();
   HalHealth health(double uptimeS) const;
   MotionState readState();
+  std::string axisDiagnosticsJson();
   void emergencyStop();
   std::string enableSide(Side side, bool enabled = true);
   void homeSide(Side side);

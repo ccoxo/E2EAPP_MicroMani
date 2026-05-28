@@ -86,12 +86,12 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["leftEnabledAxes"] == [True] * 6
     assert teleop["rightEnabledAxes"] == [True] * 6
     assert teleop["softLimitUnitSpec"] == ["um", "um", "um", "deg", "deg", "deg"]
-    assert teleop["leftSoftLimitMin"] == [-25000.0, -37500.0, -37500.0, -90.0, -90.0, -7.0]
-    assert teleop["leftSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 90.0, 90.0, 7.0]
-    assert teleop["rightSoftLimitMin"] == [-25000.0, -37500.0, -37500.0, -90.0, -90.0, -7.0]
-    assert teleop["rightSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 90.0, 90.0, 7.0]
-    assert teleop["leftImpulseCoeff"] == [-5000000, 10000000, -10000000, 1667, -2500, -333.3333]
-    assert teleop["rightImpulseCoeff"] == [-5000000, -10000000, -10000000, 1667, 2500, 3333.333]
+    assert teleop["leftSoftLimitMin"] == [-25000.0, -37500.0, -37500.0, -100.0, -100.0, -7.0]
+    assert teleop["leftSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 100.0, 100.0, 7.0]
+    assert teleop["rightSoftLimitMin"] == [-25000.0, -37500.0, -37500.0, -100.0, -100.0, -7.0]
+    assert teleop["rightSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 0.0, 100.0, 7.0]
+    assert teleop["leftImpulseCoeff"] == [-5000000, 5000000, -10000000, 1667, -2500, -333.3333]
+    assert teleop["rightImpulseCoeff"] == [-5000000, -10000000, -5000000, 1667, 2500, 3333.333]
     assert teleop["leftDirectionSign"] == [1, -1, -1, 1, -1, -1]
     assert teleop["rightDirectionSign"] == [1, 1, -1, 1, 1, 1]
     assert teleop["gripperTeleop"]["leftSourceHand"] == "PhysicalRight"
@@ -109,11 +109,11 @@ def test_motion_kinematics_defaults_match_icf_mapping() -> None:
     assert kinematics["rightAxisMap"] == [8, 6, 11, 14, 7, 13]
     assert kinematics["leftPhysicalAxis"] == [0, 1, 3, 5, 4, 2]
     assert kinematics["rightPhysicalAxis"] == [2, 0, 5, 8, 1, 7]
-    assert kinematics["leftSignedPulsePerUnit"] == [-5000.0, 10000.0, -10000.0, 1666.666667, -2500.0, -3333.333]
+    assert kinematics["leftSignedPulsePerUnit"] == [-5000.0, 5000.0, -10000.0, 1666.666667, -2500.0, -3333.333]
     assert kinematics["rightSignedPulsePerUnit"] == [
         -5000.0,
         -10000.0,
-        -10000.0,
+        -5000.0,
         1666.666667,
         2500.0,
         333.3333,
@@ -124,7 +124,7 @@ def test_work_origin_defaults_match_icf_reference_position() -> None:
     config = default_config()
     origin = config["motion"]["origin"]
 
-    assert config["motion"]["workOriginStrategyVersion"] == "icf_work_origin_20260519"
+    assert config["motion"]["workOriginStrategyVersion"] == "icf_work_origin_20260521_rotation_limit_v2"
     assert origin["valid"] is True
     assert origin["leftValid"] is True
     assert origin["rightValid"] is True
@@ -193,7 +193,7 @@ def test_native_teleop_xy_signs_match_site_verified_stage_direction() -> None:
     teleop = default_config()["teleop"]
 
     assert teleop["swapTeleopChannels"] is True
-    assert teleop["leftImpulseCoeff"][:2] == [-5000000, 10000000]
+    assert teleop["leftImpulseCoeff"][:2] == [-5000000, 5000000]
     assert teleop["rightImpulseCoeff"][:2] == [-5000000, -10000000]
 
 
