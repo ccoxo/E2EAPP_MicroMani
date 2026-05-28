@@ -213,8 +213,8 @@ export const defaultRightSoftLimits = {
   x: { min: -1000000000, max: 1000000000 },
   y: { min: -1000000000, max: 1000000000 },
   z: { min: -1000000000, max: 1000000000 },
-  roll: { min: -100000, max: 0 },
-  pitch: { min: -100000, max: 100000 },
+  roll: { min: -90000, max: 100000 },
+  pitch: { min: -90000, max: 90000 },
   yaw: { min: -7000, max: 7000 },
 }
 
@@ -226,8 +226,8 @@ export const defaultRotationWorkLimits = {
     yaw: { min: -7, max: 7 },
   },
   right: {
-    roll: { min: -100, max: 0 },
-    pitch: { min: -100, max: 100 },
+    roll: { min: -90, max: 100 },
+    pitch: { min: -90, max: 90 },
     yaw: { min: -7, max: 7 },
   },
 }
@@ -571,12 +571,12 @@ export const defaultConfig: AppConfig = {
     continuousMicroConfirmTicks: 0,
     diagLog: false,
     leftEnabledAxes: [true, true, true, true, true, true],
-    rightEnabledAxes: [true, true, true, true, true, true],
+    rightEnabledAxes: [true, true, true, true, true, false],
     softLimitUnitSpec: ['um', 'um', 'um', 'deg', 'deg', 'deg'],
     leftSoftLimitMin: [-25000, -37500, -37500, -100, -100, -7],
     leftSoftLimitMax: [25000, 37500, 37500, 100, 100, 7],
-    rightSoftLimitMin: [-25000, -37500, -37500, -100, -100, -7],
-    rightSoftLimitMax: [25000, 37500, 37500, 0, 100, 7],
+    rightSoftLimitMin: [-25000, -37500, -37500, -90, -90, -7],
+    rightSoftLimitMax: [25000, 37500, 37500, 100, 90, 7],
     leftImpulseCoeff: [-5000000, 10000000, -10000000, 1667, -2500, -333.3333],
     rightImpulseCoeff: [-5000000, -10000000, -10000000, 1667, 2500, 3333.333],
     leftDirectionSign: [1, -1, -1, 1, -1, -1],

@@ -1601,7 +1601,10 @@ class TeleopMappingService:
         raw = config.get("teleop", {}).get(key, DEFAULT_ENABLED_AXES)
         if not isinstance(raw, list) or len(raw) != 6:
             raw = DEFAULT_ENABLED_AXES
-        return [bool(value) for value in raw]
+        axes = [bool(value) for value in raw]
+        if side == "right":
+            axes[5] = False
+        return axes
 
     def _soft_limit_arrays(self, side: SideName, config: dict[str, Any]) -> tuple[list[float], list[float]]:
         return native_teleop_limit_arrays(config, side)

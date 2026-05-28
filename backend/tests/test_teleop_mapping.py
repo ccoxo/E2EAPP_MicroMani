@@ -9,6 +9,7 @@ import pytest
 from backend.core.config import SettingsService
 from backend.core.defaults import ICF_TELEOP_STRATEGY_VERSION, ICF_WORK_ORIGIN_VERSION, default_config
 from backend.core.logging import LogService
+from backend.core.motion_limits import effective_limits_ui, side_origin_ui
 from backend.services.teleop_mapping import TeleopMappingService
 
 
@@ -1585,20 +1586,21 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
         100.0,
         7.0,
     ]
+    assert config["teleop"]["rightEnabledAxes"] == [True, True, True, True, True, False]
     assert config["teleop"]["rightSoftLimitMin"] == [
         -25000.0,
         -37500.0,
         -37500.0,
-        -100.0,
-        -100.0,
+        -90.0,
+        -90.0,
         -7.0,
     ]
     assert config["teleop"]["rightSoftLimitMax"] == [
         25000.0,
         37500.0,
         37500.0,
-        0.0,
         100.0,
+        90.0,
         7.0,
     ]
     assert config["teleop"]["leftImpulseCoeff"] == [-5000000, 5000000, -10000000, 1667, -2500, -333.3333]
@@ -1610,7 +1612,8 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
     assert config["motion"]["rotationWorkLimits"]["left"]["roll"] == {"min": -100.0, "max": 100.0}
     assert config["motion"]["rotationWorkLimits"]["left"]["pitch"] == {"min": -100.0, "max": 100.0}
     assert config["motion"]["rotationWorkLimits"]["left"]["yaw"] == {"min": -7.0, "max": 7.0}
-    assert config["motion"]["rotationWorkLimits"]["right"]["roll"] == {"min": -100.0, "max": 0.0}
+    assert config["motion"]["rotationWorkLimits"]["right"]["roll"] == {"min": -90.0, "max": 100.0}
+    assert config["motion"]["rotationWorkLimits"]["right"]["pitch"] == {"min": -90.0, "max": 90.0}
     assert config["motion"]["leftSoftLimits"]["x"] == {"min": -25000.0, "max": 25000.0}
     assert config["motion"]["leftSoftLimits"]["y"] == {"min": -37500.0, "max": 37500.0}
     assert config["motion"]["leftSoftLimits"]["z"] == {"min": -37500.0, "max": 37500.0}
@@ -1652,6 +1655,60 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
     assert config["teleop"]["gripperTeleop"]["rightSourceHand"] == "PhysicalLeft"
     assert config["teleop"]["gripperTeleop"]["rightGapInvert"] is False
     assert config["teleop"]["gripperTeleop"]["autoGapCalibration"] is True
+
+
+def test_settings_migration_updates_prior_right_roll_negative_only_window(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["motion"]["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
+    config["teleop"]["rightSoftLimitMin"][3] = -100.0
+    config["teleop"]["rightSoftLimitMax"][3] = 0.0
+    config["motion"]["rotationWorkLimits"]["right"]["roll"] = {"min": -100.0, "max": 0.0}
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert migrated["teleop"]["rightSoftLimitMin"][3] == -90.0
+    assert migrated["teleop"]["rightSoftLimitMax"][3] == 100.0
+    assert migrated["motion"]["rotationWorkLimits"]["right"]["roll"] == {"min": -90.0, "max": 100.0}
+    origin = side_origin_ui(migrated, "right")
+    assert origin is not None
+    limits = effective_limits_ui(migrated, "right")
+    assert limits[3].min - origin[3] == pytest.approx(-90.0, abs=1e-6)
+    assert limits[3].max - origin[3] == pytest.approx(100.0, abs=1e-6)
+
+
+def test_settings_migration_updates_prior_right_pitch_window_and_yaw_axis(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["motion"]["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
+    config["teleop"]["rightEnabledAxes"] = [True, True, True, True, True, True]
+    config["teleop"]["rightSoftLimitMin"][4] = -100.0
+    config["teleop"]["rightSoftLimitMax"][4] = 100.0
+    config["motion"]["rotationWorkLimits"]["right"]["pitch"] = {"min": -100.0, "max": 100.0}
+    origin = side_origin_ui(config, "right")
+    assert origin is not None
+    config["motion"]["rightSoftLimits"]["pitch"] = {
+        "min": (origin[4] - 100.0) * 1000.0,
+        "max": (origin[4] + 100.0) * 1000.0,
+    }
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert migrated["teleop"]["rightEnabledAxes"] == [True, True, True, True, True, False]
+    assert migrated["teleop"]["rightSoftLimitMin"][4] == -90.0
+    assert migrated["teleop"]["rightSoftLimitMax"][4] == 90.0
+    assert migrated["motion"]["rotationWorkLimits"]["right"]["pitch"] == {"min": -90.0, "max": 90.0}
+    limits = effective_limits_ui(migrated, "right")
+    migrated_origin = side_origin_ui(migrated, "right")
+    assert migrated_origin is not None
+    assert limits[4].min - migrated_origin[4] == pytest.approx(-90.0, abs=1e-6)
+    assert limits[4].max - migrated_origin[4] == pytest.approx(90.0, abs=1e-6)
 
 
 def test_settings_preserves_current_strategy_mechanical_soft_limits_when_origin_changes(tmp_path: Any) -> None:

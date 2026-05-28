@@ -769,11 +769,13 @@ describe('AppStation M0 frontend', () => {
     expect(defaultConfig.teleop.swapTeleopChannels).toBe(true)
     expect(defaultConfig.teleop.leftSoftLimitMin).toEqual([-25000, -37500, -37500, -100, -100, -7])
     expect(defaultConfig.teleop.leftSoftLimitMax).toEqual([25000, 37500, 37500, 100, 100, 7])
-    expect(defaultConfig.teleop.rightSoftLimitMin).toEqual([-25000, -37500, -37500, -100, -100, -7])
-    expect(defaultConfig.teleop.rightSoftLimitMax).toEqual([25000, 37500, 37500, 0, 100, 7])
+    expect(defaultConfig.teleop.rightEnabledAxes).toEqual([true, true, true, true, true, false])
+    expect(defaultConfig.teleop.rightSoftLimitMin).toEqual([-25000, -37500, -37500, -90, -90, -7])
+    expect(defaultConfig.teleop.rightSoftLimitMax).toEqual([25000, 37500, 37500, 100, 90, 7])
     expect(defaultConfig.motion.rotationWorkLimits.left.roll).toEqual({ min: -100, max: 100 })
     expect(defaultConfig.motion.rotationWorkLimits.left.pitch).toEqual({ min: -100, max: 100 })
-    expect(defaultConfig.motion.rotationWorkLimits.right.roll).toEqual({ min: -100, max: 0 })
+    expect(defaultConfig.motion.rotationWorkLimits.right.roll).toEqual({ min: -90, max: 100 })
+    expect(defaultConfig.motion.rotationWorkLimits.right.pitch).toEqual({ min: -90, max: 90 })
     expect(defaultConfig.teleop.leftTranslationScale).toBe(1)
     expect(defaultConfig.teleop.rightTranslationScale).toBe(1)
     expect(defaultConfig.teleop.leftRotationScale).toBe(1)
@@ -941,6 +943,15 @@ describe('AppStation M0 frontend', () => {
     expect(screen.queryByText('开发者模式')).not.toBeInTheDocument()
   })
 
+  it('disables right-arm Yaw in manual controls', () => {
+    window.history.pushState({}, '', '/settings#manual')
+    render(<App />)
+    const yawButtons = screen.getAllByRole('button', { name: 'Yaw' })
+    expect(yawButtons.length).toBeGreaterThanOrEqual(2)
+    expect(yawButtons[0]).not.toBeDisabled()
+    expect(yawButtons[1]).toBeDisabled()
+  })
+
   it('records arm and gripper manual actions into replay memory', () => {
     window.history.pushState({}, '', '/settings#manual')
     useTelemetryStore.setState((state) => ({
@@ -1026,7 +1037,7 @@ describe('AppStation M0 frontend', () => {
     expect(screen.queryByText('设为采集零点')).not.toBeInTheDocument()
     expect(screen.queryByText('清除零点')).not.toBeInTheDocument()
     expect(screen.getAllByText('Roll/Pitch ±100° · Yaw ±7°').length).toBeGreaterThan(0)
-    expect(screen.getAllByText('Roll -100~0° / Pitch ±100° · Yaw ±7°').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Roll -90~100° / Pitch ±90° · Yaw disabled').length).toBeGreaterThan(0)
   })
 
   it('updates the hardware zero state when the side controls are used', async () => {

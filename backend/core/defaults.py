@@ -60,7 +60,7 @@ DEFAULT_SOFT_LIMITS: dict[str, Any] = {
     "y": {"min": -37500, "max": 37500},
     "z": {"min": -37500, "max": 37500},
     "roll": {"min": -90000, "max": 90000},
-    "pitch": {"min": -90000, "max": 90000},
+    "pitch": {"min": -100000, "max": 100000},
     "yaw": {"min": -7000, "max": 7000},
 }
 
@@ -77,8 +77,8 @@ ICF_RIGHT_MOTION_SOFT_LIMITS: dict[str, Any] = {
     "x": {"min": -25000, "max": 25000},
     "y": {"min": -37500, "max": 37500},
     "z": {"min": -37500, "max": 37500},
-    "roll": {"min": -100000, "max": 0},
-    "pitch": {"min": -100000, "max": 100000},
+    "roll": {"min": -90000, "max": 100000},
+    "pitch": {"min": -90000, "max": 90000},
     "yaw": {"min": -7000, "max": 7000},
 }
 
@@ -103,8 +103,8 @@ ICF_KINEMATICS_DEFAULTS: dict[str, Any] = {
 ICF_TELEOP_SOFT_LIMIT_UNIT_SPEC = ["um", "um", "um", "deg", "deg", "deg"]
 ICF_LEFT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -100.0, -100.0, -7.0]
 ICF_LEFT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 100.0, 100.0, 7.0]
-ICF_RIGHT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -100.0, -100.0, -7.0]
-ICF_RIGHT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 0.0, 100.0, 7.0]
+ICF_RIGHT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -90.0, -90.0, -7.0]
+ICF_RIGHT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 100.0, 90.0, 7.0]
 
 ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "engine": "hal_native",
@@ -169,7 +169,7 @@ ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "continuousMicroConfirmTicks": 0,
     "diagLog": False,
     "leftEnabledAxes": [True, True, True, True, True, True],
-    "rightEnabledAxes": [True, True, True, True, True, True],
+    "rightEnabledAxes": [True, True, True, True, True, False],
     "softLimitUnitSpec": list(ICF_TELEOP_SOFT_LIMIT_UNIT_SPEC),
     "leftSoftLimitMin": list(ICF_LEFT_TELEOP_SOFT_LIMIT_MIN),
     "leftSoftLimitMax": list(ICF_LEFT_TELEOP_SOFT_LIMIT_MAX),

@@ -101,7 +101,9 @@ def rotation_work_limits_ui(config: dict[str, Any], side: str) -> list[AxisLimit
         raw_axis = raw_side.get(axis_key, {}) if isinstance(raw_side, dict) else {}
         default_axis = ROTATION_WORK_DEFAULTS[axis_key]
         if side == "right" and axis_key == "roll":
-            default_axis = {"min": -100.0, "max": 0.0}
+            default_axis = {"min": -90.0, "max": 100.0}
+        if side == "right" and axis_key == "pitch":
+            default_axis = {"min": -90.0, "max": 90.0}
         min_value = raw_axis.get("min", default_axis["min"]) if isinstance(raw_axis, dict) else default_axis["min"]
         max_value = raw_axis.get("max", default_axis["max"]) if isinstance(raw_axis, dict) else default_axis["max"]
         limits.append(AxisLimit(float(min_value), float(max_value)))

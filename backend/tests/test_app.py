@@ -131,8 +131,8 @@ def _assert_rotation_window_from_origin(config: dict[str, Any], side: str) -> No
     assert origin is not None
     limits = effective_limits_ui(config, side)
     expected_span = {
-        "roll": (-100.0, 0.0) if side == "right" else (-100.0, 100.0),
-        "pitch": (-100.0, 100.0),
+        "roll": (-90.0, 100.0) if side == "right" else (-100.0, 100.0),
+        "pitch": (-90.0, 90.0) if side == "right" else (-100.0, 100.0),
         "yaw": (-7.0, 7.0),
     }
     for axis_index, axis in enumerate(("roll", "pitch", "yaw"), start=3):

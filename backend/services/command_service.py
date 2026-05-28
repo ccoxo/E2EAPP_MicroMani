@@ -329,6 +329,7 @@ class CommandService:
     async def manual_axis_move(self, request: ManualAxisMoveRequest) -> dict[str, object]:
         config = self.settings.get_config()
         # 所有手动 jog 都先过后端安全边界，再决定发往真机还是本地模拟。
+        self._validate_manual_axis_policy(config, request)
         self._validate_manual_axis_safety(config, request)
         effective_direction = self._manual_axis_effective_direction(request.side, request.axis, request.direction)
         op_id = self.logs.new_op_id("manual")
@@ -734,6 +735,11 @@ class CommandService:
             )
         if self._axis_profile(config, request)["maxVelocity"] <= 0:
             raise RuntimeError("manual axis velocity must be positive")
+
+    def _validate_manual_axis_policy(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> None:
+        _ = config
+        if request.side == "right" and request.axis == "Yaw":
+            raise RuntimeError("right Yaw motion axis is disabled by safety policy")
 
     def _manual_axis_step_pulse(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> float:
         return abs(float(request.step)) * self._manual_axis_pulse_per_ui_unit(config, request.side, request.axis)

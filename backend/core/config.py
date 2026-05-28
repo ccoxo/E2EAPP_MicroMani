@@ -123,7 +123,9 @@ def _float_close(value: Any, expected: float, tolerance: float = 1e-6) -> bool:
         return False
 
 
-def _right_roll_limits_for_current_origin(config: dict[str, Any], max_deg: float) -> dict[str, float] | None:
+def _right_axis_limits_for_current_origin(
+    config: dict[str, Any], axis_index: int, min_deg: float, max_deg: float
+) -> dict[str, float] | None:
     motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
     origin = motion.get("origin", {}) if isinstance(motion, dict) else {}
     kinematics = motion.get("kinematics", {}) if isinstance(motion, dict) else {}
@@ -133,23 +135,34 @@ def _right_roll_limits_for_current_origin(config: dict[str, Any], max_deg: float
         not isinstance(origin, dict)
         or not bool(origin.get("rightValid", origin.get("valid", False)))
         or not isinstance(right_pulse, list)
-        or len(right_pulse) < 4
+        or len(right_pulse) <= axis_index
         or not isinstance(right_signed, list)
-        or len(right_signed) < 4
+        or len(right_signed) <= axis_index
     ):
         return None
     try:
-        origin_roll_deg = float(right_pulse[3]) / float(right_signed[3])
+        origin_deg = float(right_pulse[axis_index]) / float(right_signed[axis_index])
     except (TypeError, ValueError, ZeroDivisionError):
         return None
     return {
-        "min": ui_limit_to_config(origin_roll_deg - 100.0, 3),
-        "max": ui_limit_to_config(origin_roll_deg + max_deg, 3),
+        "min": ui_limit_to_config(origin_deg + min_deg, axis_index),
+        "max": ui_limit_to_config(origin_deg + max_deg, axis_index),
     }
 
 
-def _normalize_right_roll_negative_limit(config: dict[str, Any]) -> None:
-    changed = False
+def _normalize_right_yaw_disabled(config: dict[str, Any]) -> None:
+    teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
+    if not isinstance(teleop, dict):
+        return
+    raw = teleop.get("rightEnabledAxes")
+    axes = [True, True, True, True, True, False]
+    if isinstance(raw, list) and len(raw) >= 6:
+        axes = [bool(value) for value in raw[:6]]
+        axes[5] = False
+    teleop["rightEnabledAxes"] = axes
+
+
+def _normalize_right_roll_window(config: dict[str, Any]) -> None:
     teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
     mins = teleop.get("rightSoftLimitMin") if isinstance(teleop, dict) else None
     maxes = teleop.get("rightSoftLimitMax") if isinstance(teleop, dict) else None
@@ -159,10 +172,10 @@ def _normalize_right_roll_negative_limit(config: dict[str, Any]) -> None:
         and len(mins) >= 4
         and len(maxes) >= 4
         and _float_close(mins[3], -100.0)
-        and _float_close(maxes[3], 100.0)
+        and (_float_close(maxes[3], 0.0) or _float_close(maxes[3], 100.0))
     ):
-        maxes[3] = 0.0
-        changed = True
+        mins[3] = -90.0
+        maxes[3] = 100.0
 
     motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
     work_limits = motion.get("rotationWorkLimits", {}) if isinstance(motion, dict) else {}
@@ -171,24 +184,74 @@ def _normalize_right_roll_negative_limit(config: dict[str, Any]) -> None:
     if (
         isinstance(right_roll_work, dict)
         and _float_close(right_roll_work.get("min"), -100.0)
-        and _float_close(right_roll_work.get("max"), 100.0)
+        and (_float_close(right_roll_work.get("max"), 0.0) or _float_close(right_roll_work.get("max"), 100.0))
     ):
-        right_roll_work["max"] = 0.0
-        changed = True
+        right_roll_work["min"] = -90.0
+        right_roll_work["max"] = 100.0
 
     right_soft_limits = motion.get("rightSoftLimits", {}) if isinstance(motion, dict) else {}
     right_roll_soft = right_soft_limits.get("roll", {}) if isinstance(right_soft_limits, dict) else {}
-    legacy_limits = _right_roll_limits_for_current_origin(config, 100.0)
-    next_limits = _right_roll_limits_for_current_origin(config, 0.0)
+    old_negative_only_limits = _right_axis_limits_for_current_origin(config, 3, -100.0, 0.0)
+    old_symmetric_limits = _right_axis_limits_for_current_origin(config, 3, -100.0, 100.0)
+    next_limits = _right_axis_limits_for_current_origin(config, 3, -90.0, 100.0)
     if (
-        changed
-        and isinstance(right_roll_soft, dict)
-        and legacy_limits is not None
+        isinstance(right_roll_soft, dict)
         and next_limits is not None
-        and _float_close(right_roll_soft.get("min"), legacy_limits["min"], 1e-3)
-        and _float_close(right_roll_soft.get("max"), legacy_limits["max"], 1e-3)
+        and (
+            (
+                old_negative_only_limits is not None
+                and _float_close(right_roll_soft.get("min"), old_negative_only_limits["min"], 1e-3)
+                and _float_close(right_roll_soft.get("max"), old_negative_only_limits["max"], 1e-3)
+            )
+            or (
+                old_symmetric_limits is not None
+                and _float_close(right_roll_soft.get("min"), old_symmetric_limits["min"], 1e-3)
+                and _float_close(right_roll_soft.get("max"), old_symmetric_limits["max"], 1e-3)
+            )
+        )
     ):
         right_soft_limits["roll"] = next_limits
+
+
+def _normalize_right_pitch_window(config: dict[str, Any]) -> None:
+    teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
+    mins = teleop.get("rightSoftLimitMin") if isinstance(teleop, dict) else None
+    maxes = teleop.get("rightSoftLimitMax") if isinstance(teleop, dict) else None
+    if (
+        isinstance(mins, list)
+        and isinstance(maxes, list)
+        and len(mins) >= 5
+        and len(maxes) >= 5
+        and _float_close(mins[4], -100.0)
+        and _float_close(maxes[4], 100.0)
+    ):
+        mins[4] = -90.0
+        maxes[4] = 90.0
+
+    motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+    work_limits = motion.get("rotationWorkLimits", {}) if isinstance(motion, dict) else {}
+    right_work = work_limits.get("right", {}) if isinstance(work_limits, dict) else {}
+    right_pitch_work = right_work.get("pitch", {}) if isinstance(right_work, dict) else {}
+    if (
+        isinstance(right_pitch_work, dict)
+        and _float_close(right_pitch_work.get("min"), -100.0)
+        and _float_close(right_pitch_work.get("max"), 100.0)
+    ):
+        right_pitch_work["min"] = -90.0
+        right_pitch_work["max"] = 90.0
+
+    right_soft_limits = motion.get("rightSoftLimits", {}) if isinstance(motion, dict) else {}
+    right_pitch_soft = right_soft_limits.get("pitch", {}) if isinstance(right_soft_limits, dict) else {}
+    old_limits = _right_axis_limits_for_current_origin(config, 4, -100.0, 100.0)
+    next_limits = _right_axis_limits_for_current_origin(config, 4, -90.0, 90.0)
+    if (
+        isinstance(right_pitch_soft, dict)
+        and old_limits is not None
+        and next_limits is not None
+        and _float_close(right_pitch_soft.get("min"), old_limits["min"], 1e-3)
+        and _float_close(right_pitch_soft.get("max"), old_limits["max"], 1e-3)
+    ):
+        right_soft_limits["pitch"] = next_limits
 
 
 class SettingsService:
@@ -245,6 +308,9 @@ class SettingsService:
                 old_config = loaded if isinstance(loaded, dict) else {}
             except (OSError, json.JSONDecodeError):
                 old_config = {}
+        if isinstance(config, dict):
+            _normalize_right_yaw_disabled(config)
+            _normalize_right_pitch_window(config)
         validated = AppConfig.model_validate(config).model_dump(mode="json")
         old_hash = stable_config_hash(old_config) if old_config else "-"
         new_hash = stable_config_hash(validated)
@@ -593,7 +659,9 @@ class SettingsService:
             motion["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
         if isinstance(motion, dict):
             motion.setdefault("rotationWorkLimits", json.loads(json.dumps(ICF_ROTATION_WORK_LIMIT_DEFAULTS)))
-        _normalize_right_roll_negative_limit(config)
+        _normalize_right_yaw_disabled(config)
+        _normalize_right_roll_window(config)
+        _normalize_right_pitch_window(config)
         gripper_teleop = teleop.get("gripperTeleop", {})
         if isinstance(gripper_teleop, dict):
             default_thresholds = (

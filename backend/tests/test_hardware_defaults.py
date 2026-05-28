@@ -84,12 +84,12 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["continuousMicroConfirmTicks"] == 0
     assert teleop["diagLog"] is False
     assert teleop["leftEnabledAxes"] == [True] * 6
-    assert teleop["rightEnabledAxes"] == [True] * 6
+    assert teleop["rightEnabledAxes"] == [True, True, True, True, True, False]
     assert teleop["softLimitUnitSpec"] == ["um", "um", "um", "deg", "deg", "deg"]
     assert teleop["leftSoftLimitMin"] == [-25000.0, -37500.0, -37500.0, -100.0, -100.0, -7.0]
     assert teleop["leftSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 100.0, 100.0, 7.0]
-    assert teleop["rightSoftLimitMin"] == [-25000.0, -37500.0, -37500.0, -100.0, -100.0, -7.0]
-    assert teleop["rightSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 0.0, 100.0, 7.0]
+    assert teleop["rightSoftLimitMin"] == [-25000.0, -37500.0, -37500.0, -90.0, -90.0, -7.0]
+    assert teleop["rightSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 100.0, 90.0, 7.0]
     assert teleop["leftImpulseCoeff"] == [-5000000, 5000000, -10000000, 1667, -2500, -333.3333]
     assert teleop["rightImpulseCoeff"] == [-5000000, -10000000, -5000000, 1667, 2500, 3333.333]
     assert teleop["leftDirectionSign"] == [1, -1, -1, 1, -1, -1]

@@ -1067,7 +1067,7 @@ function MotionCard({
       confirmText: '确认恢复',
       onConfirm: handleRestorePreviousOrigin,
     })
-  const rotationWindowLabel = side === 'right' ? 'Roll -100~0° / Pitch ±100° · Yaw ±7°' : 'Roll/Pitch ±100° · Yaw ±7°'
+  const rotationWindowLabel = side === 'right' ? `Roll -90~100\u00b0 / Pitch \u00b190\u00b0 \u00b7 Yaw disabled` : `Roll/Pitch \u00b1100\u00b0 \u00b7 Yaw \u00b17\u00b0`
 
   return (
     <HardwareConfigCard
@@ -1962,6 +1962,7 @@ function TeleopHandCard({
   }
  /** 设置当前流程的对应状态。 */
  const setEnabledAxis = (axisIndex: number, value: boolean) => {
+    if (side === 'right' && axisIndex === 5) return
     const next = [...enabledAxes]
     next[axisIndex] = value
     updateTeleop(side === 'left' ? { leftEnabledAxes: next } : { rightEnabledAxes: next })
@@ -2217,7 +2218,13 @@ function TeleopHandCard({
           <span key={axis}>
             <small>{axis}</small>
             <InputNumber min={0} step={0.05} value={axisOutputScale[axisIndex] ?? 1} onChange={(value) => setAxisOutputScale(axisIndex, Number(value ?? 1))} />
-            <Switch checked={enabledAxes[axisIndex] ?? true} checkedChildren="On" unCheckedChildren="Off" onChange={(value) => setEnabledAxis(axisIndex, value)} />
+            <Switch
+              checked={side === 'right' && axisIndex === 5 ? false : enabledAxes[axisIndex] ?? true}
+              checkedChildren="On"
+              disabled={side === 'right' && axisIndex === 5}
+              unCheckedChildren="Off"
+              onChange={(value) => setEnabledAxis(axisIndex, value)}
+            />
           </span>
         ))}
       </div>
@@ -2332,6 +2339,7 @@ function ManualArmControl({
 }) {
   const sideSpec = armHardwareSpecs[side]
   const selectedAxis = manualControl.selectedSide === side ? manualControl.selectedAxis : 'X'
+  const rightYawDisabled = side === 'right' && selectedAxis === 'Yaw'
   const axisIndex = manualAxisOrder.indexOf(selectedAxis)
   const axisKey = manualAxisSoftKey(selectedAxis)
   const unit = manualAxisUnit(selectedAxis)
@@ -2341,7 +2349,8 @@ function ManualArmControl({
   const stepValue = unit === 'um' ? manualControl.axisStepUm : manualControl.axisStepDeg
   const stepLimit = manualAxisStepLimit(config, side, axisIndex, manualControl.speedMode)
   const boundedStepValue = clampManualAxisStep(stepValue, stepLimit)
-  const manualAxisBlocked = displayLimits.blocked
+  const manualAxisBlocked = displayLimits.blocked || rightYawDisabled
+  const manualAxisBlockedText = rightYawDisabled ? 'right Yaw disabled' : 'work_origin_missing'
   const softMargin = manualAxisBlocked || translationSoftLimitDisabled ? 0 : Math.min(Math.abs(position - displayLimits.min), Math.abs(displayLimits.max - position))
   const profile = side === 'left' ? config.motion.leftProfile : config.motion.rightProfile
   const group = axisIndex < 3 ? profile.translation : profile.rotation
@@ -2438,8 +2447,9 @@ function ManualArmControl({
           <div className="manual-axis-chip-grid">
             {manualAxisOrder.map((axis) => {
               const active = manualControl.selectedSide === side && manualControl.selectedAxis === axis
+              const axisDisabled = side === 'right' && axis === 'Yaw'
               return (
-                <Button key={axis} type={active ? 'primary' : 'default'} onClick={() => selectManualAxis(side, axis)}>
+                <Button key={axis} type={active ? 'primary' : 'default'} disabled={axisDisabled} onClick={() => selectManualAxis(side, axis)}>
                   {axis}
                 </Button>
               )
@@ -2453,7 +2463,7 @@ function ManualArmControl({
             <MetricBox label="相对硬件零点" value={`${position.toFixed(unit === 'um' ? 1 : 3)} ${unit}`} hint={originHint} tone={originValid ? 'neutral' : 'warn'} />
             <MetricBox
               label="软限位余量"
-              value={translationSoftLimitDisabled ? '已取消' : manualAxisBlocked ? 'work_origin_missing' : `${softMargin.toFixed(unit === 'um' ? 0 : 2)} ${unit}`}
+              value={translationSoftLimitDisabled ? '已取消' : manualAxisBlocked ? manualAxisBlockedText : `${softMargin.toFixed(unit === 'um' ? 0 : 2)} ${unit}`}
               tone={manualAxisBlocked ? 'warn' : 'ok'}
             />
             <MetricBox
@@ -2482,7 +2492,7 @@ function ManualArmControl({
             </Form.Item>
             <Form.Item label="软限位范围">
               <Input
-                value={translationSoftLimitDisabled ? 'XYZ 软件限位已取消，仅保留机械限位 / 急停' : manualAxisBlocked ? 'work_origin_missing' : `${formatSoftLimitValue(displayLimits.min, axisIndex)} ~ ${formatSoftLimitValue(displayLimits.max, axisIndex)} ${unit}`}
+                value={translationSoftLimitDisabled ? 'XYZ 软件限位已取消，仅保留机械限位 / 急停' : manualAxisBlocked ? manualAxisBlockedText : `${formatSoftLimitValue(displayLimits.min, axisIndex)} ~ ${formatSoftLimitValue(displayLimits.max, axisIndex)} ${unit}`}
                 readOnly
               />
             </Form.Item>

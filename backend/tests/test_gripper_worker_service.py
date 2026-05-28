@@ -96,7 +96,7 @@ class MovingAfterFirstCommandHal(FakeHal):
         state = await super().motion_state()
         if self.commands:
             moving = [False] * 12
-            moving[11] = True
+            moving[10] = True
             return {**state, "moving": moving}
         return state
 
@@ -316,18 +316,39 @@ def test_manual_axis_move_allows_enabled_motion_side() -> None:
     assert hal.commands[0][1]["direction"] == 1
 
 
+def test_manual_axis_move_rejects_right_yaw_disabled_by_policy() -> None:
+    config = default_config()
+    settings = FakeSettings(config)
+    hal = FakeHal(enabled=True)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    try:
+        asyncio.run(
+            service.manual_axis_move(
+                ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=0.1, speedMode="fine")
+            )
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected right yaw motion to fail")
+
+    assert "right Yaw motion axis is disabled" in message
+    assert hal.commands == []
+
+
 def test_manual_axis_move_uses_faster_coarse_rotation_profile() -> None:
     config = default_config()
     config["motion"]["origin"]["rightValid"] = False
     config["motion"]["rotationWorkLimits"]["enabled"] = False
-    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -20000, "max": 20000}
+    config["motion"]["rightSoftLimits"]["pitch"] = {"min": -20000, "max": 20000}
     settings = FakeSettings(config)
     hal = FakeHal(enabled=True)
     service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
 
     result = asyncio.run(
         service.manual_axis_move(
-            ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=1, speedMode="coarse")
+            ManualAxisMoveRequest(side="right", axis="Pitch", direction=1, step=1, speedMode="coarse")
         )
     )
 
@@ -339,7 +360,7 @@ def test_manual_axis_move_caps_faster_coarse_rotation_profile() -> None:
     config = default_config()
     config["motion"]["origin"]["rightValid"] = False
     config["motion"]["rotationWorkLimits"]["enabled"] = False
-    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -20000, "max": 20000}
+    config["motion"]["rightSoftLimits"]["pitch"] = {"min": -20000, "max": 20000}
     config["motion"]["rightProfile"]["rotation"]["maxSpeed"] = 30
     settings = FakeSettings(config)
     hal = FakeHal(enabled=True)
@@ -347,7 +368,7 @@ def test_manual_axis_move_caps_faster_coarse_rotation_profile() -> None:
 
     result = asyncio.run(
         service.manual_axis_move(
-            ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=1, speedMode="coarse")
+            ManualAxisMoveRequest(side="right", axis="Pitch", direction=1, step=1, speedMode="coarse")
         )
     )
 
@@ -375,19 +396,19 @@ def test_manual_axis_move_allows_hal_translation_single_step_limit() -> None:
 
 def test_manual_axis_move_chunks_coarse_rotation_above_hal_single_step_limit() -> None:
     config = default_config()
-    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -20000, "max": 20000}
+    config["motion"]["rightSoftLimits"]["pitch"] = {"min": -20000, "max": 20000}
     config["motion"]["rotationWorkLimits"]["enabled"] = False
     config["motion"]["rightProfile"]["rotation"]["maxSpeed"] = 30
     config["motion"]["rightProfile"]["rotation"]["accTimeSec"] = 0.001
     config["motion"]["rightProfile"]["rotation"]["decTimeSec"] = 0.001
-    config["motion"]["rotationWorkLimits"]["right"]["yaw"] = {"min": -20, "max": 20}
+    config["motion"]["rotationWorkLimits"]["right"]["pitch"] = {"min": -20, "max": 20}
     settings = FakeSettings(config)
     hal = FakeHal(enabled=True)
     service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
 
     result = asyncio.run(
         service.manual_axis_move(
-            ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=10, speedMode="coarse")
+            ManualAxisMoveRequest(side="right", axis="Pitch", direction=1, step=10, speedMode="coarse")
         )
     )
 
@@ -404,9 +425,9 @@ def test_manual_axis_move_chunks_coarse_rotation_above_hal_single_step_limit() -
 
 def test_manual_axis_move_rejects_coarse_rotation_above_chunked_limit() -> None:
     config = default_config()
-    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -20000, "max": 20000}
+    config["motion"]["rightSoftLimits"]["pitch"] = {"min": -20000, "max": 20000}
     config["motion"]["rotationWorkLimits"]["enabled"] = False
-    config["motion"]["rotationWorkLimits"]["right"]["yaw"] = {"min": -20, "max": 20}
+    config["motion"]["rotationWorkLimits"]["right"]["pitch"] = {"min": -20, "max": 20}
     settings = FakeSettings(config)
     hal = FakeHal(enabled=True)
     service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
@@ -414,7 +435,7 @@ def test_manual_axis_move_rejects_coarse_rotation_above_chunked_limit() -> None:
     try:
         asyncio.run(
             service.manual_axis_move(
-                ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=10.1, speedMode="coarse")
+                ManualAxisMoveRequest(side="right", axis="Pitch", direction=1, step=10.1, speedMode="coarse")
             )
         )
     except RuntimeError as exc:
@@ -422,7 +443,7 @@ def test_manual_axis_move_rejects_coarse_rotation_above_chunked_limit() -> None:
     else:
         raise AssertionError("expected coarse rotation step above chunked cap to fail")
 
-    assert "manual Yaw step must be <= 10.000 degree" in message
+    assert "manual Pitch step must be <= 10.000 degree" in message
     assert hal.commands == []
 
 
@@ -436,7 +457,7 @@ def test_manual_axis_move_rejects_medium_rotation_step_above_hal_single_step_lim
     try:
         asyncio.run(
             service.manual_axis_move(
-                ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=2.1, speedMode="medium")
+                ManualAxisMoveRequest(side="right", axis="Pitch", direction=1, step=2.1, speedMode="medium")
             )
         )
     except RuntimeError as exc:
@@ -444,17 +465,17 @@ def test_manual_axis_move_rejects_medium_rotation_step_above_hal_single_step_lim
     else:
         raise AssertionError("expected medium rotation step above HAL cap to fail")
 
-    assert "manual Yaw step must be <= 2.000 degree" in message
+    assert "manual Pitch step must be <= 2.000 degree" in message
     assert hal.commands == []
 
 
 def test_manual_axis_move_waits_for_axis_idle_between_rotation_chunks() -> None:
     moving = [False] * 12
-    moving[11] = True
+    moving[10] = True
     config = default_config()
-    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -20000, "max": 20000}
+    config["motion"]["rightSoftLimits"]["pitch"] = {"min": -20000, "max": 20000}
     config["motion"]["rotationWorkLimits"]["enabled"] = False
-    config["motion"]["rotationWorkLimits"]["right"]["yaw"] = {"min": -20, "max": 20}
+    config["motion"]["rotationWorkLimits"]["right"]["pitch"] = {"min": -20, "max": 20}
     settings = FakeSettings(config)
     hal = FakeHal(
         enabled=True,
@@ -469,7 +490,7 @@ def test_manual_axis_move_waits_for_axis_idle_between_rotation_chunks() -> None:
 
     result = asyncio.run(
         service.manual_axis_move(
-            ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=4, speedMode="coarse")
+            ManualAxisMoveRequest(side="right", axis="Pitch", direction=1, step=4, speedMode="coarse")
         )
     )
 
@@ -480,11 +501,11 @@ def test_manual_axis_move_waits_for_axis_idle_between_rotation_chunks() -> None:
 
 def test_manual_axis_move_aborts_remaining_rotation_chunks_on_estop() -> None:
     moving = [False] * 12
-    moving[11] = True
+    moving[10] = True
     config = default_config()
-    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -20000, "max": 20000}
+    config["motion"]["rightSoftLimits"]["pitch"] = {"min": -20000, "max": 20000}
     config["motion"]["rotationWorkLimits"]["enabled"] = False
-    config["motion"]["rotationWorkLimits"]["right"]["yaw"] = {"min": -20, "max": 20}
+    config["motion"]["rotationWorkLimits"]["right"]["pitch"] = {"min": -20, "max": 20}
     settings = FakeSettings(config)
     hal = FakeHal(enabled=True, motion_states=[{}, {}, {"moving": moving, "estop_active": True}])
     service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
@@ -492,7 +513,7 @@ def test_manual_axis_move_aborts_remaining_rotation_chunks_on_estop() -> None:
     try:
         asyncio.run(
             service.manual_axis_move(
-                ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=4, speedMode="coarse")
+                ManualAxisMoveRequest(side="right", axis="Pitch", direction=1, step=4, speedMode="coarse")
             )
         )
     except RuntimeError as exc:
@@ -506,7 +527,7 @@ def test_manual_axis_move_aborts_remaining_rotation_chunks_on_estop() -> None:
 
 def test_manual_axis_move_aborts_remaining_rotation_chunks_on_idle_timeout() -> None:
     config = default_config()
-    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -20000, "max": 20000}
+    config["motion"]["rightSoftLimits"]["pitch"] = {"min": -20000, "max": 20000}
     config["motion"]["rotationWorkLimits"]["enabled"] = False
     settings = FakeSettings(config)
     hal = MovingAfterFirstCommandHal(enabled=True)
@@ -522,7 +543,7 @@ def test_manual_axis_move_aborts_remaining_rotation_chunks_on_idle_timeout() -> 
         try:
             asyncio.run(
                 service.manual_axis_move(
-                    ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=4, speedMode="coarse")
+                    ManualAxisMoveRequest(side="right", axis="Pitch", direction=1, step=4, speedMode="coarse")
                 )
             )
         except RuntimeError as exc:
