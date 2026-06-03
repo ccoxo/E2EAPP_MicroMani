@@ -12,6 +12,8 @@ from collections import deque
 from multiprocessing.queues import Queue
 from typing import Any
 
+CAMERA_CAPTURE_FOURCC = "YUYV"
+
 
 def run_camera_capture_worker(
     index: int,
@@ -184,7 +186,7 @@ class _CameraCaptureWorker:
         assert self.cv2 is not None
         if hasattr(self.cv2, "CAP_PROP_FOURCC") and hasattr(self.cv2, "VideoWriter_fourcc"):
             try:
-                capture.set(self.cv2.CAP_PROP_FOURCC, self.cv2.VideoWriter_fourcc(*"MJPG"))
+                capture.set(self.cv2.CAP_PROP_FOURCC, self.cv2.VideoWriter_fourcc(*CAMERA_CAPTURE_FOURCC))
             except Exception:
                 pass
         if hasattr(self.cv2, "CAP_PROP_BUFFERSIZE"):

@@ -32,7 +32,7 @@ const HINTS = [
   { key: 'Ctrl', desc: '离合器切换' },
   { key: '1/2/3', desc: '速度粗/中/细' },
   { key: 'T', desc: '力觉 Tare' },
-  { key: 'R', desc: '回硬件零点' },
+  { key: 'R', desc: '回已记录零点' },
   { key: 'P', desc: '暂停遥操作' },
 ]
 /** 格式化对应数值用于界面展示。 */
@@ -100,7 +100,7 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
 
       <Divider style={{ margin: '10px 0' }} />
 
-      <div className="record-??-progress-head">
+      <div className="record-episode-progress-head">
         <span>#{String(currentEpisode).padStart(3, '0')}</span>
         <small>
           目标 {targetEpisodes} 条 / 已完成 {savedEpisodes}
@@ -209,19 +209,19 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
           size="small"
           icon={<Crosshair size={13} />}
           loading={pendingOriginSide === 'left'}
-          disabled={busy}
+          disabled={busy || pendingOriginSide !== null}
           onClick={() => void handleReturnOrigin('left')}
         >
-          左从臂回硬件零点
+          左从臂回已记录零点
         </Button>
         <Button
           size="small"
           icon={<Crosshair size={13} />}
           loading={pendingOriginSide === 'right'}
-          disabled={busy}
+          disabled={busy || pendingOriginSide !== null}
           onClick={() => void handleReturnOrigin('right')}
         >
-          右从臂回硬件零点
+          右从臂回已记录零点
         </Button>
       </div>
     </Card>

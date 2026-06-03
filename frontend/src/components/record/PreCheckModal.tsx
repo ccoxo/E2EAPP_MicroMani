@@ -18,7 +18,10 @@ function diagnosticReady(diagnostics: DiagnosticItem[], key: string) {
 }
 /** 计算对应的业务值或展示值。 */
 function teleopHandsReady(frame: TelemetryFrame) {
-  return frame.teleopHands.every((hand) => hand.connected && hand.lastReadOk)
+  const requiredHands = frame.teleopHands.filter(
+    (hand) => !hand.message.toLowerCase().includes('logical teleop hand disconnected'),
+  )
+  return requiredHands.length > 0 && requiredHands.every((hand) => hand.connected && hand.lastReadOk)
 }
 
 const STEPS: StepDef[] = [

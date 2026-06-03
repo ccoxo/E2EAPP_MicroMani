@@ -4,9 +4,9 @@ import { useTelemetryStore } from '../../stores/telemetry'
 import type { AppConfig, CameraTelemetry } from '../../types'
 
 const cameraSpecs = {
-  global: { label: '全局', title: '全局相机', model: 'AR0234' },
-  wrist_left: { label: '左腕', title: '左腕相机', model: 'IMX258' },
-  wrist_right: { label: '右腕', title: '右腕相机', model: 'IMX258' },
+  global: { label: '全局', title: '全局相机', model: 'IMX335' },
+  wrist_left: { label: '左腕', title: '左腕相机', model: 'IMX335' },
+  wrist_right: { label: '右腕', title: '右腕相机', model: 'IMX335' },
 } as const
 /** 计算对应的业务值或展示值。 */
 const cameraResolution = (config: AppConfig, kind: keyof typeof cameraSpecs) => {

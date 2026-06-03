@@ -13,7 +13,7 @@ namespace {
 constexpr const char* kVelocityAdmittanceMode = "velocity_admittance";
 constexpr const char* kIncrementalPositionMode = "incremental_position";
 constexpr int kGripperTeleopDeadbandFloorCounts = 1;
-constexpr double kGripperTeleopMinCommandIntervalFloorMs = 1000.0 / 30.0;
+constexpr double kGripperTeleopMinCommandIntervalFloorMs = 10.0;
 constexpr auto kGripperPositionSampleInterval = std::chrono::microseconds(33333);
 
 std::int64_t unixTimeMs() {
@@ -288,6 +288,10 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config) {
   normalized.gripperMinCommandIntervalMs = std::max(
       kGripperTeleopMinCommandIntervalFloorMs,
       normalized.gripperMinCommandIntervalMs);
+  normalized.gripperIcfTargetMinGapMm = std::clamp(
+      normalized.gripperIcfTargetMinGapMm,
+      0.0,
+      std::max(0.001, normalized.gripper.strokeMm));
   normalized.incrementalTranslationMinEffectiveDeltaM = std::max(
       normalized.translationDeadzoneM,
       normalized.incrementalTranslationMinEffectiveDeltaM);
@@ -328,8 +332,21 @@ void NativeTeleopController::configureGripper(const JodellGripperConfig& config)
   {
     std::scoped_lock lock(mutex_);
     config_.gripper = config;
+    config_.gripperIcfTargetMinGapMm = std::clamp(
+        config_.gripperIcfTargetMinGapMm,
+        0.0,
+        std::max(0.001, config_.gripper.strokeMm));
   }
   gripper_.configure(config);
+}
+
+void NativeTeleopController::configureGripperProtection(bool enabled, double minGapMm) {
+  std::scoped_lock lock(mutex_);
+  config_.gripperIcfTargetProtectionEnabled = enabled;
+  config_.gripperIcfTargetMinGapMm = std::clamp(
+      minGapMm,
+      0.0,
+      std::max(0.001, config_.gripper.strokeMm));
 }
 
 void NativeTeleopController::start(bool leftConnected, bool rightConnected) {
@@ -509,12 +526,11 @@ bool NativeTeleopController::commandGripperTarget(
     int torque,
     std::string* message) {
   const int index = sideIndex(side);
-  double stroke = 26.0;
+  double bounded = targetMm;
   {
     std::scoped_lock lock(mutex_);
-    stroke = std::max(0.001, config_.gripper.strokeMm);
+    bounded = effectiveGripperTargetMm(targetMm);
   }
-  const double bounded = std::clamp(targetMm, 0.0, stroke);
   if (gripperWorkerRunning_.load()) {
     {
       std::scoped_lock lock(mutex_);
@@ -641,8 +657,14 @@ std::string NativeTeleopController::statusJson() const {
       << (forceOutput[1] ? "true" : "false") << "]"
       << ",\"gripperCommand\":{\"speed\":" << config_.gripper.speed
       << ",\"torque\":" << config_.gripper.torque
+      << ",\"workerMode\":\"" << (config_.gripper.processWorkersEnabled ? "isolated_process" : "inline") << "\""
+      << ",\"processWorkersEnabled\":"
+      << (config_.gripper.processWorkersEnabled ? "true" : "false")
       << ",\"deadbandCounts\":" << config_.gripperDeadbandCounts
-      << ",\"minCommandIntervalMs\":" << config_.gripperMinCommandIntervalMs << "}}";
+      << ",\"minCommandIntervalMs\":" << config_.gripperMinCommandIntervalMs
+      << ",\"icfTargetProtectionEnabled\":"
+      << (config_.gripperIcfTargetProtectionEnabled ? "true" : "false")
+      << ",\"icfTargetMinGapMm\":" << config_.gripperIcfTargetMinGapMm << "}}";
   return out.str();
 }
 
@@ -1306,6 +1328,7 @@ void NativeTeleopController::tickGrippers(const std::array<Omega7State, 2>& hand
     } else {
       continue;
     }
+    targetMm = effectiveGripperTargetMm(targetMm);
     const int raw = static_cast<int>(std::lround(
         (std::max(0.001, config_.gripper.strokeMm) - std::clamp(targetMm, 0.0, config_.gripper.strokeMm))
         / std::max(0.001, config_.gripper.strokeMm) * 255.0));
@@ -1432,6 +1455,16 @@ int NativeTeleopController::gripperSourceIndex(int targetIndex) const {
     return 0;
   }
   return targetIndex;
+}
+
+double NativeTeleopController::effectiveGripperTargetMm(double targetMm) const {
+  const double stroke = std::max(0.001, config_.gripper.strokeMm);
+  const double bounded = std::clamp(targetMm, 0.0, stroke);
+  if (!config_.gripperIcfTargetProtectionEnabled) {
+    return bounded;
+  }
+  const double minGap = std::clamp(config_.gripperIcfTargetMinGapMm, 0.0, stroke);
+  return std::clamp(bounded, minGap, stroke);
 }
 
 Side NativeTeleopController::sideFromIndex(int index) const {

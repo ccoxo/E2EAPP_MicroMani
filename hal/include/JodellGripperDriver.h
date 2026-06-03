@@ -15,8 +15,11 @@ struct JodellGripperConfig {
   int baudrate{115200};
   double strokeMm{26.0};
   int speed{255};
-  int torque{192};
+  int torque{1};
   std::string dllPath{"F:/E2EAPP_MicroMani/backend/vendor/jodell/jodellTool.dll"};
+  bool processWorkersEnabled{true};
+  std::string workerExePath{};
+  double workerCommandTimeoutMs{2000.0};
 };
 
 class JodellGripperDriver {
@@ -39,10 +42,27 @@ class JodellGripperDriver {
   std::string lastError() const;
 
  private:
+#ifdef _WIN32
+  struct ProcessWorkerHandle {
+    void* process{nullptr};
+    void* stdinWrite{nullptr};
+    void* stdoutRead{nullptr};
+  };
+#endif
+
   bool ensureLoadedUnlocked(std::string* message);
   bool ensurePortOpenUnlocked(int index, int port, std::string* message);
   int portNumber(const std::string& value) const;
   int sideIndex(Side side) const;
+#ifdef _WIN32
+  bool ensureProcessWorkerUnlocked(int index, std::string* message);
+  bool commandProcessWorkerUnlocked(
+      int index,
+      const std::string& command,
+      double* positionMm,
+      std::string* message);
+  void closeProcessWorkersUnlocked();
+#endif
 
   mutable std::mutex mutex_;
   JodellGripperConfig config_{};
@@ -58,6 +78,7 @@ class JodellGripperDriver {
   int(__stdcall* runWithParam_)(int, int, int, int) = nullptr;
   int(__stdcall* getClawCurrentLocation_)(int) = nullptr;
   std::array<int, 2> activePorts_{{-1, -1}};
+  std::array<ProcessWorkerHandle, 2> workerProcesses_{};
 #endif
 };
 

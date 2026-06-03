@@ -1783,13 +1783,18 @@ select {
 }
 
 .status-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 45;
   display: flex;
   align-items: center;
+  flex-shrink: 0;
   gap: 6px;
   min-height: 26px;
   padding: 0 10px;
   border-top: 1px solid #d7dde7;
   background: #ffffff;
+  box-shadow: 0 -1px 10px rgba(31, 41, 55, 0.06);
   overflow: hidden;
   white-space: nowrap;
 }
@@ -3009,16 +3014,60 @@ select {
   width: 108px;
 }
 
+.teleop-route-label {
+  display: inline-grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  gap: 1px 6px;
+  min-height: 32px;
+  padding: 4px 9px;
+  border: 1px solid #d7e3ee;
+  border-radius: 8px;
+  color: #17324d;
+  background: #f4f7fb;
+}
+
+.teleop-route-label small,
+.teleop-route-label em {
+  color: #667085;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.teleop-route-label b {
+  font-size: 13px;
+  line-height: 1;
+}
+
+.teleop-route-label em {
+  grid-column: 1 / -1;
+  font-weight: 600;
+}
+
 .teleop-connection-strip,
-.gripper-teleop-strip {
+.gripper-teleop-strip,
+.camera-status-strip,
+.pico-status-strip {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 8px;
   margin-bottom: 10px;
 }
 
+.camera-status-strip {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.pico-status-strip {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
 .teleop-connection-strip > div,
-.gripper-teleop-strip > div {
+.gripper-teleop-strip > div,
+.camera-status-strip > div,
+.pico-status-strip > div {
   display: flex;
   min-width: 0;
   flex-direction: column;
@@ -3031,19 +3080,25 @@ select {
 }
 
 .teleop-connection-strip > .teleop-status-ok,
-.gripper-teleop-strip > .gripper-status-ok {
+.gripper-teleop-strip > .gripper-status-ok,
+.camera-status-strip > .camera-status-ok,
+.pico-status-strip > .pico-status-ok {
   border-color: #3fb36b;
   background: #ecfdf3;
 }
 
 .teleop-connection-strip > .teleop-status-warn,
-.gripper-teleop-strip > .gripper-status-warn {
+.gripper-teleop-strip > .gripper-status-warn,
+.camera-status-strip > .camera-status-warn,
+.pico-status-strip > .pico-status-warn {
   border-color: #f59e0b;
   background: #fff7df;
 }
 
 .teleop-connection-strip > .teleop-status-error,
-.gripper-teleop-strip > .gripper-status-error {
+.gripper-teleop-strip > .gripper-status-error,
+.camera-status-strip > .camera-status-error,
+.pico-status-strip > .pico-status-error {
   min-height: 66px;
   padding: 12px 14px 12px 16px;
   border-color: #b85f58;
@@ -3053,13 +3108,17 @@ select {
 }
 
 .teleop-connection-strip > .teleop-status-pending,
-.gripper-teleop-strip > .gripper-status-pending {
+.gripper-teleop-strip > .gripper-status-pending,
+.camera-status-strip > .camera-status-pending,
+.pico-status-strip > .pico-status-pending {
   border-color: #d7e3ee;
   background: #f8fbfd;
 }
 
 .teleop-connection-strip b,
-.gripper-teleop-strip b {
+.gripper-teleop-strip b,
+.camera-status-strip b,
+.pico-status-strip b {
   color: #17324d;
   font-size: 12px;
 }
@@ -3067,26 +3126,40 @@ select {
 .teleop-status-ok b,
 .teleop-status-ok span,
 .gripper-status-ok b,
-.gripper-status-ok span {
+.gripper-status-ok span,
+.camera-status-ok b,
+.camera-status-ok span,
+.pico-status-ok b,
+.pico-status-ok span {
   color: #0f6b3b;
 }
 
 .teleop-status-warn b,
 .teleop-status-warn span,
 .gripper-status-warn b,
-.gripper-status-warn span {
+.gripper-status-warn span,
+.camera-status-warn b,
+.camera-status-warn span,
+.pico-status-warn b,
+.pico-status-warn span {
   color: #8a5a00;
 }
 
 .teleop-status-error b,
 .teleop-status-error span,
 .gripper-status-error b,
-.gripper-status-error span {
+.gripper-status-error span,
+.camera-status-error b,
+.camera-status-error span,
+.pico-status-error b,
+.pico-status-error span {
   color: #7f2f2a;
 }
 
 .teleop-status-error small,
-.gripper-status-error small {
+.gripper-status-error small,
+.camera-status-error small,
+.pico-status-error small {
   color: #8f3f35;
   font-weight: 700;
 }
@@ -3145,25 +3218,35 @@ select {
 .teleop-connection-strip span,
 .teleop-connection-strip small,
 .gripper-teleop-strip span,
-.gripper-teleop-strip small {
+.gripper-teleop-strip small,
+.camera-status-strip span,
+.camera-status-strip small,
+.pico-status-strip span,
+.pico-status-strip small {
   overflow-wrap: anywhere;
 }
 
 .teleop-connection-strip span,
-.gripper-teleop-strip span {
+.gripper-teleop-strip span,
+.camera-status-strip span,
+.pico-status-strip span {
   color: #1f344b;
   font-size: 12px;
   font-weight: 700;
 }
 
 .teleop-status-error span,
-.gripper-status-error span {
+.gripper-status-error span,
+.camera-status-error span,
+.pico-status-error span {
   font-size: 14px;
   font-weight: 800;
 }
 
 .teleop-connection-strip small,
-.gripper-teleop-strip small {
+.gripper-teleop-strip small,
+.camera-status-strip small,
+.pico-status-strip small {
   color: #667085;
   line-height: 1.35;
 }
@@ -4062,7 +4145,9 @@ select {
   .camera-slider-row,
   .camera-tuning-control-row,
   .teleop-connection-strip,
-  .gripper-teleop-strip {
+  .gripper-teleop-strip,
+  .camera-status-strip,
+  .pico-status-strip {
     grid-template-columns: 1fr;
   }
 
@@ -4107,13 +4192,17 @@ select {
     white-space: normal;
   }
 
+  .status-bar .ant-typography {
+    display: none;
+  }
+
   .safety-test-button {
     display: none;
   }
 
   .floating-emergency-stack {
     right: 10px;
-    bottom: 58px;
+    bottom: 132px;
   }
 
   .floating-emergency-stop.ant-btn,

@@ -58,8 +58,11 @@ def test_hal_home_all_requires_work_origin_payload() -> None:
     source = (REPO_ROOT / "hal" / "src" / "HalServer.cpp").read_text(encoding="utf-8")
     normalized = " ".join(source.split())
 
-    assert "jsonWorkOriginPulse(requestBody(request))" in normalized
-    assert "motion.homeOriginSide(side, jsonSideWorkOriginPulse(bodyText))" in normalized
+    assert "const auto enabledAxes = jsonHomeAllEnabledAxes(bodyText);" in normalized
+    assert "motion.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes)" in normalized
+    assert "jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled)" in normalized
+    assert "motion.enableSide(side, true, jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled))" in normalized
+    assert "motion.homeSide(side, jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled))" in normalized
     assert "home_all requires leftPulse[6] work origin payload" in source
     assert "home_all requires rightPulse[6] work origin payload" in source
     assert "home_origin_side requires pulse[6] work origin payload" in source
@@ -233,10 +236,16 @@ def test_hal_launch_promotes_latest_built_binary() -> None:
     build_hal = (REPO_ROOT / "hal" / "build_hal.cmd").read_text(encoding="utf-8")
 
     assert "$halNextExe = Join-Path $repo \"hal\\build\\HalServer.next.exe\"" in start_hal
+    assert "$workerExe = Join-Path $repo \"hal\\build\\JodellGripperWorker.exe\"" in start_hal
+    assert "$workerNextExe = Join-Path $repo \"hal\\build\\JodellGripperWorker.next.exe\"" in start_hal
     assert "function Promote-HalCandidate" in start_hal
     assert "LastWriteTimeUtc" in start_hal
-    assert "Copy-Item -LiteralPath $halNextExe -Destination $halExe -Force" in start_hal
+    assert "Promote-HalCandidate -CandidateExe $halNextExe -TargetExe $halExe" in start_hal
+    assert "Promote-HalCandidate -CandidateExe $workerNextExe -TargetExe $workerExe" in start_hal
+    assert "Copy-Item -LiteralPath $CandidateExe -Destination $TargetExe -Force" in start_hal
+    assert 'Join-Path $halBuild "JodellGripperWorker.exe"' in start_hal
     assert 'copy /Y "HalServer.next.exe" "HalServer.exe"' in build_hal
+    assert 'copy /Y "JodellGripperWorker.next.exe" "JodellGripperWorker.exe"' in build_hal
 
 
 def test_hal_stage_axis_configuration_matches_icf_card_counts() -> None:
@@ -256,6 +265,34 @@ def test_hal_enable_side_rejects_partial_servo_failures() -> None:
     assert "succeeded == 0 && failed > 0" not in normalized
 
 
+def test_hal_home_origin_enables_only_participating_axes_without_disabling_skipped_axes() -> None:
+    header = (REPO_ROOT / "hal" / "include" / "LTDMCDriver.h").read_text(encoding="utf-8")
+    source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
+    server = (REPO_ROOT / "hal" / "src" / "HalServer.cpp").read_text(encoding="utf-8")
+    home_all_branch = server.split('POST /motion/home_all ', 1)[1].split(
+        'POST /motion/home_origin_side ',
+        1,
+    )[0]
+    home_side_branch = server.split('POST /motion/home_origin_side ', 1)[1].split(
+        'POST /motion/enable_side ',
+        1,
+    )[0]
+
+    assert "std::string enableHomeAxes(Side side, const std::array<bool, 6>& enabledAxes);" in header
+    enable_home_body = source.split("std::string LTDMCDriver::enableHomeAxes", 1)[1].split(
+        "void LTDMCDriver::homeSide",
+        1,
+    )[0]
+
+    assert "motion.enableHomeAxes(appstation::hal::Side::Left, enabledAxes[0]);" in home_all_branch
+    assert "motion.enableHomeAxes(appstation::hal::Side::Right, enabledAxes[1]);" in home_all_branch
+    assert "motion.enableHomeAxes(side, enabledAxes);" in home_side_branch
+    assert "dmcCheckDone" not in enable_home_body
+    assert "if (!enabledAxes[axisIndex]) { continue; }" in " ".join(enable_home_body.split())
+    assert "dmcWriteSevonPin(card, axisNo, 1)" in enable_home_body
+    assert "axisEnabled ? 1 : 0" not in enable_home_body
+
+
 def test_hal_treats_card0_dmc5c10_sevon_feedback_as_unreadable() -> None:
     source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
     header = (REPO_ROOT / "hal" / "include" / "LTDMCDriver.h").read_text(encoding="utf-8")
@@ -273,7 +310,7 @@ def test_hal_treats_card0_dmc5c10_sevon_feedback_as_unreadable() -> None:
     ) in normalized
     assert (
         "if (!usesSevonPin(side, axis)) { const auto index = stateIndex(side, axis); "
-        "enabled_[index] = enabled; commandedEnabled_[index] = enabled; "
+        "enabled_[index] = axisEnabled; commandedEnabled_[index] = axisEnabled; "
         "++succeeded; continue; }"
     ) in normalized
 
@@ -286,8 +323,8 @@ def test_hal_ignores_card0_unsupported_sevon_write_without_masking_other_failure
     assert "side == appstation::hal::Side::Right" in normalized
     assert "ret == 2" in normalized
     assert "if (ignoreUnsupportedSevonWriteFailure(side, axis, ret))" in normalized
-    assert "enabled_[index] = enabled;" in normalized
-    assert "commandedEnabled_[index] = enabled;" in normalized
+    assert "enabled_[index] = axisEnabled;" in normalized
+    assert "commandedEnabled_[index] = axisEnabled;" in normalized
     assert "++succeeded;" in normalized
     assert "continue;" in normalized
     assert "failures << dmcAxisFailureMessage(\"dmc_write_sevon_pin\", ret, card, axisNo);" in normalized
@@ -379,7 +416,7 @@ def test_hal_native_controller_defaults_match_site_corrected_output_and_xy_signs
 
     assert "std::array<double, 2> translationScale{{1.0, 1.0}}" in normalized
     assert "std::array<double, 2> rotationScale{{1.0, 1.0}}" in normalized
-    assert "{0.40, 0.25, 0.25, 0.40, 0.20, 0.20}" in normalized
+    assert "{0.40, 0.25, 0.25, 0.40, 0.10, 0.15}" in normalized
     assert "{-5000000.0, 5000000.0, -10000000.0, 1667.0, -2500.0, -333.3333}" in normalized
     assert "{-5000000.0, -10000000.0, -5000000.0, 1667.0, 2500.0, 3333.333}" in normalized
 
@@ -398,9 +435,11 @@ def test_hal_native_home_stops_controller_and_waits_for_motion_done() -> None:
 
     assert "nativeTeleop.stop();" in home_all_branch
     assert "nativeTeleop.stop();" in home_side_branch
-    assert "motion.enableSide(appstation::hal::Side::Left, true);" in home_all_branch
-    assert "motion.enableSide(appstation::hal::Side::Right, true);" in home_all_branch
-    assert "motion.enableSide(side, true);" in home_side_branch
+    assert "const auto enabledAxes = jsonHomeAllEnabledAxes(bodyText);" in home_all_branch
+    assert "motion.enableHomeAxes(appstation::hal::Side::Left, enabledAxes[0]);" in home_all_branch
+    assert "motion.enableHomeAxes(appstation::hal::Side::Right, enabledAxes[1]);" in home_all_branch
+    assert "const auto enabledAxes = jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled);" in home_side_branch
+    assert "motion.enableHomeAxes(side, enabledAxes);" in home_side_branch
     assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_all pre-move\", 3000)" in motion
     assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_all\", 60000)" in motion
     assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_origin_side\", 60000)" in motion
@@ -432,6 +471,28 @@ def test_hal_native_home_origin_moves_to_absolute_work_origin_like_icf() -> None
         in motion
     )
     assert "relative fallback ret=" in motion
+
+
+def test_hal_emergency_stop_preempts_long_motion_waits() -> None:
+    header = (REPO_ROOT / "hal" / "include" / "LTDMCDriver.h").read_text(encoding="utf-8")
+    motion = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
+    server = (REPO_ROOT / "hal" / "src" / "HalServer.cpp").read_text(encoding="utf-8")
+    emergency_body = motion.split("void LTDMCDriver::emergencyStop() {", 1)[1].split(
+        "std::string LTDMCDriver::enableSide",
+        1,
+    )[0]
+    emergency_branch = server.split('POST /motion/emergency_stop ', 1)[1].split(
+        'POST /motion/home_all ',
+        1,
+    )[0]
+
+    assert "nativeTeleop.stop();" in emergency_branch
+    assert "std::scoped_lock lock(mutex_)" not in emergency_body
+    assert "stopAllAxesBestEffort();" in emergency_body
+    assert "std::unique_lock<std::mutex> stateLock(mutex_, std::try_to_lock);" in emergency_body
+    assert "std::atomic_bool estopActive_{false};" in header
+    assert "std::atomic_uint64_t estopSequence_{0};" in header
+    assert "void clearEstopIfUnchanged(std::uint64_t sequenceAtStart);" in header
 
 
 def test_hal_native_gripper_manual_endpoint_uses_native_controller_queue() -> None:
@@ -1150,6 +1211,60 @@ def test_hal_native_gripper_worker_samples_positions_without_commands() -> None:
 
     assert "bool readPositionMm(Side side, std::string* message = nullptr);" in gripper_header
     assert "bool JodellGripperDriver::readPositionMm(" in gripper_source
+
+
+def test_hal_native_gripper_uses_isolated_jodell_worker_processes() -> None:
+    gripper_header = (REPO_ROOT / "hal" / "include" / "JodellGripperDriver.h").read_text(encoding="utf-8")
+    gripper_source = (REPO_ROOT / "hal" / "src" / "JodellGripperDriver.cpp").read_text(encoding="utf-8")
+    worker_source = (REPO_ROOT / "hal" / "src" / "JodellGripperWorker.cpp").read_text(encoding="utf-8")
+    controller_header = (REPO_ROOT / "hal" / "include" / "NativeTeleopController.h").read_text(encoding="utf-8")
+    controller_source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
+    server_source = (REPO_ROOT / "hal" / "src" / "HalServer.cpp").read_text(encoding="utf-8")
+    cmake = (REPO_ROOT / "hal" / "CMakeLists.txt").read_text(encoding="utf-8")
+    build_cmd = (REPO_ROOT / "hal" / "build_hal.cmd").read_text(encoding="utf-8")
+    command_body = gripper_source.split("bool JodellGripperDriver::commandTarget(", 1)[1].split(
+        "bool JodellGripperDriver::readPositionMm",
+        1,
+    )[0]
+    read_body = gripper_source.split("bool JodellGripperDriver::readPositionMm", 1)[1].split(
+        "std::array<double, 2> JodellGripperDriver::targetMm",
+        1,
+    )[0]
+    loop_body = controller_source.split("void NativeTeleopController::gripperLoop()", 1)[1].split(
+        "void NativeTeleopController::sampleGripperPosition",
+        1,
+    )[0]
+    sample_body = (
+        controller_source.split("void NativeTeleopController::sampleGripperPosition", 1)[1].split(
+            "double NativeTeleopController::mappedDirection",
+            1,
+        )[0]
+        if "void NativeTeleopController::sampleGripperPosition" in controller_source
+        else ""
+    )
+    normalized_loop = " ".join(loop_body.split())
+    normalized_sample = " ".join(sample_body.split())
+
+    assert "bool processWorkersEnabled{true};" in gripper_header
+    assert "std::array<ProcessWorkerHandle, 2> workerProcesses_" in gripper_header
+    assert "ensureProcessWorkerUnlocked" in gripper_source
+    assert "CreateProcessA" in gripper_source
+    assert "JodellGripperWorker.exe" in gripper_source
+    assert "commandProcessWorkerUnlocked" in gripper_source
+    assert "closeProcessWorkersUnlocked" in gripper_source
+    assert "processWorkersEnabled = false" in worker_source
+    assert "std::getline(std::cin, line)" in worker_source
+    assert "driver.commandTarget" in worker_source
+    assert "driver.readPositionMm" in worker_source
+    assert command_body.index("if (config_.processWorkersEnabled)") < command_body.index("ensureLoadedUnlocked")
+    assert read_body.index("if (config_.processWorkersEnabled)") < read_body.index("ensureLoadedUnlocked")
+    assert '\\"workerMode\\":\\"' in controller_source
+    assert "processWorkersEnabled" in controller_source
+    assert "gripperProcessWorkersEnabled" in server_source
+    assert "jodellWorkerExePath" in server_source
+    assert "gripperWorkerCommandTimeoutMs" in server_source
+    assert "add_executable(JodellGripperWorker src/JodellGripperWorker.cpp)" in cmake
+    assert "JodellGripperWorker.next.exe" in build_cmd
     assert "getClawCurrentLocation_(slave)" in gripper_source
     assert "void sampleGripperPosition(Side side);" in controller_header
     assert "nextGripperSampleIndex_" not in controller_header
@@ -1199,7 +1314,7 @@ def test_hal_native_gripper_teleop_throttles_background_jodell_commands() -> Non
     normalized_tick = " ".join(tick_body.split())
 
     assert "constexpr int kGripperTeleopDeadbandFloorCounts = 1;" in source
-    assert "constexpr double kGripperTeleopMinCommandIntervalFloorMs = 1000.0 / 30.0;" in source
+    assert "constexpr double kGripperTeleopMinCommandIntervalFloorMs = 10.0;" in source
     assert "normalized.gripperDeadbandCounts = std::max(" in source
     assert "normalized.gripperMinCommandIntervalMs = std::max(" in source
     assert "int gripperDeadbandCounts{1};" in header
@@ -1209,6 +1324,28 @@ def test_hal_native_gripper_teleop_throttles_background_jodell_commands() -> Non
         "if (gripperLastRaw_[targetIndex] >= 0 && std::abs(raw - gripperLastRaw_[targetIndex]) "
         "< config_.gripperDeadbandCounts)"
     ) in normalized_tick
+
+
+def test_hal_native_gripper_icf_min_gap_contract() -> None:
+    header = (REPO_ROOT / "hal" / "include" / "NativeTeleopController.h").read_text(encoding="utf-8")
+    source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
+    server = (REPO_ROOT / "hal" / "src" / "HalServer.cpp").read_text(encoding="utf-8")
+    tick_body = source.split("void NativeTeleopController::tickGrippers(", 1)[1].split(
+        "void NativeTeleopController::enqueueGripperCommand",
+        1,
+    )[0]
+    command_body = source.split("bool NativeTeleopController::commandGripperTarget(", 1)[1].split(
+        "std::string NativeTeleopController::statusJson() const",
+        1,
+    )[0]
+
+    assert "bool gripperIcfTargetProtectionEnabled{true};" in header
+    assert "double gripperIcfTargetMinGapMm{1.02};" in header
+    assert "effectiveGripperTargetMm" in header
+    assert "effectiveGripperTargetMm(targetMm)" in command_body
+    assert "effectiveGripperTargetMm(targetMm)" in tick_body
+    assert 'jsonBoolValue(body, "icfTargetProtectionEnabled"' in server
+    assert 'jsonNumberValue(body, "icfTargetMinGapMm"' in server
 
 
 def test_hal_native_status_reports_logical_hand_connections() -> None:

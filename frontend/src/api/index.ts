@@ -10,7 +10,9 @@ import type {
   ManualControlSide,
   ManualGripperCommand,
   ManualSpeedMode,
+  MotionHomeReferenceConfig,
   MotionOriginConfig,
+  MotionWorkOriginOffsetConfig,
   ParameterSnapshot,
   ParameterSnapshotScope,
 } from '../types'
@@ -318,6 +320,24 @@ export const reconnectCamera = (camera: CameraTelemetry['key']) =>
 /** 应用对应配置或状态。 */
 export const applyCameraTuning = (camera: CameraTelemetry['key'], config?: AppConfig) =>
   postCommand(`/cameras/${camera}/tuning/apply`, config)
+export interface PicoCommandResponse {
+  ok: boolean
+  data?: {
+    ok?: boolean
+    message?: string
+    stdout?: string
+    stderr?: string
+  }
+  ts?: number
+}
+/** 发送或封装对应的后端命令。 */
+export const connectPicoAdb = () => postCommand('/pico/adb/connect') as Promise<PicoCommandResponse>
+/** 发送或封装对应的后端命令。 */
+export const startPicoVision = () => postCommand('/pico/vision/start') as Promise<PicoCommandResponse>
+/** 发送或封装对应的后端命令。 */
+export const stopPicoVision = () => postCommand('/pico/vision/stop') as Promise<PicoCommandResponse>
+/** 发送或封装对应的后端命令。 */
+export const checkPicoStatus = () => postCommand('/pico/status/check') as Promise<PicoCommandResponse>
 /** 计算或执行手动控制的对应逻辑。 */
 export async function manualAxisMove(
   side: ManualControlSide,
@@ -348,6 +368,8 @@ export interface MotionOriginResponse {
   ok: boolean
   data?: {
     origin?: MotionOriginConfig
+    homeReference?: MotionHomeReferenceConfig
+    workOriginOffset?: MotionWorkOriginOffsetConfig
     config?: AppConfig
     originCaptureDrift?: MotionOriginCaptureDrift
   }
@@ -355,7 +377,16 @@ export interface MotionOriginResponse {
 
 /** 从后端读取对应数据。 */
 export async function fetchMotionOrigin(): Promise<MotionOriginResponse> {
-  if (mockMode) return { ok: true, data: { origin: structuredClone(defaultConfig.motion.origin) } }
+  if (mockMode) {
+    return {
+      ok: true,
+      data: {
+        origin: structuredClone(defaultConfig.motion.origin),
+        homeReference: structuredClone(defaultConfig.motion.homeReference),
+        workOriginOffset: structuredClone(defaultConfig.motion.workOriginOffset),
+      },
+    }
+  }
   const response = await fetch(`${apiBase}/api/motion/origin`)
   if (!response.ok) throw new Error(`motion origin fetch failed: ${response.status}`)
   return response.json() as Promise<MotionOriginResponse>

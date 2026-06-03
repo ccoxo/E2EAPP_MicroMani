@@ -35,6 +35,7 @@ import { manualAxisStepLimitFromPulse } from '../manualMotionLimits'
 import { manualMaxVelocity } from '../manualSpeed'
 import type {
   AppConfig,
+  ConnectionState,
   DiagnosticItem,
   EpisodeRecord,
   LogEntry,
@@ -298,6 +299,7 @@ interface TelemetryStore {
   logs: LogEntry[]
   diagnostics: DiagnosticItem[]
   config: AppConfig
+  picoConnection: { state: ConnectionState; message: string; checkedAt: number | null }
   recording: boolean
   autoRunning: boolean
   clutchActive: boolean
@@ -351,6 +353,7 @@ interface TelemetryStore {
   sendBackendCommandLog: (level: LogLevel, msg: string, channel?: LogEntry['channel']) => void
   refreshHardwareStatus: () => Promise<void>
   runDiagnostics: () => Promise<void>
+  setPicoConnectionStatus: (state: ConnectionState, message: string) => void
   updateConfig: (patch: Partial<AppConfig>) => void
   saveParameterSnapshot: (scope: ParameterSnapshotScope, name: string) => void
   applyParameterSnapshot: (id: string) => void
@@ -696,6 +699,8 @@ type TelemetryStoreSet = (partial: TelemetryStorePatch | ((state: TelemetryStore
 type TelemetryStoreGet = () => TelemetryStore
 
 let finishRecordSessionAfterReview = false
+let recordSessionStartInFlight = false
+let recordMotionOriginInFlight = false
 let pendingBackendFrame: TelemetryFrame | null = null
 let backendFrameDelayTimer: number | null = null
 let backendFrameRaf: number | null = null
@@ -858,6 +863,47 @@ function mergeConfig(current: AppConfig, patch: Partial<AppConfig>): AppConfig {
     wsl: { ...current.wsl, ...patch.wsl },
   }
 }
+
+/** 应用当前现场硬件的前端配置迁移。 */
+export function normalizeConfig(config: AppConfig): AppConfig {
+  const hasPreviousImx258CameraDefaults =
+    config.cameras.global === 'AR0234 / index 1'
+    && config.cameras.wristLeft === 'IMX258 / index 2'
+    && config.cameras.wristRight === 'IMX258 / index 0'
+  const hasLegacyReversedWristCameras =
+    config.cameras.global === 'AR0234 / index 2'
+    && config.cameras.wristLeft === 'IMX258 / index 1'
+    && config.cameras.wristRight === 'IMX258 / index 0'
+  const hasLegacyCyclicCameraRoles =
+    config.cameras.global === 'AR0234 / index 2'
+    && config.cameras.wristLeft === 'IMX258 / index 0'
+    && config.cameras.wristRight === 'IMX258 / index 1'
+  const hasStalePicoIp = config.picoVision.ip === '10.90.132.51'
+  if (!hasPreviousImx258CameraDefaults && !hasLegacyReversedWristCameras && !hasLegacyCyclicCameraRoles && !hasStalePicoIp) {
+    return config
+  }
+  const next = cloneConfig(config)
+  if (hasPreviousImx258CameraDefaults || hasLegacyReversedWristCameras || hasLegacyCyclicCameraRoles) {
+    next.cameras = {
+      ...next.cameras,
+      global: defaultConfig.cameras.global,
+      globalIdentity: defaultConfig.cameras.globalIdentity,
+      wristLeft: defaultConfig.cameras.wristLeft,
+      wristLeftIdentity: defaultConfig.cameras.wristLeftIdentity,
+      wristRight: defaultConfig.cameras.wristRight,
+      wristRightIdentity: defaultConfig.cameras.wristRightIdentity,
+    }
+  }
+  if (hasStalePicoIp) {
+    next.picoVision = {
+      ...next.picoVision,
+      ip: defaultConfig.picoVision.ip,
+      gateway: defaultConfig.picoVision.gateway,
+      ifIndex: defaultConfig.picoVision.ifIndex,
+    }
+  }
+  return next
+}
 /** 计算对应的业务值或展示值。 */
 function diagnosticsFromHardwareStatus(
   diagnostics: DiagnosticItem[],
@@ -882,6 +928,15 @@ function diagnosticsFromHardwareStatus(
     }
     return item
   })
+}
+/** 计算对应的业务值或展示值。 */
+function picoConnectionFromHardwareStatus(status: Awaited<ReturnType<typeof fetchHardwareStatus>>) {
+  if (!status.pico) return null
+  return {
+    state: status.pico.ok ? 'ok' : 'warn',
+    message: status.pico.message,
+    checkedAt: Date.now(),
+  } satisfies TelemetryStore['picoConnection']
 }
 
 /** 构建当前流程需要的数据结构。 */
@@ -1036,6 +1091,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   logs: [makeLog('INFO', mockMode ? 'M0 test telemetry fixture started at 30Hz' : 'Backend telemetry initializing', '[BACKEND]')],
   diagnostics: defaultDiagnostics,
   config: defaultConfig,
+  picoConnection: { state: 'pending', message: '尚未检查 PICO ADB', checkedAt: null },
   recording: false,
   autoRunning: false,
   clutchActive: false,
@@ -1113,7 +1169,7 @@ startBackend: () => {
     }
     // 网页套接字建立前先拉一次静态配置和硬件概况，首屏不会等到下一帧遥测才有数据。
     void fetchConfig()
-      .then((config) => set({ config }))
+      .then((config) => set({ config: normalizeConfig(config) }))
       .catch((error) => {
         set((state) => ({
           logs: appendLog(state.logs, makeLog('ERROR', `settings fetch failed: ${String(error)}`, '[BACKEND]')),
@@ -1130,6 +1186,7 @@ startBackend: () => {
       .then((status) => {
         set((state) => ({
           diagnostics: diagnosticsFromHardwareStatus(state.diagnostics, status),
+          picoConnection: picoConnectionFromHardwareStatus(status) ?? state.picoConnection,
           logs: appendLog(state.logs, makeLog('INFO', 'Real hardware status probe completed', '[BACKEND]')),
         }))
       })
@@ -1166,7 +1223,7 @@ startBackend: () => {
           return
         }
         if (message.type === 'config') {
-          set({ config: message.data })
+          set({ config: normalizeConfig(message.data) })
         }
       } catch (error) {
         set((state) => ({
@@ -1299,6 +1356,13 @@ setRecordEpisodeTimes: (episodeS, resetS) =>
 
 /** 启动对应流程。 */
 startRecordSession: (datasetName, task) => {
+    if (recordSessionStartInFlight || get().recordSession.phase !== 'idle') {
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('WARNING', 'record session start ignored: start is already pending', '[LEROBOT]')),
+      }))
+      return
+    }
+    recordSessionStartInFlight = true
     finishRecordSessionAfterReview = false
     const nextDatasetName = datasetName.trim() || initialRecordSession.datasetName
     set((state) => ({
@@ -1374,6 +1438,9 @@ startRecordSession: (datasetName, task) => {
           },
           logs: appendLog(state.logs, makeLog('ERROR', `record session start failed: ${String(error)}`, '[LEROBOT]')),
         }))
+      })
+      .finally(() => {
+        recordSessionStartInFlight = false
       })
   },
 
@@ -1640,6 +1707,13 @@ homeRecordArms: () => {
 
 /** 描述当前方法的功能边界。 */
 returnRecordMotionOrigin: async (side) => {
+    if (recordMotionOriginInFlight) {
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('WARNING', `${side} slave arm return-to-origin ignored: request is already pending`, '[HAL]')),
+      }))
+      return
+    }
+    recordMotionOriginInFlight = true
     try {
       await returnMotionOriginSideApi(side)
       set((state) => ({
@@ -1649,6 +1723,8 @@ returnRecordMotionOrigin: async (side) => {
       set((state) => ({
         logs: appendLog(state.logs, makeLog('ERROR', `${side} slave arm return-to-origin failed: ${String(error)}`, '[HAL]')),
       }))
+    } finally {
+      recordMotionOriginInFlight = false
     }
   },
 
@@ -1800,6 +1876,7 @@ sendBackendCommandLog: (level, msg, channel) => {
       const status = await fetchHardwareStatus()
       set((state) => ({
         diagnostics: diagnosticsFromHardwareStatus(state.diagnostics, status),
+        picoConnection: picoConnectionFromHardwareStatus(status) ?? state.picoConnection,
         logs: appendLog(state.logs, makeLog('INFO', 'Real hardware status probe completed', '[BACKEND]')),
       }))
     } catch (error) {
@@ -1823,6 +1900,11 @@ sendBackendCommandLog: (level, msg, channel) => {
       }),
       logs: appendLog(state.logs, makeLog('INFO', 'Diagnostics completed with backend hardware markers', '[BACKEND]')),
     }))
+  },
+
+ /** 设置当前流程的对应状态。 */
+ setPicoConnectionStatus: (state, message) => {
+    set({ picoConnection: { state, message, checkedAt: Date.now() } })
   },
 
 /** 描述当前方法的功能边界。 */
@@ -1885,7 +1967,7 @@ applyParameterSnapshot: (id) => {
         .then((response) => {
           const data = response.data as { config?: AppConfig; snapshots?: ParameterSnapshot[] } | undefined
           const patch: Partial<TelemetryStore> = {}
-          if (data?.config) patch.config = data.config
+          if (data?.config) patch.config = normalizeConfig(data.config)
           if (data?.snapshots) patch.parameterSnapshots = data.snapshots
           if (Object.keys(patch).length > 0) set(patch)
         })
@@ -2115,7 +2197,7 @@ issueManualGripperMove: (side, command, targetMm) => {
           // 说明当前代码块的功能用途。
           if (command === 'enable' || command === 'disable') {
             void fetchConfig()
-              .then((config) => set({ config }))
+              .then((config) => set({ config: normalizeConfig(config) }))
               .catch(() => undefined)
           }
         })

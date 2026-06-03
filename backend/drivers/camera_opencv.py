@@ -51,6 +51,7 @@ CAMERA_INITIAL_FRAME_GRACE_SEC = 1.5
 CAMERA_FRAME_WAIT_SEC = 1.5
 CAMERA_FPS_WINDOW_SEC = 1.0
 CAMERA_RELEASE_JOIN_SEC = 2.0
+CAMERA_CAPTURE_FOURCC = "YUYV"
 CAMERA_TUNING_DEFAULTS: dict[str, dict[str, float | bool]] = {
     "global": {
         "autoExposure": False,
@@ -1003,7 +1004,7 @@ class OpenCVCameraDriver:
                     device=index,
                     backend=label,
                     attemptNo=attempt_no,
-                    fourcc="MJPG",
+                    fourcc=CAMERA_CAPTURE_FOURCC,
                     width=width,
                     height=height,
                     fps=fps,
@@ -1027,7 +1028,7 @@ class OpenCVCameraDriver:
                 device=index,
                 backend=label,
                 attemptNo=attempt_no,
-                fourcc="MJPG",
+                fourcc=CAMERA_CAPTURE_FOURCC,
                 width=width,
                 height=height,
                 fps=fps,
@@ -1237,11 +1238,10 @@ class OpenCVCameraDriver:
         fps: float,
         profile: dict[str, float | bool] | None = None,
     ) -> None:
-        # The order matters on Windows: FOURCC must be set BEFORE width/height/fps
-        # or Media Foundation falls back to YUY2 and caps at ~10fps for HD.
+        # The order matters on Windows: FOURCC must be set before width/height/fps.
         if hasattr(cv2, "CAP_PROP_FOURCC") and hasattr(cv2, "VideoWriter_fourcc"):
             try:
-                capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*CAMERA_CAPTURE_FOURCC))
             except Exception:
                 pass
         if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):

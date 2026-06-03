@@ -29,7 +29,7 @@ DEFAULT_ROTATION_STEP_DEG = 0.2
 DEFAULT_AXIS_OUTPUT_SCALE = [1.0] * 6
 DEFAULT_ENABLED_AXES = [True] * 6
 NATIVE_STATUS_SUMMARY_LOG_INTERVAL_MS = 5000
-NATIVE_STATUS_POLL_INTERVAL_S = 0.2
+DEFAULT_NATIVE_STATUS_SAMPLE_HZ = 30.0
 
 
 class TeleopMappingService:
@@ -182,13 +182,15 @@ class TeleopMappingService:
         if side is None and not bool(origin["valid"]):
             raise RuntimeError("motion work origin is not captured")
         if side is None:
-            await self.hal.command("motion.enable_side", {"side": "left"})
-            await self.hal.command("motion.enable_side", {"side": "right"})
+            await self.hal.command("motion.enable_side", {"side": "left", "enabledAxes": self._enabled_axes("left", config)})
+            await self.hal.command("motion.enable_side", {"side": "right", "enabledAxes": self._enabled_axes("right", config)})
             await self.hal.command(
                 "motion.home_all",
                 {
                     "leftPulse": origin["leftPulse"],
                     "rightPulse": origin["rightPulse"],
+                    "leftEnabledAxes": self._enabled_axes("left", config),
+                    "rightEnabledAxes": self._enabled_axes("right", config),
                 },
             )
             self.logs.info("[HAL]", "teleop pre-start return-to-work-origin completed")
@@ -197,12 +199,13 @@ class TeleopMappingService:
         pulse_key = "leftPulse" if side == "left" else "rightPulse"
         if not bool(origin[valid_key]):
             raise RuntimeError(f"{side} motion work origin is not captured")
-        await self.hal.command("motion.enable_side", {"side": side})
+        await self.hal.command("motion.enable_side", {"side": side, "enabledAxes": self._enabled_axes(side, config)})
         await self.hal.command(
             "motion.home_origin_side",
             {
                 "side": side,
                 "pulse": origin[pulse_key],
+                "enabledAxes": self._enabled_axes(side, config),
             },
         )
         self.logs.info("[HAL]", f"teleop pre-start {side} return-to-work-origin completed")
@@ -330,9 +333,8 @@ class TeleopMappingService:
                     self.logs.error("[HAL]", f"HAL-native teleop status recovered: {message}")
                     self._last_error = message
                     self._last_error_at = now
-            await asyncio.sleep(
-                max(NATIVE_STATUS_POLL_INTERVAL_S, self._command_interval_s(self.settings.get_config()))
-            )
+            config = self.settings.get_config()
+            await asyncio.sleep(max(self._native_status_interval_s(config), self._command_interval_s(config)))
 
     async def _configure_and_start_native(self, config: dict[str, Any]) -> None:
         payload = self._native_payload(config)
@@ -1185,6 +1187,15 @@ class TeleopMappingService:
     def _command_interval_s(self, config: dict[str, Any]) -> float:
         return max(1.0, float(config.get("teleop", {}).get("commandIntervalMs", 10))) / 1000.0
 
+    def _native_status_interval_s(self, config: dict[str, Any]) -> float:
+        gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
+        try:
+            sample_hz = float(gripper.get("sampleHz", DEFAULT_NATIVE_STATUS_SAMPLE_HZ))
+        except (TypeError, ValueError):
+            sample_hz = DEFAULT_NATIVE_STATUS_SAMPLE_HZ
+        sample_hz = min(max(sample_hz, 1.0), 60.0)
+        return 1.0 / sample_hz
+
     def _native_engine(self, config: dict[str, Any]) -> bool:
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         return str(teleop.get("engine", "python_mapper")).lower() == "hal_native"
@@ -1193,6 +1204,9 @@ class TeleopMappingService:
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
         gripper_teleop = teleop.get("gripperTeleop", {}) if isinstance(teleop.get("gripperTeleop"), dict) else {}
+        worker_timeout = gripper.get("workerCommandTimeoutMs")
+        if worker_timeout is None:
+            worker_timeout = float(gripper.get("workerCommandTimeoutSec", 2.0)) * 1000.0
         payload: dict[str, Any] = {
             "engine": str(teleop.get("engine", "hal_native")),
             "controlMode": str(teleop.get("controlMode", "incremental_position")),
@@ -1339,7 +1353,12 @@ class TeleopMappingService:
             "rightSlaveId": int(gripper.get("rightSlaveId", 9)),
             "baudrate": int(gripper.get("baudrate", 115200)),
             "strokeMm": float(gripper.get("strokeMm", 26)),
+            "icfTargetProtectionEnabled": bool(gripper.get("icfTargetProtectionEnabled", True)),
+            "icfTargetMinGapMm": float(gripper.get("icfTargetMinGapMm", 1.02)),
             "jodellDllPath": str(gripper.get("jodellDllPath", "")),
+            "gripperProcessWorkersEnabled": bool(gripper.get("processWorkersEnabled", True)),
+            "jodellWorkerExePath": str(gripper.get("jodellWorkerExePath", "")),
+            "gripperWorkerCommandTimeoutMs": float(worker_timeout),
             "leftGapMinMm": float(gripper_teleop.get("leftGapMinMm", 0.0)),
             "leftGapMaxMm": float(gripper_teleop.get("leftGapMaxMm", 25.0)),
             "rightGapMinMm": float(gripper_teleop.get("rightGapMinMm", 0.0)),
@@ -1349,7 +1368,7 @@ class TeleopMappingService:
             "leftSourceHand": str(gripper_teleop.get("leftSourceHand", "PhysicalRight")),
             "rightSourceHand": str(gripper_teleop.get("rightSourceHand", "PhysicalLeft")),
             "gripSpeed": int(gripper_teleop.get("gripSpeed", 255)),
-            "gripTorque": int(gripper_teleop.get("gripTorque", 192)),
+            "gripTorque": int(gripper_teleop.get("gripTorque", 1)),
             "positionDeadbandCounts": int(gripper_teleop.get("positionDeadbandCounts", 1)),
             "minCommandIntervalMs": float(gripper_teleop.get("minCommandIntervalMs", 20)),
             "buttonFallback": bool(gripper_teleop.get("buttonFallback", True)),

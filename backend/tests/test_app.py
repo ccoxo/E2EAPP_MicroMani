@@ -131,8 +131,8 @@ def _assert_rotation_window_from_origin(config: dict[str, Any], side: str) -> No
     assert origin is not None
     limits = effective_limits_ui(config, side)
     expected_span = {
-        "roll": (-90.0, 100.0) if side == "right" else (-100.0, 100.0),
-        "pitch": (-90.0, 90.0) if side == "right" else (-100.0, 100.0),
+        "roll": (-95.0, 5.0) if side == "right" else (-5.0, 95.0),
+        "pitch": (-30.0, 30.0),
         "yaw": (-7.0, 7.0),
     }
     for axis_index, axis in enumerate(("roll", "pitch", "yaw"), start=3):
@@ -1104,6 +1104,8 @@ def test_home_all_requires_and_sends_captured_work_origin(tmp_path: Path, monkey
     assert data["payload"] == {
         "leftPulse": [0.0] * 6,
         "rightPulse": [0.0] * 6,
+        "leftEnabledAxes": [True] * 6,
+        "rightEnabledAxes": [True, True, True, True, True, False],
     }
 
 
@@ -1147,13 +1149,15 @@ def test_home_all_enables_motion_sides_before_work_origin(tmp_path: Path, monkey
 
     assert response.status_code == 200
     assert fake_hal.commands[:3] == [
-        ("motion.enable_side", {"side": "left"}),
-        ("motion.enable_side", {"side": "right"}),
+        ("motion.enable_side", {"side": "left", "enabledAxes": [True] * 6}),
+        ("motion.enable_side", {"side": "right", "enabledAxes": [True, True, True, True, True, False]}),
         (
             "motion.home_all",
             {
                 "leftPulse": origin["leftPulse"],
                 "rightPulse": origin["rightPulse"],
+                "leftEnabledAxes": [True] * 6,
+                "rightEnabledAxes": [True, True, True, True, True, False],
             },
         ),
     ]
@@ -1198,15 +1202,183 @@ def test_return_origin_side_enables_side_before_work_origin(tmp_path: Path, monk
 
     assert response.status_code == 200
     assert fake_hal.commands[:2] == [
-        ("motion.enable_side", {"side": "right"}),
+        ("motion.enable_side", {"side": "right", "enabledAxes": [True, True, True, True, True, False]}),
         (
             "motion.home_origin_side",
             {
                 "side": "right",
                 "pulse": origin["rightPulse"],
+                "enabledAxes": [True, True, True, True, True, False],
             },
         ),
     ]
+
+
+def test_return_origin_side_ignores_disabled_right_yaw_soft_limit(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    class FakeHal:
+        def __init__(self) -> None:
+            self.commands: list[tuple[str, dict[str, Any]]] = []
+
+        async def motion_state(self) -> dict[str, Any]:
+            return {
+                "positions": [0.0] * 12,
+                "pulses": [0.0] * 12,
+                "enabled": [True] * 12,
+                "estop_active": False,
+            }
+
+        async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
+            self.commands.append((name, payload or {}))
+            return {"command": name, "payload": payload or {}}
+
+    fake_hal = FakeHal()
+    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: fake_hal)
+    client = TestClient(create_app(tmp_path))
+    origin = {
+        "valid": True,
+        "leftValid": True,
+        "rightValid": True,
+        "leftPulse": [0.0] * 6,
+        "rightPulse": [0.0, 0.0, 0.0, 0.0, 0.0, 1_000_000.0],
+        "updatedAt": 123,
+    }
+    config = client.app.state.settings.get_config()
+    config["motion"]["origin"] = origin
+    config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
+    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -1000.0, "max": 1000.0}
+    client.app.state.settings.save_config(config, emit_log=False)
+
+    response = client.post("/api/motion/right/return_origin")
+
+    assert response.status_code == 200
+    assert fake_hal.commands[:2] == [
+        ("motion.enable_side", {"side": "right", "enabledAxes": [True, True, True, True, True, False]}),
+        (
+            "motion.home_origin_side",
+            {
+                "side": "right",
+                "pulse": origin["rightPulse"],
+                "enabledAxes": [True, True, True, True, True, False],
+            },
+        ),
+    ]
+
+
+def test_home_motion_side_recalibrates_origin_from_home_reference_offset(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+    old_left_ref = [1000.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0]
+    new_left_ref = [1010.0, 2020.0, 3030.0, 4050.0, 5060.0, 6070.0]
+    left_offset = [11.0, 22.0, 33.0, 44.0, 55.0, 66.0]
+    expected_origin = [new_left_ref[index] + left_offset[index] for index in range(6)]
+
+    class FakeHal:
+        def __init__(self) -> None:
+            self.commands: list[tuple[str, dict[str, Any]]] = []
+
+        async def motion_state(self) -> dict[str, Any]:
+            return {
+                "positions": [0.0] * 12,
+                "pulses": new_left_ref + [0.0] * 6,
+                "enabled": [True] * 12,
+                "estop_active": False,
+            }
+
+        async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
+            self.commands.append((name, payload or {}))
+            return {"command": name, "payload": payload or {}}
+
+    fake_hal = FakeHal()
+    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: fake_hal)
+    client = TestClient(create_app(tmp_path))
+    settings = client.app.state.settings
+    config = settings.get_config()
+    config["motion"]["homeReference"] = {
+        "valid": True,
+        "leftValid": True,
+        "rightValid": False,
+        "leftPulse": old_left_ref,
+        "rightPulse": [0.0] * 6,
+        "updatedAt": 123,
+    }
+    config["motion"]["workOriginOffset"] = {
+        "valid": True,
+        "leftValid": True,
+        "rightValid": False,
+        "leftPulseDelta": left_offset,
+        "rightPulseDelta": [0.0] * 6,
+        "updatedAt": 123,
+    }
+    config["motion"]["origin"]["leftPulse"] = [old_left_ref[index] + left_offset[index] for index in range(6)]
+    config["motion"]["origin"]["leftValid"] = True
+    config["motion"]["origin"]["valid"] = False
+    settings.save_config(config, emit_log=False)
+
+    response = client.post("/api/motion/left/home")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["command"] == "motion.home_side"
+    assert fake_hal.commands == [("motion.home_side", {"side": "left", "enabledAxes": [True] * 6})]
+    saved = settings.get_config()
+    assert saved["motion"]["homeReference"]["leftPulse"] == new_left_ref
+    assert saved["motion"]["workOriginOffset"]["leftPulseDelta"] == left_offset
+    assert saved["motion"]["origin"]["leftPulse"] == expected_origin
+    origin = side_origin_ui(saved, "left")
+    assert origin is not None
+    limits = effective_limits_ui(saved, "left")
+    assert limits[3].min == pytest.approx(origin[3] - 5.0, abs=1e-6)
+    assert limits[3].max == pytest.approx(origin[3] + 95.0, abs=1e-6)
+
+
+def test_motion_origin_capture_updates_home_reference_and_zero_offset(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    hardware_zero_pulses = [
+        53026.0,
+        277839.0,
+        -323796.0,
+        10142.0,
+        84625.0,
+        -12820.0,
+        46474.0,
+        49416.0,
+        366208.0,
+        -159813.0,
+        -680804.0,
+        -694.0,
+    ]
+
+    class FakeHal:
+        async def motion_state(self) -> dict[str, Any]:
+            return {
+                "positions": [0.0] * 12,
+                "pulses": hardware_zero_pulses,
+                "enabled": [True] * 12,
+                "estop_active": False,
+            }
+
+        async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
+            return {"command": name, "payload": payload or {}}
+
+    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: FakeHal())
+    client = TestClient(create_app(tmp_path))
+
+    response = client.post("/api/motion/origin/capture", json={"confirmLargeDrift": True})
+
+    assert response.status_code == 200
+    saved = response.json()["data"]["config"]
+    assert saved["motion"]["homeReference"]["leftPulse"] == hardware_zero_pulses[:6]
+    assert saved["motion"]["homeReference"]["rightPulse"] == hardware_zero_pulses[6:12]
+    assert saved["motion"]["homeReference"]["leftValid"] is True
+    assert saved["motion"]["homeReference"]["rightValid"] is True
+    assert saved["motion"]["workOriginOffset"]["leftPulseDelta"] == [0.0] * 6
+    assert saved["motion"]["workOriginOffset"]["rightPulseDelta"] == [0.0] * 6
+    assert saved["motion"]["workOriginOffset"]["leftValid"] is True
+    assert saved["motion"]["workOriginOffset"]["rightValid"] is True
 
 
 def test_motion_origin_capture_preserves_previous_work_origin(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -1251,8 +1423,8 @@ def test_motion_origin_capture_preserves_previous_work_origin(tmp_path: Path, mo
 
     assert response.status_code == 200
     assert fake_hal.commands == [
-        ("motion.home_side", {"side": "left"}),
-        ("motion.home_side", {"side": "right"}),
+        ("motion.home_side", {"side": "left", "enabledAxes": [True] * 6}),
+        ("motion.home_side", {"side": "right", "enabledAxes": [True, True, True, True, True, False]}),
     ]
     origin = response.json()["data"]["origin"]
     assert origin["leftPulse"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
@@ -3845,18 +4017,18 @@ def test_camera_identities_lock_all_role_indices(monkeypatch: MonkeyPatch) -> No
         "_camera_identities_by_index",
         lambda: {
             0: {
-                "name": "WN Camera",
-                "devicePath": "\\\\?\\usb#vid_0edc&pid_3080&mi_00#6&1bbfdb86&0&0000#{guid}\\global",
+                "name": "USB Camera",
+                "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&398f0a3&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:right",
             },
             1: {
-                "name": "UVC Camera",
-                "devicePath": "\\\\?\\usb#vid_1d6b&pid_0102&mi_00#6&1e9a8698&0&0000#{guid}\\global",
+                "name": "USB Camera",
+                "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&124ccba8&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:global",
             },
             2: {
-                "name": "WN Camera",
-                "devicePath": "\\\\?\\usb#vid_0edc&pid_3080&mi_00#7&38b4ea25&0&0000#{guid}\\global",
+                "name": "USB Camera",
+                "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&7861a93&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:left",
             },
         },
@@ -3870,12 +4042,12 @@ def test_camera_identities_lock_all_role_indices(monkeypatch: MonkeyPatch) -> No
 def test_default_camera_mapping_matches_deployment_hardware() -> None:
     config = default_config()
 
-    assert config["cameras"]["global"] == "AR0234 / index 1"
-    assert config["cameras"]["globalIdentity"] == "USB\\VID_1D6B&PID_0102&MI_00\\6&1E9A8698&0&0000"
-    assert config["cameras"]["wristLeft"] == "IMX258 / index 2"
-    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0EDC&PID_3080&MI_00\\7&38B4EA25&0&0000"
-    assert config["cameras"]["wristRight"] == "IMX258 / index 0"
-    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0EDC&PID_3080&MI_00\\6&1BBFDB86&0&0000"
+    assert config["cameras"]["global"] == "IMX335 / index 1"
+    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&124CCBA8&0&0000"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 2"
+    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&7861A93&0&0000"
+    assert config["cameras"]["wristRight"] == "IMX335 / index 0"
+    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
     assert config["cameras"]["previewResolution"] == "640x480"
     assert config["cameras"]["globalResolution"] == "640x480"
     assert config["cameras"]["wristLeftResolution"] == "640x480"

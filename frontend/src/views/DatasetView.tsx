@@ -88,9 +88,9 @@ interface ReviewDataset {
 }
 
 const cameras: ReviewCamera[] = [
-  { key: 'global', label: '全局相机', model: 'AR0234', resolution: '1920x1080', aspectRatio: '16 / 9' },
-  { key: 'wrist_left', label: '左腕相机', model: 'IMX258', resolution: '1920x1080', aspectRatio: '16 / 9' },
-  { key: 'wrist_right', label: '右腕相机', model: 'IMX258', resolution: '1920x1080', aspectRatio: '16 / 9' },
+  { key: 'global', label: '全局相机', model: 'IMX335', resolution: '1920x1080', aspectRatio: '16 / 9' },
+  { key: 'wrist_left', label: '左腕相机', model: 'IMX335', resolution: '1920x1080', aspectRatio: '16 / 9' },
+  { key: 'wrist_right', label: '右腕相机', model: 'IMX335', resolution: '1920x1080', aspectRatio: '16 / 9' },
 ]
 
 const axisLabels = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']

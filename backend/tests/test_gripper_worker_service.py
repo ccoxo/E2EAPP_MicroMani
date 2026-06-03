@@ -167,6 +167,41 @@ def test_gripper_command_uses_dual_worker_when_enabled() -> None:
     assert settings.config["gripper"]["targetLeftMm"] == 7.5
 
 
+def test_gripper_command_close_uses_icf_min_gap_for_worker_path() -> None:
+    config = default_config()
+    config["teleop"]["engine"] = "python_mapper"
+    config["gripper"]["sampleMode"] = "dual_worker"
+    config["gripper"]["leftEnabled"] = True
+    settings = FakeSettings(config)
+    hardware = FakeHardware()
+    workers = FakeWorkers()
+    service = CommandService(settings, FakeTelemetry(), FakeHal(), FakeLogs(), hardware, workers)
+
+    result = asyncio.run(service.gripper_command(GripperCommandRequest(side="left", command="close")))
+
+    assert result["targetMm"] == 1.02
+    assert workers.calls == [("left", "target", 1.02)]
+    assert settings.config["gripper"]["targetLeftMm"] == 1.02
+
+
+def test_gripper_command_close_can_disable_icf_min_gap_for_worker_path() -> None:
+    config = default_config()
+    config["teleop"]["engine"] = "python_mapper"
+    config["gripper"]["sampleMode"] = "dual_worker"
+    config["gripper"]["icfTargetProtectionEnabled"] = False
+    config["gripper"]["leftEnabled"] = True
+    settings = FakeSettings(config)
+    hardware = FakeHardware()
+    workers = FakeWorkers()
+    service = CommandService(settings, FakeTelemetry(), FakeHal(), FakeLogs(), hardware, workers)
+
+    result = asyncio.run(service.gripper_command(GripperCommandRequest(side="left", command="close")))
+
+    assert result["targetMm"] == 0.0
+    assert workers.calls == [("left", "close", None)]
+    assert settings.config["gripper"]["targetLeftMm"] == 0.0
+
+
 def test_gripper_command_keeps_direct_driver_when_worker_disabled() -> None:
     config = default_config()
     config["teleop"]["engine"] = "python_mapper"
@@ -268,13 +303,34 @@ def test_hal_native_gripper_motion_command_auto_enables_disabled_side() -> None:
                 "rightSlaveId": 9,
                 "baudrate": 115200,
                 "strokeMm": config["gripper"]["strokeMm"],
+                "icfTargetProtectionEnabled": True,
+                "icfTargetMinGapMm": 1.02,
                 "jodellDllPath": config["gripper"]["jodellDllPath"],
                 "gripSpeed": 255,
-                "gripTorque": 192,
+                "gripTorque": 1,
             },
         )
     ]
     assert settings.config["gripper"]["rightEnabled"] is True
+
+
+def test_hal_native_gripper_close_payload_uses_icf_min_gap() -> None:
+    config = default_config()
+    config["hal"]["mode"] = "real"
+    config["teleop"]["engine"] = "hal_native"
+    config["gripper"]["rightEnabled"] = True
+    settings = FakeSettings(config)
+    hal = FakeHal()
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    result = asyncio.run(service.gripper_command(GripperCommandRequest(side="right", command="close")))
+
+    assert result["nativeManaged"] is True
+    assert result["targetMm"] == 1.02
+    assert hal.commands[-1][1]["targetMm"] == 1.02
+    assert hal.commands[-1][1]["icfTargetProtectionEnabled"] is True
+    assert hal.commands[-1][1]["icfTargetMinGapMm"] == 1.02
+    assert settings.config["gripper"]["targetRightMm"] == 1.02
 
 
 def test_manual_axis_move_rejects_disabled_motion_side() -> None:
@@ -622,6 +678,19 @@ def test_motion_enabled_refresh_reports_card0_dmc5c10_feedback_as_unknown() -> N
     assert telemetry.motion_enabled["right"] is None
 
 
+def test_enable_motion_side_masks_right_yaw_by_default() -> None:
+    config = default_config()
+    settings = FakeSettings(config)
+    hal = FakeHal(enabled=True)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    asyncio.run(service.enable_motion_side("right"))
+
+    assert hal.commands == [
+        ("motion.enable_side", {"side": "right", "enabledAxes": [True, True, True, True, True, False]})
+    ]
+
+
 def test_manual_axis_move_allows_right_roll_when_card0_feedback_is_unreadable() -> None:
     config = default_config()
     settings = FakeSettings(config)
@@ -644,7 +713,9 @@ def test_manual_axis_move_allows_right_pitch_when_card0_feedback_is_unreadable()
     settings = FakeSettings(config)
     enabled_values = [True] * 12
     enabled_values[10] = False
-    hal = FakeHal(enabled_values=enabled_values)
+    pulses = [0.0] * 12
+    pulses[10] = float(config["motion"]["origin"]["rightPulse"][4])
+    hal = FakeHal(enabled_values=enabled_values, motion_states=[{"pulses": pulses}, {"pulses": pulses}])
     service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
 
     asyncio.run(
@@ -719,9 +790,11 @@ def test_hal_native_gripper_command_routes_manual_target_through_hal() -> None:
                 "rightSlaveId": 9,
                 "baudrate": 115200,
                 "strokeMm": 26.0,
+                "icfTargetProtectionEnabled": True,
+                "icfTargetMinGapMm": 1.02,
                 "jodellDllPath": config["gripper"]["jodellDllPath"],
                     "gripSpeed": 255,
-                "gripTorque": 192,
+                "gripTorque": 1,
             },
         )
     ]
@@ -808,9 +881,11 @@ def test_hal_native_gripper_enable_updates_state_without_python_com() -> None:
                 "rightSlaveId": 9,
                 "baudrate": 115200,
                 "strokeMm": 26.0,
+                "icfTargetProtectionEnabled": True,
+                "icfTargetMinGapMm": 1.02,
                 "jodellDllPath": config["gripper"]["jodellDllPath"],
                     "gripSpeed": 255,
-                "gripTorque": 192,
+                "gripTorque": 1,
             },
         )
     ]

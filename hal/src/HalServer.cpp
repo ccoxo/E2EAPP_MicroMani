@@ -3,6 +3,7 @@
 #include <ws2tcpip.h>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -20,6 +21,8 @@
 #include "Omega7Driver.h"
 
 namespace {
+
+constexpr std::array<bool, 6> kAllAxesEnabled{true, true, true, true, true, true};
 
 long long unixTimeMs() {
   const auto now = std::chrono::system_clock::now().time_since_epoch();
@@ -493,6 +496,13 @@ std::array<bool, 6> jsonBoolArray6(
   return values;
 }
 
+std::array<std::array<bool, 6>, 2> jsonHomeAllEnabledAxes(const std::string& body) {
+  return {{
+      jsonBoolArray6(body, "leftEnabledAxes", kAllAxesEnabled),
+      jsonBoolArray6(body, "rightEnabledAxes", kAllAxesEnabled),
+  }};
+}
+
 std::array<appstation::hal::AxisLimit, 6> jsonAxisLimits(
     const std::string& body,
     const std::string& minKey,
@@ -673,6 +683,11 @@ appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& bo
   config.gripper.speed = static_cast<int>(jsonNumberValue(body, "gripSpeed", config.gripper.speed));
   config.gripper.torque = static_cast<int>(jsonNumberValue(body, "gripTorque", config.gripper.torque));
   config.gripper.dllPath = jsonStringValueOr(body, "jodellDllPath", config.gripper.dllPath);
+  config.gripper.processWorkersEnabled =
+      jsonBoolValue(body, "gripperProcessWorkersEnabled", config.gripper.processWorkersEnabled);
+  config.gripper.workerExePath = jsonStringValueOr(body, "jodellWorkerExePath", config.gripper.workerExePath);
+  config.gripper.workerCommandTimeoutMs =
+      jsonNumberValue(body, "gripperWorkerCommandTimeoutMs", config.gripper.workerCommandTimeoutMs);
   config.gripperGapMinMm[0] = jsonNumberValue(body, "leftGapMinMm", config.gripperGapMinMm[0]);
   config.gripperGapMaxMm[0] = jsonNumberValue(body, "leftGapMaxMm", config.gripperGapMaxMm[0]);
   config.gripperGapMinMm[1] = jsonNumberValue(body, "rightGapMinMm", config.gripperGapMinMm[1]);
@@ -685,8 +700,22 @@ appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& bo
       static_cast<int>(jsonNumberValue(body, "positionDeadbandCounts", config.gripperDeadbandCounts));
   config.gripperMinCommandIntervalMs =
       jsonNumberValue(body, "minCommandIntervalMs", config.gripperMinCommandIntervalMs);
+  config.gripperIcfTargetProtectionEnabled =
+      jsonBoolValue(body, "icfTargetProtectionEnabled", config.gripperIcfTargetProtectionEnabled);
+  config.gripperIcfTargetMinGapMm =
+      jsonNumberValue(body, "icfTargetMinGapMm", config.gripperIcfTargetMinGapMm);
   config.gripperButtonFallback = jsonBoolValue(body, "buttonFallback", config.gripperButtonFallback);
   return config;
+}
+
+double effectiveGripperTargetMm(const appstation::hal::NativeTeleopConfig& config, double targetMm) {
+  const double stroke = (std::max)(0.001, config.gripper.strokeMm);
+  const double bounded = std::clamp(targetMm, 0.0, stroke);
+  if (!config.gripperIcfTargetProtectionEnabled) {
+    return bounded;
+  }
+  const double minGap = std::clamp(config.gripperIcfTargetMinGapMm, 0.0, stroke);
+  return std::clamp(bounded, minGap, stroke);
 }
 
 appstation::hal::Side parseSide(const std::string& value) {
@@ -814,42 +843,56 @@ void serveConnection(
         const auto bodyText = requestBody(request);
         const auto config = jsonNativeTeleopConfig(bodyText);
         nativeTeleop.configureGripper(config.gripper);
+        nativeTeleop.configureGripperProtection(
+            config.gripperIcfTargetProtectionEnabled,
+            config.gripperIcfTargetMinGapMm);
         const auto side = parseSide(jsonStringValue(bodyText, "side"));
         const auto targetMm = jsonNumberValue(bodyText, "targetMm", 0.0);
+        const auto effectiveTargetMm = effectiveGripperTargetMm(config, targetMm);
         const auto speed = static_cast<int>(jsonNumberValue(bodyText, "gripSpeed", config.gripper.speed));
         const auto torque = static_cast<int>(jsonNumberValue(bodyText, "gripTorque", config.gripper.torque));
         std::string message;
         if (!nativeTeleop.commandGripperTarget(side, targetMm, speed, torque, &message)) {
           throw std::runtime_error(message);
         }
-        body = "{\"ok\":true,\"message\":\"" + jsonEscape(message) + "\",\"targetMm\":" + std::to_string(targetMm) + "}";
+        body = "{\"ok\":true,\"message\":\"" + jsonEscape(message) + "\",\"targetMm\":"
+            + std::to_string(effectiveTargetMm) + "}";
       } else if (request.rfind("POST /motion/emergency_stop ", 0) == 0) {
+        nativeTeleop.stop();
         motion.emergencyStop();
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/home_all ", 0) == 0) {
+        const auto bodyText = requestBody(request);
+        const auto enabledAxes = jsonHomeAllEnabledAxes(bodyText);
         nativeTeleop.stop();
-        motion.enableSide(appstation::hal::Side::Left, true);
-        motion.enableSide(appstation::hal::Side::Right, true);
-        motion.homeAll(jsonWorkOriginPulse(requestBody(request)));
+        motion.enableHomeAxes(appstation::hal::Side::Left, enabledAxes[0]);
+        motion.enableHomeAxes(appstation::hal::Side::Right, enabledAxes[1]);
+        motion.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes);
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/home_origin_side ", 0) == 0) {
         const auto bodyText = requestBody(request);
         const auto side = parseSide(jsonStringValue(bodyText, "side"));
+        const auto enabledAxes = jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled);
         nativeTeleop.stop();
-        motion.enableSide(side, true);
-        motion.homeOriginSide(side, jsonSideWorkOriginPulse(bodyText));
+        motion.enableHomeAxes(side, enabledAxes);
+        motion.homeOriginSide(
+            side,
+            jsonSideWorkOriginPulse(bodyText),
+            enabledAxes);
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/enable_side ", 0) == 0) {
-        const auto side = parseSide(jsonStringValue(requestBody(request), "side"));
-        const auto message = motion.enableSide(side, true);
+        const auto bodyText = requestBody(request);
+        const auto side = parseSide(jsonStringValue(bodyText, "side"));
+        const auto message = motion.enableSide(side, true, jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled));
         body = "{\"ok\":true,\"message\":\"" + jsonEscape(message) + "\"}";
       } else if (request.rfind("POST /motion/disable_side ", 0) == 0) {
         const auto side = parseSide(jsonStringValue(requestBody(request), "side"));
         const auto message = motion.enableSide(side, false);
         body = "{\"ok\":true,\"message\":\"" + jsonEscape(message) + "\"}";
       } else if (request.rfind("POST /motion/home_side ", 0) == 0) {
-        const auto side = parseSide(jsonStringValue(requestBody(request), "side"));
-        motion.homeSide(side);
+        const auto bodyText = requestBody(request);
+        const auto side = parseSide(jsonStringValue(bodyText, "side"));
+        motion.homeSide(side, jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled));
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/manual_axis_move ", 0) == 0) {
         const auto bodyText = requestBody(request);

@@ -1,6 +1,7 @@
 import { Progress, Space, Tag } from 'antd'
 import { Bot, Camera, Gamepad2, Hand, RadioTower } from 'lucide-react'
 import { axisNames, forceChannels } from '../../data'
+import { teleopHandState, teleopHandValue } from '../../teleopStatus'
 import type { CameraTelemetry, ConnectionState, DiagnosticItem, TelemetryFrame, TelemetrySample } from '../../types'
 import { CameraPreview } from '../CameraPreview'
 import { ForceChart } from '../Charts'
@@ -41,7 +42,7 @@ export function ArmOverviewPanel({
   const forces = isLeft ? frame.forceLeft : frame.forceRight
   const forceDiag = diagnosticState(diagnostics, isLeft ? 'ati-left' : 'ati-right')
   const gripState = diagnosticState(diagnostics, 'gripper')
-  const teleopState = diagnosticState(diagnostics, 'omega7')
+  const teleopState = teleopHandState(frame, diagnostics, side)
   const forceNorm = forceMagnitude(forces)
   const gripperText = formatGripperPosition(frame.gripperPositions[isLeft ? 0 : 1])
   const riskState: ConnectionState = forceNorm > 2.4 || frame.dangerIndex > 0.65 ? 'warn' : 'ok'
@@ -86,7 +87,7 @@ export function ArmOverviewPanel({
       key: `${side}-teleop`,
       label: '遥操作主手',
       state: teleopState,
-      primary: isLeft ? '左 Omega.7 主手' : '右 Omega.7 主手',
+      primary: teleopHandValue(frame, side),
       secondary: '主从映射和离合器状态由 HAL 回报',
       metric: 'USB / SDK',
       group: '遥操作',

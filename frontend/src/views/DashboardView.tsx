@@ -7,6 +7,7 @@ import { AxisGroupChart, ForceChart } from '../components/Charts'
 import { MetricPill } from '../components/MetricPill'
 import { armHardwareSpecs } from '../data'
 import { useTelemetryStore } from '../stores/telemetry'
+import { teleopHandState, teleopHandValue, teleopPairState, teleopPairValue } from '../teleopStatus'
 import type { CameraTelemetry, ConnectionState, DiagnosticItem, TelemetryFrame, TelemetrySample } from '../types'
 
 const semanticAxes = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']
@@ -120,7 +121,7 @@ function GlobalHardwarePanel({
 }) {
   const navigate = useNavigate()
   const globalCamera = cameraByKey(frame.cameras, 'global')
-  const omegaState = diagnosticState(diagnostics, 'omega7')
+  const omegaState = teleopPairState(frame, diagnostics)
   const halState: ConnectionState = frame.halOk ? 'ok' : 'error'
   const safetyState: ConnectionState = frame.dangerIndex > 0.85 ? 'error' : frame.dangerIndex > 0.6 ? 'warn' : 'ok'
  /** 描述当前方法的功能边界。 */
@@ -159,7 +160,7 @@ function GlobalHardwarePanel({
           <HardwareStatusButton
             label="双 Omega.7 主手"
             state={omegaState}
-            value="左右主手枚举"
+            value={teleopPairValue(frame)}
             detail="Force Dimension SDK / USB 设备状态"
             icon={<Gamepad2 size={15} />}
             onClick={() => go('teleop-left')}
@@ -200,7 +201,7 @@ function ArmHardwarePanel({
   const forceValues = isLeft ? frame.forceLeft : frame.forceRight
   const forceState = diagnosticState(diagnostics, isLeft ? 'ati-left' : 'ati-right')
   const gripperState = diagnosticState(diagnostics, 'gripper')
-  const teleopState = diagnosticState(diagnostics, 'omega7')
+  const teleopState = teleopHandState(frame, diagnostics, side)
   const motionState: ConnectionState = frame.halOk ? 'ok' : 'error'
   const forceNorm = forceMagnitude(forceValues)
   const safetyState: ConnectionState = forceNorm > 2.5 || frame.dangerIndex > 0.65 ? 'warn' : 'ok'
@@ -224,7 +225,7 @@ function ArmHardwarePanel({
         <DeviceChip label="物理轴号" state={motionState} value={axisOrder} icon={<MapPinned size={14} />} onClick={() => go(isLeft ? 'motion-left' : 'motion-right')} />
         <DeviceChip label="Nano-17" state={forceState} value="mN" icon={<Waves size={14} />} onClick={() => go(isLeft ? 'force-left' : 'force-right')} />
         <DeviceChip label="夹爪" state={gripperState} value={gripperValue} icon={<Hand size={14} />} onClick={() => go(isLeft ? 'gripper-left' : 'gripper-right')} />
-        <DeviceChip label="主手" state={teleopState} value={isLeft ? '左 Omega.7' : '右 Omega.7'} icon={<Gamepad2 size={14} />} onClick={() => go(isLeft ? 'teleop-left' : 'teleop-right')} />
+        <DeviceChip label="主手" state={teleopState} value={teleopHandValue(frame, side)} icon={<Gamepad2 size={14} />} onClick={() => go(isLeft ? 'teleop-left' : 'teleop-right')} />
       </div>
 
       <div className="arm-hardware-layout">

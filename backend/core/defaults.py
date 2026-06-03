@@ -20,14 +20,15 @@ DEFAULT_MOTION_PROFILE: dict[str, Any] = {
 
 ICF_TELEOP_STRATEGY_VERSION = "e2e_omega7_native_v27_right_yaw333_com9_20260520"
 ICF_WORK_ORIGIN_VERSION = "icf_work_origin_20260521_rotation_limit_v2"
+ICF_HOME_REFERENCE_VERSION = "icf_home_reference_20260602_v1"
 
 ICF_CAMERA_DEFAULTS: dict[str, Any] = {
-    "global": "AR0234 / index 1",
-    "globalIdentity": "USB\\VID_1D6B&PID_0102&MI_00\\6&1E9A8698&0&0000",
-    "wristLeft": "IMX258 / index 2",
-    "wristLeftIdentity": "USB\\VID_0EDC&PID_3080&MI_00\\7&38B4EA25&0&0000",
-    "wristRight": "IMX258 / index 0",
-    "wristRightIdentity": "USB\\VID_0EDC&PID_3080&MI_00\\6&1BBFDB86&0&0000",
+    "global": "IMX335 / index 1",
+    "globalIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&124CCBA8&0&0000",
+    "wristLeft": "IMX335 / index 2",
+    "wristLeftIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&7861A93&0&0000",
+    "wristRight": "IMX335 / index 0",
+    "wristRightIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000",
     "previewResolution": "640x480",
     "globalResolution": "640x480",
     "wristLeftResolution": "640x480",
@@ -68,8 +69,8 @@ ICF_LEFT_MOTION_SOFT_LIMITS: dict[str, Any] = {
     "x": {"min": -25000, "max": 25000},
     "y": {"min": -37500, "max": 37500},
     "z": {"min": -37500, "max": 37500},
-    "roll": {"min": -100000, "max": 100000},
-    "pitch": {"min": -100000, "max": 100000},
+    "roll": {"min": -5000, "max": 95000},
+    "pitch": {"min": -30000, "max": 30000},
     "yaw": {"min": -7000, "max": 7000},
 }
 
@@ -77,8 +78,8 @@ ICF_RIGHT_MOTION_SOFT_LIMITS: dict[str, Any] = {
     "x": {"min": -25000, "max": 25000},
     "y": {"min": -37500, "max": 37500},
     "z": {"min": -37500, "max": 37500},
-    "roll": {"min": -90000, "max": 100000},
-    "pitch": {"min": -90000, "max": 90000},
+    "roll": {"min": -95000, "max": 5000},
+    "pitch": {"min": -30000, "max": 30000},
     "yaw": {"min": -7000, "max": 7000},
 }
 
@@ -101,10 +102,10 @@ ICF_KINEMATICS_DEFAULTS: dict[str, Any] = {
 }
 
 ICF_TELEOP_SOFT_LIMIT_UNIT_SPEC = ["um", "um", "um", "deg", "deg", "deg"]
-ICF_LEFT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -100.0, -100.0, -7.0]
-ICF_LEFT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 100.0, 100.0, 7.0]
-ICF_RIGHT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -90.0, -90.0, -7.0]
-ICF_RIGHT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 100.0, 90.0, 7.0]
+ICF_LEFT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -5.0, -30.0, -7.0]
+ICF_LEFT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 95.0, 30.0, 7.0]
+ICF_RIGHT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -95.0, -30.0, -7.0]
+ICF_RIGHT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 5.0, 30.0, 7.0]
 
 ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "engine": "hal_native",
@@ -143,8 +144,8 @@ ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "leftRotationScale": 1.0,
     "rightRotationScale": 1.0,
     "homeBeforeStart": True,
-    "leftAxisOutputScale": [0.40, 0.25, 0.25, 0.40, 0.20, 0.20],
-    "rightAxisOutputScale": [0.40, 0.25, 0.25, 0.40, 0.20, 0.20],
+    "leftAxisOutputScale": [0.40, 0.25, 0.25, 0.40, 0.08, 0.10],
+    "rightAxisOutputScale": [0.40, 0.25, 0.25, 0.35, 0.08, 0.15],
     "translationDeadzone": 0.00002,
     "rotationDeadzone": 0.03,
     "incrementalTranslationMinEffectiveDelta": 0.000025,
@@ -193,6 +194,29 @@ ICF_WORK_ORIGIN_DEFAULTS: dict[str, Any] = {
     "previousLeftPulse": [258494.0, -200013.0, 274821.0, 49833.0, 84839.0, 381102.0],
     "previousRightPulse": [99771.0, 382485.0, 881208.0, 19527.0, -175123.0, -7412.0],
     "previousUpdatedAt": 1779190104000,
+}
+
+ICF_HOME_REFERENCE_DEFAULTS: dict[str, Any] = {
+    "valid": True,
+    "leftValid": True,
+    "rightValid": True,
+    "leftPulse": list(ICF_WORK_ORIGIN_DEFAULTS["leftPulse"]),
+    "rightPulse": list(ICF_WORK_ORIGIN_DEFAULTS["rightPulse"]),
+    "updatedAt": ICF_WORK_ORIGIN_DEFAULTS["updatedAt"],
+}
+
+ICF_WORK_ORIGIN_OFFSET_DEFAULTS: dict[str, Any] = {
+    "valid": True,
+    "leftValid": True,
+    "rightValid": True,
+    "leftPulseDelta": [0.0] * 6,
+    "rightPulseDelta": [0.0] * 6,
+    "updatedAt": ICF_WORK_ORIGIN_DEFAULTS["updatedAt"],
+}
+
+ICF_RELATIVE_SOFT_LIMIT_DEFAULTS: dict[str, Any] = {
+    "left": deepcopy(ICF_LEFT_MOTION_SOFT_LIMITS),
+    "right": deepcopy(ICF_RIGHT_MOTION_SOFT_LIMITS),
 }
 
 
@@ -307,7 +331,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "yawSoftLimitDeg": 7,
         "positionSource": "dmc_get_position",
         "workOriginStrategyVersion": ICF_WORK_ORIGIN_VERSION,
+        "homeReferenceVersion": ICF_HOME_REFERENCE_VERSION,
         "origin": deepcopy(ICF_WORK_ORIGIN_DEFAULTS),
+        "homeReference": deepcopy(ICF_HOME_REFERENCE_DEFAULTS),
+        "workOriginOffset": deepcopy(ICF_WORK_ORIGIN_OFFSET_DEFAULTS),
+        "relativeSoftLimits": deepcopy(ICF_RELATIVE_SOFT_LIMIT_DEFAULTS),
         "homeOnStartup": {
             "enabled": False,
             "mode": "work_origin",
@@ -333,11 +361,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "commandForceLimitN": 8,
         "commandSpeed": 10,
         "commandTorque": 1,
+        "icfTargetProtectionEnabled": True,
+        "icfTargetMinGapMm": 1.02,
         "sampleMode": "dual_worker",
         "sampleHz": 30,
         "sampleStaleMs": 500,
         "sampleEnableOnNegative": True,
         "workerCommandTimeoutSec": 2.0,
+        "processWorkersEnabled": True,
+        "jodellWorkerExePath": "",
         "forceFeedbackAvailable": False,
         "jodellDllPath": (
             "F:/E2EAPP_MicroMani/backend/vendor/jodell/jodellTool.dll"
@@ -372,7 +404,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "rotationVelocityDegS": 0.5,
     },
     "picoVision": {
-        "ip": "10.90.132.174",
+        "ip": "10.90.129.166",
         "adbPort": 5555,
         "videoPort": 12345,
         "commandPort": 13579,
@@ -380,8 +412,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ifIndex": 13,
         "rotation": "ccw90",
         "cameraSource": "global",
-        "scriptsDir": "F:/ICFNewProject/PicoWirelessTools",
-        "senderBuildDir": "F:/ICFNewProject/QSerialTest3.0/QSerialTest/QSerialTest/tools/pico_mono_sender/build",
+        "scriptsDir": "F:/ICFNewProject - 副本/QSerialTest3.0/QSerialTest/QSerialTest/tools/pico_mono_sender/build",
+        "senderBuildDir": "F:/ICFNewProject - 副本/QSerialTest3.0/QSerialTest/QSerialTest/tools/pico_mono_sender/build",
     },
     "teleop": {
         "coarse": 1,
@@ -413,14 +445,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "openThreshold": 0.30,
             "closeThreshold": 0.70,
             "gripSpeed": 255,
-            "gripTorque": 192,
+            "gripTorque": 1,
             "positionDeadbandCounts": 1,
             "minCommandIntervalMs": 20,
             "autoGapCalibration": True,
             "autoGapMinSpanMm": 2.0,
             "autoGapMarginMm": 1.0,
             "releaseSpeed": 255,
-            "releaseTorque": 64,
+            "releaseTorque": 1,
             "leftSourceHand": "PhysicalRight",
             "rightSourceHand": "PhysicalLeft",
             "objectDetectMargin": 10,

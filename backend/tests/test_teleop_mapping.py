@@ -7,9 +7,14 @@ from typing import Any
 import pytest
 
 from backend.core.config import SettingsService
-from backend.core.defaults import ICF_TELEOP_STRATEGY_VERSION, ICF_WORK_ORIGIN_VERSION, default_config
+from backend.core.defaults import (
+    ICF_HOME_REFERENCE_VERSION,
+    ICF_TELEOP_STRATEGY_VERSION,
+    ICF_WORK_ORIGIN_VERSION,
+    default_config,
+)
 from backend.core.logging import LogService
-from backend.core.motion_limits import effective_limits_ui, side_origin_ui
+from backend.core.motion_limits import effective_limits_ui, rotation_work_limits_ui, side_origin_ui
 from backend.services.teleop_mapping import TeleopMappingService
 
 
@@ -248,8 +253,8 @@ def test_native_teleop_start_configures_and_starts_hal_controller(monkeypatch: p
         assert start_payload["rightTranslationScale"] == 1.0
         assert start_payload["leftRotationScale"] == 1.0
         assert start_payload["rightRotationScale"] == 1.0
-        assert start_payload["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
-        assert start_payload["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
+        assert start_payload["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.08, 0.10]
+        assert start_payload["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.35, 0.08, 0.15]
         assert start_payload["leftImpulseCoeff"] == [-5000000, 5000000, -10000000, 1667, -2500, -333.3333]
         assert start_payload["rightImpulseCoeff"] == [-5000000, -10000000, -5000000, 1667, 2500, 3333.333]
         assert start_payload["gripperTeleopEnabled"] is True
@@ -496,6 +501,35 @@ def test_native_teleop_status_feeds_dataset_action_history(monkeypatch: pytest.M
         assert status["lastAction"]["deltaVector"][6] == 10.0
         assert status["actionHistory"][0]["sourceSide"] == "left"
         assert status["blockers"]["left"]["state"] == "active"
+
+    asyncio.run(run())
+
+
+def test_native_status_loop_uses_gripper_sample_rate_for_recording(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def run() -> None:
+        hal = FakeHal()
+        config = start_config(engine="hal_native")
+        config["gripper"]["sampleHz"] = 30
+        config["teleop"]["commandIntervalMs"] = 10
+        mapper = TeleopMappingService(settings=FakeSettings(config), hal=hal, logs=LogService())
+        mapper._stop_event = asyncio.Event()
+        delays: list[float] = []
+
+        async def fake_refresh() -> None:
+            assert mapper._stop_event is not None
+            mapper._stop_event.set()
+
+        async def fake_sleep(delay: float) -> None:
+            delays.append(delay)
+
+        monkeypatch.setattr(mapper, "_refresh_native_status", fake_refresh)
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        await mapper._run_native_status_loop()
+
+        assert delays == pytest.approx([1.0 / 30.0])
 
     asyncio.run(run())
 
@@ -856,17 +890,19 @@ def test_teleop_start_returns_to_work_origin_before_real_mapper(monkeypatch: pyt
         assert hal.commands[:3] == [
             (
                 "motion.enable_side",
-                {"side": "left"},
+                {"side": "left", "enabledAxes": [True, True, True, True, True, True]},
             ),
             (
                 "motion.enable_side",
-                {"side": "right"},
+                {"side": "right", "enabledAxes": [True, True, True, True, True, False]},
             ),
             (
                 "motion.home_all",
                 {
                     "leftPulse": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
                     "rightPulse": [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+                    "leftEnabledAxes": [True, True, True, True, True, True],
+                    "rightEnabledAxes": [True, True, True, True, True, False],
                 },
             ),
         ]
@@ -887,13 +923,14 @@ def test_teleop_start_returns_requested_side_to_origin_before_real_mapper(monkey
         assert hal.commands[:2] == [
             (
                 "motion.enable_side",
-                {"side": "right"},
+                {"side": "right", "enabledAxes": [True, True, True, True, True, False]},
             ),
             (
                 "motion.home_origin_side",
                 {
                     "side": "right",
                     "pulse": [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+                    "enabledAxes": [True, True, True, True, True, False],
                 },
             ),
         ]
@@ -1442,6 +1479,19 @@ def test_hal_native_payload_sends_kalman_filter_toggle() -> None:
     assert payload["kalmanRotationIntentVelocityThreshold"] == 0.7
 
 
+def test_hal_native_payload_enables_isolated_gripper_workers_by_default() -> None:
+    config = start_config(engine="hal_native")
+    config["gripper"]["jodellWorkerExePath"] = "F:/custom/JodellGripperWorker.exe"
+    config["gripper"]["workerCommandTimeoutSec"] = 1.5
+    mapper = TeleopMappingService(settings=FakeSettings(config), hal=FakeHal(), logs=LogService())
+
+    payload = mapper._native_payload(config)
+
+    assert payload["gripperProcessWorkersEnabled"] is True
+    assert payload["jodellWorkerExePath"] == "F:/custom/JodellGripperWorker.exe"
+    assert payload["gripperWorkerCommandTimeoutMs"] == 1500.0
+
+
 def test_hal_native_payload_disables_translation_limits_and_sends_rotation_work_window() -> None:
     config = start_config(engine="hal_native")
     config["motion"]["leftSoftLimits"] = {
@@ -1549,8 +1599,8 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
     assert config["teleop"]["leftRotationScale"] == 1.0
     assert config["teleop"]["rightRotationScale"] == 1.0
     assert config["teleop"]["mappingMode"] == "direct"
-    assert config["teleop"]["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
-    assert config["teleop"]["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
+    assert config["teleop"]["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.08, 0.10]
+    assert config["teleop"]["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.35, 0.08, 0.15]
     assert config["teleop"]["translationStepLimitPulse"] == 4000
     assert config["teleop"]["rotationStepLimitPulse"] == 1250
     assert config["teleop"]["translationPulseDeadband"] == 2
@@ -1574,16 +1624,16 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
         -25000.0,
         -37500.0,
         -37500.0,
-        -100.0,
-        -100.0,
+        -5.0,
+        -30.0,
         -7.0,
     ]
     assert config["teleop"]["leftSoftLimitMax"] == [
         25000.0,
         37500.0,
         37500.0,
-        100.0,
-        100.0,
+        95.0,
+        30.0,
         7.0,
     ]
     assert config["teleop"]["rightEnabledAxes"] == [True, True, True, True, True, False]
@@ -1591,16 +1641,16 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
         -25000.0,
         -37500.0,
         -37500.0,
-        -90.0,
-        -90.0,
+        -95.0,
+        -30.0,
         -7.0,
     ]
     assert config["teleop"]["rightSoftLimitMax"] == [
         25000.0,
         37500.0,
         37500.0,
-        100.0,
-        90.0,
+        5.0,
+        30.0,
         7.0,
     ]
     assert config["teleop"]["leftImpulseCoeff"] == [-5000000, 5000000, -10000000, 1667, -2500, -333.3333]
@@ -1609,11 +1659,11 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
     assert config["teleop"]["rightDirectionSign"] == [1, 1, -1, 1, 1, 1]
     assert config["teleop"]["syncImpulseCoeffFromKinematics"] is False
     assert config["motion"]["rotationWorkLimits"]["enabled"] is True
-    assert config["motion"]["rotationWorkLimits"]["left"]["roll"] == {"min": -100.0, "max": 100.0}
-    assert config["motion"]["rotationWorkLimits"]["left"]["pitch"] == {"min": -100.0, "max": 100.0}
+    assert config["motion"]["rotationWorkLimits"]["left"]["roll"] == {"min": -5.0, "max": 95.0}
+    assert config["motion"]["rotationWorkLimits"]["left"]["pitch"] == {"min": -30.0, "max": 30.0}
     assert config["motion"]["rotationWorkLimits"]["left"]["yaw"] == {"min": -7.0, "max": 7.0}
-    assert config["motion"]["rotationWorkLimits"]["right"]["roll"] == {"min": -90.0, "max": 100.0}
-    assert config["motion"]["rotationWorkLimits"]["right"]["pitch"] == {"min": -90.0, "max": 90.0}
+    assert config["motion"]["rotationWorkLimits"]["right"]["roll"] == {"min": -95.0, "max": 5.0}
+    assert config["motion"]["rotationWorkLimits"]["right"]["pitch"] == {"min": -30.0, "max": 30.0}
     assert config["motion"]["leftSoftLimits"]["x"] == {"min": -25000.0, "max": 25000.0}
     assert config["motion"]["leftSoftLimits"]["y"] == {"min": -37500.0, "max": 37500.0}
     assert config["motion"]["leftSoftLimits"]["z"] == {"min": -37500.0, "max": 37500.0}
@@ -1621,10 +1671,10 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
     assert config["motion"]["rightSoftLimits"]["y"] == {"min": -37500.0, "max": 37500.0}
     assert config["motion"]["rightSoftLimits"]["z"] == {"min": -37500.0, "max": 37500.0}
     assert config["motion"]["leftSoftLimits"]["roll"] == pytest.approx(
-        {"min": -70100.2, "max": 129899.8}
+        {"min": 24899.8, "max": 124899.8}
     )
     assert config["motion"]["leftSoftLimits"]["pitch"] == pytest.approx(
-        {"min": -133935.6, "max": 66064.4}
+        {"min": -63935.6, "max": -3935.6}
     )
     assert config["motion"]["leftSoftLimits"]["yaw"] == pytest.approx(
         {"min": -121330.611, "max": -107330.611}
@@ -1670,14 +1720,98 @@ def test_settings_migration_updates_prior_right_roll_negative_only_window(tmp_pa
 
     migrated = SettingsService(runtime_dir, LogService()).get_config()
 
-    assert migrated["teleop"]["rightSoftLimitMin"][3] == -90.0
-    assert migrated["teleop"]["rightSoftLimitMax"][3] == 100.0
-    assert migrated["motion"]["rotationWorkLimits"]["right"]["roll"] == {"min": -90.0, "max": 100.0}
+    assert migrated["teleop"]["rightSoftLimitMin"][3] == -95.0
+    assert migrated["teleop"]["rightSoftLimitMax"][3] == 5.0
+    assert migrated["motion"]["rotationWorkLimits"]["right"]["roll"] == {"min": -95.0, "max": 5.0}
     origin = side_origin_ui(migrated, "right")
     assert origin is not None
     limits = effective_limits_ui(migrated, "right")
-    assert limits[3].min - origin[3] == pytest.approx(-90.0, abs=1e-6)
-    assert limits[3].max - origin[3] == pytest.approx(100.0, abs=1e-6)
+    assert limits[3].min - origin[3] == pytest.approx(-95.0, abs=1e-6)
+    assert limits[3].max - origin[3] == pytest.approx(5.0, abs=1e-6)
+
+
+def test_settings_migration_reanchors_stale_right_roll_window_to_current_origin(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["motion"]["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
+    config["motion"]["origin"]["rightPulse"][3] = -674_985.0
+    config["motion"]["origin"]["rightValid"] = True
+    config["motion"]["origin"]["valid"] = True
+    config["motion"]["rightSoftLimits"]["roll"] = {
+        "min": -78_283.80000234324,
+        "max": 111_716.19999765676,
+    }
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    origin = side_origin_ui(migrated, "right")
+    assert origin is not None
+    limits = effective_limits_ui(migrated, "right")
+    assert limits[3].min < origin[3] < limits[3].max
+    assert limits[3].min == pytest.approx(origin[3] - 95.0, abs=1e-6)
+    assert limits[3].max == pytest.approx(origin[3] + 5.0, abs=1e-6)
+
+
+def test_settings_migration_reanchors_stale_left_yaw_limit_to_current_origin(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["motion"]["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
+    config["motion"]["origin"]["leftPulse"][5] = 1393.0
+    config["motion"]["origin"]["leftValid"] = True
+    config["motion"]["origin"]["valid"] = True
+    config["motion"]["leftSoftLimits"]["yaw"] = {"min": -121_330.61143306113, "max": -107_330.61143306113}
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    origin = side_origin_ui(migrated, "left")
+    assert origin is not None
+    limits = effective_limits_ui(migrated, "left")
+    assert limits[5].min < origin[5] < limits[5].max
+    assert limits[5].min == pytest.approx(origin[5] - 7.0)
+    assert limits[5].max == pytest.approx(origin[5] + 7.0)
+    assert migrated["teleop"]["leftEnabledAxes"][5] is True
+    assert migrated["teleop"]["rightEnabledAxes"][5] is False
+
+
+def test_settings_migration_adds_home_reference_model_and_reanchors_stale_left_roll(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["motion"]["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
+    config["motion"].pop("homeReferenceVersion", None)
+    config["motion"].pop("homeReference", None)
+    config["motion"].pop("workOriginOffset", None)
+    config["motion"].pop("relativeSoftLimits", None)
+    config["motion"]["origin"]["leftPulse"] = [100686.0, 66003.0, -68716.0, -152667.0, 5073.0, -297.0]
+    config["motion"]["origin"]["leftValid"] = True
+    config["motion"]["origin"]["valid"] = True
+    config["motion"]["leftSoftLimits"]["roll"] = {
+        "min": -70100.20000597996,
+        "max": 129899.79999402004,
+    }
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert migrated["motion"]["homeReferenceVersion"] == ICF_HOME_REFERENCE_VERSION
+    assert migrated["motion"]["homeReference"]["leftPulse"] == config["motion"]["origin"]["leftPulse"]
+    assert migrated["motion"]["homeReference"]["leftValid"] is True
+    assert migrated["motion"]["workOriginOffset"]["leftPulseDelta"] == [0.0] * 6
+    assert migrated["motion"]["workOriginOffset"]["leftValid"] is True
+    assert migrated["motion"]["relativeSoftLimits"]["left"]["roll"] == {"min": -5000.0, "max": 95000.0}
+    origin = side_origin_ui(migrated, "left")
+    assert origin is not None
+    limits = effective_limits_ui(migrated, "left")
+    assert limits[3].min < origin[3] < limits[3].max
+    assert limits[3].min == pytest.approx(origin[3] - 5.0, abs=1e-6)
+    assert limits[3].max == pytest.approx(origin[3] + 95.0, abs=1e-6)
 
 
 def test_settings_migration_updates_prior_right_pitch_window_and_yaw_axis(tmp_path: Any) -> None:
@@ -1701,14 +1835,61 @@ def test_settings_migration_updates_prior_right_pitch_window_and_yaw_axis(tmp_pa
     migrated = SettingsService(runtime_dir, LogService()).get_config()
 
     assert migrated["teleop"]["rightEnabledAxes"] == [True, True, True, True, True, False]
-    assert migrated["teleop"]["rightSoftLimitMin"][4] == -90.0
-    assert migrated["teleop"]["rightSoftLimitMax"][4] == 90.0
-    assert migrated["motion"]["rotationWorkLimits"]["right"]["pitch"] == {"min": -90.0, "max": 90.0}
+    assert migrated["teleop"]["rightSoftLimitMin"][4] == -30.0
+    assert migrated["teleop"]["rightSoftLimitMax"][4] == 30.0
+    assert migrated["motion"]["rotationWorkLimits"]["right"]["pitch"] == {"min": -30.0, "max": 30.0}
     limits = effective_limits_ui(migrated, "right")
     migrated_origin = side_origin_ui(migrated, "right")
     assert migrated_origin is not None
-    assert limits[4].min - migrated_origin[4] == pytest.approx(-90.0, abs=1e-6)
-    assert limits[4].max - migrated_origin[4] == pytest.approx(90.0, abs=1e-6)
+    assert limits[4].min - migrated_origin[4] == pytest.approx(-30.0, abs=1e-6)
+    assert limits[4].max - migrated_origin[4] == pytest.approx(30.0, abs=1e-6)
+
+
+def test_rotation_work_limit_missing_axis_defaults_to_icf_window() -> None:
+    config = default_config()
+    config["motion"]["rotationWorkLimits"]["left"].pop("roll")
+    config["motion"]["rotationWorkLimits"]["right"].pop("roll")
+    config["motion"]["rotationWorkLimits"]["right"].pop("pitch")
+
+    left_limits = rotation_work_limits_ui(config, "left")
+    right_limits = rotation_work_limits_ui(config, "right")
+
+    assert left_limits[3].min == -5.0
+    assert left_limits[3].max == 95.0
+    assert right_limits[3].min == -95.0
+    assert right_limits[3].max == 5.0
+    assert right_limits[4].min == -30.0
+    assert right_limits[4].max == 30.0
+
+
+def test_settings_migration_updates_current_axis_output_defaults_to_slower_wrist_rates(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["teleop"]["leftAxisOutputScale"] = [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
+    config["teleop"]["rightAxisOutputScale"] = [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert migrated["teleop"]["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.08, 0.10]
+    assert migrated["teleop"]["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.35, 0.08, 0.15]
+
+
+def test_settings_migration_updates_prior_pitch_yaw_axis_output_defaults_to_current_tuning(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["teleop"]["leftAxisOutputScale"] = [0.40, 0.25, 0.25, 0.40, 0.10, 0.15]
+    config["teleop"]["rightAxisOutputScale"] = [0.40, 0.25, 0.25, 0.40, 0.10, 0.15]
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert migrated["teleop"]["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.08, 0.10]
+    assert migrated["teleop"]["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.35, 0.08, 0.15]
 
 
 def test_settings_preserves_current_strategy_mechanical_soft_limits_when_origin_changes(tmp_path: Any) -> None:
@@ -1752,12 +1933,28 @@ def test_settings_migration_updates_legacy_reversed_wrist_cameras(tmp_path: Any)
 
     config = SettingsService(runtime_dir, LogService()).get_config()
 
-    assert config["cameras"]["global"] == "AR0234 / index 1"
-    assert config["cameras"]["globalIdentity"] == "USB\\VID_1D6B&PID_0102&MI_00\\6&1E9A8698&0&0000"
-    assert config["cameras"]["wristLeft"] == "IMX258 / index 2"
-    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0EDC&PID_3080&MI_00\\7&38B4EA25&0&0000"
-    assert config["cameras"]["wristRight"] == "IMX258 / index 0"
-    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0EDC&PID_3080&MI_00\\6&1BBFDB86&0&0000"
+    assert config["cameras"]["global"] == "IMX335 / index 1"
+    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&124CCBA8&0&0000"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 2"
+    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&7861A93&0&0000"
+    assert config["cameras"]["wristRight"] == "IMX335 / index 0"
+    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
+
+
+def test_settings_migration_updates_previous_imx258_camera_defaults(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    old_config = default_config()
+    old_config["cameras"]["global"] = "AR0234 / index 1"
+    old_config["cameras"]["wristLeft"] = "IMX258 / index 2"
+    old_config["cameras"]["wristRight"] = "IMX258 / index 0"
+    (runtime_dir / "config.json").write_text(json.dumps(old_config), encoding="utf-8")
+
+    config = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert config["cameras"]["global"] == "IMX335 / index 1"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 2"
+    assert config["cameras"]["wristRight"] == "IMX335 / index 0"
 
 
 def test_settings_migration_updates_cyclic_camera_roles(tmp_path: Any) -> None:
@@ -1771,6 +1968,6 @@ def test_settings_migration_updates_cyclic_camera_roles(tmp_path: Any) -> None:
 
     config = SettingsService(runtime_dir, LogService()).get_config()
 
-    assert config["cameras"]["global"] == "AR0234 / index 1"
-    assert config["cameras"]["wristLeft"] == "IMX258 / index 2"
-    assert config["cameras"]["wristRight"] == "IMX258 / index 0"
+    assert config["cameras"]["global"] == "IMX335 / index 1"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 2"
+    assert config["cameras"]["wristRight"] == "IMX335 / index 0"

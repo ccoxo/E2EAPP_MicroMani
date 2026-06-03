@@ -8,14 +8,17 @@ from typing import Any, cast
 from backend.core.defaults import (
     DEFAULT_SOFT_LIMITS,
     ICF_CAMERA_DEFAULTS,
+    ICF_HOME_REFERENCE_VERSION,
     ICF_KINEMATICS_DEFAULTS,
     ICF_LEFT_MOTION_MECHANICAL_LIMITS,
     ICF_LEFT_MOTION_SOFT_LIMITS,
+    ICF_RELATIVE_SOFT_LIMIT_DEFAULTS,
     ICF_RIGHT_MOTION_MECHANICAL_LIMITS,
     ICF_RIGHT_MOTION_SOFT_LIMITS,
     ICF_ROTATION_WORK_LIMIT_DEFAULTS,
     ICF_TELEOP_DEFAULTS,
     ICF_TELEOP_STRATEGY_VERSION,
+    ICF_WORK_ORIGIN_OFFSET_DEFAULTS,
     ICF_WORK_ORIGIN_DEFAULTS,
     ICF_WORK_ORIGIN_VERSION,
     anchored_mechanical_soft_limits,
@@ -23,7 +26,7 @@ from backend.core.defaults import (
     rotation_work_limits_from_soft_limits,
 )
 from backend.core.logging import LogService, now_ms, stable_config_hash
-from backend.core.motion_limits import ui_limit_to_config
+from backend.core.motion_limits import WorkOriginMissing, effective_limits_ui, side_origin_ui, ui_limit_to_config
 from backend.core.schemas import (
     AppConfig,
     MotionCardSnapshotConfig,
@@ -75,6 +78,131 @@ def _relative_soft_limits_from_teleop(config: dict[str, Any], side: str) -> dict
         return json.loads(json.dumps(fallback))
 
 
+def _six_float_list(value: Any, fallback: list[float] | None = None) -> list[float]:
+    if isinstance(value, list):
+        try:
+            values = [float(item) for item in value[:6]]
+            return values + [0.0] * max(0, 6 - len(values))
+        except (TypeError, ValueError):
+            pass
+    return list(fallback) if fallback is not None else [0.0] * 6
+
+
+def _side_valid(root: dict[str, Any], side: str) -> bool:
+    key = "leftValid" if side == "left" else "rightValid"
+    return bool(root.get(key, root.get("valid", False)))
+
+
+def _relative_soft_limits_from_motion(config: dict[str, Any], side: str) -> dict[str, Any]:
+    motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+    relative = motion.get("relativeSoftLimits", {}) if isinstance(motion, dict) else {}
+    raw_side = relative.get(side) if isinstance(relative, dict) else None
+    fallback = _relative_soft_limits_from_teleop(config, side)
+    if not isinstance(raw_side, dict):
+        return fallback
+    normalized: dict[str, Any] = {}
+    try:
+        for axis_key in AXIS_KEYS:
+            raw_axis = raw_side.get(axis_key)
+            if not isinstance(raw_axis, dict):
+                raise ValueError(axis_key)
+            normalized[axis_key] = {
+                "min": float(raw_axis["min"]),
+                "max": float(raw_axis["max"]),
+            }
+    except (KeyError, TypeError, ValueError):
+        return fallback
+    return normalized
+
+
+def _ensure_home_reference_model(config: dict[str, Any], has_current_home_reference_strategy: bool) -> None:
+    motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+    if not isinstance(motion, dict):
+        return
+    origin = motion.get("origin", {}) if isinstance(motion.get("origin"), dict) else {}
+    raw_reference = motion.get("homeReference") if has_current_home_reference_strategy else {}
+    raw_offset = motion.get("workOriginOffset") if has_current_home_reference_strategy else {}
+    reference = raw_reference if isinstance(raw_reference, dict) else {}
+    offset = raw_offset if isinstance(raw_offset, dict) else {}
+    default_reference = ICF_WORK_ORIGIN_DEFAULTS
+    default_offset = ICF_WORK_ORIGIN_OFFSET_DEFAULTS
+    updated_at = reference.get("updatedAt", origin.get("updatedAt", default_reference["updatedAt"]))
+    offset_updated_at = offset.get("updatedAt", origin.get("updatedAt", default_offset["updatedAt"]))
+    try:
+        updated_at = int(updated_at)
+    except (TypeError, ValueError):
+        updated_at = int(default_reference["updatedAt"])
+    try:
+        offset_updated_at = int(offset_updated_at)
+    except (TypeError, ValueError):
+        offset_updated_at = int(default_offset["updatedAt"])
+
+    next_reference: dict[str, Any] = {"updatedAt": updated_at}
+    next_offset: dict[str, Any] = {"updatedAt": offset_updated_at}
+    for side in ("left", "right"):
+        pulse_key = "leftPulse" if side == "left" else "rightPulse"
+        delta_key = "leftPulseDelta" if side == "left" else "rightPulseDelta"
+        valid_key = "leftValid" if side == "left" else "rightValid"
+        default_pulse = list(default_reference[pulse_key])
+        if has_current_home_reference_strategy:
+            side_reference = _six_float_list(reference.get(pulse_key), default_pulse)
+            side_offset = _six_float_list(offset.get(delta_key), list(default_offset[delta_key]))
+            side_reference_valid = _side_valid(reference, side)
+            side_offset_valid = _side_valid(offset, side)
+        else:
+            side_reference = _six_float_list(origin.get(pulse_key), default_pulse)
+            side_offset = [0.0] * 6
+            side_reference_valid = _side_valid(origin, side)
+            side_offset_valid = side_reference_valid
+        next_reference[pulse_key] = side_reference
+        next_reference[valid_key] = side_reference_valid
+        next_offset[delta_key] = side_offset
+        next_offset[valid_key] = side_offset_valid
+    next_reference["valid"] = bool(next_reference["leftValid"] and next_reference["rightValid"])
+    next_offset["valid"] = bool(next_offset["leftValid"] and next_offset["rightValid"])
+    motion["homeReferenceVersion"] = ICF_HOME_REFERENCE_VERSION
+    motion["homeReference"] = next_reference
+    motion["workOriginOffset"] = next_offset
+
+    motion["relativeSoftLimits"] = {
+        "left": (
+            _relative_soft_limits_from_motion(config, "left")
+            if has_current_home_reference_strategy
+            else _relative_soft_limits_from_teleop(config, "left")
+        ),
+        "right": (
+            _relative_soft_limits_from_motion(config, "right")
+            if has_current_home_reference_strategy
+            else _relative_soft_limits_from_teleop(config, "right")
+        ),
+    }
+    for side in ("left", "right"):
+        if not isinstance(motion["relativeSoftLimits"].get(side), dict):
+            motion["relativeSoftLimits"][side] = json.loads(json.dumps(ICF_RELATIVE_SOFT_LIMIT_DEFAULTS[side]))
+
+
+def _origin_outside_effective_limits(config: dict[str, Any], side: str) -> bool:
+    origin = side_origin_ui(config, side)
+    if origin is None:
+        return False
+    try:
+        limits = effective_limits_ui(config, side)
+    except WorkOriginMissing:
+        return False
+    for axis_index in range(3, 6):
+        limit = limits[axis_index]
+        target = origin[axis_index]
+        if limit.min > limit.max or target < limit.min or target > limit.max:
+            return True
+    return False
+
+
+def _reanchor_stale_origin_windows(config: dict[str, Any]) -> None:
+    for side in ("left", "right"):
+        if _origin_outside_effective_limits(config, side):
+            reanchor_motion_soft_limits_to_current_origin(config, side)
+
+
 def reanchor_motion_soft_limits_to_current_origin(config: dict[str, Any], side: str | None = None) -> None:
     motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
     origin = motion.get("origin", {}) if isinstance(motion, dict) else {}
@@ -98,7 +226,7 @@ def reanchor_motion_soft_limits_to_current_origin(config: dict[str, Any], side: 
             continue
         try:
             next_limits = anchored_mechanical_soft_limits(
-                _relative_soft_limits_from_teleop(config, active_side),
+                _relative_soft_limits_from_motion(config, active_side),
                 [float(value) for value in origin_pulse[:6]],
                 [float(value) for value in signed_pulse_per_unit[:6]],
             )
@@ -126,22 +254,31 @@ def _float_close(value: Any, expected: float, tolerance: float = 1e-6) -> bool:
 def _right_axis_limits_for_current_origin(
     config: dict[str, Any], axis_index: int, min_deg: float, max_deg: float
 ) -> dict[str, float] | None:
+    return _side_axis_limits_for_current_origin(config, "right", axis_index, min_deg, max_deg)
+
+
+def _side_axis_limits_for_current_origin(
+    config: dict[str, Any], side: str, axis_index: int, min_deg: float, max_deg: float
+) -> dict[str, float] | None:
     motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
     origin = motion.get("origin", {}) if isinstance(motion, dict) else {}
     kinematics = motion.get("kinematics", {}) if isinstance(motion, dict) else {}
-    right_pulse = origin.get("rightPulse") if isinstance(origin, dict) else None
-    right_signed = kinematics.get("rightSignedPulsePerUnit") if isinstance(kinematics, dict) else None
+    valid_key = "leftValid" if side == "left" else "rightValid"
+    pulse_key = "leftPulse" if side == "left" else "rightPulse"
+    signed_key = "leftSignedPulsePerUnit" if side == "left" else "rightSignedPulsePerUnit"
+    side_pulse = origin.get(pulse_key) if isinstance(origin, dict) else None
+    side_signed = kinematics.get(signed_key) if isinstance(kinematics, dict) else None
     if (
         not isinstance(origin, dict)
-        or not bool(origin.get("rightValid", origin.get("valid", False)))
-        or not isinstance(right_pulse, list)
-        or len(right_pulse) <= axis_index
-        or not isinstance(right_signed, list)
-        or len(right_signed) <= axis_index
+        or not bool(origin.get(valid_key, origin.get("valid", False)))
+        or not isinstance(side_pulse, list)
+        or len(side_pulse) <= axis_index
+        or not isinstance(side_signed, list)
+        or len(side_signed) <= axis_index
     ):
         return None
     try:
-        origin_deg = float(right_pulse[axis_index]) / float(right_signed[axis_index])
+        origin_deg = float(side_pulse[axis_index]) / float(side_signed[axis_index])
     except (TypeError, ValueError, ZeroDivisionError):
         return None
     return {
@@ -162,6 +299,36 @@ def _normalize_right_yaw_disabled(config: dict[str, Any]) -> None:
     teleop["rightEnabledAxes"] = axes
 
 
+def _normalize_left_yaw_window(config: dict[str, Any]) -> None:
+    motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+    work_limits = motion.get("rotationWorkLimits", {}) if isinstance(motion, dict) else {}
+    left_work = work_limits.get("left", {}) if isinstance(work_limits, dict) else {}
+    left_yaw_work = left_work.get("yaw", {}) if isinstance(left_work, dict) else {}
+    if not (
+        isinstance(left_yaw_work, dict)
+        and _float_close(left_yaw_work.get("min"), -7.0)
+        and _float_close(left_yaw_work.get("max"), 7.0)
+    ):
+        return
+    next_limits = _side_axis_limits_for_current_origin(config, "left", 5, -7.0, 7.0)
+    if next_limits is None:
+        return
+    left_soft_limits = motion.get("leftSoftLimits", {}) if isinstance(motion, dict) else {}
+    left_yaw_soft = left_soft_limits.get("yaw", {}) if isinstance(left_soft_limits, dict) else {}
+    if not isinstance(left_yaw_soft, dict):
+        return
+    try:
+        origin_deg = (float(next_limits["min"]) / 1000.0) + 7.0
+        current_min = float(left_yaw_soft.get("min")) / 1000.0
+        current_max = float(left_yaw_soft.get("max")) / 1000.0
+    except (TypeError, ValueError):
+        left_soft_limits["yaw"] = next_limits
+        return
+    current_width = current_max - current_min
+    if current_min > current_max or (_float_close(current_width, 14.0, 1e-3) and not (current_min <= origin_deg <= current_max)):
+        left_soft_limits["yaw"] = next_limits
+
+
 def _normalize_right_roll_window(config: dict[str, Any]) -> None:
     teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
     mins = teleop.get("rightSoftLimitMin") if isinstance(teleop, dict) else None
@@ -174,8 +341,8 @@ def _normalize_right_roll_window(config: dict[str, Any]) -> None:
         and _float_close(mins[3], -100.0)
         and (_float_close(maxes[3], 0.0) or _float_close(maxes[3], 100.0))
     ):
-        mins[3] = -90.0
-        maxes[3] = 100.0
+        mins[3] = -95.0
+        maxes[3] = 5.0
 
     motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
     work_limits = motion.get("rotationWorkLimits", {}) if isinstance(motion, dict) else {}
@@ -186,14 +353,14 @@ def _normalize_right_roll_window(config: dict[str, Any]) -> None:
         and _float_close(right_roll_work.get("min"), -100.0)
         and (_float_close(right_roll_work.get("max"), 0.0) or _float_close(right_roll_work.get("max"), 100.0))
     ):
-        right_roll_work["min"] = -90.0
-        right_roll_work["max"] = 100.0
+        right_roll_work["min"] = -95.0
+        right_roll_work["max"] = 5.0
 
     right_soft_limits = motion.get("rightSoftLimits", {}) if isinstance(motion, dict) else {}
     right_roll_soft = right_soft_limits.get("roll", {}) if isinstance(right_soft_limits, dict) else {}
     old_negative_only_limits = _right_axis_limits_for_current_origin(config, 3, -100.0, 0.0)
     old_symmetric_limits = _right_axis_limits_for_current_origin(config, 3, -100.0, 100.0)
-    next_limits = _right_axis_limits_for_current_origin(config, 3, -90.0, 100.0)
+    next_limits = _right_axis_limits_for_current_origin(config, 3, -95.0, 5.0)
     if (
         isinstance(right_roll_soft, dict)
         and next_limits is not None
@@ -211,46 +378,42 @@ def _normalize_right_roll_window(config: dict[str, Any]) -> None:
         )
     ):
         right_soft_limits["roll"] = next_limits
+        return
+    if not isinstance(right_roll_soft, dict) or next_limits is None:
+        return
+    try:
+        origin_deg = (float(next_limits["min"]) / 1000.0) + 95.0
+        current_min = float(right_roll_soft.get("min")) / 1000.0
+        current_max = float(right_roll_soft.get("max")) / 1000.0
+    except (TypeError, ValueError):
+        right_soft_limits["roll"] = next_limits
+        return
+    current_width = current_max - current_min
+    stale_width = _float_close(current_width, 100.0, 1e-3) or _float_close(current_width, 190.0, 1e-3)
+    if current_min > current_max or (stale_width and not (current_min <= origin_deg <= current_max)):
+        right_soft_limits["roll"] = next_limits
 
 
 def _normalize_right_pitch_window(config: dict[str, Any]) -> None:
     teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
     mins = teleop.get("rightSoftLimitMin") if isinstance(teleop, dict) else None
     maxes = teleop.get("rightSoftLimitMax") if isinstance(teleop, dict) else None
-    if (
-        isinstance(mins, list)
-        and isinstance(maxes, list)
-        and len(mins) >= 5
-        and len(maxes) >= 5
-        and _float_close(mins[4], -100.0)
-        and _float_close(maxes[4], 100.0)
-    ):
-        mins[4] = -90.0
-        maxes[4] = 90.0
+    if isinstance(mins, list) and isinstance(maxes, list) and len(mins) >= 5 and len(maxes) >= 5:
+        mins[4] = -30.0
+        maxes[4] = 30.0
 
     motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
     work_limits = motion.get("rotationWorkLimits", {}) if isinstance(motion, dict) else {}
     right_work = work_limits.get("right", {}) if isinstance(work_limits, dict) else {}
     right_pitch_work = right_work.get("pitch", {}) if isinstance(right_work, dict) else {}
-    if (
-        isinstance(right_pitch_work, dict)
-        and _float_close(right_pitch_work.get("min"), -100.0)
-        and _float_close(right_pitch_work.get("max"), 100.0)
-    ):
-        right_pitch_work["min"] = -90.0
-        right_pitch_work["max"] = 90.0
+    if isinstance(right_pitch_work, dict):
+        right_pitch_work["min"] = -30.0
+        right_pitch_work["max"] = 30.0
 
     right_soft_limits = motion.get("rightSoftLimits", {}) if isinstance(motion, dict) else {}
     right_pitch_soft = right_soft_limits.get("pitch", {}) if isinstance(right_soft_limits, dict) else {}
-    old_limits = _right_axis_limits_for_current_origin(config, 4, -100.0, 100.0)
-    next_limits = _right_axis_limits_for_current_origin(config, 4, -90.0, 90.0)
-    if (
-        isinstance(right_pitch_soft, dict)
-        and old_limits is not None
-        and next_limits is not None
-        and _float_close(right_pitch_soft.get("min"), old_limits["min"], 1e-3)
-        and _float_close(right_pitch_soft.get("max"), old_limits["max"], 1e-3)
-    ):
+    next_limits = _right_axis_limits_for_current_origin(config, 4, -30.0, 30.0)
+    if isinstance(right_pitch_soft, dict) and next_limits is not None:
         right_soft_limits["pitch"] = next_limits
 
 
@@ -278,10 +441,15 @@ class SettingsService:
                 isinstance(raw_motion, dict)
                 and raw_motion.get("workOriginStrategyVersion") == ICF_WORK_ORIGIN_VERSION
             )
+            has_current_home_reference_strategy = (
+                isinstance(raw_motion, dict)
+                and raw_motion.get("homeReferenceVersion") == ICF_HOME_REFERENCE_VERSION
+            )
             merged = self._migrate_config(
                 self._merge_defaults(data),
                 has_current_teleop_strategy,
                 has_current_work_origin_strategy,
+                has_current_home_reference_strategy,
             )
             validated = AppConfig.model_validate(merged).model_dump(mode="json")
             if merged != data:
@@ -311,6 +479,12 @@ class SettingsService:
         if isinstance(config, dict):
             _normalize_right_yaw_disabled(config)
             _normalize_right_pitch_window(config)
+            raw_motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+            _ensure_home_reference_model(
+                config,
+                isinstance(raw_motion, dict)
+                and raw_motion.get("homeReferenceVersion") == ICF_HOME_REFERENCE_VERSION,
+            )
         validated = AppConfig.model_validate(config).model_dump(mode="json")
         old_hash = stable_config_hash(old_config) if old_config else "-"
         new_hash = stable_config_hash(validated)
@@ -476,6 +650,7 @@ class SettingsService:
         config: dict[str, Any],
         has_current_teleop_strategy: bool,
         has_current_work_origin_strategy: bool,
+        has_current_home_reference_strategy: bool,
     ) -> dict[str, Any]:
         teleop = config.get("teleop", {})
         if isinstance(teleop, dict) and not has_current_teleop_strategy:
@@ -511,7 +686,7 @@ class SettingsService:
                 gripper_teleop["leftGapInvert"] = False
                 gripper_teleop["rightGapInvert"] = False
                 gripper_teleop["gripSpeed"] = 255
-                gripper_teleop["gripTorque"] = 192
+                gripper_teleop["gripTorque"] = 1
                 gripper_teleop["positionDeadbandCounts"] = 1
                 gripper_teleop["minCommandIntervalMs"] = 20
                 gripper_teleop["autoGapCalibration"] = True
@@ -550,6 +725,14 @@ class SettingsService:
             if has_legacy_icf_translation_speed:
                 teleop["translationStartVelocityUmS"] = ICF_TELEOP_DEFAULTS["translationStartVelocityUmS"]
                 teleop["translationMaxVelocityUmS"] = ICF_TELEOP_DEFAULTS["translationMaxVelocityUmS"]
+            if teleop.get("leftAxisOutputScale") == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]:
+                teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
+            if teleop.get("rightAxisOutputScale") == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]:
+                teleop["rightAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["rightAxisOutputScale"]))
+            if teleop.get("leftAxisOutputScale") == [0.40, 0.25, 0.25, 0.40, 0.10, 0.15]:
+                teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
+            if teleop.get("rightAxisOutputScale") == [0.40, 0.25, 0.25, 0.40, 0.10, 0.15]:
+                teleop["rightAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["rightAxisOutputScale"]))
             if teleop.get("leftAxisOutputScale") == [0.20, 0.20, 0.20, 0.25, 0.25, 1.00]:
                 teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
             if teleop.get("rightAxisOutputScale") == [0.20, 0.20, 0.20, 0.25, 0.25, 1.00]:
@@ -598,9 +781,15 @@ class SettingsService:
                 and cameras.get("wristLeft") == "IMX258 / index 0"
                 and cameras.get("wristRight") == "IMX258 / index 1"
             )
+            has_previous_imx258_camera_defaults = (
+                cameras.get("global") == "AR0234 / index 1"
+                and cameras.get("wristLeft") == "IMX258 / index 2"
+                and cameras.get("wristRight") == "IMX258 / index 0"
+            )
             if (
                 has_legacy_reversed_wrist_cameras
                 or has_legacy_cyclic_camera_roles
+                or has_previous_imx258_camera_defaults
             ):
                 for key, value in ICF_CAMERA_DEFAULTS.items():
                     if key == "tuning":
@@ -659,9 +848,13 @@ class SettingsService:
             motion["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
         if isinstance(motion, dict):
             motion.setdefault("rotationWorkLimits", json.loads(json.dumps(ICF_ROTATION_WORK_LIMIT_DEFAULTS)))
+            _ensure_home_reference_model(config, has_current_home_reference_strategy)
         _normalize_right_yaw_disabled(config)
+        _normalize_left_yaw_window(config)
         _normalize_right_roll_window(config)
         _normalize_right_pitch_window(config)
+        if not has_current_home_reference_strategy:
+            _reanchor_stale_origin_windows(config)
         gripper_teleop = teleop.get("gripperTeleop", {})
         if isinstance(gripper_teleop, dict):
             default_thresholds = (

@@ -1,5 +1,6 @@
 import { Card } from 'antd'
 import { useTelemetryStore } from '../../stores/telemetry'
+import { teleopPairValue } from '../../teleopStatus'
 import type { DiagnosticItem, TelemetryFrame } from '../../types'
 
 interface HwItem {
@@ -28,8 +29,7 @@ function teleopHandsReady(frame: TelemetryFrame) {
 /** 计算对应的业务值或展示值。 */
 function teleopHandsValue(frame: TelemetryFrame, diagnostics: DiagnosticItem[]) {
   if (!diagnosticOk(diagnostics, 'omega7')) return '待确认'
-  const connected = frame.teleopHands.filter((hand) => hand.connected && hand.lastReadOk).length
-  return connected === 2 ? '逻辑 2/2' : `逻辑 ${connected}/2`
+  return teleopPairValue(frame)
 }
 
 const HW_ITEMS: HwItem[] = [

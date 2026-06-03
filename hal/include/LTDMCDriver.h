@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string>
 
@@ -16,9 +18,19 @@ class LTDMCDriver {
   std::string axisDiagnosticsJson();
   void emergencyStop();
   std::string enableSide(Side side, bool enabled = true);
+  std::string enableSide(Side side, bool enabled, const std::array<bool, 6>& enabledAxes);
+  std::string enableHomeAxes(Side side, const std::array<bool, 6>& enabledAxes);
   void homeSide(Side side);
+  void homeSide(Side side, const std::array<bool, 6>& enabledAxes);
   void homeAll(const std::array<double, 12>& workOriginPulse);
+  void homeAll(
+      const std::array<double, 12>& workOriginPulse,
+      const std::array<std::array<bool, 6>, 2>& enabledAxes);
   void homeOriginSide(Side side, const std::array<double, 6>& workOriginPulse);
+  void homeOriginSide(
+      Side side,
+      const std::array<double, 6>& workOriginPulse,
+      const std::array<bool, 6>& enabledAxes);
   void moveAllUi(const std::array<double, 12>& targetUi, const std::array<AxisLimit, 12>& limits);
   // maxVelocityUiPerSec/startVelocityUiPerSec are in the semantic UI unit
   // (um/s for translation, deg/s for rotation). Pass <= 0 to fall back to the
@@ -54,10 +66,13 @@ class LTDMCDriver {
   void configureStageAxes(Side side);
   void checkLimits(const std::array<double, 12>& targetUi, const std::array<AxisLimit, 12>& limits) const;
   bool axisMotionEnabled(Side side, SemanticAxis axis) const;
+  void stopAllAxesBestEffort() noexcept;
+  void clearEstopIfUnchanged(std::uint64_t sequenceAtStart);
 
   mutable std::mutex mutex_;
   bool initialized_{false};
-  bool estopActive_{false};
+  std::atomic_bool estopActive_{false};
+  std::atomic_uint64_t estopSequence_{0};
   std::string lastError_;
   std::array<double, 12> pulse_{};
   std::array<bool, 12> enabled_{};

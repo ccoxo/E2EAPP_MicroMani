@@ -183,6 +183,29 @@ export interface MotionOriginConfig {
   previousUpdatedAt: number
 }
 
+export interface MotionHomeReferenceConfig {
+  valid: boolean
+  leftValid: boolean
+  rightValid: boolean
+  leftPulse: number[]
+  rightPulse: number[]
+  updatedAt: number
+}
+
+export interface MotionWorkOriginOffsetConfig {
+  valid: boolean
+  leftValid: boolean
+  rightValid: boolean
+  leftPulseDelta: number[]
+  rightPulseDelta: number[]
+  updatedAt: number
+}
+
+export interface MotionRelativeSoftLimitsConfig {
+  left: ArmSoftLimitConfig
+  right: ArmSoftLimitConfig
+}
+
 export interface MotionStartupHomeConfig {
   enabled: boolean
   mode: 'work_origin'
@@ -423,7 +446,11 @@ export interface AppConfig {
     yawSoftLimitDeg: number
     positionSource: 'dmc_get_position' | 'dmc_get_encoder'
     workOriginStrategyVersion: string
+    homeReferenceVersion: string
     origin: MotionOriginConfig
+    homeReference: MotionHomeReferenceConfig
+    workOriginOffset: MotionWorkOriginOffsetConfig
+    relativeSoftLimits: MotionRelativeSoftLimitsConfig
     homeOnStartup: MotionStartupHomeConfig
     leftProfile: ArmMotionProfile
     rightProfile: ArmMotionProfile
@@ -446,6 +473,8 @@ export interface AppConfig {
     commandForceLimitN: number
     commandSpeed: number
     commandTorque: number
+    icfTargetProtectionEnabled: boolean
+    icfTargetMinGapMm: number
     sampleMode: 'direct' | 'dual_worker'
     sampleHz: number
     sampleStaleMs: number

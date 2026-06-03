@@ -66,8 +66,8 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["rightRotationScale"] == 1.0
     assert teleop["leftForceFeedback"] is True
     assert teleop["rightForceFeedback"] is True
-    assert teleop["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
-    assert teleop["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
+    assert teleop["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.08, 0.10]
+    assert teleop["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.35, 0.08, 0.15]
     assert teleop["translationStepLimitPulse"] == 4000
     assert teleop["rotationStepLimitPulse"] == 1250
     assert teleop["translationPulseDeadband"] == 2
@@ -86,10 +86,10 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["leftEnabledAxes"] == [True] * 6
     assert teleop["rightEnabledAxes"] == [True, True, True, True, True, False]
     assert teleop["softLimitUnitSpec"] == ["um", "um", "um", "deg", "deg", "deg"]
-    assert teleop["leftSoftLimitMin"] == [-25000.0, -37500.0, -37500.0, -100.0, -100.0, -7.0]
-    assert teleop["leftSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 100.0, 100.0, 7.0]
-    assert teleop["rightSoftLimitMin"] == [-25000.0, -37500.0, -37500.0, -90.0, -90.0, -7.0]
-    assert teleop["rightSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 100.0, 90.0, 7.0]
+    assert teleop["leftSoftLimitMin"] == [-25000.0, -37500.0, -37500.0, -5.0, -30.0, -7.0]
+    assert teleop["leftSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 95.0, 30.0, 7.0]
+    assert teleop["rightSoftLimitMin"] == [-25000.0, -37500.0, -37500.0, -95.0, -30.0, -7.0]
+    assert teleop["rightSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 5.0, 30.0, 7.0]
     assert teleop["leftImpulseCoeff"] == [-5000000, 5000000, -10000000, 1667, -2500, -333.3333]
     assert teleop["rightImpulseCoeff"] == [-5000000, -10000000, -5000000, 1667, 2500, 3333.333]
     assert teleop["leftDirectionSign"] == [1, -1, -1, 1, -1, -1]
@@ -156,18 +156,22 @@ def test_safety_defaults_are_stored_in_backend_units() -> None:
 def test_pico_script_defaults_point_to_reference_tools() -> None:
     config = default_config()
 
-    assert config["picoVision"]["ip"] == "10.90.132.174"
+    assert config["picoVision"]["ip"] == "10.90.129.166"
     assert config["picoVision"]["videoPort"] == 12345
     assert config["picoVision"]["commandPort"] == 13579
-    assert config["picoVision"]["scriptsDir"].endswith("PicoWirelessTools")
+    assert config["picoVision"]["scriptsDir"].replace("\\", "/").endswith("pico_mono_sender/build")
+    assert config["picoVision"]["senderBuildDir"].replace("\\", "/").endswith("pico_mono_sender/build")
 
 
 def test_storage_defaults_separate_recording_fps_from_camera_preview() -> None:
     config = default_config()
 
-    assert config["cameras"]["global"] == "AR0234 / index 1"
-    assert config["cameras"]["wristLeft"] == "IMX258 / index 2"
-    assert config["cameras"]["wristRight"] == "IMX258 / index 0"
+    assert config["cameras"]["global"] == "IMX335 / index 1"
+    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&124CCBA8&0&0000"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 2"
+    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&7861A93&0&0000"
+    assert config["cameras"]["wristRight"] == "IMX335 / index 0"
+    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
     assert config["cameras"]["previewResolution"] == "640x480"
     assert config["cameras"]["fps"] == 30
     assert config["storage"]["recordFps"] == 30
@@ -177,10 +181,14 @@ def test_gripper_teleop_defaults_match_omega7_gap_range() -> None:
     config = default_config()
     gripper_teleop = config["teleop"]["gripperTeleop"]
 
+    assert config["gripper"]["icfTargetProtectionEnabled"] is True
+    assert config["gripper"]["icfTargetMinGapMm"] == 1.02
     assert gripper_teleop["leftGapMaxMm"] == 25.0
     assert gripper_teleop["rightGapMaxMm"] == 25.0
     assert gripper_teleop["positionDeadbandCounts"] == 1
     assert gripper_teleop["minCommandIntervalMs"] == 20
+    assert gripper_teleop["gripTorque"] == 1
+    assert gripper_teleop["releaseTorque"] == 1
     assert gripper_teleop["leftSourceHand"] == "PhysicalRight"
     assert gripper_teleop["rightSourceHand"] == "PhysicalLeft"
     assert gripper_teleop["leftGapInvert"] is False
@@ -204,5 +212,5 @@ def test_native_teleop_axis_scales_use_icf_effective_output_scale() -> None:
     assert teleop["rightTranslationScale"] == 1.0
     assert teleop["leftRotationScale"] == 1.0
     assert teleop["rightRotationScale"] == 1.0
-    assert teleop["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
-    assert teleop["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
+    assert teleop["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.08, 0.10]
+    assert teleop["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.35, 0.08, 0.15]

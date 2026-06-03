@@ -8,8 +8,8 @@ from backend.core.units import motion_pulse_per_unit, pulse_to_ui
 AXIS_KEYS = ("x", "y", "z", "roll", "pitch", "yaw")
 AXIS_NAMES = ("X", "Y", "Z", "Roll", "Pitch", "Yaw")
 ROTATION_WORK_DEFAULTS = {
-    "roll": {"min": -100.0, "max": 100.0},
-    "pitch": {"min": -100.0, "max": 100.0},
+    "roll": {"min": -5.0, "max": 95.0},
+    "pitch": {"min": -30.0, "max": 30.0},
     "yaw": {"min": -7.0, "max": 7.0},
 }
 TRANSLATION_SOFT_LIMIT_DISABLED_MIN = -1_000_000_000.0
@@ -101,9 +101,9 @@ def rotation_work_limits_ui(config: dict[str, Any], side: str) -> list[AxisLimit
         raw_axis = raw_side.get(axis_key, {}) if isinstance(raw_side, dict) else {}
         default_axis = ROTATION_WORK_DEFAULTS[axis_key]
         if side == "right" and axis_key == "roll":
-            default_axis = {"min": -90.0, "max": 100.0}
+            default_axis = {"min": -95.0, "max": 5.0}
         if side == "right" and axis_key == "pitch":
-            default_axis = {"min": -90.0, "max": 90.0}
+            default_axis = {"min": -30.0, "max": 30.0}
         min_value = raw_axis.get("min", default_axis["min"]) if isinstance(raw_axis, dict) else default_axis["min"]
         max_value = raw_axis.get("max", default_axis["max"]) if isinstance(raw_axis, dict) else default_axis["max"]
         limits.append(AxisLimit(float(min_value), float(max_value)))

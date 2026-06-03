@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from backend.core.config import SettingsService
+from backend.core.gripper_protection import protected_gripper_target_mm_from_values
 from backend.core.logging import LogService
 from backend.hal_client.client import HalClient
 from backend.services.hardware_service import HardwareService
@@ -56,7 +57,12 @@ class FollowGripper:
         open_ratio = max(0.0, min(1.0, (gap_mm - gap_min) / span))
         if bool(cfg.get(f"{side}GapInvert", False)):
             open_ratio = 1.0 - open_ratio
-        target_mm = max(0.0, min(stroke_mm, open_ratio * stroke_mm))
+        target_mm = protected_gripper_target_mm_from_values(
+            open_ratio * stroke_mm,
+            stroke_mm,
+            bool(cfg.get("icfTargetProtectionEnabled", False)),
+            float(cfg.get("icfTargetMinGapMm", 0.0)),
+        )
         raw_position = round((1.0 - (target_mm / stroke_mm)) * 255) if stroke_mm > 0 else 255
         return self._maybe_command(target_mm, raw_position, cfg, now_ms)
 
@@ -70,8 +76,13 @@ class FollowGripper:
         if self._button_pressed is pressed:
             return None
         self._button_pressed = pressed
-        target_mm = 0.0 if pressed else stroke_mm
-        raw_position = 255 if pressed else 0
+        target_mm = protected_gripper_target_mm_from_values(
+            0.0 if pressed else stroke_mm,
+            stroke_mm,
+            bool(cfg.get("icfTargetProtectionEnabled", False)),
+            float(cfg.get("icfTargetMinGapMm", 0.0)),
+        )
+        raw_position = round((1.0 - (target_mm / stroke_mm)) * 255) if stroke_mm > 0 else 255
         return self._maybe_command(target_mm, raw_position, cfg, now_ms, force=True)
 
     def _effective_gap_range(
@@ -211,7 +222,13 @@ class GripperTeleService:
                     for h in omega.get("hands", [])
                     if isinstance(h, dict) and "side" in h
                 }
-                stroke_mm = float(config.get("gripper", {}).get("strokeMm", 26))
+                gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
+                stroke_mm = float(gripper.get("strokeMm", 26))
+                follower_cfg = {
+                    **gt_cfg,
+                    "icfTargetProtectionEnabled": bool(gripper.get("icfTargetProtectionEnabled", True)),
+                    "icfTargetMinGapMm": float(gripper.get("icfTargetMinGapMm", 1.02)),
+                }
 
                 for side, follower in (("left", self._left), ("right", self._right)):
                     hand = self._select_source_hand(hands, gt_cfg, side)
@@ -228,7 +245,7 @@ class GripperTeleService:
                                 "[GRIPPER]",
                                 f"{side} gap unavailable, button={pressed} state={follower.state}",
                             )
-                        command = follower.update_button(pressed, gt_cfg, stroke_mm)
+                        command = follower.update_button(pressed, follower_cfg, stroke_mm)
                     else:
                         gap_mm = float(gap_mm)
                         if diag:
@@ -236,7 +253,7 @@ class GripperTeleService:
                                 "[GRIPPER]",
                                 f"{side} gap={gap_mm:.2f}mm state={follower.state}",
                             )
-                        command = follower.update(gap_mm, gt_cfg, stroke_mm)
+                        command = follower.update(gap_mm, follower_cfg, stroke_mm)
                     if command is None:
                         continue
                     target_mm, raw_position = command
@@ -246,7 +263,7 @@ class GripperTeleService:
                         side,
                         "target",
                         int(gt_cfg.get("gripSpeed", 255)),
-                        int(gt_cfg.get("gripTorque", 192)),
+                        int(gt_cfg.get("gripTorque", 1)),
                         target_mm,
                     )
                     self._logs.info(

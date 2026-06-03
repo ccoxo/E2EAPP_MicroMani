@@ -7,6 +7,11 @@ from collections.abc import Callable
 from typing import Any, cast
 
 from backend.core.config import SettingsService, reanchor_motion_soft_limits_to_current_origin
+from backend.core.gripper_protection import (
+    icf_target_min_gap_mm,
+    icf_target_protection_enabled,
+    protected_gripper_target_mm,
+)
 from backend.core.logging import LogService, now_ms
 from backend.core.motion_limits import (
     WorkOriginMissing,
@@ -24,6 +29,7 @@ from backend.services.telemetry_hub import TelemetryHub
 
 AXIS_ORDER = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
 AXIS_LABELS = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
+RIGHT_YAW_DISABLED_AXES = [True, True, True, True, True, False]
 MANUAL_AXIS_STEP_LIMIT_PULSE = 100000.0
 MANUAL_TRANSLATION_STEP_LIMIT_UM = 5000.0
 MANUAL_ROTATION_STEP_LIMIT_DEG = 2.0
@@ -118,20 +124,24 @@ class CommandService:
             raise RuntimeError("motion work origin is not captured")
         left_pulse = cast(list[float], origin["leftPulse"])
         right_pulse = cast(list[float], origin["rightPulse"])
-        self._validate_work_origin_target(config, "left")
-        self._validate_work_origin_target(config, "right")
-        await self.enable_motion_side("left")
-        await self.enable_motion_side("right")
+        left_enabled_axes = self._home_enabled_axes("left")
+        right_enabled_axes = self._home_enabled_axes("right")
+        self._validate_work_origin_target(config, "left", left_enabled_axes)
+        self._validate_work_origin_target(config, "right", right_enabled_axes)
+        await self.enable_motion_side("left", left_enabled_axes)
+        await self.enable_motion_side("right", right_enabled_axes)
         result = await self.hal.command(
             "motion.home_all",
             {
                 "leftPulse": left_pulse,
                 "rightPulse": right_pulse,
+                "leftEnabledAxes": left_enabled_axes,
+                "rightEnabledAxes": right_enabled_axes,
             },
         )
         self.telemetry.home_all()
-        self._log_work_origin_moves(config, op_id, "home_all", "complete", "left", left_pulse)
-        self._log_work_origin_moves(config, op_id, "home_all", "complete", "right", right_pulse)
+        self._log_work_origin_moves(config, op_id, "home_all", "complete", "left", left_pulse, left_enabled_axes)
+        self._log_work_origin_moves(config, op_id, "home_all", "complete", "right", right_pulse, right_enabled_axes)
         self.logs.event(
             "[HAL]",
             "INFO",
@@ -164,17 +174,19 @@ class CommandService:
         if not bool(origin[valid_key]):
             raise RuntimeError(f"{side} motion work origin is not captured")
         pulse = cast(list[float], origin[pulse_key])
-        self._validate_work_origin_target(config, side)
-        await self.enable_motion_side(side)
+        enabled_axes = self._home_enabled_axes(side)
+        self._validate_work_origin_target(config, side, enabled_axes)
+        await self.enable_motion_side(side, enabled_axes)
         result = await self.hal.command(
             "motion.home_origin_side",
             {
                 "side": side,
                 "pulse": pulse,
+                "enabledAxes": enabled_axes,
             },
         )
         self.telemetry.home_side(side)
-        self._log_work_origin_moves(config, op_id, "home_origin_side", "complete", side, pulse)
+        self._log_work_origin_moves(config, op_id, "home_origin_side", "complete", side, pulse, enabled_axes)
         self.logs.event(
             "[HAL]",
             "INFO",
@@ -188,9 +200,12 @@ class CommandService:
         )
         return result
 
-    async def enable_motion_side(self, side: str) -> dict[str, object]:
+    async def enable_motion_side(self, side: str, enabled_axes: list[bool] | None = None) -> dict[str, object]:
         self._validate_side(side)
-        result = await self.hal.command("motion.enable_side", {"side": side})
+        enabled_axes = self._home_enabled_axes(side) if enabled_axes is None else enabled_axes
+        payload: dict[str, object] = {"side": side}
+        payload["enabledAxes"] = list(enabled_axes)
+        result = await self.hal.command("motion.enable_side", payload)
         await self._refresh_motion_enabled(side)
         side_label = "left" if side == "left" else "right"
         self.logs.info("[HAL]", f"{side_label} motion axes enable requested")
@@ -213,15 +228,46 @@ class CommandService:
 
     async def home_motion_side(self, side: str) -> dict[str, object]:
         self._validate_side(side)
-        result = await self.hal.command("motion.home_side", {"side": side})
+        self._ensure_origin_mutation_allowed()
+        result = await self.hal.command("motion.home_side", {"side": side, "enabledAxes": self._home_enabled_axes(side)})
         self.telemetry.home_side(side)
+        state = await self.hal.motion_state()
+        pulses = self._motion_state_pulses(state)
+        config = self.settings.get_config()
+        drift = self._motion_origin_capture_drift(config, self._normalized_home_reference(config), pulses, side)
+        if bool(drift["requiresConfirmation"]):
+            side_label = "left" if side == "left" else "right"
+            self.logs.warning("[HAL]", f"{side_label} motion home reference drift is large; origin recalibration skipped")
+            response = dict(result)
+            response["homeReferenceDrift"] = drift
+            return response
+        home_reference = self._normalized_home_reference(config)
+        work_origin_offset = self._normalized_work_origin_offset(config)
+        origin = self._normalized_motion_origin(config)
+        now = now_ms()
+        self._set_home_reference_side(home_reference, side, pulses, now)
+        if bool(work_origin_offset["leftValid" if side == "left" else "rightValid"]):
+            self._apply_home_reference_offset(origin, home_reference, work_origin_offset, side, now)
+            config["motion"]["origin"] = origin
+            reanchor_motion_soft_limits_to_current_origin(config, side)
+        config["motion"]["homeReference"] = home_reference
+        config["motion"]["workOriginOffset"] = work_origin_offset
+        saved = self.settings.save_config(config, emit_log=False)
         side_label = "left" if side == "left" else "right"
         self.logs.info("[HAL]", f"{side_label} motion homing requested")
-        return result
+        response = dict(result)
+        response["homeReference"] = saved["motion"]["homeReference"]
+        response["workOriginOffset"] = saved["motion"]["workOriginOffset"]
+        response["origin"] = saved["motion"]["origin"]
+        return response
 
     def motion_origin_status(self) -> dict[str, object]:
         config = self.settings.get_config()
-        return {"origin": self._normalized_motion_origin(config)}
+        return {
+            "origin": self._normalized_motion_origin(config),
+            "homeReference": self._normalized_home_reference(config),
+            "workOriginOffset": self._normalized_work_origin_offset(config),
+        }
 
     async def capture_motion_origin(
         self,
@@ -233,7 +279,7 @@ class CommandService:
             self._validate_side(side)
         self._ensure_origin_mutation_allowed()
         for home_side in (("left", "right") if side is None else (side,)):
-            await self.hal.command("motion.home_side", {"side": home_side})
+            await self.hal.command("motion.home_side", {"side": home_side, "enabledAxes": self._home_enabled_axes(home_side)})
         state = await self.hal.motion_state()
         pulses = self._motion_state_pulses(state)
         config = self.settings.get_config()
@@ -248,15 +294,24 @@ class CommandService:
             origin["previousLeftPulse"] = list(cast(list[float], origin["leftPulse"]))
             origin["previousRightPulse"] = list(cast(list[float], origin["rightPulse"]))
             origin["previousUpdatedAt"] = int(origin["updatedAt"])
+        home_reference = self._normalized_home_reference(config)
+        work_origin_offset = self._normalized_work_origin_offset(config)
+        captured_at = now_ms()
         if side in {None, "left"}:
             origin["leftPulse"] = pulses[:6]
             origin["leftValid"] = True
+            self._set_home_reference_side(home_reference, "left", pulses, captured_at)
+            self._set_zero_work_origin_offset_side(work_origin_offset, "left", captured_at)
         if side in {None, "right"}:
             origin["rightPulse"] = pulses[6:12]
             origin["rightValid"] = True
+            self._set_home_reference_side(home_reference, "right", pulses, captured_at)
+            self._set_zero_work_origin_offset_side(work_origin_offset, "right", captured_at)
         origin["valid"] = bool(origin["leftValid"] and origin["rightValid"])
-        origin["updatedAt"] = now_ms()
+        origin["updatedAt"] = captured_at
         config["motion"]["origin"] = origin
+        config["motion"]["homeReference"] = home_reference
+        config["motion"]["workOriginOffset"] = work_origin_offset
         reanchor_motion_soft_limits_to_current_origin(config, side)
         saved = self.settings.save_config(config, emit_log=False)
         label = side or "both"
@@ -304,6 +359,16 @@ class CommandService:
         origin["valid"] = bool(origin["leftValid"] and origin["rightValid"])
         origin["updatedAt"] = now_ms() if origin["leftValid"] or origin["rightValid"] else 0
         config["motion"]["origin"] = origin
+        work_origin_offset = self._normalized_work_origin_offset(config)
+        if side in {None, "left"}:
+            work_origin_offset["leftPulseDelta"] = [0.0] * 6
+            work_origin_offset["leftValid"] = False
+        if side in {None, "right"}:
+            work_origin_offset["rightPulseDelta"] = [0.0] * 6
+            work_origin_offset["rightValid"] = False
+        work_origin_offset["valid"] = bool(work_origin_offset["leftValid"] and work_origin_offset["rightValid"])
+        work_origin_offset["updatedAt"] = origin["updatedAt"]
+        config["motion"]["workOriginOffset"] = work_origin_offset
         saved = self.settings.save_config(config, emit_log=False)
         label = side or "both"
         self.logs.info("[HAL]", f"{label} motion hardware zero record cleared")
@@ -414,9 +479,9 @@ class CommandService:
             if target is None:
                 if request.command == "enable":
                     target_key = "targetLeftMm" if request.side == "left" else "targetRightMm"
-                    target = min(
-                        max(float(config.get("gripper", {}).get(target_key, 0.0)), 0.0),
-                        float(config.get("gripper", {}).get("strokeMm", 26.0)),
+                    target = protected_gripper_target_mm(
+                        config,
+                        float(config.get("gripper", {}).get(target_key, 0.0)),
                     )
                     payload = self._native_gripper_payload(config, request.side, target)
                     try:
@@ -500,23 +565,24 @@ class CommandService:
             # 真机成功响应后才保存目标开合度，避免 UI 记住未执行的硬件状态。
             use_gripper_workers = self.gripper_workers is not None and self.gripper_workers.is_enabled(config)
             gripper_backend = "dual_worker" if use_gripper_workers else "python_rs485"
+            target = self._gripper_command_target(config, request)
+            dispatch_command, dispatch_target = self._gripper_dispatch_command(config, request, target)
             if use_gripper_workers:
-                result = self.gripper_workers.command(config, request.side, request.command, request.targetMm)
+                result = self.gripper_workers.command(config, request.side, dispatch_command, dispatch_target)
             else:
-                result = self.hardware.gripper.command(config, request.side, request.command, request.targetMm)
+                result = self.hardware.gripper.command(config, request.side, dispatch_command, dispatch_target)
             if not result.ok:
                 self._log_gripper_command(
                     config,
                     request,
                     backend=gripper_backend,
-                    target=self._gripper_command_target(config, request),
+                    target=target,
                     run_ret=result.ok,
                     ipc_ok=True,
                     error=result.message,
                 )
                 self.logs.error("[GRIPPER]", result.message)
                 raise RuntimeError(result.message)
-            target = self._gripper_command_target(config, request)
             self._save_gripper_command_state(config, request, target)
             self._log_gripper_command(
                 config,
@@ -532,8 +598,12 @@ class CommandService:
             if target is not None:
                 response["targetMm"] = target
             return response
-        target = self.telemetry.apply_gripper(request.side, request.command, request.targetMm)
         config = self.settings.get_config()
+        target = self._gripper_command_target(config, request)
+        if target is None:
+            target = self.telemetry.apply_gripper(request.side, request.command, request.targetMm)
+        else:
+            self.telemetry.apply_gripper(request.side, "target", target)
         self._save_gripper_command_state(config, request, target)
         self._log_gripper_command(
             config,
@@ -599,11 +669,15 @@ class CommandService:
         phase: str,
         side: str,
         pulses: list[float],
+        enabled_axes: list[bool] | None = None,
     ) -> None:
         motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
         kinematics = motion.get("kinematics", {}) if isinstance(motion.get("kinematics"), dict) else {}
         axis_map = kinematics.get(f"{side}PhysicalAxis", kinematics.get(f"{side}AxisMap", list(range(6))))
+        axes = enabled_axes if isinstance(enabled_axes, list) and len(enabled_axes) >= 6 else [True] * 6
         for axis_index, axis_name in enumerate(AXIS_LABELS):
+            if not axes[axis_index]:
+                continue
             self.logs.event(
                 "[HAL]",
                 "INFO",
@@ -658,8 +732,10 @@ class CommandService:
             slave=gripper.get(slave_key, ""),
             command=request.command,
             pos=target if target is not None else "",
+            minTargetMm=icf_target_min_gap_mm(config),
+            minTargetEnabled=icf_target_protection_enabled(config),
             speed=gripper_teleop.get("gripSpeed", gripper.get("speed", "")),
-            torque=gripper_teleop.get("gripTorque", gripper.get("torque", "")),
+            torque=gripper_teleop.get("gripTorque", gripper.get("commandTorque", 1)),
             runRet=run_ret,
             ipcOk=ipc_ok,
             error=error,
@@ -669,11 +745,29 @@ class CommandService:
         stroke = float(config["gripper"].get("strokeMm", 26))
         if request.command == "open":
             return stroke
-        if request.command in {"close", "home"}:
+        if request.command == "close":
+            return protected_gripper_target_mm(config, 0.0)
+        if request.command == "home":
+            if self._hal_native_teleop(config):
+                return protected_gripper_target_mm(config, 0.0)
             return 0.0
         if request.command == "target":
-            return min(max(float(request.targetMm if request.targetMm is not None else 0.0), 0.0), stroke)
+            return protected_gripper_target_mm(config, float(request.targetMm if request.targetMm is not None else 0.0))
         return None
+
+    def _gripper_dispatch_command(
+        self,
+        config: dict[str, Any],
+        request: GripperCommandRequest,
+        target: float | None,
+    ) -> tuple[str, float | None]:
+        if target is None:
+            return request.command, request.targetMm
+        if request.command == "target":
+            return "target", target
+        if request.command == "close" and icf_target_protection_enabled(config):
+            return "target", target
+        return request.command, request.targetMm
 
     def _save_gripper_command_state(
         self,
@@ -706,7 +800,9 @@ class CommandService:
             "strokeMm": float(gripper.get("strokeMm", 26)),
             "jodellDllPath": str(gripper.get("jodellDllPath", "")),
             "gripSpeed": int(gripper_teleop.get("gripSpeed", 255)),
-            "gripTorque": int(gripper_teleop.get("gripTorque", 192)),
+            "gripTorque": int(gripper_teleop.get("gripTorque", 1)),
+            "icfTargetProtectionEnabled": icf_target_protection_enabled(config),
+            "icfTargetMinGapMm": icf_target_min_gap_mm(config),
         }
 
     def _hal_response_message(self, result: dict[str, object]) -> str:
@@ -869,7 +965,12 @@ class CommandService:
                 raise RuntimeError(f"manual {side} {axis} chunk wait timed out")
             await asyncio.sleep(MANUAL_AXIS_CHUNK_WAIT_POLL_SEC)
 
-    def _validate_work_origin_target(self, config: dict[str, Any], side: str) -> None:
+    def _validate_work_origin_target(
+        self,
+        config: dict[str, Any],
+        side: str,
+        enabled_axes: list[bool] | None = None,
+    ) -> None:
         origin = side_origin_ui(config, side)
         if origin is None:
             raise RuntimeError(f"{side} motion work origin is not captured")
@@ -877,7 +978,10 @@ class CommandService:
             limits = effective_limits_ui(config, side)
         except WorkOriginMissing as exc:
             raise RuntimeError(str(exc)) from exc
+        axes = enabled_axes if isinstance(enabled_axes, list) and len(enabled_axes) >= 6 else self._home_enabled_axes(side)
         for axis_index, axis_name in enumerate(AXIS_ORDER):
+            if not axes[axis_index]:
+                continue
             limit = limits[axis_index]
             target = origin[axis_index]
             if limit.min > limit.max or target < limit.min or target > limit.max:
@@ -1007,6 +1111,9 @@ class CommandService:
         if side not in {"left", "right"}:
             raise RuntimeError("side must be left or right")
 
+    def _home_enabled_axes(self, side: str) -> list[bool]:
+        return list(RIGHT_YAW_DISABLED_AXES if side == "right" else [True] * 6)
+
     def _motion_state_pulses(self, state: dict[str, Any]) -> list[float]:
         raw_pulses = state.get("pulses")
         if not isinstance(raw_pulses, list) or len(raw_pulses) != 12:
@@ -1044,6 +1151,94 @@ class CommandService:
             "previousRightPulse": previous_right_pulse,
             "previousUpdatedAt": previous_updated_at,
         }
+
+    def _normalized_home_reference(self, config: dict[str, Any]) -> dict[str, object]:
+        raw_reference = config.get("motion", {}).get("homeReference", {})
+        reference = raw_reference if isinstance(raw_reference, dict) else {}
+        left_pulse = self._six_pulses(reference.get("leftPulse"))
+        right_pulse = self._six_pulses(reference.get("rightPulse"))
+        left_valid = bool(reference.get("leftValid", reference.get("valid", False)))
+        right_valid = bool(reference.get("rightValid", reference.get("valid", False)))
+        updated_at = reference.get("updatedAt", 0)
+        try:
+            updated_at = int(updated_at)
+        except (TypeError, ValueError):
+            updated_at = 0
+        return {
+            "valid": bool(left_valid and right_valid),
+            "leftValid": left_valid,
+            "rightValid": right_valid,
+            "leftPulse": left_pulse,
+            "rightPulse": right_pulse,
+            "updatedAt": updated_at,
+        }
+
+    def _normalized_work_origin_offset(self, config: dict[str, Any]) -> dict[str, object]:
+        raw_offset = config.get("motion", {}).get("workOriginOffset", {})
+        offset = raw_offset if isinstance(raw_offset, dict) else {}
+        left_delta = self._six_pulses(offset.get("leftPulseDelta"))
+        right_delta = self._six_pulses(offset.get("rightPulseDelta"))
+        left_valid = bool(offset.get("leftValid", offset.get("valid", False)))
+        right_valid = bool(offset.get("rightValid", offset.get("valid", False)))
+        updated_at = offset.get("updatedAt", 0)
+        try:
+            updated_at = int(updated_at)
+        except (TypeError, ValueError):
+            updated_at = 0
+        return {
+            "valid": bool(left_valid and right_valid),
+            "leftValid": left_valid,
+            "rightValid": right_valid,
+            "leftPulseDelta": left_delta,
+            "rightPulseDelta": right_delta,
+            "updatedAt": updated_at,
+        }
+
+    def _set_home_reference_side(
+        self,
+        home_reference: dict[str, object],
+        side: str,
+        pulses: list[float],
+        updated_at: int,
+    ) -> None:
+        offset = 0 if side == "left" else 6
+        pulse_key = "leftPulse" if side == "left" else "rightPulse"
+        valid_key = "leftValid" if side == "left" else "rightValid"
+        home_reference[pulse_key] = list(pulses[offset : offset + 6])
+        home_reference[valid_key] = True
+        home_reference["valid"] = bool(home_reference["leftValid"] and home_reference["rightValid"])
+        home_reference["updatedAt"] = updated_at
+
+    def _set_zero_work_origin_offset_side(
+        self,
+        work_origin_offset: dict[str, object],
+        side: str,
+        updated_at: int,
+    ) -> None:
+        delta_key = "leftPulseDelta" if side == "left" else "rightPulseDelta"
+        valid_key = "leftValid" if side == "left" else "rightValid"
+        work_origin_offset[delta_key] = [0.0] * 6
+        work_origin_offset[valid_key] = True
+        work_origin_offset["valid"] = bool(work_origin_offset["leftValid"] and work_origin_offset["rightValid"])
+        work_origin_offset["updatedAt"] = updated_at
+
+    def _apply_home_reference_offset(
+        self,
+        origin: dict[str, object],
+        home_reference: dict[str, object],
+        work_origin_offset: dict[str, object],
+        side: str,
+        updated_at: int,
+    ) -> None:
+        pulse_key = "leftPulse" if side == "left" else "rightPulse"
+        delta_key = "leftPulseDelta" if side == "left" else "rightPulseDelta"
+        valid_key = "leftValid" if side == "left" else "rightValid"
+        reference_pulse = cast(list[float], home_reference[pulse_key])
+        delta_pulse = cast(list[float], work_origin_offset[delta_key])
+        origin[pulse_key] = [reference_pulse[index] + delta_pulse[index] for index in range(6)]
+        origin[valid_key] = True
+        origin["valid"] = bool(origin["leftValid"] and origin["rightValid"])
+        origin["updatedAt"] = updated_at
 
     def _six_pulses(self, value: object) -> list[float]:
         if not isinstance(value, list):

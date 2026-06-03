@@ -120,8 +120,9 @@ ACTION_STALE_S = 1.0
 HAL_NATIVE_SAMPLE_HZ = 1000.0
 OMEGA_NATIVE_SAMPLE_HZ = 100.0
 CRITICAL_ALIGNMENT_SOURCE_KEYS: tuple[str, ...] = ("hal", "force", "gripper", "omega")
-NATIVE_DATA_FILE_SIZE_MB = 10240
-NATIVE_VIDEO_FILE_SIZE_MB = 20480
+# LeRobot starts a new parquet/mp4 file when current + next episode reaches this limit.
+NATIVE_DATA_FILE_SIZE_MB = 0.000001
+NATIVE_VIDEO_FILE_SIZE_MB = 0.000001
 
 
 class DatasetSaveError(RuntimeError):
@@ -451,6 +452,7 @@ class DatasetRecorderService:
         self._write_enqueue_idle.set()
         self._session_active = False
         self._recording = False
+        self._accepting_frame_jobs = False
         self._samplers_paused = False
         self._session_id = ""
         self._dataset_id = ""
@@ -531,24 +533,28 @@ class DatasetRecorderService:
         if not native_started:
             await self._stop_writer_task()
             raise RuntimeError(self._native_required_message())
-        async with self._lock:
-            self._write_appstation_info(self._require_dataset_dir(), config)
-            self._episode_index = self._next_episode_index(self._dataset_dir)
-            self._session_started_at = time.monotonic()
-            self._session_active = True
-            self._write_enqueue_pending = 0
-            self._write_enqueue_idle.set()
-            self._begin_episode_locked()
-            self._start_sampler_tasks_locked()
-            self._loop_task = asyncio.create_task(self._record_loop(), name="dataset-recorder")
-            self._assembler_task = asyncio.create_task(self._frame_assembler_loop(), name="dataset-frame-assembler")
-            self.telemetry.episode_count = self._episode_index
-            self.telemetry.frame_count = 0
-            self.telemetry.recording = True
-        if self._real_hardware_mode(config):
-            await self._refresh_gripper_cache(config)
-        await self.teleop.start("recording")
-        await self._wait_for_episode_warmup()
+        try:
+            async with self._lock:
+                self._write_appstation_info(self._require_dataset_dir(), config)
+                self._episode_index = self._next_episode_index(self._dataset_dir)
+                self._session_started_at = time.monotonic()
+                self._session_active = True
+                self._write_enqueue_pending = 0
+                self._write_enqueue_idle.set()
+                self._begin_episode_locked()
+                self._start_sampler_tasks_locked()
+                self._loop_task = asyncio.create_task(self._record_loop(), name="dataset-recorder")
+                self._assembler_task = asyncio.create_task(self._frame_assembler_loop(), name="dataset-frame-assembler")
+                self.telemetry.episode_count = self._episode_index
+                self.telemetry.frame_count = 0
+                self.telemetry.recording = True
+            if self._real_hardware_mode(config):
+                await self._refresh_gripper_cache(config)
+            await self.teleop.start("recording", pre_home=False)
+            await self._wait_for_episode_warmup()
+        except (asyncio.CancelledError, Exception):
+            await self._rollback_failed_start()
+            raise
         self.logs.info("[LEROBOT]", f"record session started: {self._dataset_name} episode={self._episode_index:06d}")
         return self.status()
 
@@ -557,11 +563,16 @@ class DatasetRecorderService:
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
-            self._recording = False
+            self._accepting_frame_jobs = False
             self.telemetry.recording = False
         await self._drain_recording_queues()
-        if self._native_writer_active():
-            await self._save_native_episode()
+        try:
+            if self._native_writer_active():
+                await self._save_native_episode()
+        finally:
+            async with self._lock:
+                self._recording = False
+                self._accepting_frame_jobs = False
         async with self._lock:
             episode = self._finalize_episode_locked(status="review", deleted=False)
             self._last_saved_episode = episode
@@ -580,6 +591,7 @@ class DatasetRecorderService:
             was_recording = self._recording
             if was_recording:
                 self._recording = False
+                self._accepting_frame_jobs = False
                 self.telemetry.recording = False
         if was_recording:
             await self._drain_recording_queues()
@@ -614,7 +626,7 @@ class DatasetRecorderService:
             self._begin_episode_locked()
             self.telemetry.recording = True
             self.telemetry.frame_count = 0
-        await self.teleop.start("recording")
+        await self.teleop.start("recording", pre_home=False)
         await self._wait_for_episode_warmup()
         self.logs.info("[LEROBOT]", f"reset skipped; recording episode={self._episode_index:06d}")
         return self.status()
@@ -625,6 +637,7 @@ class DatasetRecorderService:
             was_recording = self._session_active and self._recording
             if was_recording:
                 self._recording = False
+                self._accepting_frame_jobs = False
                 self.telemetry.recording = False
         if was_recording:
             await self._drain_recording_queues()
@@ -632,6 +645,7 @@ class DatasetRecorderService:
                 await self._clear_native_episode_buffer()
         async with self._lock:
             self._recording = False
+            self._accepting_frame_jobs = False
             self._session_active = False
             self._last_saved_episode = None
             self._reset_pending = False
@@ -1364,6 +1378,13 @@ class DatasetRecorderService:
         await asyncio.to_thread(writer.join, 2.0)
         self._writer_thread = None
 
+    async def _rollback_failed_start(self) -> None:
+        """Best-effort cleanup for failures after a record session begins activating."""
+        try:
+            await self.finish_session()
+        except Exception as exc:  # noqa: BLE001
+            self.logs.warning("[LEROBOT]", f"record session rollback failed: {exc}")
+
     def _sample_source_loop(self, source: str) -> None:
         """按源采样频率循环采样硬件数据并写入时间缓存。"""
         epoch_s = 0.0
@@ -1615,7 +1636,7 @@ class DatasetRecorderService:
         while self._session_active:
             try:
                 async with self._lock:
-                    recording = self._recording
+                    recording = self._recording and getattr(self, "_accepting_frame_jobs", self._recording)
                     frame_index = self._queued_episode_frames
                     episode_index = self._episode_index
                     episode_generation = self._episode_generation
@@ -1746,6 +1767,7 @@ class DatasetRecorderService:
         """在持锁状态下校验组帧任务是否匹配当前帧序号。"""
         return (
             self._recording
+            and getattr(self, "_accepting_frame_jobs", self._recording)
             and self._episode_index == job.episode_index
             and self._episode_generation == job.episode_generation
             and self._queued_episode_frames == job.frame_index
@@ -1769,6 +1791,7 @@ class DatasetRecorderService:
     def _stop_recording_for_backpressure_locked(self, message: str) -> None:
         """在队列背压异常时停止录制并登记质量告警。"""
         self._recording = False
+        self._accepting_frame_jobs = False
         self.telemetry.recording = False
         self._episode_late_frames += 1
         self._source_warnings.append(message)
@@ -2044,7 +2067,6 @@ class DatasetRecorderService:
             late_source_frames = getattr(self, "_late_source_frames", {})
             late_source_frames[sample.source] = late_source_frames.get(sample.source, 0) + 1
             self._late_source_frames = late_source_frames
-            self._source_warnings.append(f"{sample.source} skew {round(abs_skew_ms, 3)}ms")
         if sample.stale:
             stale_counts = getattr(self, "_stale_counts", {})
             stale_counts[sample.source] = stale_counts.get(sample.source, 0) + 1
@@ -2171,6 +2193,7 @@ class DatasetRecorderService:
         self._native_dataset_from_index = self._native_total_frames_cached
         self._samplers_paused = False
         self._recording = True
+        self._accepting_frame_jobs = True
 
     def _finalize_episode_locked(self, *, status: str, deleted: bool) -> dict[str, Any]:
         """生成并写入 episode 元数据，更新 native 索引和数据集信息。"""
@@ -3249,7 +3272,12 @@ class DatasetRecorderService:
         skew = self._skew_stats()
         if skew["maxSkewMs"] > 20.0:
             warnings.append(f"max skew: {skew['maxSkewMs']}ms")
-        warnings.extend(dict.fromkeys(self._source_warnings))
+        warnings.extend(self._source_latency_warnings())
+        warnings.extend(
+            warning
+            for warning in dict.fromkeys(self._source_warnings)
+            if not self._is_source_latency_detail_warning(warning)
+        )
         for source, count in self._stale_counts.items():
             if count:
                 warnings.append(f"{source} stale: {count}")
@@ -3260,6 +3288,36 @@ class DatasetRecorderService:
             if count:
                 warnings.append(f"{key} camera drops: {count}")
         return warnings
+
+    def _source_latency_warnings(self) -> list[str]:
+        """将逐帧 source skew 压缩成每个异常源一条延迟统计。"""
+        warnings: list[str] = []
+        late_source_frames = getattr(self, "_late_source_frames", {})
+        source_skews_ms = getattr(self, "_source_skews_ms", {})
+        if not isinstance(late_source_frames, dict) or not isinstance(source_skews_ms, dict):
+            return warnings
+        for source, warning_count in late_source_frames.items():
+            try:
+                count = int(warning_count)
+            except (TypeError, ValueError):
+                continue
+            if count <= 0:
+                continue
+            raw_values = source_skews_ms.get(source, [])
+            values = [abs(float(value)) for value in raw_values] if isinstance(raw_values, list) else []
+            if values:
+                avg_ms = round(sum(values) / len(values), 3)
+                max_ms = round(max(values), 3)
+                warnings.append(
+                    f"{source} latency summary: samples={len(values)} warnings={count} avg={avg_ms}ms max={max_ms}ms"
+                )
+            else:
+                warnings.append(f"{source} latency summary: samples=0 warnings={count}")
+        return warnings
+
+    def _is_source_latency_detail_warning(self, warning: str) -> bool:
+        """识别旧的逐帧 source skew 明细，避免质量报告继续刷屏。"""
+        return re.fullmatch(r"[A-Za-z0-9_]+ skew [-+]?\d+(?:\.\d+)?ms", warning.strip()) is not None
 
     def _skew_stats(self) -> dict[str, float]:
         # 记录每个硬件源相对录制 tick 的时序，用于质量统计而不写入训练帧。

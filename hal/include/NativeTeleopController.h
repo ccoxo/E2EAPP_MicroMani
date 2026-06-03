@@ -28,8 +28,8 @@ struct NativeTeleopConfig {
   std::array<double, 2> translationScale{{1.0, 1.0}};
   std::array<double, 2> rotationScale{{1.0, 1.0}};
   std::array<std::array<double, 6>, 2> axisOutputScale{{
-      {0.40, 0.25, 0.25, 0.40, 0.20, 0.20},
-      {0.40, 0.25, 0.25, 0.40, 0.20, 0.20},
+      {0.40, 0.25, 0.25, 0.40, 0.10, 0.15},
+      {0.40, 0.25, 0.25, 0.40, 0.10, 0.15},
   }};
   std::array<std::array<double, 6>, 2> impulseCoeff{{
       {-5000000.0, 5000000.0, -10000000.0, 1667.0, -2500.0, -333.3333},
@@ -117,6 +117,8 @@ struct NativeTeleopConfig {
   std::array<std::string, 2> gripperSourceHand{{"PhysicalRight", "PhysicalLeft"}};
   int gripperDeadbandCounts{1};
   double gripperMinCommandIntervalMs{20.0};
+  bool gripperIcfTargetProtectionEnabled{true};
+  double gripperIcfTargetMinGapMm{1.02};
   bool gripperButtonFallback{true};
 };
 
@@ -147,6 +149,7 @@ class NativeTeleopController {
 
   void configure(const NativeTeleopConfig& config);
   void configureGripper(const JodellGripperConfig& config);
+  void configureGripperProtection(bool enabled, double minGapMm);
   void start(bool leftConnected, bool rightConnected);
   void stop();
   std::string statusJson() const;
@@ -229,6 +232,7 @@ class NativeTeleopController {
   double mappedDirection(int sourceIndex, Side targetSide, int axisIndex) const;
   std::array<AxisLimit, 6> effectiveSoftLimits(Side targetSide, int targetIndex) const;
   int gripperSourceIndex(int targetIndex) const;
+  double effectiveGripperTargetMm(double targetMm) const;
   Side sideFromIndex(int index) const;
   int sideIndex(Side side) const;
 
