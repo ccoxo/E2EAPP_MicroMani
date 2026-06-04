@@ -8,6 +8,7 @@ from multiprocessing.queues import Queue
 from typing import Any
 
 from backend.drivers.gripper_rs485 import Rs485GripperDriver
+from backend.core.gripper_protection import icf_target_min_gap_mm
 
 
 def run_gripper_worker(
@@ -147,6 +148,7 @@ class _GripperWorker:
             self.stroke_mm,
             int(speed_override if speed_override is not None else self.config["gripper"].get("commandSpeed", 10)),
             int(torque_override if torque_override is not None else self.config["gripper"].get("commandTorque", 1)),
+            icf_target_min_gap_mm(self.config),
         )
         ret = int(self.dll.runWithParam(self.slave, pos, speed, torque))
         return (

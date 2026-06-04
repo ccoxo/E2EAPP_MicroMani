@@ -7,7 +7,7 @@ interface QualityReportModalProps {
   onReRecord: () => void
   onAccept: () => void
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export default function QualityReportModal({
   open,
   report,

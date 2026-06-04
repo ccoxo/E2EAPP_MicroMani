@@ -8,6 +8,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from backend.core.gripper_protection import icf_target_min_gap_mm
+
 
 @dataclass
 class GripperResult:
@@ -136,6 +138,7 @@ class Rs485GripperDriver:
                     float(gripper.get("strokeMm", 26)),
                     int(gripper.get("commandSpeed", 10)),
                     int(gripper.get("commandTorque", 1)),
+                    icf_target_min_gap_mm(config),
                 )
                 ret = int(dll.runWithParam(slave, pos, speed, torque))
                 return GripperResult(
@@ -329,15 +332,19 @@ class Rs485GripperDriver:
         stroke_mm: float,
         speed: int = 10,
         torque: int = 1,
+        min_gap_mm: float = 0.0,
     ) -> tuple[int, int, int, float]:
         safe_speed = min(max(int(speed), 1), 255)
         safe_torque = min(max(int(torque), 1), 255)
+        stroke = max(0.001, float(stroke_mm))
+        min_gap = min(max(float(min_gap_mm), 0.0), stroke)
         if command == "open":
-            return 0, safe_speed, safe_torque, stroke_mm
+            return 0, safe_speed, safe_torque, stroke
         if command == "close":
-            return 255, safe_speed, safe_torque, 0.0
+            pos = round((stroke - min_gap) / stroke * 255)
+            return pos, safe_speed, safe_torque, min_gap
         if command == "target":
-            bounded = min(max(float(target_mm if target_mm is not None else 0.0), 0.0), stroke_mm)
-            pos = round((stroke_mm - bounded) / stroke_mm * 255)
+            bounded = min(max(float(target_mm if target_mm is not None else 0.0), min_gap), stroke)
+            pos = round((stroke - bounded) / stroke * 255)
             return pos, safe_speed, safe_torque, bounded
         raise ValueError(f"unsupported gripper command: {command}")

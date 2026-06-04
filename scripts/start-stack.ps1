@@ -18,7 +18,55 @@ function Stop-ProcessTree {
   Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue
 }
 
+function Stop-BackendProcessTrees {
+  $allProcesses = Get-CimInstance Win32_Process
+  $escapedRepo = [regex]::Escape($repo)
+  $backendProcesses = @($allProcesses | Where-Object {
+      $process = $_
+      $commandLine = $process.CommandLine
+      if (-not $commandLine) {
+        return $false
+      }
+      if ($commandLine -notmatch "backend\.app:create_app" -or $commandLine -notmatch "--port\s+$BackendPort") {
+        return $false
+      }
+      if ($commandLine -match $escapedRepo) {
+        return $true
+      }
+      $parent = $allProcesses | Where-Object { $_.ProcessId -eq $process.ParentProcessId } | Select-Object -First 1
+      return (
+        $parent -and
+        $parent.CommandLine -and
+        $parent.CommandLine -match $escapedRepo -and
+        $parent.CommandLine -match "backend\.app:create_app" -and
+        $parent.CommandLine -match "--port\s+$BackendPort"
+      )
+    })
+
+  $rootPids = @($backendProcesses | ForEach-Object {
+      $process = $_
+      $rootPid = $process.ProcessId
+      $parent = $allProcesses | Where-Object { $_.ProcessId -eq $process.ParentProcessId } | Select-Object -First 1
+      if (
+        $parent -and
+        $parent.CommandLine -and
+        $parent.CommandLine -match $escapedRepo -and
+        $parent.CommandLine -match "backend\.app:create_app" -and
+        $parent.CommandLine -match "--port\s+$BackendPort"
+      ) {
+        $rootPid = $parent.ProcessId
+      }
+      $rootPid
+    } | Sort-Object -Unique)
+
+  foreach ($rootPid in $rootPids) {
+    Stop-ProcessTree -RootPid $rootPid
+  }
+}
+
 & (Join-Path $PSScriptRoot "start-hal.ps1") -Restart | Out-Host
+
+Stop-BackendProcessTrees
 
 $backendPid = Get-NetTCPConnection -LocalPort $BackendPort -State Listen -ErrorAction SilentlyContinue |
   Select-Object -ExpandProperty OwningProcess -First 1
@@ -51,7 +99,7 @@ $backend = Start-Process `
   -WindowStyle Hidden `
   -PassThru
 
-$frontendCommand = "`$env:VITE_MOCK_MODE='false'; `$env:VITE_AUTO_SHUTDOWN_ON_CLOSE='true'; `$env:VITE_API_BASE='http://127.0.0.1:$BackendPort'; `$env:VITE_WS_URL='ws://127.0.0.1:$BackendPort/ws'; npm run dev -- --host 127.0.0.1 --port $FrontendPort"
+$frontendCommand = "`$env:VITE_MOCK_MODE='false'; `$env:VITE_API_BASE='http://127.0.0.1:$BackendPort'; `$env:VITE_WS_URL='ws://127.0.0.1:$BackendPort/ws'; npm run dev -- --host 127.0.0.1 --port $FrontendPort"
 $frontend = Start-Process `
   -FilePath "powershell.exe" `
   -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $frontendCommand) `

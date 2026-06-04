@@ -15,7 +15,7 @@ interface MetricPillProps {
   label: ReactNode
   tip?: string
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function MetricPill({ state, label, tip }: MetricPillProps) {
   const tag = (
     <Tag className="metric-pill" color={colorByState[state]}>

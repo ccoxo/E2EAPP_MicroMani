@@ -5,7 +5,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$appUrl = "http://127.0.0.1:$FrontendPort/settings#manual"
+$cacheBust = [DateTime]::UtcNow.Ticks
+$appUrl = "http://127.0.0.1:$FrontendPort/settings?appver=$cacheBust#manual"
 $profileDir = Join-Path $repo ".app-browser-profile"
 
 function Find-Browser {
@@ -26,16 +27,27 @@ function Find-Browser {
 function Wait-HttpOk([string]$Url, [int]$TimeoutSeconds) {
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   while ((Get-Date) -lt $deadline) {
-    try {
-      $response = Invoke-WebRequest $Url -UseBasicParsing -TimeoutSec 3
-      if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
-        return
-      }
-    } catch {
-      Start-Sleep -Milliseconds 500
+    if (Test-HttpOk $Url 3) {
+      return
     }
+    Start-Sleep -Milliseconds 500
   }
   throw "Timed out waiting for $Url"
+}
+
+function Test-HttpOk([string]$Url, [int]$TimeoutSeconds) {
+  try {
+    $response = Invoke-WebRequest $Url -UseBasicParsing -TimeoutSec $TimeoutSeconds
+    return ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500)
+  } catch {
+    return $false
+  }
+}
+
+function Restart-AppStack([string]$Reason) {
+  Write-Warning $Reason
+  & (Join-Path $PSScriptRoot "start-stack.ps1") -BackendPort $BackendPort -FrontendPort $FrontendPort | Out-Host
+  Wait-HttpOk $appUrl 45
 }
 
 function Get-AppBrowserProcesses {
@@ -54,24 +66,29 @@ try {
   & (Join-Path $PSScriptRoot "start-stack.ps1") -BackendPort $BackendPort -FrontendPort $FrontendPort | Out-Host
   Wait-HttpOk $appUrl 45
 
-  $browser = Find-Browser
-  Write-Host "Opening App window: $appUrl"
-  Start-Process `
-    -FilePath $browser `
-    -ArgumentList @(
-      "--app=$appUrl",
-      "--user-data-dir=$profileDir",
-      "--no-first-run",
-      "--disable-background-mode",
-      "--disable-extensions"
-    ) `
-    -WorkingDirectory $repo | Out-Null
+  $processes = @(Get-AppBrowserProcesses)
+  if ($processes.Count -eq 0) {
+    $browser = Find-Browser
+    Write-Host "Opening App window: $appUrl"
+    Start-Process `
+      -FilePath $browser `
+      -ArgumentList @(
+        "--app=$appUrl",
+        "--user-data-dir=$profileDir",
+        "--no-first-run",
+        "--disable-background-mode",
+        "--disable-extensions"
+      ) `
+      -WorkingDirectory $repo | Out-Null
 
-  $deadline = (Get-Date).AddSeconds(20)
-  do {
-    Start-Sleep -Milliseconds 500
-    $processes = @(Get-AppBrowserProcesses)
-  } while ($processes.Count -eq 0 -and (Get-Date) -lt $deadline)
+    $deadline = (Get-Date).AddSeconds(20)
+    do {
+      Start-Sleep -Milliseconds 500
+      $processes = @(Get-AppBrowserProcesses)
+    } while ($processes.Count -eq 0 -and (Get-Date) -lt $deadline)
+  } else {
+    Write-Host "Using existing App window: $appUrl"
+  }
 
   if ($processes.Count -eq 0) {
     throw "App browser process was not detected after launch."
@@ -79,6 +96,10 @@ try {
 
   Write-Host "App is running. Close the App window to stop frontend, backend, and HAL."
   while (@(Get-AppBrowserProcesses).Count -gt 0) {
+    $backendHealthUrl = "http://127.0.0.1:$BackendPort/docs"
+    if (-not (Test-HttpOk $backendHealthUrl 3)) {
+      Restart-AppStack "backend health check failed; restarting stack"
+    }
     Start-Sleep -Seconds 1
   }
 } finally {

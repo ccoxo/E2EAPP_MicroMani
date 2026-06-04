@@ -12,7 +12,7 @@ import { FineTuneView } from './views/FineTuneView'
 import { ModelView } from './views/ModelView'
 import RecordPage from './views/RecordPage'
 import { SettingsView } from './views/SettingsView'
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export default function App() {
   const startMock = useTelemetryStore((state) => state.startMock)
   const stopMock = useTelemetryStore((state) => state.stopMock)

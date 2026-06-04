@@ -12,6 +12,9 @@ namespace {
 
 constexpr const char* kVelocityAdmittanceMode = "velocity_admittance";
 constexpr const char* kIncrementalPositionMode = "incremental_position";
+constexpr int kGripperTeleopDeadbandFloorCounts = 1;
+constexpr double kGripperTeleopMinCommandIntervalFloorMs = 10.0;
+constexpr auto kGripperPositionSampleInterval = std::chrono::microseconds(33333);
 
 std::int64_t unixTimeMs() {
   const auto now = std::chrono::system_clock::now().time_since_epoch();
@@ -35,6 +38,15 @@ const char* axisName(int index) {
     case 4: return "Pitch";
     default: return "Yaw";
   }
+}
+
+double wrapKalmanRotationResidualDeg(double residualDeg) {
+  // residualDeg：旋转轴观测残差，单位为度；归一化后避免 +180/-180 附近出现假大跳变。
+  double wrapped = std::fmod(residualDeg + 180.0, 360.0);
+  if (wrapped < 0.0) {
+    wrapped += 360.0;
+  }
+  return wrapped - 180.0;
 }
 
 std::string jsonEscape(const std::string& value) {
@@ -184,8 +196,18 @@ NativeTeleopController::NativeTeleopController(
         AxisLimit{-25000.0, 25000.0},
         AxisLimit{-37500.0, 37500.0},
         AxisLimit{-37500.0, 37500.0},
-        AxisLimit{-90.0, 90.0},
-        AxisLimit{-90.0, 90.0},
+        AxisLimit{-100.0, 100.0},
+        AxisLimit{-100.0, 100.0},
+        AxisLimit{-7.0, 7.0},
+    };
+  }
+  for (auto& sideLimits : config_.rotationWorkLimits) {
+    sideLimits = {
+        AxisLimit{0.0, 0.0},
+        AxisLimit{0.0, 0.0},
+        AxisLimit{0.0, 0.0},
+        AxisLimit{-100.0, 100.0},
+        AxisLimit{-100.0, 100.0},
         AxisLimit{-7.0, 7.0},
     };
   }
@@ -214,6 +236,62 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config) {
   normalized.translationMinActivePulse = std::max(0.0, normalized.translationMinActivePulse);
   normalized.rotationMinActivePulse = std::max(0.0, normalized.rotationMinActivePulse);
   normalized.continuousMicroConfirmTicks = std::max(0, normalized.continuousMicroConfirmTicks);
+  // kalmanBeta：遗忘因子 beta，限制在 [0,1] 内，保证 Q/R 的凸组合更新有效。
+  normalized.kalmanBeta = std::clamp(normalized.kalmanBeta, 0.0, 1.0);
+  // kalmanMinVariance：所有方差/协方差的保护下限，避免数值退化。
+  normalized.kalmanMinVariance = std::max(1e-15, normalized.kalmanMinVariance);
+  // kalmanMaxVariance：所有方差/协方差的保护上限，且不能小于下限。
+  normalized.kalmanMaxVariance = std::max(normalized.kalmanMinVariance, normalized.kalmanMaxVariance);
+  // kalmanDtMinSec：dt 下限，过滤异常小的采样间隔。
+  normalized.kalmanDtMinSec = std::clamp(normalized.kalmanDtMinSec, 0.0001, 1.0);
+  // kalmanDtMaxSec：dt 上限，过滤线程卡顿带来的异常大预测步长。
+  normalized.kalmanDtMaxSec = std::max(normalized.kalmanDtMinSec, normalized.kalmanDtMaxSec);
+  // kalmanTranslationPositionVariance：平移轴 P00 初值，至少为 minVariance。
+  normalized.kalmanTranslationPositionVariance =
+      std::max(normalized.kalmanMinVariance, normalized.kalmanTranslationPositionVariance);
+  // kalmanTranslationVelocityVariance：平移轴 P11 初值，至少为 minVariance。
+  normalized.kalmanTranslationVelocityVariance =
+      std::max(normalized.kalmanMinVariance, normalized.kalmanTranslationVelocityVariance);
+  // kalmanTranslationMeasurementVariance：平移轴 R 初值，至少为 minVariance。
+  normalized.kalmanTranslationMeasurementVariance =
+      std::max(normalized.kalmanMinVariance, normalized.kalmanTranslationMeasurementVariance);
+  // kalmanTranslationProcessPositionVariance：平移轴 Q00 初值，至少为 minVariance。
+  normalized.kalmanTranslationProcessPositionVariance =
+      std::max(normalized.kalmanMinVariance, normalized.kalmanTranslationProcessPositionVariance);
+  // kalmanTranslationProcessVelocityVariance：平移轴 Q11 初值，至少为 minVariance。
+  normalized.kalmanTranslationProcessVelocityVariance =
+      std::max(normalized.kalmanMinVariance, normalized.kalmanTranslationProcessVelocityVariance);
+  // kalmanRotationPositionVariance：旋转轴 P00 初值，至少为 minVariance。
+  normalized.kalmanRotationPositionVariance =
+      std::max(normalized.kalmanMinVariance, normalized.kalmanRotationPositionVariance);
+  // kalmanRotationVelocityVariance：旋转轴 P11 初值，至少为 minVariance。
+  normalized.kalmanRotationVelocityVariance =
+      std::max(normalized.kalmanMinVariance, normalized.kalmanRotationVelocityVariance);
+  // kalmanRotationMeasurementVariance：旋转轴 R 初值，至少为 minVariance。
+  normalized.kalmanRotationMeasurementVariance =
+      std::max(normalized.kalmanMinVariance, normalized.kalmanRotationMeasurementVariance);
+  // kalmanRotationProcessPositionVariance：旋转轴 Q00 初值，至少为 minVariance。
+  normalized.kalmanRotationProcessPositionVariance =
+      std::max(normalized.kalmanMinVariance, normalized.kalmanRotationProcessPositionVariance);
+  // kalmanRotationProcessVelocityVariance：旋转轴 Q11 初值，至少为 minVariance。
+  normalized.kalmanRotationProcessVelocityVariance =
+      std::max(normalized.kalmanMinVariance, normalized.kalmanRotationProcessVelocityVariance);
+  // kalmanTranslationIntentVelocityThreshold：平移轴 v_th，必须为正，供 w2 意图权重使用。
+  normalized.kalmanTranslationIntentVelocityThreshold =
+      std::max(1e-12, normalized.kalmanTranslationIntentVelocityThreshold);
+  // kalmanRotationIntentVelocityThreshold：旋转轴 v_th，必须为正，供 w2 意图权重使用。
+  normalized.kalmanRotationIntentVelocityThreshold =
+      std::max(1e-12, normalized.kalmanRotationIntentVelocityThreshold);
+  normalized.gripperDeadbandCounts = std::max(
+      kGripperTeleopDeadbandFloorCounts,
+      normalized.gripperDeadbandCounts);
+  normalized.gripperMinCommandIntervalMs = std::max(
+      kGripperTeleopMinCommandIntervalFloorMs,
+      normalized.gripperMinCommandIntervalMs);
+  normalized.gripperIcfTargetMinGapMm = std::clamp(
+      normalized.gripperIcfTargetMinGapMm,
+      0.0,
+      std::max(0.001, normalized.gripper.strokeMm));
   normalized.incrementalTranslationMinEffectiveDeltaM = std::max(
       normalized.translationDeadzoneM,
       normalized.incrementalTranslationMinEffectiveDeltaM);
@@ -227,12 +305,48 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config) {
       }
     }
   }
+  for (auto& sideLimits : normalized.rotationWorkLimits) {
+    for (int axisIndex = 3; axisIndex < 6; ++axisIndex) {
+      auto& limit = sideLimits[axisIndex];
+      if (limit.min >= limit.max) {
+        limit = axisIndex == 5 ? AxisLimit{-7.0, 7.0} : AxisLimit{-100.0, 100.0};
+      }
+    }
+  }
   {
     std::scoped_lock lock(mutex_);
     config_ = normalized;
+    // kalmanStates_：配置变化后清空滤波状态，下一帧用新参数重新初始化。
+    kalmanStates_ = {};
+    // lastIntentWeight_：配置变化后先恢复 w2=1，避免旧权重影响新配置首帧。
+    for (auto& weights : lastIntentWeight_) {
+      // weights：单只主手的 6 个语义轴 w2 权重数组。
+      weights.fill(1.0);
+    }
   }
   gripper_.configure(normalized.gripper);
   omega_.setGravityCompensation(normalized.leftGravityCompensation, normalized.rightGravityCompensation);
+}
+
+void NativeTeleopController::configureGripper(const JodellGripperConfig& config) {
+  {
+    std::scoped_lock lock(mutex_);
+    config_.gripper = config;
+    config_.gripperIcfTargetMinGapMm = std::clamp(
+        config_.gripperIcfTargetMinGapMm,
+        0.0,
+        std::max(0.001, config_.gripper.strokeMm));
+  }
+  gripper_.configure(config);
+}
+
+void NativeTeleopController::configureGripperProtection(bool enabled, double minGapMm) {
+  std::scoped_lock lock(mutex_);
+  config_.gripperIcfTargetProtectionEnabled = enabled;
+  config_.gripperIcfTargetMinGapMm = std::clamp(
+      minGapMm,
+      0.0,
+      std::max(0.001, config_.gripper.strokeMm));
 }
 
 void NativeTeleopController::start(bool leftConnected, bool rightConnected) {
@@ -248,6 +362,13 @@ void NativeTeleopController::start(bool leftConnected, bool rightConnected) {
     continuousPulseCarry_ = {};
     continuousDirection_ = {};
     continuousStreak_ = {};
+    // kalmanStates_：启动 teleop 时清空历史滤波状态，保证新会话从首帧重新初始化。
+    kalmanStates_ = {};
+    // lastIntentWeight_：启动时恢复 w2=1，避免上次会话的意图权重残留。
+    for (auto& weights : lastIntentWeight_) {
+      // weights：单只主手的 6 个语义轴 w2 权重数组。
+      weights.fill(1.0);
+    }
     lastSemanticPose_ = {};
     lastRawDelta_ = {};
     lastFilteredDelta_ = {};
@@ -287,6 +408,7 @@ void NativeTeleopController::stop() {
   }
   stopGripperWorker();
   std::scoped_lock lock(mutex_);
+  logicalConnected_ = {false, false};
   referenceValid_ = {false, false};
   targetActive_ = {false, false};
   velocityUiPerSec_ = {};
@@ -296,6 +418,13 @@ void NativeTeleopController::stop() {
     continuousPulseCarry_ = {};
     continuousDirection_ = {};
     continuousStreak_ = {};
+    // kalmanStates_：停止 teleop 时清空滤波状态，避免下一次启动复用旧估计。
+    kalmanStates_ = {};
+    // lastIntentWeight_：停止时恢复 w2=1，与清空滤波状态保持一致。
+    for (auto& weights : lastIntentWeight_) {
+      // weights：单只主手的 6 个语义轴 w2 权重数组。
+      weights.fill(1.0);
+    }
     lastRawDelta_ = {};
     lastFilteredDelta_ = {};
     lastRequestedPulse_ = {};
@@ -323,11 +452,13 @@ void NativeTeleopController::stopGripperWorker() {
 }
 
 void NativeTeleopController::gripperLoop() {
+  auto nextSampleAt = std::chrono::steady_clock::now();
   while (gripperWorkerRunning_.load()) {
     std::array<PendingGripperCommand, 2> commands{};
+    bool shouldSample = false;
     {
       std::unique_lock lock(gripperMutex_);
-      gripperCv_.wait(lock, [&] {
+      gripperCv_.wait_until(lock, nextSampleAt, [&] {
         return !gripperWorkerRunning_.load()
             || pendingGripperCommands_[0].pending
             || pendingGripperCommands_[1].pending;
@@ -337,15 +468,28 @@ void NativeTeleopController::gripperLoop() {
       }
       commands = pendingGripperCommands_;
       pendingGripperCommands_ = {};
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= nextSampleAt) {
+        shouldSample = true;
+        nextSampleAt = now + kGripperPositionSampleInterval;
+      }
     }
     for (const auto& command : commands) {
       if (!command.pending) {
         continue;
       }
       std::string message;
-      const bool ok = gripper_.commandTarget(command.side, command.targetMm, command.speed, command.torque, &message);
+      const bool ok = gripper_.commandTarget(
+          command.side,
+          command.targetMm,
+          command.speed,
+          command.torque,
+          &message,
+          false);
       {
         std::scoped_lock lock(mutex_);
+        const auto gripperPositions = gripper_.positionMmSnapshot(gripperPositionsMm_);
+        gripperPositionsMm_ = gripperPositions;
         gripperLastCommandOk_[command.targetIndex] = ok;
         gripperLastMessage_[command.targetIndex] = message;
         gripperLastCommandTs_[command.targetIndex] = unixTimeMs();
@@ -354,6 +498,20 @@ void NativeTeleopController::gripperLoop() {
         }
       }
     }
+    if (shouldSample) {
+      sampleGripperPosition(Side::Left);
+      sampleGripperPosition(Side::Right);
+    }
+  }
+}
+
+void NativeTeleopController::sampleGripperPosition(Side side) {
+  std::string message;
+  const bool ok = gripper_.readPositionMm(side, &message);
+  std::scoped_lock lock(mutex_);
+  gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);
+  if (!ok && !message.empty()) {
+    lastError_ = std::string("native gripper ") + sideName(side) + " position: " + message;
   }
 }
 
@@ -361,9 +519,56 @@ bool NativeTeleopController::running() const {
   return running_.load();
 }
 
+bool NativeTeleopController::commandGripperTarget(
+    Side side,
+    double targetMm,
+    int speed,
+    int torque,
+    std::string* message) {
+  const int index = sideIndex(side);
+  double bounded = targetMm;
+  {
+    std::scoped_lock lock(mutex_);
+    bounded = effectiveGripperTargetMm(targetMm);
+  }
+  if (gripperWorkerRunning_.load()) {
+    {
+      std::scoped_lock lock(mutex_);
+      gripperTargetsMm_[index] = bounded;
+      gripperLastCommandOk_[index] = true;
+      gripperLastMessage_[index] = "queued native gripper command";
+      gripperLastCommandTs_[index] = unixTimeMs();
+    }
+    enqueueGripperCommand(index, side, bounded, speed, torque);
+    if (message) {
+      *message = "queued native gripper command";
+    }
+    return true;
+  }
+
+  std::string driverMessage;
+  const bool ok = gripper_.commandTarget(side, bounded, speed, torque, &driverMessage);
+  {
+    std::scoped_lock lock(mutex_);
+    gripperTargetsMm_[index] = bounded;
+    gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);
+    gripperLastCommandOk_[index] = ok;
+    gripperLastMessage_[index] = driverMessage;
+    gripperLastCommandTs_[index] = unixTimeMs();
+    if (!ok) {
+      lastError_ = std::string("native gripper ") + sideName(side) + ": " + driverMessage;
+    }
+  }
+  if (message) {
+    *message = driverMessage;
+  }
+  return ok;
+}
+
 std::string NativeTeleopController::statusJson() const {
   const auto forceOutput = omega_.forceOutputEnabled();
   std::scoped_lock lock(mutex_);
+  const auto gripperPositions = gripper_.positionMmSnapshot(gripperPositionsMm_);
   std::ostringstream out;
   out << "{\"running\":" << (running_.load() ? "true" : "false")
       << ",\"controlMode\":\"" << jsonEscape(config_.controlMode) << "\""
@@ -423,10 +628,24 @@ std::string NativeTeleopController::statusJson() const {
   appendArray(out, gripperTargetsMm_);
   out << ",\"grippers\":{\"left\":{\"ok\":" << (gripperLastCommandOk_[0] ? "true" : "false")
       << ",\"targetMm\":" << gripperTargetsMm_[0]
+      << ",\"positionMm\":";
+  if (gripperPositions[0] >= 0.0) {
+    out << gripperPositions[0];
+  } else {
+    out << "null";
+  }
+  out
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[0]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[0]
       << "},\"right\":{\"ok\":" << (gripperLastCommandOk_[1] ? "true" : "false")
       << ",\"targetMm\":" << gripperTargetsMm_[1]
+      << ",\"positionMm\":";
+  if (gripperPositions[1] >= 0.0) {
+    out << gripperPositions[1];
+  } else {
+    out << "null";
+  }
+  out
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[1]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[1]
       << "}}";
@@ -438,8 +657,14 @@ std::string NativeTeleopController::statusJson() const {
       << (forceOutput[1] ? "true" : "false") << "]"
       << ",\"gripperCommand\":{\"speed\":" << config_.gripper.speed
       << ",\"torque\":" << config_.gripper.torque
+      << ",\"workerMode\":\"" << (config_.gripper.processWorkersEnabled ? "isolated_process" : "inline") << "\""
+      << ",\"processWorkersEnabled\":"
+      << (config_.gripper.processWorkersEnabled ? "true" : "false")
       << ",\"deadbandCounts\":" << config_.gripperDeadbandCounts
-      << ",\"minCommandIntervalMs\":" << config_.gripperMinCommandIntervalMs << "}}";
+      << ",\"minCommandIntervalMs\":" << config_.gripperMinCommandIntervalMs
+      << ",\"icfTargetProtectionEnabled\":"
+      << (config_.gripperIcfTargetProtectionEnabled ? "true" : "false")
+      << ",\"icfTargetMinGapMm\":" << config_.gripperIcfTargetMinGapMm << "}}";
   return out.str();
 }
 
@@ -504,6 +729,7 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
   lastDiagnosticTargetSide_[sourceIndex] = targetSide;
   if (!logicalConnected) {
     setBlockerUnlocked(sourceIndex, "idle", "logical hand is disconnected");
+    resetKalmanSideUnlocked(sourceIndex);
     referenceValid_[sourceIndex] = false;
     incrementalCarry_[sourceIndex] = {};
     incrementalDirection_[sourceIndex] = {};
@@ -519,6 +745,7 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
   }
   if (!hand.connected || !hand.lastReadOk) {
     setBlockerUnlocked(sourceIndex, "blocked", hand.lastReadError.empty() ? "Omega.7 read is unavailable" : hand.lastReadError);
+    resetKalmanSideUnlocked(sourceIndex);
     referenceValid_[sourceIndex] = false;
     incrementalCarry_[sourceIndex] = {};
     incrementalDirection_[sourceIndex] = {};
@@ -534,6 +761,7 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
   }
   if (config_.requireClutch && !hand.clutchPressed) {
     setBlockerUnlocked(sourceIndex, "blocked", "clutch is required but not pressed");
+    resetKalmanSideUnlocked(sourceIndex);
     referenceValid_[sourceIndex] = false;
     incrementalCarry_[sourceIndex] = {};
     incrementalDirection_[sourceIndex] = {};
@@ -547,7 +775,10 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
     }
     return;
   }
-  const auto semanticPose = omegaPoseToSemantic(hand.pose, config_.mappingMode);
+  // rawSemanticPose：Omega.7 当前采样姿态 z_k 的语义轴表示，未经过 Kalman 滤波。
+  const auto rawSemanticPose = omegaPoseToSemantic(hand.pose, config_.mappingMode);
+  // semanticPose：开启滤波时为 Kalman 估计位置 p_hat，关闭时保持 rawSemanticPose。
+  const auto semanticPose = kalmanPoseForSide(sourceIndex, rawSemanticPose, dtSec);
   lastSemanticPose_[sourceIndex] = semanticPose;
   lastDiagnosticTargetSide_[sourceIndex] = targetSide;
   if (!referenceValid_[sourceIndex]) {
@@ -563,9 +794,12 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
     return;
   }
 
-  const auto deltas = config_.controlMode == kIncrementalPositionMode
+  // deltas：由当前姿态计算出的从手 UI 增量；随后按 w2 意图权重进行软门控。
+  auto deltas = config_.controlMode == kIncrementalPositionMode
       ? incrementalDeltasUi(sourceIndex, targetSide, semanticPose)
       : velocityDeltasUi(sourceIndex, targetSide, semanticPose, dtSec);
+  // applyKalmanIntentWeights：开启滤波时使用 v_hat 得到的 w2 衰减低置信度微动。
+  deltas = applyKalmanIntentWeights(sourceIndex, deltas);
   if (!hasMotion(deltas)) {
     if (config_.controlMode == kIncrementalPositionMode) {
       const auto stopMessage = incrementalInputActive_[sourceIndex]
@@ -619,16 +853,267 @@ void NativeTeleopController::syncIncrementalZeroDeltaUnlocked(
   setBlockerUnlocked(sourceIndex, "active", message);
 }
 
-std::array<AxisLimit, 6> NativeTeleopController::effectiveSoftLimits(Side targetSide, int targetIndex) const {
-  auto limits = config_.softLimits[targetIndex];
-  if (!config_.workOriginValid[targetIndex]) {
-    return limits;
+std::array<double, 6> NativeTeleopController::kalmanPoseForSide(
+    int sourceIndex,
+    const std::array<double, 6>& rawSemanticPose,
+    double dtSec) {
+  // sourceIndex：当前主手输入索引，用来选择左右手各自独立的滤波状态。
+  // rawSemanticPose：六轴观测向量 z_k，来自 Omega.7 当前采样姿态。
+  // dtSec：本帧实际循环间隔，后续会夹紧为 boundedDtSec。
+  // kalmanFilterEnabled：运行期开关；关闭时不改变返回值，并清空该主手的滤波历史。
+  if (!config_.kalmanFilterEnabled) {
+    resetKalmanSideUnlocked(sourceIndex);
+    return rawSemanticPose;
+  }
+  // filteredPose：六个语义轴的滤波后位置/角度输出，对应每轴状态中的 p_hat。
+  std::array<double, 6> filteredPose{};
+  // boundedDtSec：夹紧后的采样周期 dt，进入状态转移矩阵 A 的时间项。
+  const double boundedDtSec = std::clamp(dtSec, config_.kalmanDtMinSec, config_.kalmanDtMaxSec);
+  for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    // axisIndex：当前处理的语义轴，0-2 为平移轴，3-5 为旋转轴。
+    // rawSemanticPose[axisIndex]：该轴本帧观测值 z_k。
+    // kalmanStates_[sourceIndex][axisIndex]：该主手该轴的 x/P/Q/R 持久状态。
+    filteredPose[axisIndex] = updateKalmanAxis(
+        axisIndex,
+        rawSemanticPose[axisIndex],
+        boundedDtSec,
+        kalmanStates_[sourceIndex][axisIndex]);
+    // lastIntentWeight_：用更新后的速度估计 v_hat 计算 w2，供本帧下发增量软衰减。
+    lastIntentWeight_[sourceIndex][axisIndex] =
+        kalmanIntentWeight(axisIndex, kalmanStates_[sourceIndex][axisIndex]);
+  }
+  return filteredPose;
+}
+
+double NativeTeleopController::updateKalmanAxis(
+    int axisIndex,
+    double measurement,
+    double dtSec,
+    KalmanAxisState& state) {
+  // axisIndex：当前语义轴索引，决定使用平移参数还是旋转参数。
+  // measurement：该轴本帧观测值 z_k。
+  // dtSec：进入状态转移矩阵 A 的采样时间间隔。
+  // state：该轴上一帧保留下来的 x/P/Q/R 状态，本函数会原地更新。
+  // rotation：区分平移轴和旋转轴，从而选择不同量纲的 P/Q/R/v_th 参数。
+  const bool rotation = axisIndex >= 3;
+  // minVariance：P/Q/R 的统一下限，保证后续除法和协方差更新数值稳定。
+  const double minVariance = config_.kalmanMinVariance;
+  // maxVariance：P/Q/R 的统一上限，防止自适应噪声估计无限增大。
+  const double maxVariance = config_.kalmanMaxVariance;
+  // initialPositionVariance：P00 初始值，对应状态 x=[p,v]^T 中 p 的不确定度。
+  const double initialPositionVariance = rotation
+      ? config_.kalmanRotationPositionVariance
+      : config_.kalmanTranslationPositionVariance;
+  // initialVelocityVariance：P11 初始值，对应状态 x=[p,v]^T 中 v 的不确定度。
+  const double initialVelocityVariance = rotation
+      ? config_.kalmanRotationVelocityVariance
+      : config_.kalmanTranslationVelocityVariance;
+  // initialMeasurementVariance：R 初始值，对应观测方程 z=Hx+v 的测量噪声方差。
+  const double initialMeasurementVariance = rotation
+      ? config_.kalmanRotationMeasurementVariance
+      : config_.kalmanTranslationMeasurementVariance;
+  // initialProcessPositionVariance：Q00 初始值，对应状态转移中位置过程噪声。
+  const double initialProcessPositionVariance = rotation
+      ? config_.kalmanRotationProcessPositionVariance
+      : config_.kalmanTranslationProcessPositionVariance;
+  // initialProcessVelocityVariance：Q11 初始值，对应状态转移中速度过程噪声。
+  const double initialProcessVelocityVariance = rotation
+      ? config_.kalmanRotationProcessVelocityVariance
+      : config_.kalmanTranslationProcessVelocityVariance;
+  if (!state.initialized) {
+    // 初始化：第一帧没有上一时刻状态，直接令 p_0=z_0，v_0=0。
+    state.initialized = true;
+    // position：状态向量 x 的 p 分量，用第一帧观测 measurement 初始化。
+    state.position = measurement;
+    // velocity：状态向量 x 的 v 分量，首帧尚无速度估计，置 0。
+    state.velocity = 0.0;
+    // p00：状态协方差 P 的 (0,0)，代表 p 的初始不确定度。
+    state.p00 = initialPositionVariance;
+    // p01：状态协方差 P 的 (0,1)，首帧认为 p 与 v 暂无相关性。
+    state.p01 = 0.0;
+    // p10：状态协方差 P 的 (1,0)，首帧认为 v 与 p 暂无相关性。
+    state.p10 = 0.0;
+    // p11：状态协方差 P 的 (1,1)，代表 v 的初始不确定度。
+    state.p11 = initialVelocityVariance;
+    // q00：过程噪声 Q 的 (0,0)，代表位置过程噪声初值。
+    state.q00 = initialProcessPositionVariance;
+    // q01：过程噪声 Q 的 (0,1)，首帧交叉项未知，初始化为 0。
+    state.q01 = 0.0;
+    // q10：过程噪声 Q 的 (1,0)，首帧交叉项未知，初始化为 0。
+    state.q10 = 0.0;
+    // q11：过程噪声 Q 的 (1,1)，代表速度过程噪声初值。
+    state.q11 = initialProcessVelocityVariance;
+    // r：测量噪声 R 的初始值，来自 UI/默认参数。
+    state.r = initialMeasurementVariance;
+    return measurement;
+  }
+
+  // 1) 状态预测：x_{k|k-1}=A x_{k-1}+B u_k。
+  // controlInput：公式中的 u_k；当前 HAL 没有外部加速度/控制输入，因此取 0。
+  const double controlInput = 0.0;
+  // predictedPosition：预测位置 p_{k|k-1}=p_{k-1}+v_{k-1}dt+0.5dt^2u。
+  const double predictedPosition = state.position + state.velocity * dtSec + 0.5 * dtSec * dtSec * controlInput;
+  // predictedVelocity：预测速度 v_{k|k-1}=v_{k-1}+dt*u。
+  const double predictedVelocity = state.velocity + dtSec * controlInput;
+  // 2) 协方差预测：P_{k|k-1}=A P_{k-1} A^T + Q_{k-1}。
+  // predictedP00：P_{k|k-1}(0,0)，预测位置方差。
+  const double predictedP00 =
+      state.p00 + dtSec * (state.p10 + state.p01) + dtSec * dtSec * state.p11 + state.q00;
+  // predictedP01：P_{k|k-1}(0,1)，预测位置-速度协方差。
+  const double predictedP01 = state.p01 + dtSec * state.p11 + state.q01;
+  // predictedP10：P_{k|k-1}(1,0)，预测速度-位置协方差。
+  const double predictedP10 = state.p10 + dtSec * state.p11 + state.q10;
+  // predictedP11：P_{k|k-1}(1,1)，预测速度方差。
+  const double predictedP11 = state.p11 + state.q11;
+  // 3) 观测预测：z_{k|k-1}=H x_{k|k-1}；本实现 H=[1,0]，只观测位置。
+  const double predictedMeasurement = predictedPosition;
+  // gamma：创新序列 gamma_k=z_k-H*x_hat_{k|k-1}。
+  double gamma = measurement - predictedMeasurement;
+  if (rotation) {
+    // 旋转轴使用角度残差归一化，避免 +180/-180 度附近的周期跳变被当成真实大运动。
+    gamma = wrapKalmanRotationResidualDeg(gamma);
+  }
+  // hPredictedPHt：H P_{k|k-1} H^T；H=[1,0] 时就是 predictedP00。
+  const double hPredictedPHt = predictedP00;
+  // innovationVariance：创新协方差 S=H P H^T + R，用于计算 Kalman 增益。
+  const double innovationVariance = std::max(minVariance, hPredictedPHt + state.r);
+  // gainPosition：Kalman 增益 K 的位置分量 K_p=P00/S。
+  const double gainPosition = predictedP00 / innovationVariance;
+  // gainVelocity：Kalman 增益 K 的速度分量 K_v=P10/S。
+  const double gainVelocity = predictedP10 / innovationVariance;
+
+  // 4) 状态校正：x_{k|k}=x_{k|k-1}+K_k gamma_k。
+  // position：校正后的 p_hat，作为滤波后位置/角度返回。
+  state.position = predictedPosition + gainPosition * gamma;
+  // velocity：校正后的 v_hat，作为意图速度估计和 w2 计算基础。
+  state.velocity = predictedVelocity + gainVelocity * gamma;
+  // 5) 协方差校正：P_{k|k}=(I-KH)P_{k|k-1}，按 H=[1,0] 展开。
+  // p00：校正后位置方差，夹紧到合法数值范围。
+  state.p00 = std::clamp((1.0 - gainPosition) * predictedP00, minVariance, maxVariance);
+  // p01：校正后位置-速度协方差。
+  state.p01 = (1.0 - gainPosition) * predictedP01;
+  // p10：校正后速度-位置协方差。
+  state.p10 = predictedP10 - gainVelocity * predictedP00;
+  // pCrossSymmetric：理论上 P01=P10；用平均值消除浮点累计造成的微小不对称。
+  const double pCrossSymmetric = 0.5 * (state.p01 + state.p10);
+  state.p01 = pCrossSymmetric;
+  state.p10 = pCrossSymmetric;
+  // p11：校正后速度方差，夹紧到合法数值范围。
+  state.p11 = std::clamp(predictedP11 - gainVelocity * predictedP01, minVariance, maxVariance);
+
+  // 6) 过程噪声自适应：Q_k=(1-beta)Q_{k-1}+beta(K gamma gamma^T K^T)。
+  // q00Adaptive：K_p*gamma*gamma*K_p，对应 Q 的位置-位置项。
+  const double q00Adaptive = gainPosition * gamma * gamma * gainPosition;
+  // q01Adaptive：K_p*gamma*gamma*K_v，对应 Q 的位置-速度项。
+  const double q01Adaptive = gainPosition * gamma * gamma * gainVelocity;
+  // q10Adaptive：K_v*gamma*gamma*K_p，对应 Q 的速度-位置项。
+  const double q10Adaptive = gainVelocity * gamma * gamma * gainPosition;
+  // q11Adaptive：K_v*gamma*gamma*K_v，对应 Q 的速度-速度项。
+  const double q11Adaptive = gainVelocity * gamma * gamma * gainVelocity;
+  // q00：按遗忘因子 beta 融合上一时刻 Q00 和本帧自适应估计。
+  state.q00 = std::clamp(
+      (1.0 - config_.kalmanBeta) * state.q00
+          + config_.kalmanBeta * q00Adaptive,
+      minVariance,
+      maxVariance);
+  // q01：按遗忘因子 beta 融合上一时刻 Q01 和本帧自适应估计。
+  state.q01 = (1.0 - config_.kalmanBeta) * state.q01
+      + config_.kalmanBeta * q01Adaptive;
+  // q10：按遗忘因子 beta 融合上一时刻 Q10 和本帧自适应估计。
+  state.q10 = (1.0 - config_.kalmanBeta) * state.q10
+      + config_.kalmanBeta * q10Adaptive;
+  // qCrossSymmetric：理论上 Q01=Q10；用平均值保持过程噪声协方差矩阵对称。
+  const double qCrossSymmetric = 0.5 * (state.q01 + state.q10);
+  state.q01 = qCrossSymmetric;
+  state.q10 = qCrossSymmetric;
+  // q11：按遗忘因子 beta 融合上一时刻 Q11 和本帧自适应估计。
+  state.q11 = std::clamp(
+      (1.0 - config_.kalmanBeta) * state.q11
+          + config_.kalmanBeta * q11Adaptive,
+      minVariance,
+      maxVariance);
+  // 7) 测量噪声自适应：R_k=(1-beta)R_{k-1}+beta(gamma gamma^T-H P H^T)。
+  // rAdaptive：gamma^2-H P_{k|k-1}H^T；一维观测下 gamma gamma^T 即 gamma^2。
+  const double rAdaptive = gamma * gamma - hPredictedPHt;
+  // r：按遗忘因子 beta 融合上一时刻 R 和本帧自适应估计，并做数值夹紧。
+  state.r = std::clamp(
+      (1.0 - config_.kalmanBeta) * state.r + config_.kalmanBeta * rAdaptive,
+      minVariance,
+      maxVariance);
+  return state.position;
+}
+
+double NativeTeleopController::kalmanIntentWeight(int axisIndex, const KalmanAxisState& state) const {
+  // threshold：该轴的意图速度阈值 v_th；平移轴和旋转轴使用不同量纲参数。
+  const double threshold = axisIndex >= 3
+      ? config_.kalmanRotationIntentVelocityThreshold
+      : config_.kalmanTranslationIntentVelocityThreshold;
+  // speed：意图估计速度 |v_hat|，由 Kalman 状态中的速度分量得到。
+  const double speed = std::abs(state.velocity);
+  // 当 |v_hat| >= v_th 时，认为操作者存在明确意图，w2=1。
+  if (speed >= threshold) {
+    return 1.0;
+  }
+  // velocitySigma：速度估计标准差 sqrt(P11)，用于衡量 v_hat 的置信度。
+  const double velocitySigma = std::sqrt(std::max(config_.kalmanMinVariance, state.p11));
+  // velocityConfidence：速度置信度软因子；速度方差越大，置信度越低。
+  const double velocityConfidence = threshold / (threshold + velocitySigma);
+  // w2：低于阈值时不硬截断，而按速度比例和置信度共同软衰减。
+  return std::clamp((speed / threshold) * velocityConfidence, 0.0, 1.0);
+}
+
+std::array<double, 6> NativeTeleopController::applyKalmanIntentWeights(
+    int sourceIndex,
+    std::array<double, 6> deltas) const {
+  // sourceIndex：当前主手输入索引，用来读取该手对应的 lastIntentWeight_。
+  // deltas：准备下发给从手的六轴增量，返回前按 w2 逐轴缩放。
+  // kalmanFilterEnabled：关闭滤波时保持原 deltas，不引入任何 w2 门控。
+  if (!config_.kalmanFilterEnabled) {
+    return deltas;
   }
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    // lastIntentWeight_[sourceIndex][axisIndex]：该主手该轴最近计算出的 w2。
+    deltas[axisIndex] *= lastIntentWeight_[sourceIndex][axisIndex];
+  }
+  return deltas;
+}
+
+void NativeTeleopController::resetKalmanSideUnlocked(int sourceIndex) {
+  // sourceIndex：要重置的主手索引，0/1 分别对应左右两路输入。
+  if (sourceIndex < 0 || sourceIndex >= static_cast<int>(kalmanStates_.size())) {
+    return;
+  }
+  // kalmanStates_：断连、松开离合或关闭滤波时清空状态，避免旧状态跨段污染。
+  kalmanStates_[sourceIndex] = {};
+  // lastIntentWeight_：重置后恢复 w2=1，保证下一段首帧不被旧权重衰减。
+  lastIntentWeight_[sourceIndex].fill(1.0);
+}
+
+std::array<AxisLimit, 6> NativeTeleopController::effectiveSoftLimits(Side targetSide, int targetIndex) const {
+  auto limits = config_.softLimits[targetIndex];
+  if (config_.workOriginValid[targetIndex]) {
+    for (int axisIndex = 0; axisIndex < 3; ++axisIndex) {
+      const auto axis = static_cast<SemanticAxis>(axisIndex);
+      const double originUi = pulseToUi(config_.workOriginPulse[targetIndex][axisIndex], targetSide, axis);
+      limits[axisIndex].min += originUi;
+      limits[axisIndex].max += originUi;
+    }
+  }
+  if (!config_.rotationWorkLimitEnabled) {
+    return limits;
+  }
+  if (!config_.workOriginValid[targetIndex]) {
+    throw std::runtime_error("work_origin_missing: rotation work limit requires captured work origin");
+  }
+  for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    if (axisIndex < 3) {
+      continue;
+    }
     const auto axis = static_cast<SemanticAxis>(axisIndex);
     const double originUi = pulseToUi(config_.workOriginPulse[targetIndex][axisIndex], targetSide, axis);
-    limits[axisIndex].min = originUi + config_.softLimits[targetIndex][axisIndex].min;
-    limits[axisIndex].max = originUi + config_.softLimits[targetIndex][axisIndex].max;
+    const auto workLimit = config_.rotationWorkLimits[targetIndex][axisIndex];
+    limits[axisIndex].min = std::max(limits[axisIndex].min, originUi + workLimit.min);
+    limits[axisIndex].max = std::min(limits[axisIndex].max, originUi + workLimit.max);
   }
   return limits;
 }
@@ -843,13 +1328,16 @@ void NativeTeleopController::tickGrippers(const std::array<Omega7State, 2>& hand
     } else {
       continue;
     }
+    targetMm = effectiveGripperTargetMm(targetMm);
     const int raw = static_cast<int>(std::lround(
         (std::max(0.001, config_.gripper.strokeMm) - std::clamp(targetMm, 0.0, config_.gripper.strokeMm))
         / std::max(0.001, config_.gripper.strokeMm) * 255.0));
     const auto elapsedMs = std::chrono::duration<double, std::milli>(now - gripperLastCommandAt_[targetIndex]).count();
+    if (gripperLastRaw_[targetIndex] >= 0 && elapsedMs < config_.gripperMinCommandIntervalMs) {
+      continue;
+    }
     if (gripperLastRaw_[targetIndex] >= 0
-        && std::abs(raw - gripperLastRaw_[targetIndex]) < config_.gripperDeadbandCounts
-        && elapsedMs < config_.gripperMinCommandIntervalMs) {
+        && std::abs(raw - gripperLastRaw_[targetIndex]) < config_.gripperDeadbandCounts) {
       continue;
     }
     const Side targetSide = sideFromIndex(targetIndex);
@@ -967,6 +1455,16 @@ int NativeTeleopController::gripperSourceIndex(int targetIndex) const {
     return 0;
   }
   return targetIndex;
+}
+
+double NativeTeleopController::effectiveGripperTargetMm(double targetMm) const {
+  const double stroke = std::max(0.001, config_.gripper.strokeMm);
+  const double bounded = std::clamp(targetMm, 0.0, stroke);
+  if (!config_.gripperIcfTargetProtectionEnabled) {
+    return bounded;
+  }
+  const double minGap = std::clamp(config_.gripperIcfTargetMinGapMm, 0.0, stroke);
+  return std::clamp(bounded, minGap, stroke);
 }
 
 Side NativeTeleopController::sideFromIndex(int index) const {

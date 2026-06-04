@@ -1,28 +1,29 @@
 import { Progress, Space, Tag } from 'antd'
 import { Bot, Camera, Gamepad2, Hand, RadioTower } from 'lucide-react'
 import { axisNames, forceChannels } from '../../data'
+import { teleopHandState, teleopHandValue } from '../../teleopStatus'
 import type { CameraTelemetry, ConnectionState, DiagnosticItem, TelemetryFrame, TelemetrySample } from '../../types'
 import { CameraPreview } from '../CameraPreview'
 import { ForceChart } from '../Charts'
 import { MetricPill } from '../MetricPill'
 import { ModuleStatusGrid, type ModuleStatus } from './ModuleStatusGrid'
-
+/** 计算对应的业务值或展示值。 */
 function diagnosticState(diagnostics: DiagnosticItem[], key: string): ConnectionState {
   return diagnostics.find((item) => item.key === key)?.status ?? 'pending'
 }
-
+/** 计算对应的业务值或展示值。 */
 function cameraByKey(cameras: CameraTelemetry[], key: CameraTelemetry['key']) {
   return cameras.find((camera) => camera.key === key)
 }
-
+/** 计算对应的业务值或展示值。 */
 function forceMagnitude(values: number[]) {
   return Math.sqrt(values.slice(0, 3).reduce((sum, value) => sum + value * value, 0))
 }
-
+/** 格式化对应数值用于界面展示。 */
 function formatGripperPosition(value: number | undefined) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? `${value.toFixed(1)} mm` : '不可用'
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function ArmOverviewPanel({
   side,
   frame,
@@ -41,7 +42,7 @@ export function ArmOverviewPanel({
   const forces = isLeft ? frame.forceLeft : frame.forceRight
   const forceDiag = diagnosticState(diagnostics, isLeft ? 'ati-left' : 'ati-right')
   const gripState = diagnosticState(diagnostics, 'gripper')
-  const teleopState = diagnosticState(diagnostics, 'omega7')
+  const teleopState = teleopHandState(frame, diagnostics, side)
   const forceNorm = forceMagnitude(forces)
   const gripperText = formatGripperPosition(frame.gripperPositions[isLeft ? 0 : 1])
   const riskState: ConnectionState = forceNorm > 2.4 || frame.dangerIndex > 0.65 ? 'warn' : 'ok'
@@ -86,7 +87,7 @@ export function ArmOverviewPanel({
       key: `${side}-teleop`,
       label: '遥操作主手',
       state: teleopState,
-      primary: isLeft ? '左 Omega.7 主手' : '右 Omega.7 主手',
+      primary: teleopHandValue(frame, side),
       secondary: '主从映射和离合器状态由 HAL 回报',
       metric: 'USB / SDK',
       group: '遥操作',

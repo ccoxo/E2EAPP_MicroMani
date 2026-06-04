@@ -7,23 +7,24 @@ import { AxisGroupChart, ForceChart } from '../components/Charts'
 import { MetricPill } from '../components/MetricPill'
 import { armHardwareSpecs } from '../data'
 import { useTelemetryStore } from '../stores/telemetry'
+import { teleopHandState, teleopHandValue, teleopPairState, teleopPairValue } from '../teleopStatus'
 import type { CameraTelemetry, ConnectionState, DiagnosticItem, TelemetryFrame, TelemetrySample } from '../types'
 
 const semanticAxes = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']
 const forceChannels = ['Fx', 'Fy', 'Fz', 'Mx', 'My', 'Mz']
-
+/** 计算对应的业务值或展示值。 */
 function diagnosticState(diagnostics: DiagnosticItem[], key: string): ConnectionState {
   return diagnostics.find((item) => item.key === key)?.status ?? 'pending'
 }
-
+/** 计算对应的业务值或展示值。 */
 function cameraByKey(cameras: CameraTelemetry[], key: CameraTelemetry['key']) {
   return cameras.find((camera) => camera.key === key)
 }
-
+/** 计算对应的业务值或展示值。 */
 function forceMagnitude(values: number[]) {
   return Math.sqrt(values.slice(0, 3).reduce((sum, value) => sum + value * value, 0))
 }
-
+/** 格式化对应数值用于界面展示。 */
 function stateText(state: ConnectionState) {
   if (state === 'ok') return '正常'
   if (state === 'warn') return '注意'
@@ -31,7 +32,7 @@ function stateText(state: ConnectionState) {
   if (state === 'checking') return '检查中'
   return '待确认'
 }
-
+/** 格式化对应数值用于界面展示。 */
 function stateTone(state: ConnectionState) {
   if (state === 'ok') return 'success'
   if (state === 'warn') return 'warning'
@@ -39,15 +40,15 @@ function stateTone(state: ConnectionState) {
   if (state === 'checking') return 'processing'
   return 'default'
 }
-
+/** 格式化对应数值用于界面展示。 */
 function formatAxisValue(value: number, index: number) {
   return index < 3 ? `${value.toFixed(1)} µm` : `${value.toFixed(2)}°`
 }
-
+/** 格式化对应数值用于界面展示。 */
 function formatForceValue(value: number, index: number) {
   return index < 3 ? `${(value * 1000).toFixed(0)}` : `${(value * 1000).toFixed(1)}`
 }
-
+/** 格式化对应数值用于界面展示。 */
 function formatGripperValue(value: number | undefined) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? `${value.toFixed(1)}mm` : '不可用'
 }
@@ -61,7 +62,7 @@ const forceReadoutGroups = [
   { key: 'force', label: '力 · mN', channels: forceChannels.slice(0, 3), start: 0 },
   { key: 'moment', label: '力矩 · mN·m', channels: forceChannels.slice(3, 6), start: 3 },
 ]
-
+/** 渲染当前界面单元，并连接所需数据。 */
 function HardwareStatusButton({
   label,
   state,
@@ -88,7 +89,7 @@ function HardwareStatusButton({
     </button>
   )
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 function DeviceChip({
   label,
   state,
@@ -110,7 +111,7 @@ function DeviceChip({
     </button>
   )
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 function GlobalHardwarePanel({
   frame,
   diagnostics,
@@ -120,10 +121,11 @@ function GlobalHardwarePanel({
 }) {
   const navigate = useNavigate()
   const globalCamera = cameraByKey(frame.cameras, 'global')
-  const omegaState = diagnosticState(diagnostics, 'omega7')
+  const omegaState = teleopPairState(frame, diagnostics)
   const halState: ConnectionState = frame.halOk ? 'ok' : 'error'
   const safetyState: ConnectionState = frame.dangerIndex > 0.85 ? 'error' : frame.dangerIndex > 0.6 ? 'warn' : 'ok'
-  const go = (hash: string) => navigate(`/settings#${hash}`)
+ /** 描述当前方法的功能边界。 */
+ const go = (hash: string) => navigate(`/settings#${hash}`)
 
   return (
     <section className="hardware-panel global-hardware-panel">
@@ -158,7 +160,7 @@ function GlobalHardwarePanel({
           <HardwareStatusButton
             label="双 Omega.7 主手"
             state={omegaState}
-            value="左右主手枚举"
+            value={teleopPairValue(frame)}
             detail="Force Dimension SDK / USB 设备状态"
             icon={<Gamepad2 size={15} />}
             onClick={() => go('teleop-left')}
@@ -176,7 +178,7 @@ function GlobalHardwarePanel({
     </section>
   )
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 function ArmHardwarePanel({
   side,
   frame,
@@ -199,12 +201,13 @@ function ArmHardwarePanel({
   const forceValues = isLeft ? frame.forceLeft : frame.forceRight
   const forceState = diagnosticState(diagnostics, isLeft ? 'ati-left' : 'ati-right')
   const gripperState = diagnosticState(diagnostics, 'gripper')
-  const teleopState = diagnosticState(diagnostics, 'omega7')
+  const teleopState = teleopHandState(frame, diagnostics, side)
   const motionState: ConnectionState = frame.halOk ? 'ok' : 'error'
   const forceNorm = forceMagnitude(forceValues)
   const safetyState: ConnectionState = forceNorm > 2.5 || frame.dangerIndex > 0.65 ? 'warn' : 'ok'
   const gripperValue = formatGripperValue(frame.gripperPositions[isLeft ? 0 : 1])
-  const go = (hash: string) => navigate(`/settings#${hash}`)
+ /** 描述当前方法的功能边界。 */
+ const go = (hash: string) => navigate(`/settings#${hash}`)
 
   return (
     <section className="hardware-panel arm-hardware-panel">
@@ -222,7 +225,7 @@ function ArmHardwarePanel({
         <DeviceChip label="物理轴号" state={motionState} value={axisOrder} icon={<MapPinned size={14} />} onClick={() => go(isLeft ? 'motion-left' : 'motion-right')} />
         <DeviceChip label="Nano-17" state={forceState} value="mN" icon={<Waves size={14} />} onClick={() => go(isLeft ? 'force-left' : 'force-right')} />
         <DeviceChip label="夹爪" state={gripperState} value={gripperValue} icon={<Hand size={14} />} onClick={() => go(isLeft ? 'gripper-left' : 'gripper-right')} />
-        <DeviceChip label="主手" state={teleopState} value={isLeft ? '左 Omega.7' : '右 Omega.7'} icon={<Gamepad2 size={14} />} onClick={() => go(isLeft ? 'teleop-left' : 'teleop-right')} />
+        <DeviceChip label="主手" state={teleopState} value={teleopHandValue(frame, side)} icon={<Gamepad2 size={14} />} onClick={() => go(isLeft ? 'teleop-left' : 'teleop-right')} />
       </div>
 
       <div className="arm-hardware-layout">
@@ -290,7 +293,7 @@ function ArmHardwarePanel({
     </section>
   )
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function DashboardView() {
   const frame = useTelemetryStore((state) => state.frame)
   const history = useTelemetryStore((state) => state.history)

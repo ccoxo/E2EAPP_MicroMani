@@ -186,6 +186,7 @@ class RealHalClient(HalClient):
             "teleop.native.start": "/teleop/native/start",
             "teleop.native.stop": "/teleop/native/stop",
             "teleop.native.status": "/teleop/native/status",
+            "teleop.native.gripper_command": "/teleop/native/gripper_command",
             "gripper.command": "/gripper/command",
         }
         path = path_by_command.get(name)

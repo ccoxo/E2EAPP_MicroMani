@@ -5,7 +5,7 @@ import { formatApiErrorMessage, stopMotionSide } from './api'
 import App from './App'
 import { ActionCompareModal } from './components/ActionCompareModal'
 import { LogPanel } from './components/LogPanel'
-import { defaultConfig } from './data'
+import { defaultConfig, defaultDiagnostics } from './data'
 import { chartHistoryIntervalMs, uiFrameIntervalMs, useTelemetryStore } from './stores/telemetry'
 import type { TelemetryFrame } from './types'
 
@@ -15,10 +15,32 @@ afterEach(() => {
   useTelemetryStore.getState().stopMock()
   useTelemetryStore.getState().stopBackend()
   useTelemetryStore.getState().clearRecordSession()
+  useTelemetryStore.setState((state) => ({
+    config: structuredClone(defaultConfig),
+    diagnostics: structuredClone(defaultDiagnostics),
+    picoConnection: { state: 'pending', message: '尚未检查 PICO ADB', checkedAt: null },
+    frame: {
+      ...state.frame,
+      teleopHands: state.frame.teleopHands.map((hand) => ({
+        ...hand,
+        connected: false,
+        calibrated: false,
+        openId: hand.side === 'left' ? defaultConfig.teleop.leftOpenId : defaultConfig.teleop.rightOpenId,
+        deviceId: -1,
+        pose: [0, 0, 0, 0, 0, 0],
+        clutchPressed: false,
+        gripperPressed: false,
+        gripperGapMm: null,
+        lastReadOk: false,
+        message: 'logical teleop hand disconnected',
+      })),
+    },
+  }))
   cleanup()
   window.localStorage.clear()
   window.history.pushState({}, '', '/')
   vi.useRealTimers()
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
 })
 
@@ -170,6 +192,316 @@ describe('AppStation M0 frontend', () => {
     expect(document.querySelector('.record-camera-placeholder-wrist_right')).toBeTruthy()
   })
 
+  it('exposes Kalman filter controls on the record page', () => {
+    window.history.pushState({}, '', '/record')
+    render(<App />)
+
+    expect(screen.getByText('卡尔曼滤波')).toBeInTheDocument()
+    expect(screen.getByText('遗忘因子 beta')).toBeInTheDocument()
+    expect(screen.getByText('平移测量方差 R')).toBeInTheDocument()
+    expect(screen.getByText('平移阈值 v_th')).toBeInTheDocument()
+    expect(screen.getByText('旋转测量方差 R')).toBeInTheDocument()
+    expect(screen.getByText('旋转阈值 v_th')).toBeInTheDocument()
+    expect(document.querySelector('.record-page-side')).toContainElement(screen.getByText('卡尔曼滤波'))
+
+    const toggle = screen.getByRole('switch', { name: '卡尔曼滤波开关' })
+    expect(toggle).not.toBeChecked()
+    fireEvent.click(toggle)
+
+    expect(useTelemetryStore.getState().config.teleop.kalmanFilterEnabled).toBe(true)
+  })
+
+  it('returns left and right slave arms to recorded zero from the record controls', async () => {
+    let resolveLeftReturn: (value: { ok: boolean }) => void = () => undefined
+    const leftReturnPromise = new Promise<{ ok: boolean }>((resolve) => {
+      resolveLeftReturn = resolve
+    })
+    const returnOriginSpy = vi.spyOn(api, 'returnMotionOriginSide').mockImplementation((side) => {
+      if (side === 'left') return leftReturnPromise
+      return Promise.resolve({ ok: true })
+    })
+
+    window.history.pushState({}, '', '/record')
+    render(<App />)
+
+    const leftButton = () => screen.getByText('左从臂回已记录零点').closest('button')!
+    const rightButton = () => screen.getByText('右从臂回已记录零点').closest('button')!
+
+    fireEvent.click(leftButton())
+    await waitFor(() => expect(returnOriginSpy).toHaveBeenCalledWith('left'), { timeout: 1000 })
+    expect(rightButton()).toBeDisabled()
+
+    resolveLeftReturn({ ok: true })
+    await waitFor(() => expect(rightButton()).toBeEnabled(), { timeout: 1000 })
+    fireEvent.click(rightButton())
+    expect(returnOriginSpy).toHaveBeenCalledWith('right')
+  })
+
+  it('shows teleop connection, gripper teleop ports, and camera tuning controls in compact status rows', () => {
+    window.history.pushState({}, '', '/settings')
+    render(<App />)
+
+    const teleopStrips = document.querySelectorAll('.teleop-connection-strip')
+    expect(teleopStrips.length).toBeGreaterThanOrEqual(2)
+    expect(teleopStrips[0].textContent).not.toContain('COM8')
+    expect(teleopStrips[0].textContent).not.toContain('COM9')
+
+    const gripperTeleopStrips = document.querySelectorAll('.gripper-teleop-strip')
+    expect(gripperTeleopStrips.length).toBeGreaterThanOrEqual(2)
+    expect(gripperTeleopStrips[0].textContent).toContain('COM8')
+    expect(gripperTeleopStrips[0].textContent).toContain('slave 10')
+
+    const cameraRows = document.querySelectorAll('.camera-tuning-control-row')
+    expect(cameraRows.length).toBeGreaterThanOrEqual(6)
+  })
+
+  it('marks a logically connected but physically offline teleop hand as an error state', () => {
+    window.history.pushState({}, '', '/settings#teleop-left')
+    useTelemetryStore.setState((state) => ({
+      config: {
+        ...state.config,
+        teleop: { ...state.config.teleop, leftConnected: true },
+      },
+      frame: {
+        ...state.frame,
+        teleopHands: state.frame.teleopHands.map((hand) =>
+          hand.side === 'left'
+            ? { ...hand, connected: false, lastReadOk: false, message: 'physical device offline' }
+            : hand,
+        ),
+      },
+    }))
+
+    render(<App />)
+
+    const teleopConnection = document.querySelector<HTMLElement>('#teleop-left .teleop-connection-strip > div:first-child')
+    expect(teleopConnection).toHaveClass('teleop-status-error')
+    expect(teleopConnection).toHaveTextContent('物理离线')
+  })
+
+  it('makes a physically offline teleop hand obvious even before logical connection', () => {
+    window.history.pushState({}, '', '/settings#teleop-left')
+    useTelemetryStore.setState((state) => ({
+      config: {
+        ...state.config,
+        teleop: { ...state.config.teleop, leftConnected: false },
+      },
+      frame: {
+        ...state.frame,
+        teleopHands: state.frame.teleopHands.map((hand) =>
+          hand.side === 'left'
+            ? { ...hand, connected: false, lastReadOk: false, message: 'waiting for operator connection' }
+            : hand,
+        ),
+      },
+    }))
+
+    render(<App />)
+
+    const teleopCard = document.querySelector<HTMLElement>('#teleop-left')
+    const teleopAlert = document.querySelector<HTMLElement>('#teleop-left .teleop-error-callout')
+    const teleopConnection = document.querySelector<HTMLElement>('#teleop-left .teleop-connection-strip > div:first-child')
+    expect(teleopCard).toHaveClass('hardware-config-card-state-error')
+    expect(teleopAlert).toHaveClass('hardware-error-callout')
+    expect(teleopAlert).toHaveTextContent('waiting for operator connection')
+    expect(teleopConnection).toHaveClass('teleop-status-error')
+    expect(teleopConnection).toHaveTextContent('物理离线')
+  })
+
+  it('uses live Omega telemetry for the displayed OpenID instead of the configured OpenID', () => {
+    window.history.pushState({}, '', '/settings#teleop-left')
+    useTelemetryStore.setState((state) => ({
+      config: {
+        ...state.config,
+        teleop: { ...state.config.teleop, leftConnected: true, leftOpenId: 0 },
+      },
+      frame: {
+        ...state.frame,
+        teleopHands: state.frame.teleopHands.map((hand) =>
+          hand.side === 'left'
+            ? {
+                ...hand,
+                connected: true,
+                lastReadOk: true,
+                openId: 1,
+                deviceId: 1,
+                serial: '22025',
+                pose: [0, 0, 0, 0, 0, 0],
+              }
+            : hand,
+        ),
+      },
+    }))
+
+    render(<App />)
+
+    const teleopCard = document.querySelector<HTMLElement>('#teleop-left')
+    expect(teleopCard).toHaveTextContent('配置 dhdOpenID(0)')
+    expect(teleopCard).toHaveTextContent('OpenID 1 / device 1')
+    expect(teleopCard).not.toHaveTextContent('OpenID 0 / device 1')
+  })
+
+  it('shows the crossed target arm for each Omega teleop source hand', () => {
+    window.history.pushState({}, '', '/settings')
+
+    render(<App />)
+
+    const leftTeleopCard = document.querySelector<HTMLElement>('#teleop-left')
+    const rightTeleopCard = document.querySelector<HTMLElement>('#teleop-right')
+    expect(leftTeleopCard).toBeTruthy()
+    expect(rightTeleopCard).toBeTruthy()
+    const leftActions = leftTeleopCard!.querySelector<HTMLElement>('.hardware-config-actions')
+    const rightActions = rightTeleopCard!.querySelector<HTMLElement>('.hardware-config-actions')
+    const leftMetrics = leftTeleopCard!.querySelector<HTMLElement>('.hardware-metric-grid')
+    const rightMetrics = rightTeleopCard!.querySelector<HTMLElement>('.hardware-metric-grid')
+    expect(leftActions).toHaveTextContent('目标臂')
+    expect(leftActions).toHaveTextContent('右臂')
+    expect(leftActions!.textContent!.indexOf('目标臂')).toBeLessThan(leftActions!.textContent!.indexOf('连接主手'))
+    expect(rightActions).toHaveTextContent('目标臂')
+    expect(rightActions).toHaveTextContent('左臂')
+    expect(rightActions!.textContent!.indexOf('目标臂')).toBeLessThan(rightActions!.textContent!.indexOf('连接主手'))
+    expect(leftMetrics).not.toHaveTextContent('目标臂')
+    expect(rightMetrics).not.toHaveTextContent('目标臂')
+  })
+
+  it('returns only the selected slave arm to the recorded hardware zero from Omega cards', async () => {
+    let resolveLeftReturn: (value: { ok: boolean }) => void = () => undefined
+    const leftReturnPromise = new Promise<{ ok: boolean }>((resolve) => {
+      resolveLeftReturn = resolve
+    })
+    const returnOriginSpy = vi.spyOn(api, 'returnMotionOriginSide').mockImplementation((side) => {
+      if (side === 'left') return leftReturnPromise
+      return Promise.resolve({ ok: true })
+    })
+    const homeAllSpy = vi.spyOn(api, 'homeAll').mockResolvedValue({ ok: true })
+    const captureOriginSpy = vi.spyOn(api, 'captureMotionOrigin').mockResolvedValue({ ok: true })
+
+    window.history.pushState({}, '', '/settings')
+    render(<App />)
+
+    const getTeleopCard = (side: 'left' | 'right') => {
+      const card = document.querySelector<HTMLElement>(`#teleop-${side}`)
+      expect(card).toBeTruthy()
+      return card!
+    }
+    const getReturnButton = (side: 'left' | 'right') => {
+      const button = [...getTeleopCard(side).querySelectorAll<HTMLButtonElement>('button')].find((item) => item.textContent?.includes('回硬件零点'))
+      expect(button).toBeTruthy()
+      return button!
+    }
+
+    fireEvent.click(getReturnButton('left'))
+    await waitFor(() => expect(returnOriginSpy).toHaveBeenCalledWith('left'), { timeout: 1000 })
+    expect(getReturnButton('right')).toBeDisabled()
+
+    resolveLeftReturn({ ok: true })
+    await waitFor(() => expect(getReturnButton('right')).toBeEnabled(), { timeout: 1000 })
+    fireEvent.click(getReturnButton('right'))
+    expect(returnOriginSpy.mock.calls).toEqual([['left'], ['right']])
+    expect(returnOriginSpy).toHaveBeenCalledWith('right')
+    expect(homeAllSpy).not.toHaveBeenCalled()
+    expect(captureOriginSpy).not.toHaveBeenCalled()
+  })
+
+  it('does not show stale Omega pose values after the latest read failed', () => {
+    window.history.pushState({}, '', '/settings#teleop-left')
+    useTelemetryStore.setState((state) => ({
+      config: {
+        ...state.config,
+        teleop: { ...state.config.teleop, leftConnected: true },
+      },
+      frame: {
+        ...state.frame,
+        teleopHands: state.frame.teleopHands.map((hand) =>
+          hand.side === 'left'
+            ? {
+                ...hand,
+                connected: true,
+                lastReadOk: false,
+                pose: [0.01, 0.02, 0.03, 4, 5, 6],
+                message: 'SDK read timeout',
+              }
+            : hand,
+        ),
+      },
+    }))
+
+    render(<App />)
+
+    const teleopCard = document.querySelector<HTMLElement>('#teleop-left')
+    expect(teleopCard).toHaveTextContent('读数待恢复')
+    expect(teleopCard).not.toHaveTextContent('10.0, 20.0, 30.0 mm')
+    expect(teleopCard).not.toHaveTextContent('4.00, 5.00, 6.00°')
+  })
+
+  it('marks dashboard Omega hand status from per-hand telemetry reads', () => {
+    useTelemetryStore.setState((state) => ({
+      diagnostics: state.diagnostics.map((item) => (item.key === 'omega7' ? { ...item, status: 'ok' } : item)),
+      config: {
+        ...state.config,
+        teleop: { ...state.config.teleop, leftConnected: true, rightConnected: true },
+      },
+      frame: {
+        ...state.frame,
+        teleopHands: state.frame.teleopHands.map((hand) =>
+          hand.side === 'left'
+            ? { ...hand, connected: true, lastReadOk: false, message: 'SDK read timeout' }
+            : { ...hand, connected: true, lastReadOk: true },
+        ),
+      },
+    }))
+
+    render(<App />)
+
+    const leftPanel = screen.getByText('左机械臂').closest('section')
+    const teleopChip = leftPanel?.querySelector<HTMLElement>('.device-chip-row button:last-child')
+    expect(teleopChip).toHaveClass('device-chip-warn')
+    expect(teleopChip).toHaveTextContent('读数待恢复')
+  })
+
+  it('marks a failed gripper teleop port as an error state', async () => {
+    vi.spyOn(api, 'fetchGripperTeleopStatus').mockResolvedValue({
+      data: {
+        running: false,
+        requestedRunning: false,
+        message: 'left gripper serial open failed',
+        ports: [
+          { side: 'left', port: 'COM8', slaveId: 10, baudrate: 115200, ok: false, message: 'serial open failed' },
+        ],
+      },
+    })
+
+    window.history.pushState({}, '', '/settings#gripper-left')
+    render(<App />)
+
+    await waitFor(() => expect(api.fetchGripperTeleopStatus).toHaveBeenCalled())
+    const gripperAlert = document.querySelector<HTMLElement>('#gripper-left .gripper-error-callout')
+    const gripperPort = document.querySelector<HTMLElement>('#gripper-left .gripper-teleop-strip > div:first-child')
+    expect(gripperAlert).toHaveClass('hardware-error-callout')
+    expect(gripperAlert).toHaveTextContent('serial open failed')
+    expect(gripperPort).toHaveClass('gripper-status-error')
+    expect(gripperPort).toHaveTextContent('serial open failed')
+  })
+
+  it('uses a danger style for the running gripper teleop stop button', async () => {
+    vi.spyOn(api, 'fetchGripperTeleopStatus').mockResolvedValue({
+      data: {
+        running: true,
+        requestedRunning: true,
+        ports: [
+          { side: 'left', port: 'COM8', slaveId: 10, baudrate: 115200, ok: true },
+        ],
+      },
+    })
+
+    window.history.pushState({}, '', '/settings#gripper-left')
+    render(<App />)
+
+    await waitFor(() => expect(screen.getAllByText('停止遥操').length).toBeGreaterThan(0))
+    const stopButton = screen.getAllByText('停止遥操')[0].closest('button')
+    expect(stopButton).toHaveClass('ant-btn-dangerous')
+  })
+
   it('runs the record precheck, save, and quality report flow', async () => {
     useTelemetryStore.setState((state) => ({
       config: {
@@ -212,6 +544,138 @@ describe('AppStation M0 frontend', () => {
     await waitFor(() => expect(screen.getByText(/Episode #000/)).toBeInTheDocument())
     fireEvent.click(screen.getByText('接受并继续').closest('button')!)
     await waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('resetting'))
+  })
+
+  it('starts the UI record timer only after the backend creates the session', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-05-22T00:00:00.000Z'))
+
+    let resolveCreateSession: (value: api.RecordSessionCommandResponse) => void = () => undefined
+    const createSessionPromise = new Promise<api.RecordSessionCommandResponse>((resolve) => {
+      resolveCreateSession = resolve
+    })
+    vi.spyOn(api, 'fetchRecordStatus').mockResolvedValue({ active: false, recording: false })
+    const createSessionSpy = vi.spyOn(api, 'createSession').mockReturnValue(createSessionPromise)
+
+    useTelemetryStore.getState().startRecordSession('micro_assembly_v1', 'Assemble ICF target component')
+
+    await vi.waitFor(() =>
+      expect(createSessionSpy).toHaveBeenCalledWith('micro_assembly_v1', 'Assemble ICF target component'),
+    )
+    expect(useTelemetryStore.getState().recording).toBe(false)
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('starting')
+    expect(useTelemetryStore.getState().recordSession.phaseStartedAt).toBeNull()
+    expect(useTelemetryStore.getState().recordSession.recorderElapsedS).toBe(0)
+    expect(useTelemetryStore.getState().recordSession.recorderTotalS).toBe(-1)
+
+    vi.setSystemTime(new Date('2026-05-22T00:00:02.000Z'))
+    resolveCreateSession({ ok: true })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(useTelemetryStore.getState().recording).toBe(true)
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('recording')
+    expect(useTelemetryStore.getState().recordSession.phaseStartedAt).toBe(Date.now())
+  })
+
+  it('ignores duplicate record session starts while the first start is pending', async () => {
+    let resolveCreateSession: (value: api.RecordSessionCommandResponse) => void = () => undefined
+    const createSessionPromise = new Promise<api.RecordSessionCommandResponse>((resolve) => {
+      resolveCreateSession = resolve
+    })
+    vi.spyOn(api, 'fetchRecordStatus').mockResolvedValue({ active: false, recording: false })
+    vi.spyOn(api, 'putConfig').mockResolvedValue(structuredClone(defaultConfig))
+    const createSessionSpy = vi.spyOn(api, 'createSession').mockReturnValue(createSessionPromise)
+
+    useTelemetryStore.getState().startRecordSession('micro_assembly_demo', 'Assemble ICF target component')
+    useTelemetryStore.getState().startRecordSession('micro_assembly_demo', 'Assemble ICF target component')
+
+    await vi.waitFor(() => expect(createSessionSpy).toHaveBeenCalledTimes(1))
+
+    resolveCreateSession({ ok: true })
+    await vi.waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('recording'))
+  })
+
+  it('ignores duplicate return-to-origin requests while the first request is pending', async () => {
+    let resolveReturnOrigin: (value: { ok: boolean }) => void = () => undefined
+    const returnOriginPromise = new Promise<{ ok: boolean }>((resolve) => {
+      resolveReturnOrigin = resolve
+    })
+    const returnOriginSpy = vi.spyOn(api, 'returnMotionOriginSide').mockReturnValue(returnOriginPromise)
+
+    const first = useTelemetryStore.getState().returnRecordMotionOrigin('right')
+    const second = useTelemetryStore.getState().returnRecordMotionOrigin('right')
+
+    expect(returnOriginSpy).toHaveBeenCalledTimes(1)
+    expect(returnOriginSpy).toHaveBeenCalledWith('right')
+
+    resolveReturnOrigin({ ok: true })
+    await Promise.all([first, second])
+  })
+
+  it('saves the latest Kalman config before creating a record session', async () => {
+    let resolveConfigSave: (value: typeof defaultConfig) => void = () => undefined
+    const configSavePromise = new Promise<typeof defaultConfig>((resolve) => {
+      resolveConfigSave = resolve
+    })
+    vi.spyOn(api, 'fetchRecordStatus').mockResolvedValue({ active: false, recording: false })
+    const putConfigSpy = vi.spyOn(api, 'putConfig').mockReturnValue(configSavePromise)
+    const createSessionSpy = vi.spyOn(api, 'createSession').mockResolvedValue({ ok: true })
+
+    act(() => {
+      useTelemetryStore.setState((state) => ({
+        config: {
+          ...state.config,
+          teleop: { ...state.config.teleop, kalmanFilterEnabled: true },
+        },
+      }))
+    })
+
+    useTelemetryStore.getState().startRecordSession('micro_assembly_v1', 'Assemble ICF target component')
+
+    await waitFor(() =>
+      expect(putConfigSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          teleop: expect.objectContaining({ kalmanFilterEnabled: true }),
+        }),
+      ),
+    )
+    expect(createSessionSpy).not.toHaveBeenCalled()
+
+    resolveConfigSave(structuredClone(useTelemetryStore.getState().config))
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(createSessionSpy).toHaveBeenCalledWith('micro_assembly_v1', 'Assemble ICF target component')
+  })
+
+  it('aligns the UI record timer to the backend recorder elapsed time', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-05-22T00:00:02.000Z'))
+
+    vi.spyOn(api, 'fetchRecordStatus').mockResolvedValue({ active: false, recording: false })
+    vi.spyOn(api, 'createSession').mockResolvedValue({
+      ok: true,
+      data: {
+        active: true,
+        recording: true,
+        elapsedS: 0.55,
+        frameCount: 16,
+        fps: 30,
+      },
+      ts: Date.now(),
+    })
+
+    useTelemetryStore.getState().startRecordSession('micro_assembly_v1', 'Assemble ICF target component')
+
+    await vi.waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('recording'))
+    const session = useTelemetryStore.getState().recordSession
+    expect(session.phase).toBe('recording')
+    expect(session.recorderElapsedS).toBeCloseTo(0.55, 3)
+    expect(session.recorderFrameCount).toBe(16)
+    expect(session.recorderFps).toBe(30)
+    expect(Date.now() - (session.phaseStartedAt ?? 0)).toBeGreaterThanOrEqual(550)
   })
 
   it('blocks record precheck until Omega.7 and gripper diagnostics are recognized', async () => {
@@ -288,7 +752,7 @@ describe('AppStation M0 frontend', () => {
     expect(confirmButton).toBeDisabled()
   })
 
-  it('finishes the record session after a save finishes when Esc is pressed during saving', async () => {
+  it('keeps the quality report visible when finish is pressed during saving, then finishes after acceptance', async () => {
     useTelemetryStore.setState((state) => ({
       recording: true,
       recordSession: {
@@ -304,7 +768,94 @@ describe('AppStation M0 frontend', () => {
     })
 
     expect(useTelemetryStore.getState().recordSession.phase).toBe('saving')
+    await waitFor(() => expect(useTelemetryStore.getState().recordSession.latestQualityReport).not.toBeNull())
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('reviewing')
+    expect(useTelemetryStore.getState().recording).toBe(false)
+
+    act(() => {
+      useTelemetryStore.getState().acceptRecordQualityReport()
+    })
+
     await waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('idle'))
+    expect(useTelemetryStore.getState().recording).toBe(false)
+  })
+
+  it('ignores reset skip unless the record workflow is resetting', () => {
+    useTelemetryStore.setState((state) => ({
+      recording: false,
+      recordSession: {
+        ...state.recordSession,
+        phase: 'idle',
+        phaseStartedAt: null,
+      },
+    }))
+
+    act(() => {
+      useTelemetryStore.getState().skipRecordReset()
+    })
+
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('idle')
+    expect(useTelemetryStore.getState().recording).toBe(false)
+  })
+
+  it('pauses for reset after discarding an active record episode', () => {
+    const discardSpy = vi.spyOn(api, 'discardEpisode').mockResolvedValue({ ok: true, data: {}, ts: Date.now() })
+    useTelemetryStore.setState((state) => ({
+      recording: true,
+      recordSession: {
+        ...state.recordSession,
+        phase: 'recording',
+        phaseStartedAt: Date.now() - 1000,
+        recorderFrameCount: 12,
+        recorderElapsedS: 1,
+      },
+    }))
+
+    act(() => {
+      useTelemetryStore.getState().discardRecordEpisode()
+    })
+
+    const state = useTelemetryStore.getState()
+    expect(discardSpy).toHaveBeenCalledTimes(1)
+    expect(state.recording).toBe(false)
+    expect(state.recordSession.phase).toBe('resetting')
+    expect(state.recordSession.recorderTotalS).toBe(state.recordSession.resetTimeS)
+  })
+
+  it('ignores quality report acceptance when no report is pending', () => {
+    useTelemetryStore.setState((state) => ({
+      recording: false,
+      recordSession: {
+        ...state.recordSession,
+        phase: 'saving',
+        latestQualityReport: null,
+      },
+    }))
+
+    act(() => {
+      useTelemetryStore.getState().acceptRecordQualityReport()
+    })
+
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('saving')
+    expect(useTelemetryStore.getState().recordSession.latestQualityReport).toBeNull()
+  })
+
+  it('does not skip reset from a repeated Space shortcut after saving', () => {
+    window.history.pushState({}, '', '/record')
+    render(<App />)
+    useTelemetryStore.setState((state) => ({
+      recording: false,
+      recordSession: {
+        ...state.recordSession,
+        phase: 'resetting',
+        phaseStartedAt: Date.now(),
+        latestQualityReport: null,
+      },
+    }))
+
+    fireEvent.keyDown(window, { key: ' ', repeat: true })
+
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('resetting')
     expect(useTelemetryStore.getState().recording).toBe(false)
   })
 
@@ -326,6 +877,34 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getByText('右力传感器实时曲线')).toBeInTheDocument()
   })
 
+  it('submits transient Hugging Face upload settings from the dataset page', async () => {
+    const hubToggleSpy = vi.spyOn(api, 'updateDatasetHubApi').mockResolvedValue({ ok: true, data: { pushToHub: true }, ts: Date.now() })
+    const pushSpy = vi.spyOn(api, 'pushDatasetApi').mockResolvedValue({ ok: true, data: { queued: true, jobId: 'job-1' }, ts: Date.now() })
+
+    useTelemetryStore.setState({ config: structuredClone(defaultConfig) })
+    render(<App />)
+    fireEvent.click(screen.getByRole('link', { name: '数据集' }))
+    fireEvent.click(screen.getByRole('button', { name: /Hub 上传/ }))
+    fireEvent.click(screen.getByRole('switch', { name: 'Hub 上传开关' }))
+    fireEvent.change(screen.getByPlaceholderText('org/dataset-name'), { target: { value: 'lab/micro_assembly_v1' } })
+    fireEvent.change(screen.getByLabelText('Local path'), { target: { value: 'E:\\data group\\micro_assembly_v1' } })
+    fireEvent.change(screen.getByPlaceholderText('hf_xxx'), { target: { value: 'hf_transient_secret' } })
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Private' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Dry-run' }))
+    fireEvent.click(screen.getByRole('button', { name: '开始上传' }))
+
+    await waitFor(() => expect(hubToggleSpy).toHaveBeenCalledWith(true))
+    await waitFor(() => expect(pushSpy).toHaveBeenCalledWith('micro_assembly_v1', {
+      repoId: 'lab/micro_assembly_v1',
+      localPath: 'E:\\data group\\micro_assembly_v1',
+      token: 'hf_transient_secret',
+      private: true,
+      dryRun: false,
+    }))
+    expect(await screen.findByText('Hub upload queued')).toBeInTheDocument()
+    expect(screen.queryByDisplayValue('hf_transient_secret')).not.toBeInTheDocument()
+  }, 30000)
+
   it('opens focused hardware settings from dashboard module buttons', () => {
     render(<App />)
     const motionButton = document.querySelector<HTMLButtonElement>('.arm-hardware-panel .device-chip-row button')
@@ -342,12 +921,68 @@ describe('AppStation M0 frontend', () => {
 
   it('formats backend command errors with detail codes and messages', () => {
     expect(formatApiErrorMessage(409, { detail: { code: 'RECORDING_BUSY', message: 'record session already active' } })).toBe(
-      'command failed: 409 RECORDING_BUSY: record session already active',
+      '录制会话已在运行，请先结束当前会话后再开始新的录制。（409 RECORDING_BUSY）',
     )
+  })
+
+  it('maps PICO API helpers to backend routes', async () => {
+    await expect(api.connectPicoAdb()).resolves.toMatchObject({ path: '/pico/adb/connect' })
+    await expect(api.checkPicoStatus()).resolves.toMatchObject({ path: '/pico/status/check' })
+    await expect(api.startPicoVision()).resolves.toMatchObject({ path: '/pico/vision/start' })
+    await expect(api.stopPicoVision()).resolves.toMatchObject({ path: '/pico/vision/stop' })
+  })
+
+  it('renders visual PICO status and current IMX335 camera hardware', () => {
+    window.history.pushState({}, '', '/settings#teleop')
+    render(<App />)
+
+    const picoCard = document.querySelector<HTMLElement>('#teleop')
+    const picoStrip = picoCard?.querySelector<HTMLElement>('.pico-status-strip')
+    expect(picoStrip).toBeTruthy()
+    expect(picoStrip).toHaveTextContent('10.90.129.166:5555')
+    expect(picoStrip).toHaveTextContent('IF 13')
+    expect(picoStrip).toHaveTextContent('IMX335 / index 1')
+
+    const cameraCards = [
+      document.querySelector<HTMLElement>('#camera-global'),
+      document.querySelector<HTMLElement>('#camera-left'),
+      document.querySelector<HTMLElement>('#camera-right'),
+    ]
+    for (const card of cameraCards) {
+      expect(card).toBeTruthy()
+      expect(card).toHaveTextContent('IMX335')
+      expect(card?.querySelector('.camera-status-strip')).toBeTruthy()
+    }
+    expect(defaultConfig.cameras.global).toBe('IMX335 / index 1')
+    expect(defaultConfig.cameras.wristLeft).toBe('IMX335 / index 2')
+    expect(defaultConfig.cameras.wristRight).toBe('IMX335 / index 0')
+  })
+
+  it('syncs PICO connection results into the global status bar', async () => {
+    window.history.pushState({}, '', '/settings#teleop')
+    vi.spyOn(api, 'checkPicoStatus').mockResolvedValue({ ok: true, data: { ok: false, message: 'device offline' } })
+
+    render(<App />)
+
+    const statusBar = document.querySelector<HTMLElement>('.status-bar')
+    expect(statusBar).toBeTruthy()
+    await waitFor(() => expect(statusBar).toHaveTextContent('CAM 3/3'))
+    expect(statusBar).toHaveTextContent('PICO 待检查')
+
+    fireEvent.click((await screen.findByText('检查状态')).closest('button')!)
+
+    await waitFor(() => expect(statusBar).toHaveTextContent('PICO 离线'))
+    expect(statusBar).toHaveTextContent('10.90.129.166')
   })
 
   it('renders hardware-specific settings from the reference manual', () => {
     window.history.pushState({}, '', '/settings#motion-left')
+    useTelemetryStore.setState((state) => ({
+      config: {
+        ...state.config,
+        teleop: { ...state.config.teleop, leftConnected: false, rightConnected: false },
+      },
+    }))
     render(<App />)
     expect(screen.getByText('左臂运动控制卡 · Card 1')).toBeInTheDocument()
     expect(screen.getByText('右臂运动控制卡 · Card 0')).toBeInTheDocument()
@@ -362,8 +997,11 @@ describe('AppStation M0 frontend', () => {
     expect(screen.queryByText('最大加速度')).not.toBeInTheDocument()
     expect(screen.getAllByText('加速时间').length).toBeGreaterThan(0)
     expect(screen.getAllByText('减速时间').length).toBeGreaterThan(0)
-    expect(screen.getAllByText('软限位下限').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('相对硬件零点位置').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('绝对软限位下限').length).toBeGreaterThan(0)
     expect(screen.getAllByText('命令力限制 N').length).toBeGreaterThan(0)
+    expect(screen.getByText('HAL API 地址')).toBeInTheDocument()
+    expect(screen.queryByText(/\?\?\?\?/)).not.toBeInTheDocument()
     expect(screen.getAllByText('手册未给出').length).toBeGreaterThan(0)
     expect(screen.getByText('PICO-4 视觉推流')).toBeInTheDocument()
     expect(screen.getByText('连接无线 ADB')).toBeInTheDocument()
@@ -392,9 +1030,9 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getAllByText('选择运动参数')).toHaveLength(2)
     expect(screen.getAllByText('保存运动参数')).toHaveLength(2)
     expect(screen.getAllByText('使能全部')[0].closest('button')).toBeEnabled()
-    expect(screen.getAllByText('回零')[0].closest('button')).toBeEnabled()
+    expect(screen.getAllByText('硬件回零')[0].closest('button')).toBeEnabled()
     expect(screen.getAllByText('连接主手').length).toBeGreaterThan(0)
-    expect(screen.getAllByText('回工作原点').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('回硬件零点').length).toBeGreaterThan(0)
     expect(screen.getAllByText('平移比例').length).toBeGreaterThan(0)
     expect(screen.getAllByText('旋转比例').length).toBeGreaterThan(0)
     expect(screen.queryByText('数据轮询周期 ms')).not.toBeInTheDocument()
@@ -407,21 +1045,56 @@ describe('AppStation M0 frontend', () => {
     expect(defaultConfig.teleop.nativeLoopHz).toBe(100)
     expect(defaultConfig.teleop.swapHands).toBe(false)
     expect(defaultConfig.teleop.swapTeleopChannels).toBe(true)
-    expect(defaultConfig.teleop.leftSoftLimitMin).toEqual([-25000, -37500, -37500, -90, -90, -7])
+    expect(defaultConfig.teleop.leftSoftLimitMin).toEqual([-25000, -37500, -37500, -5, -30, -7])
+    expect(defaultConfig.teleop.leftSoftLimitMax).toEqual([25000, 37500, 37500, 95, 30, 7])
+    expect(defaultConfig.teleop.rightEnabledAxes).toEqual([true, true, true, true, true, false])
+    expect(defaultConfig.teleop.rightSoftLimitMin).toEqual([-25000, -37500, -37500, -95, -30, -7])
+    expect(defaultConfig.teleop.rightSoftLimitMax).toEqual([25000, 37500, 37500, 5, 30, 7])
+    expect(defaultConfig.motion.rotationWorkLimits.left.roll).toEqual({ min: -5, max: 95 })
+    expect(defaultConfig.motion.rotationWorkLimits.left.pitch).toEqual({ min: -30, max: 30 })
+    expect(defaultConfig.motion.rotationWorkLimits.right.roll).toEqual({ min: -95, max: 5 })
+    expect(defaultConfig.motion.rotationWorkLimits.right.pitch).toEqual({ min: -30, max: 30 })
     expect(defaultConfig.teleop.leftTranslationScale).toBe(1)
     expect(defaultConfig.teleop.rightTranslationScale).toBe(1)
     expect(defaultConfig.teleop.leftRotationScale).toBe(1)
     expect(defaultConfig.teleop.rightRotationScale).toBe(1)
-    expect(defaultConfig.teleop.leftAxisOutputScale).toEqual([0.4, 0.25, 0.25, 0.4, 0.2, 0.2])
-    expect(defaultConfig.teleop.rightAxisOutputScale).toEqual([0.4, 0.25, 0.25, 0.4, 0.2, 0.2])
+    expect(defaultConfig.teleop.leftAxisOutputScale).toEqual([0.4, 0.25, 0.25, 0.4, 0.08, 0.1])
+    expect(defaultConfig.teleop.rightAxisOutputScale).toEqual([0.4, 0.25, 0.25, 0.35, 0.08, 0.15])
     expect(defaultConfig.teleop.leftImpulseCoeff).toEqual([-5000000, 10000000, -10000000, 1667, -2500, -333.3333])
     expect(defaultConfig.teleop.rightImpulseCoeff).toEqual([-5000000, -10000000, -10000000, 1667, 2500, 3333.333])
     expect(defaultConfig.teleop.gripperTeleop.rightGapInvert).toBe(false)
+    expect(defaultConfig.teleop.gripperTeleop.gripTorque).toBe(1)
+    expect(defaultConfig.teleop.gripperTeleop.releaseTorque).toBe(1)
+    expect(defaultConfig.gripper.icfTargetProtectionEnabled).toBe(true)
+    expect(defaultConfig.gripper.icfTargetMinGapMm).toBe(1.02)
     expect(defaultConfig.motion.leftProfile.translation.maxSpeed).toBe(4000)
     expect(defaultConfig.motion.leftProfile.rotation.maxSpeed).toBe(6)
     expect(defaultConfig.motion.kinematics.rightPhysicalAxis).toEqual([2, 0, 5, 8, 1, 7])
     expect(screen.queryByText(/OpenXR/)).not.toBeInTheDocument()
   }, 10000)
+
+  it('routes PICO vision controls through backend commands', async () => {
+    window.history.pushState({}, '', '/settings#teleop')
+    const connectSpy = vi.spyOn(api, 'connectPicoAdb').mockResolvedValue({ ok: true })
+    const statusSpy = vi.spyOn(api, 'checkPicoStatus').mockResolvedValue({ ok: true, data: { ok: false, message: 'device offline' } })
+    const startSpy = vi.spyOn(api, 'startPicoVision').mockResolvedValue({ ok: true })
+    const stopSpy = vi.spyOn(api, 'stopPicoVision').mockResolvedValue({ ok: true })
+
+    render(<App />)
+
+    fireEvent.click((await screen.findByText('连接无线 ADB')).closest('button')!)
+    await waitFor(() => expect(connectSpy).toHaveBeenCalledTimes(1))
+    fireEvent.click(screen.getByText('检查状态').closest('button')!)
+    await waitFor(() => expect(statusSpy).toHaveBeenCalledTimes(1))
+    fireEvent.click(screen.getByText('启动视觉').closest('button')!)
+    await waitFor(() => expect(startSpy).toHaveBeenCalledTimes(1))
+    fireEvent.click(screen.getByText('停止视觉').closest('button')!)
+    await waitFor(() => expect(stopSpy).toHaveBeenCalledTimes(1))
+
+    expect(statusSpy).toHaveBeenCalledTimes(1)
+    expect(startSpy).toHaveBeenCalledTimes(1)
+    expect(stopSpy).toHaveBeenCalledTimes(1)
+  })
 
   it('only keeps camera grid overlays on the global preview', () => {
     render(<App />)
@@ -502,23 +1175,19 @@ describe('AppStation M0 frontend', () => {
     expect(within(dialog).getByRole('button', { name: '确认应用' })).toBeInTheDocument()
   }, 10000)
 
-  it('shows before and after state before clearing a motion origin', async () => {
+  it('shows before and after state before recording hardware zero', async () => {
     window.history.pushState({}, '', '/settings#motion-left')
     render(<App />)
     const leftCard = document.querySelector<HTMLElement>('#motion-left')
     expect(leftCard).toBeTruthy()
 
-    fireEvent.click(within(leftCard!).getByText('设为采集零点').closest('button')!)
-    fireEvent.click((await screen.findByText('确认设为零点')).closest('button')!)
-    await waitFor(() => expect(within(leftCard!).getByText('已设置')).toBeInTheDocument())
+    fireEvent.click(within(leftCard!).getByText('回零并记录').closest('button')!)
 
-    fireEvent.click(within(leftCard!).getByText('清除零点').closest('button')!)
-
-    const dialog = (await screen.findByText('清除左臂采集零点')).closest('[role="dialog"]') as HTMLElement
+    const dialog = (await screen.findByText('左臂回零并记录硬件零点')).closest('[role="dialog"]') as HTMLElement
     expect(dialog).toBeTruthy()
     expect(within(dialog).getByText('当前')).toBeInTheDocument()
     expect(within(dialog).getByText('将应用')).toBeInTheDocument()
-    expect(within(dialog).getByText('确认清除')).toBeInTheDocument()
+    expect(within(dialog).getByText('确认回零并记录')).toBeInTheDocument()
   }, 10000)
 
   it('shows before and after values before executing a gripper target', async () => {
@@ -577,6 +1246,15 @@ describe('AppStation M0 frontend', () => {
     expect(screen.queryByText('单轴点动')).not.toBeInTheDocument()
     expect(screen.queryByText('力觉示波器')).not.toBeInTheDocument()
     expect(screen.queryByText('开发者模式')).not.toBeInTheDocument()
+  })
+
+  it('disables right-arm Yaw in manual controls', () => {
+    window.history.pushState({}, '', '/settings#manual')
+    render(<App />)
+    const yawButtons = screen.getAllByRole('button', { name: 'Yaw' })
+    expect(yawButtons.length).toBeGreaterThanOrEqual(2)
+    expect(yawButtons[0]).not.toBeDisabled()
+    expect(yawButtons[1]).toBeDisabled()
   })
 
   it('records arm and gripper manual actions into replay memory', () => {
@@ -655,27 +1333,29 @@ describe('AppStation M0 frontend', () => {
     await waitFor(() => expect(useTelemetryStore.getState().config.teleop.leftConnected).toBe(false))
   })
 
-  it('renders motion origin controls and the startup return switch', () => {
+  it('renders hardware zero controls and the startup return switch', () => {
     window.history.pushState({}, '', '/settings#motion-left')
     render(<App />)
-    expect(screen.getAllByText('设为采集零点')).toHaveLength(2)
-    expect(screen.getAllByText('清除零点')).toHaveLength(2)
-    expect(screen.getByText('开机回工作原点')).toBeInTheDocument()
+    expect(screen.getAllByText('回零并记录')).toHaveLength(2)
+    expect(screen.getByText('恢复上个零点')).toBeInTheDocument()
+    expect(screen.getByText('开机回硬件零点')).toBeInTheDocument()
+    expect(screen.queryByText('设为采集零点')).not.toBeInTheDocument()
+    expect(screen.queryByText('清除零点')).not.toBeInTheDocument()
+    expect(screen.getAllByText('Roll -5~95° / Pitch ±30° · Yaw ±7°').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Roll -95~5° / Pitch ±30° · Yaw disabled').length).toBeGreaterThan(0)
   })
 
-  it('updates the motion origin state when the side controls are used', async () => {
+  it('updates the hardware zero state when the side controls are used', async () => {
     window.history.pushState({}, '', '/settings#motion-left')
     render(<App />)
     const leftCard = document.querySelector<HTMLElement>('#motion-left')
     expect(leftCard).toBeTruthy()
 
-    fireEvent.click(within(leftCard!).getByText('设为采集零点').closest('button')!)
-    fireEvent.click((await screen.findByText('确认设为零点')).closest('button')!)
-    await waitFor(() => expect(within(leftCard!).getByText('已设置')).toBeInTheDocument())
-
-    fireEvent.click(within(leftCard!).getByText('清除零点').closest('button')!)
-    fireEvent.click((await screen.findByText('确认清除')).closest('button')!)
-    await waitFor(() => expect(within(leftCard!).getByText('未设置')).toBeInTheDocument())
+    fireEvent.click(within(leftCard!).getByText('回零并记录').closest('button')!)
+    fireEvent.click((await screen.findByText('确认回零并记录')).closest('button')!)
+    await waitFor(() => expect(within(leftCard!).getByText('已记录')).toBeInTheDocument())
+    await waitFor(() => expect(within(leftCard!).getByText(/硬件零点位置：左\[/)).toBeInTheDocument())
+    await waitFor(() => expect(useTelemetryStore.getState().logs.at(-1)?.msg).toContain('硬件零点位置：左['))
   }, 10000)
 
   it('requires a second confirmation before overwriting a drifted motion origin', async () => {
@@ -722,10 +1402,10 @@ describe('AppStation M0 frontend', () => {
     const leftCard = document.querySelector<HTMLElement>('#motion-left')
     expect(leftCard).toBeTruthy()
 
-    fireEvent.click(within(leftCard!).getByText('设为采集零点').closest('button')!)
-    fireEvent.click((await screen.findByText('确认设为零点')).closest('button')!)
+    fireEvent.click(within(leftCard!).getByText('回零并记录').closest('button')!)
+    fireEvent.click((await screen.findByText('确认回零并记录')).closest('button')!)
 
-    const driftDialog = (await screen.findByText('左臂零点漂移过大')).closest('[role="dialog"]') as HTMLElement
+    const driftDialog = (await screen.findByText('左臂硬件零点漂移过大')).closest('[role="dialog"]') as HTMLElement
     expect(within(driftDialog).getByText('确认覆盖零点')).toBeInTheDocument()
     expect(within(driftDialog).getByText('左.X 20000 um')).toBeInTheDocument()
     expect(captureSpy).toHaveBeenNthCalledWith(1, 'left', undefined)

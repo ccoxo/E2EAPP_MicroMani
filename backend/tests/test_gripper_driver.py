@@ -14,6 +14,37 @@ def test_jodell_gripper_target_position_mapping() -> None:
     assert driver._motion_params("target", 13, 26) == (128, 10, 1, 13)
 
 
+def test_gripper_close_respects_icf_min_gap_protection(monkeypatch: MonkeyPatch) -> None:
+    config = default_config()
+    config["gripper"]["leftEnabled"] = True
+    driver = Rs485GripperDriver()
+
+    class FakeDll:
+        def __init__(self) -> None:
+            self.motion_calls: list[tuple[int, int, int, int]] = []
+
+        def serialOperation(self, port: int, baudrate: int, status: bool) -> int:
+            _ = (port, baudrate, status)
+            return 1
+
+        def clawEnable(self, slave: int, status: bool) -> int:
+            _ = (slave, status)
+            return 1
+
+        def runWithParam(self, slave: int, pos: int, speed: int, torque: int) -> int:
+            self.motion_calls.append((slave, pos, speed, torque))
+            return 1
+
+    fake = FakeDll()
+    monkeypatch.setattr(driver, "_load_dll", lambda active_config: fake)
+
+    result = driver.command(config, "left", "close", None)
+
+    assert result.ok is True
+    assert result.position_mm == 1.02
+    assert fake.motion_calls == [(10, 245, 10, 1)]
+
+
 def test_jodell_gripper_default_config_matches_reference_project() -> None:
     config = default_config()
 

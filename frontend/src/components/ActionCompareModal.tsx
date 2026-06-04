@@ -21,19 +21,19 @@ interface ActionCompareModalProps {
   onConfirm: () => void
   onCancel: () => void
 }
-
+/** 描述当前方法的功能边界。 */
 function toneIcon(tone: ActionCompareModalProps['tone']) {
   if (tone === 'danger') return <ShieldAlert size={18} />
   if (tone === 'warning') return <AlertTriangle size={18} />
   return <CheckCircle2 size={18} />
 }
-
+/** 描述当前方法的功能边界。 */
 function toneType(tone: ActionCompareModalProps['tone']) {
   if (tone === 'danger') return 'error'
   if (tone === 'warning') return 'warning'
   return 'info'
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 function CompareColumn({ title, items }: { title: string; items: ActionCompareItem[] }) {
   return (
     <div className="action-compare-column">
@@ -50,7 +50,7 @@ function CompareColumn({ title, items }: { title: string; items: ActionCompareIt
     </div>
   )
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function ActionCompareModal({
   open,
   title,

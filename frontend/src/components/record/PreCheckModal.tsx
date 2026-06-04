@@ -12,13 +12,16 @@ interface StepDef {
   required?: boolean
   actionButton?: { label: string; apiCall: () => void }
 }
-
+/** 计算对应的业务值或展示值。 */
 function diagnosticReady(diagnostics: DiagnosticItem[], key: string) {
   return diagnostics.find((item) => item.key === key)?.status === 'ok'
 }
-
+/** 计算对应的业务值或展示值。 */
 function teleopHandsReady(frame: TelemetryFrame) {
-  return frame.teleopHands.every((hand) => hand.connected && hand.lastReadOk)
+  const requiredHands = frame.teleopHands.filter(
+    (hand) => !hand.message.toLowerCase().includes('logical teleop hand disconnected'),
+  )
+  return requiredHands.length > 0 && requiredHands.every((hand) => hand.connected && hand.lastReadOk)
 }
 
 const STEPS: StepDef[] = [
@@ -35,8 +38,8 @@ const STEPS: StepDef[] = [
       diagnosticReady(diagnostics, 'gripper'),
   },
   {
-    title: '自动回到工作原点',
-    description: '点击自动回零，将左右从臂移动到已采集的工作原点；确认停止后勾选完成。',
+    title: '自动回到硬件零点',
+    description: '点击自动回零，将左右从臂移动到已记录的硬件零点；确认停止后勾选完成。',
     autoCheck: false,
     check: null,
     actionButton: { label: '自动回零', apiCall: () => { void homeAll().catch(() => undefined) } },
@@ -67,7 +70,7 @@ interface PreCheckModalProps {
   onConfirm: () => void
   onCancel: () => void
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckModalProps) {
   const frame = useTelemetryStore((s) => s.frame)
   const diagnostics = useTelemetryStore((s) => s.diagnostics)
@@ -91,11 +94,13 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
   const currentStep = STEPS.findIndex((step, i) => step.required !== false && !stepStatuses[i])
   const activeStep = currentStep === -1 ? STEPS.length : currentStep
 
+  /** 处理对应的用户交互。 */
   const handleClose = () => {
     setManualChecked({})
     onCancel()
   }
 
+  /** 处理对应的用户交互。 */
   const handleConfirm = () => {
     setManualChecked({})
     onConfirm()

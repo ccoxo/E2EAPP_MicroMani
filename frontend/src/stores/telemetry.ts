@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import {
   acknowledgeSafety as acknowledgeSafetyApi,
   applyParameterSnapshotApi,
+  captureMotionOrigin as captureMotionOriginApi,
   createParameterSnapshot as createParameterSnapshotApi,
   createSession as createRecordSessionApi,
   deleteParameterSnapshotApi,
@@ -16,6 +17,7 @@ import {
   homeAll as homeAllApi,
   manualAxisMove as manualAxisMoveApi,
   mockMode,
+  returnMotionOriginSide as returnMotionOriginSideApi,
   saveEpisode as saveRecordEpisodeApi,
   sendSettingsLogCommand,
   setSpeedMode as setRecordSpeedModeApi,
@@ -29,8 +31,11 @@ import {
   wsUrl,
 } from '../api/index'
 import { defaultConfig, defaultDiagnostics, logChannels } from '../data'
+import { manualAxisStepLimitFromPulse } from '../manualMotionLimits'
+import { manualMaxVelocity } from '../manualSpeed'
 import type {
   AppConfig,
+  ConnectionState,
   DiagnosticItem,
   EpisodeRecord,
   LogEntry,
@@ -55,8 +60,8 @@ const maxLogEntries = 5000
 export const uiFrameIntervalMs = 66
 export const chartHistoryIntervalMs = 100
 export const mockTelemetryIntervalMs = 33
-// History buffer drives the live charts. It is intentionally a chart display
-// history, not a complete capture history; recording data stays backend-owned.
+// 说明当前代码块的功能用途。
+// 说明当前代码块的功能用途。
 const maxHistorySamples = 120
 const parameterSnapshotStorageKey = 'appstation.parameterSnapshots.v1'
 const cameraLabels = {
@@ -64,18 +69,25 @@ const cameraLabels = {
   wrist_left: '左腕相机',
   wrist_right: '右腕相机',
 } as const
+let configSaveQueue: Promise<unknown> = Promise.resolve()
 const manualAxisOrder: ManualControlAxis[] = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']
 const manualAxisKeys = ['x', 'y', 'z', 'roll', 'pitch', 'yaw'] as const
 const manualAxisDirectionSign = {
   left: [1, 1, 1, 1, 1, 1],
   right: [1, 1, 1, 1, 1, 1],
 } as const
-const manualAxisStepLimitPulse = 100000
-
+/** 计算或执行手动控制的对应逻辑。 */
 function manualAxisBusyKey(side: ManualControlState['selectedSide'], axis: ManualControlAxis) {
   return `${side}-${axis}`
 }
 
+/** 按顺序保存配置，避免录制启动早于最近一次参数写入。 */
+function queueConfigSave(config: AppConfig) {
+  const nextSave = configSaveQueue.catch(() => undefined).then(() => putConfig(config))
+  configSaveQueue = nextSave.catch(() => undefined)
+  return nextSave
+}
+/** 计算或执行手动控制的对应逻辑。 */
 function manualAxisPulsePerUiUnit(
   config: AppConfig,
   side: ManualControlState['selectedSide'],
@@ -88,28 +100,30 @@ function manualAxisPulsePerUiUnit(
   if (!Number.isFinite(pulsePerUnit) || pulsePerUnit <= 0) return 0
   return axisIndex < 3 ? pulsePerUnit / 1000 : pulsePerUnit
 }
-
+/** 计算或执行手动控制的对应逻辑。 */
 function manualAxisStepLimit(
   config: AppConfig,
   side: ManualControlState['selectedSide'],
   axis: ManualControlAxis,
+  speedMode: ManualSpeedMode,
 ) {
   const axisIndex = manualAxisOrder.indexOf(axis)
   if (axisIndex < 0) return Number.POSITIVE_INFINITY
   const pulsePerUiUnit = manualAxisPulsePerUiUnit(config, side, axisIndex)
-  if (pulsePerUiUnit <= 0) return Number.POSITIVE_INFINITY
-  return manualAxisStepLimitPulse / pulsePerUiUnit
+  return manualAxisStepLimitFromPulse(pulsePerUiUnit, axisIndex >= 3, speedMode)
 }
-
+/** 计算对应的业务值或展示值。 */
 function clampManualAxisStep(
   config: AppConfig,
   side: ManualControlState['selectedSide'],
   axis: ManualControlAxis,
   step: number,
+  speedMode: ManualSpeedMode,
 ) {
-  return Math.min(Math.max(0, step), manualAxisStepLimit(config, side, axis))
+  return Math.min(Math.max(0, step), manualAxisStepLimit(config, side, axis, speedMode))
 }
 
+/** 计算或执行手动控制的对应逻辑。 */
 function manualAxisEffectiveDirection(
   side: ManualControlState['selectedSide'],
   axisIndex: number,
@@ -118,7 +132,7 @@ function manualAxisEffectiveDirection(
   const sign = manualAxisDirectionSign[side][axisIndex] ?? 1
   return direction * sign >= 0 ? 1 : -1
 }
-
+/** 计算或执行手动控制的对应逻辑。 */
 function manualAxisLockMs(
   config: AppConfig,
   side: ManualControlState['selectedSide'],
@@ -126,13 +140,12 @@ function manualAxisLockMs(
   step: number,
   speedMode: ManualSpeedMode,
 ) {
-  // 前端先按运动参数估算轴占用时间，避免用户连点时堆积多条 jog 命令。
+  // 前端先按运动参数估算轴占用时间，避免用户连点时堆积多条点动命令。
   const axisIndex = manualAxisOrder.indexOf(axis)
   const profile = side === 'left' ? config.motion.leftProfile : config.motion.rightProfile
   const group = axisIndex < 3 ? profile.translation : profile.rotation
   const velocityCap = axisIndex < 3 ? 20000 : 30
-  const speedScale = speedMode === 'coarse' ? 1 : speedMode === 'medium' ? 0.5 : 0.2
-  const maxVelocity = Math.max(0.001, Math.min(group.maxSpeed, velocityCap) * speedScale)
+  const maxVelocity = manualMaxVelocity(group.maxSpeed, velocityCap, speedMode)
   const accTimeMs = Math.min(Math.max(group.accTimeSec, 0.001), 5) * 500
   const decTimeMs = Math.min(Math.max(group.decTimeSec, 0.001), 5) * 500
   const travelMs = (Math.abs(step) / maxVelocity) * 1000
@@ -174,17 +187,22 @@ const initialRecordSession: RecordSessionState = {
   forceTareActive: false,
   speedMode: 'fine',
 }
-
+/** 读取对应的本地状态或存储数据。 */
 function cloneConfig<T>(value: T): T {
   return structuredClone(value)
 }
-
+/** 描述当前方法的功能边界。 */
 function isParameterSnapshotScope(value: unknown): value is ParameterSnapshotScope {
   return value === 'all' || value === 'motion-left' || value === 'motion-right'
 }
-
+/** 构建当前流程需要的数据结构。 */
 function makeMotionCardSnapshotConfig(config: AppConfig, scope: Exclude<ParameterSnapshotScope, 'all'>): MotionCardSnapshotConfig {
   const side = scope === 'motion-left' ? 'left' : 'right'
+  const fallbackRotationWorkLimits = {
+    roll: { min: -100, max: 100 },
+    pitch: { min: -100, max: 100 },
+    yaw: { min: -7, max: 7 },
+  }
   return {
     cardNo: side === 'left' ? config.motion.leftCardNo : config.motion.rightCardNo,
     motionThreadHz: config.motion.motionThreadHz,
@@ -192,9 +210,12 @@ function makeMotionCardSnapshotConfig(config: AppConfig, scope: Exclude<Paramete
     positionSource: config.motion.positionSource,
     profile: cloneConfig(side === 'left' ? config.motion.leftProfile : config.motion.rightProfile),
     softLimits: cloneConfig(side === 'left' ? config.motion.leftSoftLimits : config.motion.rightSoftLimits),
+    rotationWorkLimitEnabled: Boolean(config.motion.rotationWorkLimits?.enabled),
+    rotationWorkLimits: cloneConfig(config.motion.rotationWorkLimits?.[side] ?? fallbackRotationWorkLimits),
   }
 }
 
+/** 应用对应配置或状态。 */
 function applyMotionCardSnapshotConfig(config: AppConfig, scope: Exclude<ParameterSnapshotScope, 'all'>, snapshot: MotionCardSnapshotConfig): AppConfig {
   if (scope === 'motion-left') {
     return {
@@ -207,6 +228,11 @@ function applyMotionCardSnapshotConfig(config: AppConfig, scope: Exclude<Paramet
         positionSource: snapshot.positionSource,
         leftProfile: cloneConfig(snapshot.profile),
         leftSoftLimits: cloneConfig(snapshot.softLimits),
+        rotationWorkLimits: {
+          ...config.motion.rotationWorkLimits,
+          enabled: snapshot.rotationWorkLimitEnabled ?? config.motion.rotationWorkLimits.enabled,
+          left: cloneConfig(snapshot.rotationWorkLimits ?? config.motion.rotationWorkLimits.left),
+        },
       },
     }
   }
@@ -220,16 +246,23 @@ function applyMotionCardSnapshotConfig(config: AppConfig, scope: Exclude<Paramet
       positionSource: snapshot.positionSource,
       rightProfile: cloneConfig(snapshot.profile),
       rightSoftLimits: cloneConfig(snapshot.softLimits),
+      rotationWorkLimits: {
+        ...config.motion.rotationWorkLimits,
+        enabled: snapshot.rotationWorkLimitEnabled ?? config.motion.rotationWorkLimits.enabled,
+        right: cloneConfig(snapshot.rotationWorkLimits ?? config.motion.rotationWorkLimits.right),
+      },
     },
   }
 }
 
+/** 描述当前方法的功能边界。 */
 function parameterSnapshotScopeLabel(scope: ParameterSnapshotScope) {
   if (scope === 'all') return '全局硬件'
   if (scope === 'motion-left') return '左臂运动控制卡'
   return '右臂运动控制卡'
 }
 
+/** 读取对应的本地状态或存储数据。 */
 function readParameterSnapshots(): ParameterSnapshot[] {
   try {
     if (typeof window === 'undefined') return []
@@ -249,13 +282,13 @@ function readParameterSnapshots(): ParameterSnapshot[] {
     return []
   }
 }
-
+/** 读取对应的本地状态或存储数据。 */
 function persistParameterSnapshots(snapshots: ParameterSnapshot[]) {
   try {
     if (typeof window === 'undefined') return
     window.localStorage.setItem(parameterSnapshotStorageKey, JSON.stringify(snapshots))
   } catch {
-    // localStorage may be unavailable in restricted browser contexts.
+    // 说明当前代码块的功能用途。
   }
 }
 
@@ -266,6 +299,7 @@ interface TelemetryStore {
   logs: LogEntry[]
   diagnostics: DiagnosticItem[]
   config: AppConfig
+  picoConnection: { state: ConnectionState; message: string; checkedAt: number | null }
   recording: boolean
   autoRunning: boolean
   clutchActive: boolean
@@ -307,6 +341,8 @@ interface TelemetryStore {
   toggleRecordClutch: () => void
   setRecordSpeedMode: (mode: ManualSpeedMode) => void
   homeRecordArms: () => void
+  returnRecordMotionOrigin: (side: ManualControlState['selectedSide']) => Promise<void>
+  captureRecordMotionOrigin: (side: ManualControlState['selectedSide']) => Promise<void>
   triggerEmergencyStop: () => void
   clearRecordSession: () => void
   setClutchActive: (active: boolean) => void
@@ -317,6 +353,7 @@ interface TelemetryStore {
   sendBackendCommandLog: (level: LogLevel, msg: string, channel?: LogEntry['channel']) => void
   refreshHardwareStatus: () => Promise<void>
   runDiagnostics: () => Promise<void>
+  setPicoConnectionStatus: (state: ConnectionState, message: string) => void
   updateConfig: (patch: Partial<AppConfig>) => void
   saveParameterSnapshot: (scope: ParameterSnapshotScope, name: string) => void
   applyParameterSnapshot: (id: string) => void
@@ -393,7 +430,7 @@ const emptyFrame: TelemetryFrame = {
     },
   ],
 }
-
+/** 构建当前流程需要的数据结构。 */
 function nextProcessStatus(t: number, autoRunning: boolean): ProcessStatus[] {
   return [
     {
@@ -441,9 +478,9 @@ function nextProcessStatus(t: number, autoRunning: boolean): ProcessStatus[] {
     },
   ]
 }
-
+/** 构建当前流程需要的数据结构。 */
 function buildFrame(state: TelemetryStore): TelemetryFrame {
-  // mock 模式生成与后端 WebSocket 同形状的数据，组件无需区分数据来源。
+  // 说明当前代码块的功能用途。
   const tick = state.tick + 1
   const t = tick / 50
   const jointPositions = Array.from({ length: 12 }, (_, index) => {
@@ -615,7 +652,7 @@ function buildFrame(state: TelemetryStore): TelemetryFrame {
 let _logIdSeq = 0
 let _manualActionIdSeq = 0
 let _manualMemoryIdSeq = 0
-
+/** 构建当前流程需要的数据结构。 */
 function makeLog(level: LogLevel, msg: string, channel?: LogEntry['channel']): LogEntry {
   const id = ++_logIdSeq
   return {
@@ -626,7 +663,7 @@ function makeLog(level: LogLevel, msg: string, channel?: LogEntry['channel']): L
     msg,
   }
 }
-
+/** 构建当前流程需要的数据结构。 */
 function appendLog(logs: LogEntry[], entry: LogEntry) {
   return [...logs, entry].slice(-maxLogEntries)
 }
@@ -635,7 +672,7 @@ type BackendWsMessage =
   | { type: 'telemetry'; data: TelemetryFrame }
   | { type: 'log'; data: LogEntry }
   | { type: 'config'; data: AppConfig }
-
+/** 描述当前方法的功能边界。 */
 function telemetrySampleFromFrame(frame: TelemetryFrame): TelemetrySample {
   // 图表只保留绘制需要的字段，避免历史缓冲持有整帧对象造成渲染压力。
   return {
@@ -648,7 +685,7 @@ function telemetrySampleFromFrame(frame: TelemetryFrame): TelemetrySample {
     queueRight: frame.queueDepth.right,
   }
 }
-
+/** 构建当前流程需要的数据结构。 */
 function appendTelemetryHistory(history: TelemetrySample[], sample: TelemetrySample) {
   const nextHistory = history.length >= maxHistorySamples
     ? history.slice(history.length - maxHistorySamples + 1)
@@ -661,16 +698,18 @@ type TelemetryStorePatch = Partial<TelemetryStore>
 type TelemetryStoreSet = (partial: TelemetryStorePatch | ((state: TelemetryStore) => TelemetryStorePatch), replace?: false) => void
 type TelemetryStoreGet = () => TelemetryStore
 
-let finishRecordSessionAfterSave = false
+let finishRecordSessionAfterReview = false
+let recordSessionStartInFlight = false
+let recordMotionOriginInFlight = false
 let pendingBackendFrame: TelemetryFrame | null = null
 let backendFrameDelayTimer: number | null = null
 let backendFrameRaf: number | null = null
 let lastBackendFrameCommitAt = 0
 let lastBackendHistoryCommitAt = 0
-
+/** 描述当前方法的功能边界。 */
 function finishRecordSessionNow(set: TelemetryStoreSet) {
   void finishRecordSessionApi().finally(() => {
-    finishRecordSessionAfterSave = false
+    finishRecordSessionAfterReview = false
     set((state) => ({
       recording: false,
       recordSession: {
@@ -698,7 +737,7 @@ function finishRecordSessionNow(set: TelemetryStoreSet) {
     },
   }))
 }
-
+/** 描述当前方法的功能边界。 */
 function backendFrameCommitIsUrgent(previous: TelemetryFrame, next: TelemetryFrame) {
   return previous.wsOk !== next.wsOk
     || previous.halOk !== next.halOk
@@ -710,7 +749,7 @@ function backendFrameCommitIsUrgent(previous: TelemetryFrame, next: TelemetryFra
     || previous.motionAxisEnabled.right.some((value, index) => value !== next.motionAxisEnabled.right[index])
     || (previous.dangerIndex < 1 && next.dangerIndex >= 1)
 }
-
+/** 构建当前流程需要的数据结构。 */
 function nextRecordSessionFromBackend(state: TelemetryStore, frame: TelemetryFrame): RecordSessionState {
   if (state.recordSession.phase !== 'recording') return state.recordSession
   return {
@@ -722,7 +761,7 @@ function nextRecordSessionFromBackend(state: TelemetryStore, frame: TelemetryFra
       : state.recordSession.recorderElapsedS,
   }
 }
-
+/** 处理对应的用户交互。 */
 function commitBackendFrame(set: TelemetryStoreSet, frame: TelemetryFrame, forceHistory: boolean) {
   const now = Date.now()
   const sample = telemetrySampleFromFrame(frame)
@@ -748,7 +787,7 @@ function commitBackendFrame(set: TelemetryStoreSet, frame: TelemetryFrame, force
   lastBackendFrameCommitAt = now
   if (historyCommitted) lastBackendHistoryCommitAt = now
 }
-
+/** 描述当前方法的功能边界。 */
 function flushPendingBackendFrame(set: TelemetryStoreSet, get: TelemetryStoreGet, force = false) {
   const frame = pendingBackendFrame
   if (!frame) return
@@ -760,14 +799,15 @@ function flushPendingBackendFrame(set: TelemetryStoreSet, get: TelemetryStoreGet
   pendingBackendFrame = null
   commitBackendFrame(set, frame, force)
 }
-
+/** 描述当前方法的功能边界。 */
 function schedulePendingBackendFrame(set: TelemetryStoreSet, get: TelemetryStoreGet) {
   if (backendFrameDelayTimer !== null || backendFrameRaf !== null) return
   const elapsed = lastBackendFrameCommitAt > 0 ? Date.now() - lastBackendFrameCommitAt : uiFrameIntervalMs
   const delayMs = Math.max(0, uiFrameIntervalMs - elapsed)
   backendFrameDelayTimer = window.setTimeout(() => {
     backendFrameDelayTimer = null
-    const flush = () => {
+   /** 描述当前方法的功能边界。 */
+   const flush = () => {
       backendFrameRaf = null
       flushPendingBackendFrame(set, get)
     }
@@ -778,7 +818,7 @@ function schedulePendingBackendFrame(set: TelemetryStoreSet, get: TelemetryStore
     flush()
   }, delayMs)
 }
-
+/** 描述当前方法的功能边界。 */
 function enqueueBackendFrame(set: TelemetryStoreSet, get: TelemetryStoreGet, frame: TelemetryFrame) {
   const urgent = backendFrameCommitIsUrgent(get().frame, frame)
   pendingBackendFrame = frame
@@ -790,7 +830,7 @@ function enqueueBackendFrame(set: TelemetryStoreSet, get: TelemetryStoreGet, fra
   }
   schedulePendingBackendFrame(set, get)
 }
-
+/** 删除对应数据并同步界面状态。 */
 function clearPendingBackendFrameFlush() {
   if (backendFrameDelayTimer !== null) {
     window.clearTimeout(backendFrameDelayTimer)
@@ -804,9 +844,9 @@ function clearPendingBackendFrameFlush() {
   lastBackendFrameCommitAt = 0
   lastBackendHistoryCommitAt = 0
 }
-
+/** 读取对应的本地状态或存储数据。 */
 function mergeConfig(current: AppConfig, patch: Partial<AppConfig>): AppConfig {
-  // 设置页按分组提交 patch；深合并可以保留未编辑分组里的现有参数。
+  // 设置页按分组提交补丁；深合并可以保留未编辑分组里的现有参数。
   return {
     ...current,
     ...patch,
@@ -824,6 +864,47 @@ function mergeConfig(current: AppConfig, patch: Partial<AppConfig>): AppConfig {
   }
 }
 
+/** 应用当前现场硬件的前端配置迁移。 */
+export function normalizeConfig(config: AppConfig): AppConfig {
+  const hasPreviousImx258CameraDefaults =
+    config.cameras.global === 'AR0234 / index 1'
+    && config.cameras.wristLeft === 'IMX258 / index 2'
+    && config.cameras.wristRight === 'IMX258 / index 0'
+  const hasLegacyReversedWristCameras =
+    config.cameras.global === 'AR0234 / index 2'
+    && config.cameras.wristLeft === 'IMX258 / index 1'
+    && config.cameras.wristRight === 'IMX258 / index 0'
+  const hasLegacyCyclicCameraRoles =
+    config.cameras.global === 'AR0234 / index 2'
+    && config.cameras.wristLeft === 'IMX258 / index 0'
+    && config.cameras.wristRight === 'IMX258 / index 1'
+  const hasStalePicoIp = config.picoVision.ip === '10.90.132.51'
+  if (!hasPreviousImx258CameraDefaults && !hasLegacyReversedWristCameras && !hasLegacyCyclicCameraRoles && !hasStalePicoIp) {
+    return config
+  }
+  const next = cloneConfig(config)
+  if (hasPreviousImx258CameraDefaults || hasLegacyReversedWristCameras || hasLegacyCyclicCameraRoles) {
+    next.cameras = {
+      ...next.cameras,
+      global: defaultConfig.cameras.global,
+      globalIdentity: defaultConfig.cameras.globalIdentity,
+      wristLeft: defaultConfig.cameras.wristLeft,
+      wristLeftIdentity: defaultConfig.cameras.wristLeftIdentity,
+      wristRight: defaultConfig.cameras.wristRight,
+      wristRightIdentity: defaultConfig.cameras.wristRightIdentity,
+    }
+  }
+  if (hasStalePicoIp) {
+    next.picoVision = {
+      ...next.picoVision,
+      ip: defaultConfig.picoVision.ip,
+      gateway: defaultConfig.picoVision.gateway,
+      ifIndex: defaultConfig.picoVision.ifIndex,
+    }
+  }
+  return next
+}
+/** 计算对应的业务值或展示值。 */
 function diagnosticsFromHardwareStatus(
   diagnostics: DiagnosticItem[],
   status: Awaited<ReturnType<typeof fetchHardwareStatus>>,
@@ -848,7 +929,17 @@ function diagnosticsFromHardwareStatus(
     return item
   })
 }
+/** 计算对应的业务值或展示值。 */
+function picoConnectionFromHardwareStatus(status: Awaited<ReturnType<typeof fetchHardwareStatus>>) {
+  if (!status.pico) return null
+  return {
+    state: status.pico.ok ? 'ok' : 'warn',
+    message: status.pico.message,
+    checkedAt: Date.now(),
+  } satisfies TelemetryStore['picoConnection']
+}
 
+/** 构建当前流程需要的数据结构。 */
 function appendManualAction(manual: ManualControlState, action: ManualControlAction): ManualControlState {
   if (!manual.recording) return manual
   return {
@@ -856,17 +947,17 @@ function appendManualAction(manual: ManualControlState, action: ManualControlAct
     draftActions: [...manual.draftActions, action],
   }
 }
-
+/** 计算对应的业务值或展示值。 */
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value))
 }
-
+/** 计算对应的业务值或展示值。 */
 function speedModeText(mode: ManualSpeedMode) {
   if (mode === 'coarse') return '粗调'
   if (mode === 'medium') return '中速'
   return '精调'
 }
-
+/** 构建当前流程需要的数据结构。 */
 function makeQualityReport(episode: number, frames: number): QualityReport {
   return {
     episode,
@@ -880,11 +971,11 @@ function makeQualityReport(episode: number, frames: number): QualityReport {
     warnings: ['左腕相机模拟掉 1 帧，需要在真实采集时检查 USB 带宽', '右臂 Fx 接近警告阈值，建议复核接触力控制'],
   }
 }
-
+/** 计算对应的业务值或展示值。 */
 function maxAbs(values: number[]) {
   return values.reduce((max, value) => Math.max(max, Math.abs(value)), 0)
 }
-
+/** 计算对应的业务值或展示值。 */
 function cameraHealthDrops(frame: TelemetryFrame) {
   return {
     global: frame.cameras.find((camera) => camera.key === 'global')?.health === 'ok' ? 0 : 1,
@@ -892,7 +983,7 @@ function cameraHealthDrops(frame: TelemetryFrame) {
     wristRight: frame.cameras.find((camera) => camera.key === 'wrist_right')?.health === 'ok' ? 0 : 1,
   }
 }
-
+/** 构建当前流程需要的数据结构。 */
 function makeRecordQualityReport(state: TelemetryStore): RecordQualityReport {
   const session = state.recordSession
   const frame = state.frame
@@ -919,7 +1010,7 @@ function makeRecordQualityReport(state: TelemetryStore): RecordQualityReport {
     passed: warnings.length === 0,
   }
 }
-
+/** 构建当前流程需要的数据结构。 */
 function reportFromSavedEpisode(fallback: RecordQualityReport, episode?: RecordEpisodeSaveApi): RecordQualityReport {
   if (!episode) return fallback
   const warnings = Array.isArray(episode.warnings) ? episode.warnings : fallback.warnings
@@ -941,7 +1032,7 @@ function reportFromSavedEpisode(fallback: RecordQualityReport, episode?: RecordE
     passed: warnings.length === 0,
   }
 }
-
+/** 构建当前流程需要的数据结构。 */
 function makeDiscardedEpisodeRecord(session: RecordSessionState): EpisodeRecord {
   return {
     index: session.currentEpisode,
@@ -954,7 +1045,7 @@ function makeDiscardedEpisodeRecord(session: RecordSessionState): EpisodeRecord 
     cameraDrops: { global: 0, wristLeft: 0, wristRight: 0 },
   }
 }
-
+/** 构建当前流程需要的数据结构。 */
 function advanceRecordSession(session: RecordSessionState): RecordSessionState {
   if (session.phase === 'idle') return session
 
@@ -1000,6 +1091,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   logs: [makeLog('INFO', mockMode ? 'M0 test telemetry fixture started at 30Hz' : 'Backend telemetry initializing', '[BACKEND]')],
   diagnostics: defaultDiagnostics,
   config: defaultConfig,
+  picoConnection: { state: 'pending', message: '尚未检查 PICO ADB', checkedAt: null },
   recording: false,
   autoRunning: false,
   clutchActive: false,
@@ -1017,7 +1109,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   backendReconnectTimer: null,
   backendReconnectAttempts: 0,
 
-  startMock: () => {
+/** 启动对应流程。 */
+startMock: () => {
     if (get().mockTimer) return
     const timer = window.setInterval(() => {
       set((state) => {
@@ -1058,13 +1151,15 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     set({ mockTimer: timer })
   },
 
-  stopMock: () => {
+/** 停止对应流程。 */
+stopMock: () => {
     const timer = get().mockTimer
     if (timer) window.clearInterval(timer)
     set({ mockTimer: null })
   },
 
-  startBackend: () => {
+/** 启动对应流程。 */
+startBackend: () => {
     if (get().backendWs) return
     clearPendingBackendFrameFlush()
     const reconnectTimer = get().backendReconnectTimer
@@ -1072,9 +1167,9 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       window.clearTimeout(reconnectTimer)
       set({ backendReconnectTimer: null })
     }
-    // WebSocket 建立前先拉一次静态配置和硬件概况，首屏不会等到下一帧遥测才有数据。
+    // 网页套接字建立前先拉一次静态配置和硬件概况，首屏不会等到下一帧遥测才有数据。
     void fetchConfig()
-      .then((config) => set({ config }))
+      .then((config) => set({ config: normalizeConfig(config) }))
       .catch((error) => {
         set((state) => ({
           logs: appendLog(state.logs, makeLog('ERROR', `settings fetch failed: ${String(error)}`, '[BACKEND]')),
@@ -1091,6 +1186,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       .then((status) => {
         set((state) => ({
           diagnostics: diagnosticsFromHardwareStatus(state.diagnostics, status),
+          picoConnection: picoConnectionFromHardwareStatus(status) ?? state.picoConnection,
           logs: appendLog(state.logs, makeLog('INFO', 'Real hardware status probe completed', '[BACKEND]')),
         }))
       })
@@ -1119,7 +1215,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
             },
           }
           enqueueBackendFrame(set, get, frame)
-          // Coalesce raw WS frames so React and ECharts update on the UI cadence.
+          // 说明当前代码块的功能用途。
           return
         }
         if (message.type === 'log') {
@@ -1127,7 +1223,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
           return
         }
         if (message.type === 'config') {
-          set({ config: message.data })
+          set({ config: normalizeConfig(message.data) })
         }
       } catch (error) {
         set((state) => ({
@@ -1170,7 +1266,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     set({ backendWs: ws })
   },
 
-  stopBackend: () => {
+/** 停止对应流程。 */
+stopBackend: () => {
     const ws = get().backendWs
     const timer = get().backendReconnectTimer
     if (timer) window.clearTimeout(timer)
@@ -1179,22 +1276,27 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     if (ws) ws.close()
   },
 
-  setLogPanelOpen: (open) => set({ logPanelOpen: open }),
-  setMode: (mode) => set({ selectedMode: mode }),
+/** 设置当前流程的对应状态。 */
+setLogPanelOpen: (open) => set({ logPanelOpen: open }),
+ /** 设置当前流程的对应状态。 */
+ setMode: (mode) => set({ selectedMode: mode }),
 
-  startRecording: () =>
+/** 启动对应流程。 */
+startRecording: () =>
     set((state) => ({
       recording: true,
       logs: appendLog(state.logs, makeLog('INFO', 'Record session started', '[LEROBOT]')),
     })),
 
-  pauseRecording: () =>
+/** 停止对应流程。 */
+pauseRecording: () =>
     set((state) => ({
       recording: false,
       logs: appendLog(state.logs, makeLog('INFO', 'Record session paused', '[LEROBOT]')),
     })),
 
-  saveEpisode: () =>
+/** 描述当前方法的功能边界。 */
+saveEpisode: () =>
     set((state) => {
       const nextEpisode = state.episodeCount + 1
       const report = makeQualityReport(state.episodeCount, Math.max(state.frameCount, 1))
@@ -1207,14 +1309,16 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       }
     }),
 
-  discardEpisode: () =>
+/** 删除对应数据并同步界面状态。 */
+discardEpisode: () =>
     set((state) => ({
       recording: false,
       frameCount: 0,
       logs: appendLog(state.logs, makeLog('WARNING', 'Current episode discarded', '[LEROBOT]')),
     })),
 
-  setRecordDatasetName: (name) =>
+/** 设置当前流程的对应状态。 */
+setRecordDatasetName: (name) =>
     set((state) => ({
       recordSession: {
         ...state.recordSession,
@@ -1222,7 +1326,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       },
     })),
 
-  setRecordTask: (task) =>
+/** 设置当前流程的对应状态。 */
+setRecordTask: (task) =>
     set((state) => ({
       recordSession: {
         ...state.recordSession,
@@ -1230,7 +1335,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       },
     })),
 
-  setRecordTargetEpisodes: (n) =>
+/** 设置当前流程的对应状态。 */
+setRecordTargetEpisodes: (n) =>
     set((state) => ({
       recordSession: {
         ...state.recordSession,
@@ -1238,7 +1344,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       },
     })),
 
-  setRecordEpisodeTimes: (episodeS, resetS) =>
+/** 设置当前流程的对应状态。 */
+setRecordEpisodeTimes: (episodeS, resetS) =>
     set((state) => ({
       recordSession: {
         ...state.recordSession,
@@ -1247,8 +1354,35 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       },
     })),
 
-  startRecordSession: (datasetName, task) => {
-    finishRecordSessionAfterSave = false
+/** 启动对应流程。 */
+startRecordSession: (datasetName, task) => {
+    if (recordSessionStartInFlight || get().recordSession.phase !== 'idle') {
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('WARNING', 'record session start ignored: start is already pending', '[LEROBOT]')),
+      }))
+      return
+    }
+    recordSessionStartInFlight = true
+    finishRecordSessionAfterReview = false
+    const nextDatasetName = datasetName.trim() || initialRecordSession.datasetName
+    set((state) => ({
+      recording: false,
+      frameCount: 0,
+      recordSession: {
+        ...state.recordSession,
+        datasetName: nextDatasetName,
+        task,
+        latestQualityReport: null,
+        phase: 'starting',
+        phaseStartedAt: null,
+        recorderFps: 0,
+        recorderFrameCount: 0,
+        recorderLateFrames: 0,
+        recorderElapsedS: 0,
+        recorderTotalS: -1,
+      },
+      logs: appendLog(state.logs, makeLog('INFO', `录制采集会话启动中：${nextDatasetName}`, '[LEROBOT]')),
+    }))
     void (async () => {
       const status = await fetchRecordStatus().catch(() => null)
       if (status?.active) {
@@ -1260,7 +1394,34 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
         }))
         await finishRecordSessionApi()
       }
-      await createRecordSessionApi(datasetName.trim() || initialRecordSession.datasetName, task)
+      await queueConfigSave(get().config)
+      const createResponse = await createRecordSessionApi(nextDatasetName, task)
+      set((state) => {
+        const now = Date.now()
+        const backendStatus = createResponse.data ?? {}
+        const backendElapsedS = typeof backendStatus.elapsedS === 'number' ? Math.max(0, backendStatus.elapsedS) : 0
+        const backendFrameCount = typeof backendStatus.frameCount === 'number' ? Math.max(0, backendStatus.frameCount) : 0
+        const backendFps = typeof backendStatus.fps === 'number' ? Math.max(0, backendStatus.fps) : 30
+        const nextSession = {
+          ...state.recordSession,
+          datasetName: nextDatasetName,
+          task,
+          latestQualityReport: null,
+          phase: 'recording' as const,
+          phaseStartedAt: now - backendElapsedS * 1000,
+          recorderFps: backendFps,
+          recorderFrameCount: backendFrameCount,
+          recorderLateFrames: 0,
+          recorderElapsedS: backendElapsedS,
+          recorderTotalS: state.recordSession.episodeTimeS,
+        }
+        return {
+          recording: true,
+          frameCount: 0,
+          recordSession: nextSession,
+          logs: appendLog(state.logs, makeLog('INFO', `录制采集会话已开始：${nextSession.datasetName}`, '[LEROBOT]')),
+        }
+      })
     })()
       .catch((error) => {
         set((state) => ({
@@ -1278,31 +1439,13 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
           logs: appendLog(state.logs, makeLog('ERROR', `record session start failed: ${String(error)}`, '[LEROBOT]')),
         }))
       })
-    set((state) => {
-      const now = Date.now()
-      const nextSession = {
-        ...state.recordSession,
-        datasetName: datasetName.trim() || initialRecordSession.datasetName,
-        task,
-        latestQualityReport: null,
-        phase: 'recording' as const,
-        phaseStartedAt: now,
-        recorderFps: 30,
-        recorderFrameCount: 0,
-        recorderLateFrames: 0,
-        recorderElapsedS: 0,
-        recorderTotalS: state.recordSession.episodeTimeS,
-      }
-      return {
-        recording: true,
-        frameCount: 0,
-        recordSession: nextSession,
-        logs: appendLog(state.logs, makeLog('INFO', `录制采集会话已开始：${nextSession.datasetName}`, '[LEROBOT]')),
-      }
-    })
+      .finally(() => {
+        recordSessionStartInFlight = false
+      })
   },
 
-  saveRecordEpisode: () => {
+/** 描述当前方法的功能边界。 */
+saveRecordEpisode: () => {
     let pendingReport: RecordQualityReport | null = null
     set((state) => {
       if (state.recordSession.phase !== 'recording') return state
@@ -1338,12 +1481,20 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
               savedEpisodes: nextSavedEpisodes,
               currentEpisode: nextCurrentEpisode,
               latestQualityReport: report,
+              phase: 'reviewing',
+              phaseStartedAt: Date.now(),
+              recorderElapsedS: 0,
+              recorderTotalS: -1,
               episodeHistory: [report, ...state.recordSession.episodeHistory].slice(0, 20),
             },
             logs: appendLog(state.logs, makeLog('INFO', `Episode #${report.index} save completed; quality report ready`, '[LEROBOT]')),
           }
         })
-        if (finishRecordSessionAfterSave) finishRecordSessionNow(set)
+        if (finishRecordSessionAfterReview) {
+          set((state) => ({
+            logs: appendLog(state.logs, makeLog('WARNING', 'record session finish is waiting for quality report acceptance', '[LEROBOT]')),
+          }))
+        }
       })
       .catch((error) => {
         set((state) => ({
@@ -1360,11 +1511,12 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
             : state.recordSession,
           logs: appendLog(state.logs, makeLog('ERROR', `record episode save failed: ${String(error)}`, '[LEROBOT]')),
         }))
-        if (finishRecordSessionAfterSave) finishRecordSessionNow(set)
+        if (finishRecordSessionAfterReview) finishRecordSessionNow(set)
       })
   },
 
-  discardRecordEpisode: () => {
+/** 删除对应数据并同步界面状态。 */
+discardRecordEpisode: () => {
     void discardRecordEpisodeApi().catch((error) => {
       set((state) => ({
         logs: appendLog(state.logs, makeLog('ERROR', `record episode discard failed: ${String(error)}`, '[LEROBOT]')),
@@ -1373,39 +1525,57 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     set((state) => {
       const record = makeDiscardedEpisodeRecord(state.recordSession)
       return {
-        recording: true,
+        recording: false,
         recordSession: {
           ...state.recordSession,
-          phase: 'recording',
+          phase: 'resetting',
           phaseStartedAt: Date.now(),
-          recorderFps: 30,
+          recorderFps: 0,
           recorderFrameCount: 0,
           recorderLateFrames: 0,
           recorderElapsedS: 0,
-          recorderTotalS: state.recordSession.episodeTimeS,
+          recorderTotalS: state.recordSession.resetTimeS,
           latestQualityReport: null,
           episodeHistory: [record, ...state.recordSession.episodeHistory].slice(0, 20),
         },
-        logs: appendLog(state.logs, makeLog('WARNING', `Episode #${record.index} 已丢弃，重新录制`, '[LEROBOT]')),
+        logs: appendLog(state.logs, makeLog('WARNING', `Episode #${record.index} 已丢弃，等待复位`, '[LEROBOT]')),
       }
     })
   },
 
-  acceptRecordQualityReport: () =>
-    set((state) => ({
-      recordSession: {
-        ...state.recordSession,
-        latestQualityReport: null,
-        phase: 'resetting',
-        phaseStartedAt: Date.now(),
-        recorderFps: 0,
-        recorderElapsedS: 0,
-        recorderTotalS: state.recordSession.resetTimeS,
-      },
-      logs: appendLog(state.logs, makeLog('INFO', '质量报告已接受，进入复位等待', '[LEROBOT]')),
-    })),
+/** 描述当前方法的功能边界。 */
+acceptRecordQualityReport: () => {
+    let shouldFinish = false
+    set((state) => {
+      if (!state.recordSession.latestQualityReport) return state
+      shouldFinish = finishRecordSessionAfterReview
+      if (shouldFinish) {
+        return {
+          recordSession: {
+            ...state.recordSession,
+            latestQualityReport: null,
+          },
+          logs: appendLog(state.logs, makeLog('INFO', '质量报告已接受，结束录制会话', '[LEROBOT]')),
+        }
+      }
+      return {
+        recordSession: {
+          ...state.recordSession,
+          latestQualityReport: null,
+          phase: 'resetting',
+          phaseStartedAt: Date.now(),
+          recorderFps: 0,
+          recorderElapsedS: 0,
+          recorderTotalS: state.recordSession.resetTimeS,
+        },
+        logs: appendLog(state.logs, makeLog('INFO', '质量报告已接受，进入复位等待', '[LEROBOT]')),
+      }
+    })
+    if (shouldFinish) finishRecordSessionNow(set)
+  },
 
-  rejectRecordQualityReport: () => {
+/** 描述当前方法的功能边界。 */
+rejectRecordQualityReport: () => {
     void discardRecordEpisodeApi().catch((error) => {
       set((state) => ({
         logs: appendLog(state.logs, makeLog('ERROR', `record episode rerecord failed: ${String(error)}`, '[LEROBOT]')),
@@ -1414,40 +1584,50 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     set((state) => {
       const report = state.recordSession.latestQualityReport
       if (!report) return state
+      finishRecordSessionAfterReview = false
       const savedEpisodes = Math.max(0, state.recordSession.savedEpisodes - 1)
       return {
-        recording: true,
+        recording: false,
         recordSession: {
           ...state.recordSession,
           currentEpisode: report.index,
           savedEpisodes,
           latestQualityReport: null,
-          phase: 'recording',
+          phase: 'resetting',
           phaseStartedAt: Date.now(),
-          recorderFps: 30,
+          recorderFps: 0,
           recorderFrameCount: 0,
           recorderLateFrames: 0,
           recorderElapsedS: 0,
-          recorderTotalS: state.recordSession.episodeTimeS,
+          recorderTotalS: state.recordSession.resetTimeS,
           episodeHistory: state.recordSession.episodeHistory.filter((item) => item.index !== report.index),
         },
-        logs: appendLog(state.logs, makeLog('WARNING', `Episode #${report.index} 已退回重录`, '[LEROBOT]')),
+        logs: appendLog(state.logs, makeLog('WARNING', `Episode #${report.index} 已退回，等待复位`, '[LEROBOT]')),
       }
     })
   },
 
-  finishRecordSession: () => {
-    if (get().recordSession.phase === 'saving') {
-      finishRecordSessionAfterSave = true
+/** 描述当前方法的功能边界。 */
+finishRecordSession: () => {
+    const phase = get().recordSession.phase
+    if (phase === 'saving' || phase === 'reviewing') {
+      finishRecordSessionAfterReview = true
       set((state) => ({
-        logs: appendLog(state.logs, makeLog('WARNING', 'record session finish queued until episode save completes', '[LEROBOT]')),
+        logs: appendLog(state.logs, makeLog('WARNING', 'record session finish queued until quality report is accepted', '[LEROBOT]')),
       }))
       return
     }
     finishRecordSessionNow(set)
   },
 
-  skipRecordReset: () => {
+/** 描述当前方法的功能边界。 */
+skipRecordReset: () => {
+    if (get().recordSession.phase !== 'resetting') {
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('WARNING', 'record reset skip ignored: reset is not pending', '[LEROBOT]')),
+      }))
+      return
+    }
     void skipRecordResetApi().catch((error) => {
       set((state) => ({
         logs: appendLog(state.logs, makeLog('ERROR', `record reset skip failed: ${String(error)}`, '[LEROBOT]')),
@@ -1469,7 +1649,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     }))
   },
 
-  tareRecordForceSensors: () => {
+/** 发送或封装对应的后端命令。 */
+tareRecordForceSensors: () => {
     void tareForceSensorsApi()
     set((state) => ({
       dangerOverride: 0,
@@ -1487,7 +1668,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     }))
   },
 
-  toggleRecordClutch: () => {
+/** 发送或封装对应的后端命令。 */
+toggleRecordClutch: () => {
     void toggleClutchApi()
     set((state) => ({
       clutchActive: !state.clutchActive,
@@ -1495,7 +1677,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     }))
   },
 
-  setRecordSpeedMode: (mode) => {
+/** 设置当前流程的对应状态。 */
+setRecordSpeedMode: (mode) => {
     void setRecordSpeedModeApi(mode)
     set((state) => ({
       manualControl: {
@@ -1510,18 +1693,77 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     }))
   },
 
-  homeRecordArms: () => {
+/** 发送或封装对应的后端命令。 */
+homeRecordArms: () => {
     void homeAllApi()
     set((state) => ({
       manualControl: {
         ...state.manualControl,
         axisOffsets: {},
       },
-      logs: appendLog(state.logs, makeLog('INFO', '双臂已回工作原点', '[HAL]')),
+      logs: appendLog(state.logs, makeLog('INFO', '双臂已回硬件零点', '[HAL]')),
     }))
   },
 
-  triggerEmergencyStop: () => {
+/** 描述当前方法的功能边界。 */
+returnRecordMotionOrigin: async (side) => {
+    if (recordMotionOriginInFlight) {
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('WARNING', `${side} slave arm return-to-origin ignored: request is already pending`, '[HAL]')),
+      }))
+      return
+    }
+    recordMotionOriginInFlight = true
+    try {
+      await returnMotionOriginSideApi(side)
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('INFO', `${side} slave arm returned to hardware zero`, '[HAL]')),
+      }))
+    } catch (error) {
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('ERROR', `${side} slave arm return-to-origin failed: ${String(error)}`, '[HAL]')),
+      }))
+    } finally {
+      recordMotionOriginInFlight = false
+    }
+  },
+
+/** 鎻忚堪褰撳墠鏂规硶鐨勫姛鑳借竟鐣屻€?*/
+captureRecordMotionOrigin: async (side) => {
+    try {
+      const response = await captureMotionOriginApi(side, undefined)
+      set((state) => {
+        const currentOrigin = state.config.motion.origin
+        const leftValid = side === 'left' ? true : currentOrigin.leftValid
+        const rightValid = side === 'right' ? true : currentOrigin.rightValid
+        const nextOrigin = response.data?.origin ?? {
+          ...currentOrigin,
+          leftValid,
+          rightValid,
+          valid: leftValid && rightValid,
+          updatedAt: Date.now(),
+        }
+        const sideLabel = side === 'left' ? 'left' : 'right'
+        return {
+          config: {
+            ...state.config,
+            motion: {
+              ...state.config.motion,
+              origin: nextOrigin,
+            },
+          },
+          logs: appendLog(state.logs, makeLog('INFO', `${sideLabel} slave arm origin captured`, '[HAL]')),
+        }
+      })
+    } catch (error) {
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('ERROR', `${side} slave arm origin capture failed: ${String(error)}`, '[HAL]')),
+      }))
+    }
+  },
+
+/** 鎻忚堪褰撳墠鏂规硶鐨勫姛鑳借竟鐣屻€?*/
+triggerEmergencyStop: () => {
     void emergencyStopApi()
     set((state) => ({
       recording: false,
@@ -1545,7 +1787,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     }))
   },
 
-  clearRecordSession: () =>
+/** 删除对应数据并同步界面状态。 */
+clearRecordSession: () =>
     set((state) => ({
       recordSession: {
         ...initialRecordSession,
@@ -1558,13 +1801,15 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       logs: appendLog(state.logs, makeLog('INFO', '录制采集会话状态已清空', '[LEROBOT]')),
     })),
 
-  setClutchActive: (active) =>
+/** 设置当前流程的对应状态。 */
+setClutchActive: (active) =>
     set((state) => ({
       clutchActive: active,
       logs: appendLog(state.logs, makeLog(active ? 'INFO' : 'DEBUG', `Clutch ${active ? 'enabled' : 'released'}`, '[HAL]')),
     })),
 
-  setAutoRunning: (running) => {
+/** 设置当前流程的对应状态。 */
+setAutoRunning: (running) => {
     if (!mockMode) {
       void (running ? startAutoExecution() : stopAutoExecution()).catch((error) => {
         set((state) => ({
@@ -1578,7 +1823,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     }))
   },
 
-  setDangerOverride: (danger) =>
+/** 设置当前流程的对应状态。 */
+setDangerOverride: (danger) =>
     set((state) => ({
       dangerOverride: danger,
       frame: {
@@ -1587,7 +1833,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       },
     })),
 
-  acknowledgeSafety: () => {
+/** 应用对应配置或状态。 */
+acknowledgeSafety: () => {
     void acknowledgeSafetyApi().catch((error) => {
       set((state) => ({
         logs: appendLog(state.logs, makeLog('ERROR', `safety acknowledge failed: ${String(error)}`, '[SAFETY]')),
@@ -1603,12 +1850,14 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     }))
   },
 
-  injectLog: (level, msg, channel) =>
+/** 描述当前方法的功能边界。 */
+injectLog: (level, msg, channel) =>
     set((state) => ({
       logs: appendLog(state.logs, makeLog(level, msg, channel)),
     })),
 
-  sendBackendCommandLog: (level, msg, channel) => {
+/** 发送或封装对应的后端命令。 */
+sendBackendCommandLog: (level, msg, channel) => {
     if (!mockMode) {
       void sendSettingsLogCommand(channel ?? '[BACKEND]', msg, level).catch((error) => {
         set((state) => ({
@@ -1621,11 +1870,13 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     }))
   },
 
-  refreshHardwareStatus: async () => {
+ /** 从后端读取对应数据。 */
+ refreshHardwareStatus: async () => {
     try {
       const status = await fetchHardwareStatus()
       set((state) => ({
         diagnostics: diagnosticsFromHardwareStatus(state.diagnostics, status),
+        picoConnection: picoConnectionFromHardwareStatus(status) ?? state.picoConnection,
         logs: appendLog(state.logs, makeLog('INFO', 'Real hardware status probe completed', '[BACKEND]')),
       }))
     } catch (error) {
@@ -1635,7 +1886,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     }
   },
 
-  runDiagnostics: async () => {
+ /** 描述当前方法的功能边界。 */
+ runDiagnostics: async () => {
     set((state) => ({
       diagnostics: state.diagnostics.map((item) => ({ ...item, status: item.status === 'pending' ? 'checking' : item.status })),
     }))
@@ -1650,11 +1902,17 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     }))
   },
 
-  updateConfig: (patch) => {
+ /** 设置当前流程的对应状态。 */
+ setPicoConnectionStatus: (state, message) => {
+    set({ picoConnection: { state, message, checkedAt: Date.now() } })
+  },
+
+/** 描述当前方法的功能边界。 */
+updateConfig: (patch) => {
     const nextConfig = mergeConfig(get().config, patch)
     set({ config: nextConfig })
     if (!mockMode) {
-      void putConfig(nextConfig).catch((error) => {
+      void queueConfigSave(nextConfig).catch((error) => {
         set((state) => ({
           logs: appendLog(state.logs, makeLog('ERROR', `settings save failed: ${String(error)}`, '[BACKEND]')),
         }))
@@ -1662,7 +1920,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     }
   },
 
-  saveParameterSnapshot: (scope, name) => {
+/** 描述当前方法的功能边界。 */
+saveParameterSnapshot: (scope, name) => {
     if (!mockMode) {
       const config = scope === 'all' ? cloneConfig(get().config) : makeMotionCardSnapshotConfig(get().config, scope)
       void createParameterSnapshotApi(scope, name, config)
@@ -1701,13 +1960,14 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     })
   },
 
-  applyParameterSnapshot: (id) => {
+/** 应用对应配置或状态。 */
+applyParameterSnapshot: (id) => {
     if (!mockMode) {
       void applyParameterSnapshotApi(id)
         .then((response) => {
           const data = response.data as { config?: AppConfig; snapshots?: ParameterSnapshot[] } | undefined
           const patch: Partial<TelemetryStore> = {}
-          if (data?.config) patch.config = data.config
+          if (data?.config) patch.config = normalizeConfig(data.config)
           if (data?.snapshots) patch.parameterSnapshots = data.snapshots
           if (Object.keys(patch).length > 0) set(patch)
         })
@@ -1730,7 +1990,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     })
   },
 
-  deleteParameterSnapshot: (id) => {
+/** 删除对应数据并同步界面状态。 */
+deleteParameterSnapshot: (id) => {
     if (!mockMode) {
       void deleteParameterSnapshotApi(id)
         .then((response) => {
@@ -1753,7 +2014,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     })
   },
 
-  selectManualAxis: (side, axis) =>
+/** 描述当前方法的功能边界。 */
+selectManualAxis: (side, axis) =>
     set((state) => ({
       manualControl: {
         ...state.manualControl,
@@ -1762,7 +2024,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       },
     })),
 
-  setManualAxisStep: (unit, value) =>
+/** 设置当前流程的对应状态。 */
+setManualAxisStep: (unit, value) =>
     set((state) => ({
       manualControl: {
         ...state.manualControl,
@@ -1770,7 +2033,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       },
     })),
 
-  setManualSpeedMode: (mode) =>
+/** 设置当前流程的对应状态。 */
+setManualSpeedMode: (mode) =>
     set((state) => ({
       manualControl: {
         ...state.manualControl,
@@ -1778,7 +2042,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       },
     })),
 
-  issueManualAxisMove: (side, axis, direction) => {
+/** 计算或执行手动控制的对应逻辑。 */
+issueManualAxisMove: (side, axis, direction) => {
     if (!mockMode) {
       const state = get()
       const axisIndex = manualAxisOrder.indexOf(axis)
@@ -1789,13 +2054,13 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
         return
       }
       const rawStep = axisIndex < 3 ? state.manualControl.axisStepUm : state.manualControl.axisStepDeg
-      const step = clampManualAxisStep(state.config, side, axis, rawStep)
       const speedMode = state.manualControl.speedMode
+      const step = clampManualAxisStep(state.config, side, axis, rawStep, speedMode)
       const busyKey = manualAxisBusyKey(side, axis)
       const now = Date.now()
       const busyUntil = state.manualControl.axisBusyUntil[busyKey] ?? 0
       if (busyUntil > now) {
-        // 前端本地节流只影响重复点击，真实安全边界仍由后端和 HAL 执行。
+        // 前端本地节流只影响重复点击，真实安全边界仍由后端和硬件抽象层执行。
         const remainingS = ((busyUntil - now) / 1000).toFixed(1)
         set((current) => ({
           logs: appendLog(
@@ -1847,10 +2112,10 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       const stateIndex = (side === 'left' ? 0 : 6) + axisIndex
       const current = state.frame.jointPositions[stateIndex] ?? 0
       const rawStep = unit === 'um' ? state.manualControl.axisStepUm : state.manualControl.axisStepDeg
-      const rawDelta = clampManualAxisStep(state.config, side, axis, rawStep)
+      const rawDelta = clampManualAxisStep(state.config, side, axis, rawStep, state.manualControl.speedMode)
       const effectiveDirection = manualAxisEffectiveDirection(side, axisIndex, direction)
       const limits = side === 'left' ? state.config.motion.leftSoftLimits[axisKey] : state.config.motion.rightSoftLimits[axisKey]
-      // mock 模式沿用软限位，保证手动页演示行为接近真机路径。
+      // 说明当前代码块的功能用途。
       const nextPosition = clamp(current + rawDelta * effectiveDirection, limits.min, limits.max)
       const appliedDelta = nextPosition - current
       const offsetKey = `${side}-${axis}`
@@ -1890,7 +2155,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     })
   },
 
-  issueManualGripperMove: (side, command, targetMm) => {
+/** 计算或执行手动控制的对应逻辑。 */
+issueManualGripperMove: (side, command, targetMm) => {
     if (!mockMode) {
       const enabledKey = side === 'left' ? 'leftEnabled' : 'rightEnabled'
       const config = get().config
@@ -1905,11 +2171,11 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
         return
       }
       const previousEnabled = Boolean(get().config.gripper[enabledKey])
-      // 夹爪启停先乐观更新 UI，再由后端持久化和回读校准最终状态。
-      // Optimistically reflect enable/disable in the UI so the user can keep
-      // clicking instead of waiting for a config refetch round-trip. The
-      // backend persists the same change to disk; we then refetch to make sure
-      // any other field (eg targetMm) is in sync.
+      // 夹爪启停先乐观更新界面，再由后端持久化和回读校准最终状态。
+      // 说明当前代码块的功能用途。
+      // 说明当前代码块的功能用途。
+      // 说明当前代码块的功能用途。
+      // 说明当前代码块的功能用途。
       if (command === 'enable' || command === 'disable') {
         set((current) => ({
           config: {
@@ -1926,12 +2192,12 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
           set((current) => ({
             logs: appendLog(current.logs, makeLog('INFO', `${side} gripper ${command} accepted by backend`, '[GRIPPER]')),
           }))
-          // For state-changing commands, pull the canonical config back from
-          // backend so the UI never drifts (eg if /api/settings has been
-          // edited externally).
+          // 说明当前代码块的功能用途。
+          // 说明当前代码块的功能用途。
+          // 说明当前代码块的功能用途。
           if (command === 'enable' || command === 'disable') {
             void fetchConfig()
-              .then((config) => set({ config }))
+              .then((config) => set({ config: normalizeConfig(config) }))
               .catch(() => undefined)
           }
         })
@@ -2001,7 +2267,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     })
   },
 
-  startManualRecording: () =>
+/** 启动对应流程。 */
+startManualRecording: () =>
     set((state) => ({
       manualControl: {
         ...state.manualControl,
@@ -2012,7 +2279,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       logs: appendLog(state.logs, makeLog('INFO', 'Manual action recording started', '[HAL]')),
     })),
 
-  stopManualRecording: () =>
+/** 停止对应流程。 */
+stopManualRecording: () =>
     set((state) => ({
       manualControl: {
         ...state.manualControl,
@@ -2021,7 +2289,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       logs: appendLog(state.logs, makeLog('INFO', 'Manual action recording stopped', '[HAL]')),
     })),
 
-  saveManualMemory: (name) =>
+/** 描述当前方法的功能边界。 */
+saveManualMemory: (name) =>
     set((state) => {
       const actions = state.manualControl.draftActions
       if (actions.length === 0) {
@@ -2051,7 +2320,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       }
     }),
 
-  replayManualMemory: (id) =>
+/** 描述当前方法的功能边界。 */
+replayManualMemory: (id) =>
     set((state) => {
       const memory = state.manualControl.memories.find((item) => item.id === id)
       if (!memory) return state
@@ -2064,7 +2334,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       }
     }),
 
-  pauseManualReplay: () =>
+/** 停止对应流程。 */
+pauseManualReplay: () =>
     set((state) => ({
       manualControl: {
         ...state.manualControl,
@@ -2073,7 +2344,8 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       logs: appendLog(state.logs, makeLog('WARNING', 'Manual memory replay paused', '[HAL]')),
     })),
 
-  deleteManualMemory: (id) =>
+/** 删除对应数据并同步界面状态。 */
+deleteManualMemory: (id) =>
     set((state) => ({
       manualControl: {
         ...state.manualControl,
@@ -2083,5 +2355,6 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
       logs: appendLog(state.logs, makeLog('INFO', 'Manual memory deleted', '[HAL]')),
     })),
 
-  closeQualityReport: () => set({ qualityReport: null }),
+/** 描述当前方法的功能边界。 */
+closeQualityReport: () => set({ qualityReport: null }),
 }))

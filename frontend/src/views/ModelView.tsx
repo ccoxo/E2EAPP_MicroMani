@@ -8,13 +8,14 @@ const fallbackModels: PolicyModelApi[] = [
   { id: 'diffusion_policy', name: 'Diffusion Policy', latencyMs: 108, status: 'ready', note: 'async policy', updatedAt: 0 },
   { id: 'smolvla', name: 'OpenVLA / SmolVLA', latencyMs: 146, status: 'not_loaded', note: 'checkpoint pending', updatedAt: 0 },
 ]
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function ModelView() {
   const [models, setModels] = useState<PolicyModelApi[]>(fallbackModels)
   const [activeModelId, setActiveModelId] = useState('')
   const [loading, setLoading] = useState(false)
 
-  const refresh = () => {
+ /** 从后端读取对应数据。 */
+ const refresh = () => {
     setLoading(true)
     void fetchModels()
       .then((result) => {
@@ -36,12 +37,14 @@ export function ModelView() {
     }
   }, [])
 
-  const startModel = (modelId: string) => {
+ /** 启动对应流程。 */
+ const startModel = (modelId: string) => {
     setLoading(true)
     void startModelApi(modelId).then(refresh).finally(() => setLoading(false))
   }
 
-  const stopModel = (modelId: string) => {
+ /** 停止对应流程。 */
+ const stopModel = (modelId: string) => {
     setLoading(true)
     void stopModelApi(modelId).then(refresh).finally(() => setLoading(false))
   }

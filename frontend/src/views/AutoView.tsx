@@ -4,7 +4,7 @@ import { dispatchNextAutoAction, queueAutoAction } from '../api'
 import { CameraPreview } from '../components/CameraPreview'
 import { QueueChart } from '../components/Charts'
 import { useTelemetryStore } from '../stores/telemetry'
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function AutoView() {
   const frame = useTelemetryStore((state) => state.frame)
   const history = useTelemetryStore((state) => state.history)

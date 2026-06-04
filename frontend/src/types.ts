@@ -158,6 +158,18 @@ export interface ArmSoftLimitConfig {
   yaw: AxisSoftLimitConfig
 }
 
+export interface RotationWorkLimitSideConfig {
+  roll: AxisSoftLimitConfig
+  pitch: AxisSoftLimitConfig
+  yaw: AxisSoftLimitConfig
+}
+
+export interface RotationWorkLimitConfig {
+  enabled: boolean
+  left: RotationWorkLimitSideConfig
+  right: RotationWorkLimitSideConfig
+}
+
 export interface MotionOriginConfig {
   valid: boolean
   leftValid: boolean
@@ -169,6 +181,29 @@ export interface MotionOriginConfig {
   previousLeftPulse: number[]
   previousRightPulse: number[]
   previousUpdatedAt: number
+}
+
+export interface MotionHomeReferenceConfig {
+  valid: boolean
+  leftValid: boolean
+  rightValid: boolean
+  leftPulse: number[]
+  rightPulse: number[]
+  updatedAt: number
+}
+
+export interface MotionWorkOriginOffsetConfig {
+  valid: boolean
+  leftValid: boolean
+  rightValid: boolean
+  leftPulseDelta: number[]
+  rightPulseDelta: number[]
+  updatedAt: number
+}
+
+export interface MotionRelativeSoftLimitsConfig {
+  left: ArmSoftLimitConfig
+  right: ArmSoftLimitConfig
 }
 
 export interface MotionStartupHomeConfig {
@@ -186,7 +221,7 @@ export type Omega7StabilityMode = 'track' | 'hold' | 'off'
 export type TeleopEngine = 'hal_native' | 'python_mapper'
 export type TeleopControlMode = 'velocity_admittance' | 'incremental_position'
 
-export type RecorderPhase = 'idle' | 'recording' | 'resetting' | 'saving' | 'finishing'
+export type RecorderPhase = 'idle' | 'starting' | 'recording' | 'reviewing' | 'resetting' | 'saving' | 'finishing'
 
 export interface EpisodeRecord {
   index: number
@@ -254,6 +289,32 @@ export interface DatasetEpisodeSampleApi {
   images?: Partial<Record<DatasetCameraKeyApi, string>>
 }
 
+export interface DatasetEpisodeMotionOriginApi {
+  valid?: boolean
+  leftValid?: boolean
+  rightValid?: boolean
+  leftPulse?: number[]
+  rightPulse?: number[]
+  updatedAt?: number
+  positionSource?: string
+  configHash?: string
+}
+
+export interface DatasetEpisodeMotionCalibrationApi {
+  kinematics?: Partial<MotionKinematicsConfig>
+  teleop?: {
+    strategyVersion?: string
+    mappingMode?: string
+    leftImpulseCoeff?: number[]
+    rightImpulseCoeff?: number[]
+    leftDirectionSign?: number[]
+    rightDirectionSign?: number[]
+    syncImpulseCoeffFromKinematics?: boolean
+  }
+  stateUnitSpec?: string[]
+  configHash?: string
+}
+
 export interface DatasetEpisodeApi {
   id: string
   name: string
@@ -273,6 +334,8 @@ export interface DatasetEpisodeApi {
   features?: DatasetFeatureSummaryApi
   featureSummary?: DatasetFeatureSummaryApi
   cameraResolutions?: Partial<Record<DatasetCameraKeyApi, DatasetCameraResolutionApi>>
+  motionOrigin?: DatasetEpisodeMotionOriginApi
+  motionCalibration?: DatasetEpisodeMotionCalibrationApi
 }
 
 export interface DatasetApi {
@@ -383,12 +446,17 @@ export interface AppConfig {
     yawSoftLimitDeg: number
     positionSource: 'dmc_get_position' | 'dmc_get_encoder'
     workOriginStrategyVersion: string
+    homeReferenceVersion: string
     origin: MotionOriginConfig
+    homeReference: MotionHomeReferenceConfig
+    workOriginOffset: MotionWorkOriginOffsetConfig
+    relativeSoftLimits: MotionRelativeSoftLimitsConfig
     homeOnStartup: MotionStartupHomeConfig
     leftProfile: ArmMotionProfile
     rightProfile: ArmMotionProfile
     leftSoftLimits: ArmSoftLimitConfig
     rightSoftLimits: ArmSoftLimitConfig
+    rotationWorkLimits: RotationWorkLimitConfig
     kinematics: MotionKinematicsConfig
   }
   gripper: {
@@ -405,6 +473,8 @@ export interface AppConfig {
     commandForceLimitN: number
     commandSpeed: number
     commandTorque: number
+    icfTargetProtectionEnabled: boolean
+    icfTargetMinGapMm: number
     sampleMode: 'direct' | 'dual_worker'
     sampleHz: number
     sampleStaleMs: number
@@ -459,6 +529,24 @@ export interface AppConfig {
     nativeRotationDeadzoneDeg: number
     nativeRotationFullScaleDeg: number
     nativeVelocitySmoothingMs: number
+    kalmanFilterEnabled: boolean
+    kalmanBeta: number
+    kalmanMinVariance: number
+    kalmanMaxVariance: number
+    kalmanDtMinSec: number
+    kalmanDtMaxSec: number
+    kalmanTranslationPositionVariance: number
+    kalmanTranslationVelocityVariance: number
+    kalmanTranslationMeasurementVariance: number
+    kalmanTranslationProcessPositionVariance: number
+    kalmanTranslationProcessVelocityVariance: number
+    kalmanRotationPositionVariance: number
+    kalmanRotationVelocityVariance: number
+    kalmanRotationMeasurementVariance: number
+    kalmanRotationProcessPositionVariance: number
+    kalmanRotationProcessVelocityVariance: number
+    kalmanTranslationIntentVelocityThreshold: number
+    kalmanRotationIntentVelocityThreshold: number
     coarse: number
     medium: number
     fine: number
@@ -565,6 +653,8 @@ export interface MotionCardSnapshotConfig {
   positionSource: AppConfig['motion']['positionSource']
   profile: ArmMotionProfile
   softLimits: ArmSoftLimitConfig
+  rotationWorkLimitEnabled: boolean
+  rotationWorkLimits: RotationWorkLimitSideConfig
 }
 
 export type ParameterSnapshot =

@@ -51,7 +51,7 @@
 | POST | `/api/teleop/clutch_toggle` | - | 遥操作离合切换 |
 | POST | `/api/teleop/speed` | `{ mode }` | 粗/中/精速度档切换 |
 | POST | `/api/motion/emergency_stop` | - | 硬件急停 |
-| POST | `/api/motion/home_all` | - | 双臂回工作原点 |
+| POST | `/api/motion/home_all` | - | 双臂回硬件零点 |
 
 所有 POST 推荐统一返回：
 
@@ -314,9 +314,9 @@ physical_um_or_mdeg = pulse / pulse_per_unit * 1000.0
 pulse = physical_um_or_mdeg * pulse_per_unit / 1000.0
 ```
 
-### 3.4 工作原点
+### 3.4 硬件零点
 
-当前文档记录的工作原点脉冲：
+当前文档记录的硬件零点脉冲：
 
 | 机构 | X | Y | Z | Roll | Pitch | Yaw |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -325,7 +325,7 @@ pulse = physical_um_or_mdeg * pulse_per_unit / 1000.0
 
 更新时间：`2026-04-20T12:34:39`
 
-后端需要把工作原点作为配置项持久化，并提供“回工作原点”和“保存当前为工作原点”的安全确认流程。不要把这些值硬编码在 HAL 里。
+后端需要把硬件零点作为配置项持久化，并提供“回硬件零点”和“硬件回零后记录硬件零点”的安全确认流程。不要把这些值硬编码在 HAL 里，也不要提供“保存当前为软件工作原点”的入口。
 
 ## 4. 硬件接入指南
 
@@ -348,7 +348,7 @@ HAL 推荐接口：
 | GET | `/motion/state` | 读取 12 轴位置、速度、运动中标志 |
 | POST | `/motion/move_all` | 12 轴目标位置下发，HAL 内部检查软限位 |
 | POST | `/motion/jog` | 单轴点动 |
-| POST | `/motion/home_all` | 双臂回工作原点 |
+| POST | `/motion/home_all` | 双臂回硬件零点 |
 | POST | `/motion/home_axis` | 单轴回零 |
 | POST | `/motion/emergency_stop` | 硬急停，必须尽量短路径执行（<1ms DLL 直调） |
 | POST | `/motion/config` | 应用 profile、软限位、卡号等配置 |

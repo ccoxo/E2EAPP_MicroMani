@@ -2,14 +2,15 @@ import { Button, Input, Space, Table, Tag, Typography } from 'antd'
 import { PauseCircle, PlayCircle } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { cancelFineTuneJobApi, fetchFineTuneJobs, startFineTuneJobApi, type FineTuneJobApi } from '../api'
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function FineTuneView() {
   const [datasetId, setDatasetId] = useState('micro_assembly_v1')
   const [baseModel, setBaseModel] = useState('act')
   const [jobs, setJobs] = useState<FineTuneJobApi[]>([])
   const [loading, setLoading] = useState(false)
 
-  const refresh = () => {
+ /** 从后端读取对应数据。 */
+ const refresh = () => {
     setLoading(true)
     void fetchFineTuneJobs().then(setJobs).finally(() => setLoading(false))
   }
@@ -24,12 +25,14 @@ export function FineTuneView() {
     }
   }, [])
 
-  const startJob = () => {
+ /** 启动对应流程。 */
+ const startJob = () => {
     setLoading(true)
     void startFineTuneJobApi(datasetId, baseModel).then(refresh).finally(() => setLoading(false))
   }
 
-  const cancelJob = (jobId: string) => {
+ /** 停止对应流程。 */
+ const cancelJob = (jobId: string) => {
     setLoading(true)
     void cancelFineTuneJobApi(jobId).then(refresh).finally(() => setLoading(false))
   }

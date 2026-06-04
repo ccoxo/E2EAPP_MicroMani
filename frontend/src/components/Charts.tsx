@@ -13,11 +13,11 @@ interface HistoryProps {
   height?: number
 }
 
-// All charts share these constants; pulling them out of the inline render keeps
-// the option objects shallowly comparable between ticks and lets React.memo
-// do its job — the previous code rebuilt 5+ ECharts options every WS frame and
-// passed them into ECharts with notMerge, which is the dominant frontend cost.
-
+// 说明当前代码块的功能用途。
+// 说明当前代码块的功能用途。
+// 之前每个网页套接字帧都会重建多个图表配置，
+// 说明当前代码块的功能用途。
+/** 渲染当前界面单元，并连接所需数据。 */
 export const JointChart = memo(function JointChart({ history, height = 210 }: HistoryProps) {
   const option = useMemo(
     () => ({
@@ -55,7 +55,7 @@ export const JointChart = memo(function JointChart({ history, height = 210 }: Hi
   )
   return <ReactECharts option={option} style={{ height }} lazyUpdate />
 })
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export const AxisGroupChart = memo(function AxisGroupChart({
   history,
   side,
@@ -107,7 +107,7 @@ export const AxisGroupChart = memo(function AxisGroupChart({
   }, [history, side, group])
   return <ReactECharts option={option} style={{ height }} lazyUpdate />
 })
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export const ForceChart = memo(function ForceChart({
   history,
   side,
@@ -146,7 +146,7 @@ export const ForceChart = memo(function ForceChart({
   }, [history, side])
   return <ReactECharts option={option} style={{ height }} lazyUpdate />
 })
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export const QueueChart = memo(function QueueChart({ history, height = 160 }: HistoryProps) {
   const option = useMemo(
     () => ({

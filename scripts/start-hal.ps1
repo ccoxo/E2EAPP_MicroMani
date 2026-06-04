@@ -7,6 +7,8 @@ $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $halExe = Join-Path $repo "hal\build\HalServer.exe"
 $halNextExe = Join-Path $repo "hal\build\HalServer.next.exe"
+$workerExe = Join-Path $repo "hal\build\JodellGripperWorker.exe"
+$workerNextExe = Join-Path $repo "hal\build\JodellGripperWorker.next.exe"
 $halBuild = Split-Path -Parent $halExe
 $leishineBin = Join-Path $repo "hal\vendor\leishine\bin"
 $forceDimensionBin = Join-Path $repo "hal\vendor\force_dimension\bin"
@@ -17,22 +19,27 @@ $omegaRightOpenId = 1
 $omegaSwapHands = $false
 
 function Promote-HalCandidate {
-  if (!(Test-Path $halNextExe)) {
+  param(
+    [string]$CandidateExe,
+    [string]$TargetExe
+  )
+  if (!(Test-Path $CandidateExe)) {
     return
   }
-  $shouldPromote = !(Test-Path $halExe)
+  $shouldPromote = !(Test-Path $TargetExe)
   if (!$shouldPromote) {
-    $shouldPromote = (Get-Item $halNextExe).LastWriteTimeUtc -gt (Get-Item $halExe).LastWriteTimeUtc
+    $shouldPromote = (Get-Item $CandidateExe).LastWriteTimeUtc -gt (Get-Item $TargetExe).LastWriteTimeUtc
   }
   if (!$shouldPromote) {
     return
   }
-  if (Test-Path $halExe) {
+  if (Test-Path $TargetExe) {
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    Copy-Item -LiteralPath $halExe -Destination (Join-Path $halBuild "HalServer.backup-$stamp.exe") -Force
+    $backupName = "{0}.backup-{1}.exe" -f [System.IO.Path]::GetFileNameWithoutExtension($TargetExe), $stamp
+    Copy-Item -LiteralPath $TargetExe -Destination (Join-Path $halBuild $backupName) -Force
   }
-  Copy-Item -LiteralPath $halNextExe -Destination $halExe -Force
-  Write-Host "Promoted newer HAL build: $halNextExe -> $halExe"
+  Copy-Item -LiteralPath $CandidateExe -Destination $TargetExe -Force
+  Write-Host "Promoted newer HAL build: $CandidateExe -> $TargetExe"
 }
 
 $existing = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
@@ -46,13 +53,15 @@ if ($existing) {
   Start-Sleep -Seconds 1
 }
 
-Promote-HalCandidate
+Promote-HalCandidate -CandidateExe $halNextExe -TargetExe $halExe
+Promote-HalCandidate -CandidateExe $workerNextExe -TargetExe $workerExe
 
 if (!(Test-Path $halExe)) {
   throw "HalServer.exe not found: $halExe"
 }
 
 foreach ($required in @(
+  (Join-Path $halBuild "JodellGripperWorker.exe"),
   (Join-Path $halBuild "LTDMC.dll"),
   (Join-Path $halBuild "dhd64.dll"),
   (Join-Path $halBuild "drd64.dll"),

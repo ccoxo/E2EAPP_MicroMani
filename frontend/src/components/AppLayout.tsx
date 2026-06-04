@@ -30,7 +30,7 @@ const navItems = [
   { to: '/auto', label: '自动', icon: PlayCircle },
   { to: '/settings', label: '设置', icon: Settings },
 ]
-
+/** 渲染当前界面单元，并连接所需数据。 */
 function TopStatus({ clock }: { clock: string }) {
   const halOk = useTelemetryStore((state) => state.frame.halOk)
   const wsOk = useTelemetryStore((state) => state.frame.wsOk)
@@ -57,7 +57,7 @@ function TopStatus({ clock }: { clock: string }) {
     </Space>
   )
 }
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export function AppLayout() {
   const selectedMode = useTelemetryStore((state) => state.selectedMode)
   const setMode = useTelemetryStore((state) => state.setMode)

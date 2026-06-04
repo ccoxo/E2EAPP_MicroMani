@@ -26,6 +26,7 @@ from backend.core.schemas import AppConfig  # noqa: E402
 AXIS_ORDER = ["x", "y", "z", "roll", "pitch", "yaw"]
 TELEOP_SOFT_LIMIT_UNIT_SPEC = ["um", "um", "um", "deg", "deg", "deg"]
 TRANSLATION_TRAVEL_UM = [50000.0, 75000.0, 75000.0]
+ROLL_PITCH_LIMIT_DEG = 100.0
 YAW_LIMIT_DEG = 7.0
 LOGICAL_TO_PHYSICAL_AXIS = {
     0: 0,
@@ -329,6 +330,9 @@ def normalize_teleop_limits(teleop: dict[str, Any], side: str) -> None:
             if maxes[index] - mins[index] > TRANSLATION_TRAVEL_UM[index]:
                 mins[index] = -half_travel
                 maxes[index] = half_travel
+        elif index in {3, 4}:
+            mins[index] = -ROLL_PITCH_LIMIT_DEG
+            maxes[index] = ROLL_PITCH_LIMIT_DEG
         elif index == 5:
             mins[index] = -YAW_LIMIT_DEG
             maxes[index] = YAW_LIMIT_DEG

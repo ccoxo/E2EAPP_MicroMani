@@ -1,5 +1,6 @@
 import { Card } from 'antd'
 import { useTelemetryStore } from '../../stores/telemetry'
+import { teleopPairValue } from '../../teleopStatus'
 import type { DiagnosticItem, TelemetryFrame } from '../../types'
 
 interface HwItem {
@@ -7,29 +8,28 @@ interface HwItem {
   getValue: (frame: TelemetryFrame, diagnostics: DiagnosticItem[]) => string
   getOk: (frame: TelemetryFrame, diagnostics: DiagnosticItem[]) => boolean
 }
-
+/** 计算对应的业务值或展示值。 */
 function diagnosticOk(diagnostics: DiagnosticItem[], key: string) {
   const status = diagnostics.find((item) => item.key === key)?.status
   return status === 'ok'
 }
-
+/** 计算对应的业务值或展示值。 */
 function cameraByKey(frame: TelemetryFrame, key: 'global' | 'wrist_left' | 'wrist_right') {
   return frame.cameras.find((camera) => camera.key === key)
 }
-
+/** 计算对应的业务值或展示值。 */
 function cameraOk(frame: TelemetryFrame, key: 'global' | 'wrist_left' | 'wrist_right') {
   const camera = cameraByKey(frame, key)
   return (camera?.fps ?? 0) >= 25 && camera?.health === 'ok'
 }
-
+/** 计算对应的业务值或展示值。 */
 function teleopHandsReady(frame: TelemetryFrame) {
   return frame.teleopHands.every((hand) => hand.connected && hand.lastReadOk)
 }
-
+/** 计算对应的业务值或展示值。 */
 function teleopHandsValue(frame: TelemetryFrame, diagnostics: DiagnosticItem[]) {
   if (!diagnosticOk(diagnostics, 'omega7')) return '待确认'
-  const connected = frame.teleopHands.filter((hand) => hand.connected && hand.lastReadOk).length
-  return connected === 2 ? '逻辑 2/2' : `逻辑 ${connected}/2`
+  return teleopPairValue(frame)
 }
 
 const HW_ITEMS: HwItem[] = [
@@ -74,7 +74,7 @@ const HW_ITEMS: HwItem[] = [
     getOk: (_frame, diagnostics) => diagnosticOk(diagnostics, 'gripper'),
   },
 ]
-
+/** 计算对应的业务值或展示值。 */
 const dotStyle = (ok: boolean): React.CSSProperties => ({
   width: 8,
   height: 8,
@@ -82,7 +82,7 @@ const dotStyle = (ok: boolean): React.CSSProperties => ({
   background: ok ? '#3B6D11' : '#E65100',
   flexShrink: 0,
 })
-
+/** 渲染当前界面单元，并连接所需数据。 */
 export default function HardwareStatusCard() {
   const frame = useTelemetryStore((s) => s.frame)
   const diagnostics = useTelemetryStore((s) => s.diagnostics)

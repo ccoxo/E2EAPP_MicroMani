@@ -78,11 +78,23 @@ class PicoAdbDriver:
             return PicoResult(False, f"executable not found: {args[0]}")
         except subprocess.TimeoutExpired:
             return PicoResult(False, f"adb command timed out: {' '.join(args)}")
-        return PicoResult(result.returncode == 0, " ".join(args), result.stdout, result.stderr)
+        message = " ".join(args)
+        if result.returncode == 0 and self._adb_output_has_offline_device(result.stdout, result.stderr):
+            return PicoResult(False, f"{message} (device offline)", result.stdout, result.stderr)
+        return PicoResult(result.returncode == 0, message, result.stdout, result.stderr)
 
     def _endpoint(self, config: dict[str, Any]) -> str:
         pico = config["picoVision"]
         return f"{pico['ip']}:{pico['adbPort']}"
+
+    def _adb_output_has_offline_device(self, stdout: str, stderr: str) -> bool:
+        if "device offline" in f"{stdout}\n{stderr}".lower():
+            return True
+        for line in stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].lower() == "offline":
+                return True
+        return False
 
     def _script(self, config: dict[str, Any], name: str) -> Path | None:
         pico = config["picoVision"]

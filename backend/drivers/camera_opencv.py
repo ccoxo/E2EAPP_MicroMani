@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import base64
+import json
 import os
+import queue
 import re
 import subprocess
+import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import import_module
 from threading import Event, Lock, Thread, current_thread
 from typing import Any
@@ -46,6 +50,8 @@ CAMERA_STALE_FRAME_SEC = 2.0
 CAMERA_INITIAL_FRAME_GRACE_SEC = 1.5
 CAMERA_FRAME_WAIT_SEC = 1.5
 CAMERA_FPS_WINDOW_SEC = 1.0
+CAMERA_RELEASE_JOIN_SEC = 2.0
+CAMERA_CAPTURE_FOURCC = "YUYV"
 CAMERA_TUNING_DEFAULTS: dict[str, dict[str, float | bool]] = {
     "global": {
         "autoExposure": False,
@@ -207,6 +213,76 @@ class CameraFrameSnapshot:
     monotonic_s: float
 
 
+@dataclass
+class _ProcessCameraCapture:
+    process: Any
+    status_queue: queue.Queue[dict[str, Any]]
+    command_queue: Any
+    prop_ids: dict[str, int]
+    backend_label: str = ""
+    status: dict[str, Any] = field(default_factory=dict)
+
+    is_process_capture = True
+
+    def isOpened(self) -> bool:
+        return self.is_alive() and bool(self.status.get("opened", False))
+
+    def is_alive(self) -> bool:
+        if hasattr(self.process, "is_alive"):
+            return bool(self.process.is_alive())
+        if hasattr(self.process, "poll"):
+            return self.process.poll() is None
+        return False
+
+    def exitcode(self) -> int | None:
+        if hasattr(self.process, "exitcode"):
+            return self.process.exitcode
+        if hasattr(self.process, "poll"):
+            return self.process.poll()
+        return None
+
+    def get(self, prop: int) -> float:
+        if prop == self.prop_ids.get("width"):
+            return float(self.status.get("actualWidth") or 0)
+        if prop == self.prop_ids.get("height"):
+            return float(self.status.get("actualHeight") or 0)
+        if prop == self.prop_ids.get("fps"):
+            return float(self.status.get("actualFps") or self.status.get("fps") or 0)
+        return 0.0
+
+    def release(self) -> None:
+        try:
+            if hasattr(self.command_queue, "put"):
+                self.command_queue.put({"type": "stop"})
+            else:
+                self.command_queue.write("stop\n")
+                self.command_queue.flush()
+        except Exception:
+            pass
+        if hasattr(self.process, "join"):
+            self.process.join(1.0)
+        elif hasattr(self.process, "wait"):
+            try:
+                self.process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+        if self.is_alive():
+            self.process.terminate()
+            if hasattr(self.process, "join"):
+                self.process.join(1.0)
+            elif hasattr(self.process, "wait"):
+                try:
+                    self.process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+
+    def apply_status(self, status: dict[str, Any]) -> None:
+        self.status.update(status)
+        backend = status.get("backend")
+        if backend:
+            self.backend_label = str(backend)
+
+
 def _backend_candidates(cv2: Any) -> list[tuple[int, str]]:
     """Return Windows OpenCV capture backends in the order we should try them.
 
@@ -232,12 +308,46 @@ def _backend_candidates(cv2: Any) -> list[tuple[int, str]]:
     return ordered
 
 
+def _camera_release_join_sec() -> float:
+    raw = os.environ.get("APPSTATION_CAMERA_RELEASE_JOIN_SEC", "").strip()
+    if not raw:
+        return CAMERA_RELEASE_JOIN_SEC
+    try:
+        return max(0.1, float(raw))
+    except ValueError:
+        return CAMERA_RELEASE_JOIN_SEC
+
+
+def _co_initialize_for_capture_thread() -> object | None:
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        hr = ctypes.windll.ole32.CoInitializeEx(None, 0)
+    except Exception:
+        return None
+    return True if hr in (0, 1) else None
+
+
+def _co_uninitialize_for_capture_thread(token: object | None) -> None:
+    if token is None:
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.ole32.CoUninitialize()
+    except Exception:
+        return
+
+
 class OpenCVCameraDriver:
     def __init__(self, logs: Any | None = None) -> None:
         self._logs = logs
         self._last_probe = 0.0
         self._cached: CameraProbeResult | None = None
         self._capture_lock = Lock()
+        self._resolved_lock = Lock()
         self._captures: dict[int, Any] = {}
         self._capture_sizes: dict[int, tuple[int, int, float]] = {}
         self._capture_opened_at: dict[int, float] = {}
@@ -406,6 +516,12 @@ class OpenCVCameraDriver:
             if frame is not None:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 return CameraFrameSnapshot(rgb, float(latest_at or time.monotonic()))
+            cached = self._latest_jpegs.get(index)
+            if cached is not None:
+                return CameraFrameSnapshot(
+                    self._decode_jpeg_to_rgb_frame(cv2, cached),
+                    float(self._latest_at.get(index) or time.monotonic()),
+                )
             event = self._frame_events.get(index)
             if event is None:
                 time.sleep(0.01)
@@ -464,10 +580,21 @@ class OpenCVCameraDriver:
         width, height = self._capture_size(config, camera)
         profile = self._camera_tuning(config, camera)
         with self._capture_lock:
+            current = self._captures.get(index)
+            if getattr(current, "is_process_capture", False):
+                self._drop_capture(index)
             capture = self._get_capture(cv2, index, width, height, fps_config, camera, config)
             if capture is None:
                 raise RuntimeError(f"{camera} index {index} open failed")
-            actual = self._apply_tuning(cv2, capture, profile)
+            if getattr(capture, "is_process_capture", False):
+                actual = {
+                    "autoExposure": None,
+                    "exposure": None,
+                    "gain": None,
+                    "autoWhiteBalance": None,
+                }
+            else:
+                actual = self._apply_tuning(cv2, capture, profile)
             self._clear_probe_cache()
         self._log("info", f"{camera} tuning applied on index {index}: {profile}")
         return {
@@ -514,7 +641,7 @@ class OpenCVCameraDriver:
         fps_config = float(config["cameras"].get("fps", 30))
         configured = self._resolved_indices(cv2, config, fps_config, max_index=max_index)
         devices: list[dict[str, Any]] = []
-        for index in range(max_index):
+        for index in self._candidate_camera_indices(max_index):
             started = time.perf_counter()
             roles = [role for role, role_index in configured.items() if role_index == index]
             probe_role = roles[0] if roles else "global"
@@ -594,6 +721,20 @@ class OpenCVCameraDriver:
                 return int(token)
         return fallback
 
+    def _candidate_camera_indices(self, max_index: int) -> list[int]:
+        identities = self._camera_identities_by_index()
+        if not identities:
+            return list(range(max_index))
+        return [
+            index
+            for index, identity in sorted(identities.items())
+            if 0 <= index < max_index and not self._is_directshow_software_source(identity)
+        ]
+
+    def _is_directshow_software_source(self, identity: dict[str, str]) -> bool:
+        descriptor = " ".join([identity.get("devicePath", ""), identity.get("displayName", "")]).lower()
+        return "@device:sw:" in descriptor
+
     def _resolved_indices(
         self,
         cv2: Any,
@@ -601,6 +742,17 @@ class OpenCVCameraDriver:
         fps: float,
         *,
         max_index: int = 10,
+    ) -> dict[str, int]:
+        with self._resolved_lock:
+            return self._resolved_indices_locked(cv2, config, fps, max_index=max_index)
+
+    def _resolved_indices_locked(
+        self,
+        cv2: Any,
+        config: dict[str, Any],
+        fps: float,
+        *,
+        max_index: int,
     ) -> dict[str, int]:
         cameras = config["cameras"]
         cache_key = (
@@ -627,6 +779,7 @@ class OpenCVCameraDriver:
             for role, config_key in CAMERA_DESCRIPTOR_KEYS.items()
         }
         resolved.update(self._resolve_indices_by_identity(cameras))
+        resolved = self._remap_software_sources(resolved, max_index)
         wrist_indices = {resolved["wrist_left"], resolved["wrist_right"]}
         if resolved["global"] < 0 or resolved["global"] in wrist_indices:
             readable = self._discover_readable_indices(cv2, *CAMERA_CAPTURE_SIZES["global"], fps, max_index)
@@ -678,11 +831,33 @@ class OpenCVCameraDriver:
             for index, identity in identities.items():
                 if index in used_indices:
                     continue
+                if self._is_directshow_software_source(identity):
+                    continue
                 if _identity_matches(expected, identity):
                     resolved[role] = index
                     used_indices.add(index)
                     break
         return resolved
+
+    def _remap_software_sources(self, resolved: dict[str, int], max_index: int) -> dict[str, int]:
+        identities = self._camera_identities_by_index()
+        if not identities:
+            return resolved
+
+        next_resolved = dict(resolved)
+        available = self._candidate_camera_indices(max_index)
+        for role in ("global", "wrist_left", "wrist_right"):
+            index = next_resolved.get(role, -1)
+            if not self._is_directshow_software_source(identities.get(index, {})):
+                continue
+            used = {
+                other_index
+                for other_role, other_index in next_resolved.items()
+                if other_role != role and other_index >= 0
+            }
+            replacement = next((candidate for candidate in available if candidate not in used), -1)
+            next_resolved[role] = replacement
+        return next_resolved
 
     def _camera_identities_by_index(self) -> dict[int, dict[str, str]]:
         if os.name != "nt":
@@ -743,7 +918,7 @@ class OpenCVCameraDriver:
 
     def _discover_readable_indices(self, cv2: Any, width: int, height: int, fps: float, max_index: int) -> list[int]:
         readable: list[int] = []
-        for index in range(max_index):
+        for index in self._candidate_camera_indices(max_index):
             with self._capture_lock:
                 capture = self._get_capture(cv2, index, width, height, fps)
             if capture is None:
@@ -772,12 +947,50 @@ class OpenCVCameraDriver:
             return capture
         if capture is not None:
             self._log("warning", f"camera index {index} reopening; stale or mismatched capture")
-        self._drop_capture(index)
+        if not self._drop_capture(index):
+            return None
 
         capture = None
         backend_label = ""
         profile = self._camera_tuning(config, camera) if config is not None and camera is not None else None
         backend_candidates = _backend_candidates(cv2)
+        if self._process_capture_enabled(cv2, backend_candidates):
+            capture = self._start_process_capture(cv2, index, width, height, fps, camera, profile, backend_candidates)
+            if capture is None:
+                self._event(
+                    "warning",
+                    "camera_worker_unavailable",
+                    role=camera or "unknown",
+                    logicalIndex=camera or "unknown",
+                    device=index,
+                    backendTried=[label for _, label in backend_candidates],
+                    requested={"width": width, "height": height, "fps": fps},
+                    deviceName="",
+                    deviceClass="opencv-worker",
+                    ownerHint="isolated camera worker failed; falling back to in-process OpenCV capture",
+                    configPath="runtime/config.json",
+                )
+            else:
+                backend_label = getattr(capture, "backend_label", "") or backend_candidates[0][1]
+                self._backend_label = backend_label
+                self._captures[index] = capture
+                self._capture_sizes[index] = (width, height, fps)
+                self._capture_opened_at[index] = time.monotonic()
+                if camera is not None:
+                    self._capture_roles[index] = camera
+                self._capture_backend_labels[index] = backend_label
+                self._stale_indices.discard(index)
+                self._frame_locks[index] = Lock()
+                self._frame_events[index] = Event()
+                self._jpeg_events[index] = Event()
+                if isinstance(capture, _ProcessCameraCapture):
+                    self._start_process_reader(index, capture)
+                self._log(
+                    "info",
+                    f"{camera or 'camera'} opened index {index} via {backend_label} worker {width}x{height}@{fps:g}",
+                )
+                return capture
+
         attempt_no = 0
         for backend, label in backend_candidates:
             attempt_no += 1
@@ -791,7 +1004,7 @@ class OpenCVCameraDriver:
                     device=index,
                     backend=label,
                     attemptNo=attempt_no,
-                    fourcc="MJPG",
+                    fourcc=CAMERA_CAPTURE_FOURCC,
                     width=width,
                     height=height,
                     fps=fps,
@@ -815,7 +1028,7 @@ class OpenCVCameraDriver:
                 device=index,
                 backend=label,
                 attemptNo=attempt_no,
-                fourcc="MJPG",
+                fourcc=CAMERA_CAPTURE_FOURCC,
                 width=width,
                 height=height,
                 fps=fps,
@@ -864,6 +1077,135 @@ class OpenCVCameraDriver:
         self._log("info", f"{camera or 'camera'} opened index {index} via {backend_label} {width}x{height}@{fps:g}")
         return capture
 
+    def _process_capture_enabled(self, cv2: Any, backend_candidates: list[tuple[int, str]]) -> bool:
+        mode = os.environ.get("APPSTATION_CAMERA_CAPTURE_MODE", "").strip().lower()
+        if mode in {"thread", "direct", "inprocess", "in-process", "0", "false", "off"}:
+            return False
+        if mode in {"process", "worker", "isolated", "1", "true", "on"}:
+            requested = True
+        else:
+            requested = os.name == "nt"
+        if not requested:
+            return False
+        if getattr(cv2, "__name__", "cv2") != "cv2":
+            return False
+        return any(label == "CAP_DSHOW" for _backend, label in backend_candidates)
+
+    def _start_process_capture(
+        self,
+        cv2: Any,
+        index: int,
+        width: int,
+        height: int,
+        fps: float,
+        camera: str | None,
+        profile: dict[str, float | bool] | None,
+        backend_candidates: list[tuple[int, str]],
+    ) -> _ProcessCameraCapture | None:
+        _ = camera
+        status_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=5)
+        startup = {
+            "index": index,
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "profile": profile,
+            "backendCandidates": backend_candidates,
+            "parentPid": os.getpid(),
+        }
+        startup_json = json.dumps(startup, separators=(",", ":"))
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        process = subprocess.Popen(
+            [sys.executable, "-m", "backend.workers.camera_capture_worker", startup_json],
+            cwd=os.getcwd(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            creationflags=creation_flags,
+        )
+        prop_ids = {
+            "width": int(getattr(cv2, "CAP_PROP_FRAME_WIDTH", -1)),
+            "height": int(getattr(cv2, "CAP_PROP_FRAME_HEIGHT", -1)),
+            "fps": int(getattr(cv2, "CAP_PROP_FPS", -1)),
+        }
+        assert process.stdin is not None
+        capture = _ProcessCameraCapture(process, status_queue, process.stdin, prop_ids)
+        self._start_process_output_reader(capture)
+        deadline = time.monotonic() + CAMERA_INITIAL_FRAME_GRACE_SEC
+        while time.monotonic() < deadline:
+            status = self._process_capture_status(capture, timeout=0.05)
+            if status is not None:
+                capture.apply_status(status)
+                if bool(status.get("opened")):
+                    return capture
+                if not capture.is_alive():
+                    break
+            elif not capture.is_alive():
+                break
+        capture.release()
+        return None
+
+    def _start_process_output_reader(self, capture: _ProcessCameraCapture) -> None:
+        stdout = getattr(capture.process, "stdout", None)
+        if stdout is None:
+            return
+
+        def read_stdout() -> None:
+            try:
+                for line in stdout:
+                    try:
+                        status = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    jpeg_b64 = status.pop("jpegB64", None)
+                    if isinstance(jpeg_b64, str):
+                        try:
+                            status["jpeg"] = base64.b64decode(jpeg_b64)
+                        except Exception:
+                            status.pop("jpeg", None)
+                    self._queue_process_status(capture, status)
+            finally:
+                try:
+                    stdout.close()
+                except Exception:
+                    pass
+
+        Thread(
+            target=read_stdout,
+            name=f"camera-worker-stdout-{getattr(capture.process, 'pid', 0)}",
+            daemon=True,
+        ).start()
+
+    def _queue_process_status(self, capture: _ProcessCameraCapture, status: dict[str, Any]) -> None:
+        try:
+            capture.status_queue.put_nowait(status)
+        except queue.Full:
+            try:
+                capture.status_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                capture.status_queue.put_nowait(status)
+            except queue.Full:
+                pass
+
+    def _process_capture_status(
+        self,
+        capture: _ProcessCameraCapture,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any] | None:
+        try:
+            if timeout is None:
+                status = capture.status_queue.get_nowait()
+            else:
+                status = capture.status_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        return status if isinstance(status, dict) else None
+
     def _capture_usable(self, capture: Any, index: int, size: tuple[int, int, float]) -> bool:
         if index in self._stale_indices:
             return False
@@ -871,6 +1213,14 @@ class OpenCVCameraDriver:
             return False
         reader = self._reader_threads.get(index)
         encoder = self._encode_threads.get(index)
+        if getattr(capture, "is_process_capture", False):
+            if reader is not None and not reader.is_alive():
+                return False
+            latest_at = self._latest_at.get(index)
+            if latest_at is not None:
+                return time.monotonic() - latest_at <= CAMERA_STALE_FRAME_SEC
+            opened_at = self._capture_opened_at.get(index)
+            return opened_at is None or time.monotonic() - opened_at <= CAMERA_INITIAL_FRAME_GRACE_SEC
         if reader is None or not reader.is_alive() or encoder is None or not encoder.is_alive():
             return False
         latest_at = self._latest_at.get(index)
@@ -888,11 +1238,10 @@ class OpenCVCameraDriver:
         fps: float,
         profile: dict[str, float | bool] | None = None,
     ) -> None:
-        # The order matters on Windows: FOURCC must be set BEFORE width/height/fps
-        # or Media Foundation falls back to YUY2 and caps at ~10fps for HD.
+        # The order matters on Windows: FOURCC must be set before width/height/fps.
         if hasattr(cv2, "CAP_PROP_FOURCC") and hasattr(cv2, "VideoWriter_fourcc"):
             try:
-                capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*CAMERA_CAPTURE_FOURCC))
             except Exception:
                 pass
         if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
@@ -990,6 +1339,14 @@ class OpenCVCameraDriver:
         except Exception:
             return None
 
+    def _decode_jpeg_to_rgb_frame(self, cv2: Any, jpeg: bytes) -> Any:
+        np = import_module("numpy")
+        buffer = np.frombuffer(jpeg, dtype=np.uint8)
+        frame = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise RuntimeError("JPEG decode failed")
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
     def _clamp_float(self, value: object, low: float, high: float, fallback: float) -> float:
         try:
             parsed = float(value)
@@ -997,17 +1354,31 @@ class OpenCVCameraDriver:
             parsed = fallback
         return min(high, max(low, parsed))
 
-    def _drop_capture(self, index: int) -> None:
+    def _drop_capture(self, index: int) -> bool:
+        for stops in (self._reader_stops, self._encode_stops):
+            stop = stops.get(index)
+            if stop is not None:
+                stop.set()
+        timeout_s = _camera_release_join_sec()
+        reader = self._reader_threads.get(index)
+        encoder = self._encode_threads.get(index)
+        for thread in (reader, encoder):
+            if thread is not None and thread.is_alive() and thread is not current_thread():
+                thread.join(timeout=timeout_s)
+        if reader is not None and reader.is_alive() and reader is not current_thread():
+            self._stale_indices.add(index)
+            self._log("warning", f"camera index {index} release deferred; reader thread did not stop")
+            return False
         for stops, threads in (
             (self._reader_stops, self._reader_threads),
             (self._encode_stops, self._encode_threads),
         ):
-            stop = stops.pop(index, None)
-            if stop is not None:
-                stop.set()
-            thread = threads.pop(index, None)
-            if thread is not None and thread.is_alive() and thread is not current_thread():
-                thread.join(timeout=0.3)
+            stop = stops.get(index)
+            thread = threads.get(index)
+            if stop is not None and (thread is None or not thread.is_alive() or thread is current_thread()):
+                stops.pop(index, None)
+            if thread is not None and (not thread.is_alive() or thread is current_thread()):
+                threads.pop(index, None)
         capture = self._captures.pop(index, None)
         self._capture_sizes.pop(index, None)
         self._capture_opened_at.pop(index, None)
@@ -1027,6 +1398,66 @@ class OpenCVCameraDriver:
         self._frame_events.pop(index, None)
         if capture is not None:
             capture.release()
+        return True
+
+    def _start_process_reader(self, index: int, capture: _ProcessCameraCapture) -> None:
+        if index in self._reader_threads:
+            return
+        stop = Event()
+        self._reader_stops[index] = stop
+
+        def read_loop() -> None:
+            try:
+                while not stop.is_set():
+                    status = self._process_capture_status(capture, timeout=0.1)
+                    if status is None:
+                        if not capture.is_alive():
+                            self._stale_indices.add(index)
+                            self._log(
+                                "warning",
+                                f"camera index {index} worker exited exitcode={capture.exitcode()}",
+                            )
+                            break
+                        continue
+                    capture.apply_status(status)
+                    if not bool(status.get("opened", True)):
+                        self._stale_indices.add(index)
+                        self._log("warning", f"camera index {index} worker status: {status.get('message', '')}")
+                        break
+                    jpeg = status.get("jpeg")
+                    if not isinstance(jpeg, bytes):
+                        continue
+                    monotonic_ms = status.get("monotonicMs")
+                    try:
+                        frame_time = float(monotonic_ms) / 1000.0
+                    except (TypeError, ValueError):
+                        frame_time = time.monotonic()
+                    self._record_frame_timestamp(index, frame_time)
+                    self._latest_at[index] = frame_time
+                    self._latest_jpegs[index] = jpeg
+                    self._latest_sequences[index] = int(
+                        status.get("sequence") or self._latest_sequences.get(index, 0) + 1
+                    )
+                    fps = status.get("fps")
+                    if fps is not None:
+                        try:
+                            self._latest_fps[index] = float(fps)
+                        except (TypeError, ValueError):
+                            pass
+                    event = self._jpeg_events.get(index)
+                    if event is not None:
+                        event.set()
+                    frame_event = self._frame_events.get(index)
+                    if frame_event is not None:
+                        frame_event.set()
+            finally:
+                if self._reader_threads.get(index) is current_thread():
+                    self._reader_threads.pop(index, None)
+                    self._reader_stops.pop(index, None)
+
+        thread = Thread(target=read_loop, name=f"camera-worker-reader-{index}", daemon=True)
+        self._reader_threads[index] = thread
+        thread.start()
 
     def _start_reader(self, cv2: Any, index: int, capture: Any) -> None:
         if index in self._reader_threads:
@@ -1038,6 +1469,7 @@ class OpenCVCameraDriver:
 
         def read_loop() -> None:
             consecutive_failures = 0
+            com_token = _co_initialize_for_capture_thread()
             try:
                 while not stop.is_set():
                     try:
@@ -1067,6 +1499,7 @@ class OpenCVCameraDriver:
                         else:
                             time.sleep(0.005)
             finally:
+                _co_uninitialize_for_capture_thread(com_token)
                 if self._reader_threads.get(index) is current_thread():
                     self._reader_threads.pop(index, None)
                     self._reader_stops.pop(index, None)

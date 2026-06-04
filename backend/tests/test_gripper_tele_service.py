@@ -40,6 +40,18 @@ def test_gripper_teleop_maps_gap_to_continuous_target() -> None:
     assert follower.update(25.0, cfg, 26.0, now_ms=20) == (26.0, 0)
 
 
+def test_gripper_teleop_respects_icf_min_gap_protection() -> None:
+    cfg = {
+        **default_config()["teleop"]["gripperTeleop"],
+        "icfTargetProtectionEnabled": True,
+        "icfTargetMinGapMm": 1.02,
+    }
+    follower = FollowGripper("left")
+
+    assert follower.update(0.0, cfg, 26.0, now_ms=0) == (1.02, 245)
+    assert follower.update_button(True, cfg, 26.0, now_ms=60) == (1.02, 245)
+
+
 def test_gripper_teleop_can_invert_right_gap_direction() -> None:
     cfg = {
         **default_config()["teleop"]["gripperTeleop"],

@@ -898,6 +898,74 @@ select {
   width: auto;
 }
 
+.record-kalman-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: #526070;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.record-kalman-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.record-kalman-groups section {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.record-kalman-groups b {
+  color: #334155;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.record-kalman-param-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.record-kalman-param {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.record-kalman-param span {
+  overflow: hidden;
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-kalman-param .ant-input-number {
+  width: 100%;
+}
+
+.record-kalman-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  color: #64748b;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+}
+
 .record-camera-layout {
   display: grid;
   grid-template-columns: minmax(0, 1.22fr) repeat(2, minmax(0, 1fr));
@@ -1344,6 +1412,16 @@ select {
   margin-top: 8px;
 }
 
+.record-origin-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.record-origin-actions .ant-btn {
+  min-width: 0;
+}
+
 .record-force-meter-ok i {
   background: #0f9f6e;
 }
@@ -1547,6 +1625,43 @@ select {
   align-items: start;
 }
 
+.camera-tuning-span {
+  grid-column: 1 / -1;
+}
+
+.camera-tuning-control-stack {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.camera-tuning-toggle-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.camera-tuning-control-row {
+  display: grid;
+  grid-template-columns: 86px minmax(180px, 1fr) 92px;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+
+.camera-tuning-control-row .ant-slider {
+  margin: 0;
+}
+
+.camera-tuning-control-row .ant-input-number {
+  width: 100%;
+}
+
+.camera-tuning-control-label {
+  font-weight: 700;
+}
+
 .camera-toggle-stack {
   display: flex;
   flex-direction: column;
@@ -1668,13 +1783,18 @@ select {
 }
 
 .status-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 45;
   display: flex;
   align-items: center;
+  flex-shrink: 0;
   gap: 6px;
   min-height: 26px;
   padding: 0 10px;
   border-top: 1px solid #d7dde7;
   background: #ffffff;
+  box-shadow: 0 -1px 10px rgba(31, 41, 55, 0.06);
   overflow: hidden;
   white-space: nowrap;
 }
@@ -1974,6 +2094,25 @@ select {
 
 .dataset-quality-workbench {
   padding: 10px;
+}
+
+.dataset-live-preview-strip {
+  padding: 10px;
+}
+
+.dataset-live-preview-strip .section-title {
+  min-height: 24px;
+  margin-bottom: 6px;
+}
+
+.dataset-live-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.dataset-live-preview-grid .camera-preview {
+  min-width: 0;
 }
 
 .dataset-quality-workbench .section-title {
@@ -2325,6 +2464,23 @@ select {
   box-shadow: 0 0 0 3px rgba(47, 111, 237, 0.14), 0 1px 2px rgba(15, 23, 42, 0.06);
 }
 
+.hardware-config-card.hardware-config-card-state-error {
+  border-color: #d99a94;
+  background:
+    linear-gradient(90deg, #b85f58 0, #b85f58 10px, transparent 10px),
+    linear-gradient(180deg, #fffafa 0%, #fff6f4 100%);
+  box-shadow: 0 0 0 3px rgba(184, 95, 88, 0.14), 0 10px 24px rgba(127, 47, 42, 0.08);
+}
+
+.hardware-config-card.hardware-config-card-state-error.hardware-config-card-focused {
+  border-color: #c6756e;
+  box-shadow: 0 0 0 4px rgba(184, 95, 88, 0.18), 0 10px 24px rgba(127, 47, 42, 0.1);
+}
+
+.hardware-config-card-state-error .hardware-config-card-head {
+  border-bottom-color: #ead0cc;
+}
+
 .hardware-config-card-head {
   display: flex;
   align-items: flex-start;
@@ -2531,6 +2687,43 @@ select {
   flex-direction: column;
   gap: 8px;
   margin-top: 8px;
+}
+
+.rotation-work-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  overflow-x: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.rotation-work-panel .hardware-subtitle-row {
+  padding: 8px 10px 0;
+}
+
+.rotation-work-table {
+  width: 100%;
+  min-width: 780px;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 12px;
+}
+
+.rotation-work-table th,
+.rotation-work-table td {
+  padding: 8px 9px;
+  border-top: 1px solid #e5e9f0;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.rotation-work-table th {
+  color: #526070;
+  font-weight: 700;
+  background: #f4f7fb;
 }
 
 .hardware-metric-box {
@@ -2819,6 +3012,243 @@ select {
 
 .teleop-switch-row .ant-input-number {
   width: 108px;
+}
+
+.teleop-route-label {
+  display: inline-grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  gap: 1px 6px;
+  min-height: 32px;
+  padding: 4px 9px;
+  border: 1px solid #d7e3ee;
+  border-radius: 8px;
+  color: #17324d;
+  background: #f4f7fb;
+}
+
+.teleop-route-label small,
+.teleop-route-label em {
+  color: #667085;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.teleop-route-label b {
+  font-size: 13px;
+  line-height: 1;
+}
+
+.teleop-route-label em {
+  grid-column: 1 / -1;
+  font-weight: 600;
+}
+
+.teleop-connection-strip,
+.gripper-teleop-strip,
+.camera-status-strip,
+.pico-status-strip {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.camera-status-strip {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.pico-status-strip {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.teleop-connection-strip > div,
+.gripper-teleop-strip > div,
+.camera-status-strip > div,
+.pico-status-strip > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 10px 9px 12px;
+  border: 1px solid #d7e3ee;
+  border-left-width: 4px;
+  border-radius: 8px;
+  background: #f8fbfd;
+}
+
+.teleop-connection-strip > .teleop-status-ok,
+.gripper-teleop-strip > .gripper-status-ok,
+.camera-status-strip > .camera-status-ok,
+.pico-status-strip > .pico-status-ok {
+  border-color: #3fb36b;
+  background: #ecfdf3;
+}
+
+.teleop-connection-strip > .teleop-status-warn,
+.gripper-teleop-strip > .gripper-status-warn,
+.camera-status-strip > .camera-status-warn,
+.pico-status-strip > .pico-status-warn {
+  border-color: #f59e0b;
+  background: #fff7df;
+}
+
+.teleop-connection-strip > .teleop-status-error,
+.gripper-teleop-strip > .gripper-status-error,
+.camera-status-strip > .camera-status-error,
+.pico-status-strip > .pico-status-error {
+  min-height: 66px;
+  padding: 12px 14px 12px 16px;
+  border-color: #b85f58;
+  border-left-width: 10px;
+  background: #fff4f2;
+  box-shadow: inset 0 0 0 2px rgba(184, 95, 88, 0.12);
+}
+
+.teleop-connection-strip > .teleop-status-pending,
+.gripper-teleop-strip > .gripper-status-pending,
+.camera-status-strip > .camera-status-pending,
+.pico-status-strip > .pico-status-pending {
+  border-color: #d7e3ee;
+  background: #f8fbfd;
+}
+
+.teleop-connection-strip b,
+.gripper-teleop-strip b,
+.camera-status-strip b,
+.pico-status-strip b {
+  color: #17324d;
+  font-size: 12px;
+}
+
+.teleop-status-ok b,
+.teleop-status-ok span,
+.gripper-status-ok b,
+.gripper-status-ok span,
+.camera-status-ok b,
+.camera-status-ok span,
+.pico-status-ok b,
+.pico-status-ok span {
+  color: #0f6b3b;
+}
+
+.teleop-status-warn b,
+.teleop-status-warn span,
+.gripper-status-warn b,
+.gripper-status-warn span,
+.camera-status-warn b,
+.camera-status-warn span,
+.pico-status-warn b,
+.pico-status-warn span {
+  color: #8a5a00;
+}
+
+.teleop-status-error b,
+.teleop-status-error span,
+.gripper-status-error b,
+.gripper-status-error span,
+.camera-status-error b,
+.camera-status-error span,
+.pico-status-error b,
+.pico-status-error span {
+  color: #7f2f2a;
+}
+
+.teleop-status-error small,
+.gripper-status-error small,
+.camera-status-error small,
+.pico-status-error small {
+  color: #8f3f35;
+  font-weight: 700;
+}
+
+.gripper-teleop-stop-button {
+  font-weight: 700;
+}
+
+.hardware-error-callout {
+  position: relative;
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px 12px 50px;
+  border: 2px solid #d09a94;
+  border-radius: 8px;
+  background: linear-gradient(180deg, #fff4f2 0%, #ffecea 100%);
+  color: #7f2f2a;
+  box-shadow: 0 8px 18px rgba(127, 47, 42, 0.1);
+}
+
+.hardware-error-callout::before {
+  position: absolute;
+  left: 14px;
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid #b85f58;
+  border-radius: 999px;
+  background: #fffafa;
+  color: #8f3f35;
+  content: "!";
+  font-size: 16px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.hardware-error-callout b {
+  flex: 0 0 auto;
+  color: #7f2f2a;
+  font-size: 16px;
+  font-weight: 800;
+}
+
+.hardware-error-callout span {
+  min-width: 0;
+  color: #7f3b35;
+  font-size: 13px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.teleop-connection-strip span,
+.teleop-connection-strip small,
+.gripper-teleop-strip span,
+.gripper-teleop-strip small,
+.camera-status-strip span,
+.camera-status-strip small,
+.pico-status-strip span,
+.pico-status-strip small {
+  overflow-wrap: anywhere;
+}
+
+.teleop-connection-strip span,
+.gripper-teleop-strip span,
+.camera-status-strip span,
+.pico-status-strip span {
+  color: #1f344b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.teleop-status-error span,
+.gripper-status-error span,
+.camera-status-error span,
+.pico-status-error span {
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.teleop-connection-strip small,
+.gripper-teleop-strip small,
+.camera-status-strip small,
+.pico-status-strip small {
+  color: #667085;
+  line-height: 1.35;
 }
 
 .hardware-subtitle-row {
@@ -3401,6 +3831,7 @@ select {
   .dataset-review-layout,
   .dataset-summary-strip,
   .dataset-cockpit-grid,
+  .dataset-live-preview-grid,
   .arm-overview-grid,
   .arm-data-layout,
   .global-hardware-layout,
@@ -3641,6 +4072,7 @@ select {
     .dataset-summary-strip,
     .dataset-summary-metrics,
     .dataset-cockpit-grid,
+    .dataset-live-preview-grid,
     .dataset-video-grid,
     .dataset-quality-grid,
     .dataset-player-controls,
@@ -3710,7 +4142,12 @@ select {
 
   .camera-settings-panel,
   .camera-tuning-grid,
-  .camera-slider-row {
+  .camera-slider-row,
+  .camera-tuning-control-row,
+  .teleop-connection-strip,
+  .gripper-teleop-strip,
+  .camera-status-strip,
+  .pico-status-strip {
     grid-template-columns: 1fr;
   }
 
@@ -3755,13 +4192,17 @@ select {
     white-space: normal;
   }
 
+  .status-bar .ant-typography {
+    display: none;
+  }
+
   .safety-test-button {
     display: none;
   }
 
   .floating-emergency-stack {
     right: 10px;
-    bottom: 58px;
+    bottom: 132px;
   }
 
   .floating-emergency-stop.ant-btn,

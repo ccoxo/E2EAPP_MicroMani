@@ -7,8 +7,14 @@ from typing import Any
 import pytest
 
 from backend.core.config import SettingsService
-from backend.core.defaults import ICF_TELEOP_DEFAULTS, ICF_TELEOP_STRATEGY_VERSION, default_config
+from backend.core.defaults import (
+    ICF_HOME_REFERENCE_VERSION,
+    ICF_TELEOP_STRATEGY_VERSION,
+    ICF_WORK_ORIGIN_VERSION,
+    default_config,
+)
 from backend.core.logging import LogService
+from backend.core.motion_limits import effective_limits_ui, rotation_work_limits_ui, side_origin_ui
 from backend.services.teleop_mapping import TeleopMappingService
 
 
@@ -61,6 +67,14 @@ class FailingTeleopHal(FakeHal):
         return {"ok": True}
 
 
+class FailingNativeStopHal(FakeHal):
+    async def command(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.commands.append((name, payload))
+        if name == "teleop.native.stop":
+            raise RuntimeError("HAL connection refused")
+        return await super().command(name, payload)
+
+
 class AppliedTeleopHal(FakeHal):
     async def command(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         self.commands.append((name, payload))
@@ -78,6 +92,43 @@ class AppliedTeleopHal(FakeHal):
         return {"ok": True}
 
 
+class StatusTimeoutHal(FakeHal):
+    async def command(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.commands.append((name, payload))
+        if name == "teleop.native.status":
+            raise RuntimeError("HAL request failed: /teleop/native/status: timed out")
+        return {"mode": "real", "command": name, "response": {}}
+
+
+class NativeStartTimeoutHal(FakeHal):
+    async def command(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.commands.append((name, payload))
+        if name == "teleop.native.start":
+            raise RuntimeError("HAL request failed: /teleop/native/start: timed out")
+        return {"mode": "real", "command": name, "response": {}}
+
+
+class SlowNativeTransitionHal(FakeHal):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_transition_commands = 0
+        self.max_active_transition_commands = 0
+
+    async def command(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if name in {"teleop.native.configure", "teleop.native.start", "teleop.native.stop"}:
+            self.active_transition_commands += 1
+            self.max_active_transition_commands = max(
+                self.max_active_transition_commands,
+                self.active_transition_commands,
+            )
+            try:
+                await asyncio.sleep(0.01)
+                return await super().command(name, payload)
+            finally:
+                self.active_transition_commands -= 1
+        return await super().command(name, payload)
+
+
 def base_hand(clutch: bool = False) -> dict[str, Any]:
     return {
         "connected": True,
@@ -88,6 +139,14 @@ def base_hand(clutch: bool = False) -> dict[str, Any]:
 
 
 def base_config(require_clutch: bool) -> dict[str, Any]:
+    motion_soft_limits = {
+        "x": {"min": -1000.0, "max": 1000.0},
+        "y": {"min": -2000.0, "max": 2000.0},
+        "z": {"min": -3000.0, "max": 3000.0},
+        "roll": {"min": -40000.0, "max": 40000.0},
+        "pitch": {"min": -50000.0, "max": 50000.0},
+        "yaw": {"min": -60000.0, "max": 60000.0},
+    }
     return {
         "teleop": {
             "leftConnected": True,
@@ -98,8 +157,8 @@ def base_config(require_clutch: bool) -> dict[str, Any]:
             "rightRotationScale": 0.10,
             "leftAxisOutputScale": [0.20, 0.20, 0.20, 0.25, 0.25, 1.50],
             "rightAxisOutputScale": [0.20, 0.20, 0.20, 0.25, 0.25, 1.50],
-            "leftImpulseCoeff": [-5000000, 10000000, -10000000, 1667, -2500, -333.3333],
-            "rightImpulseCoeff": [-5000000, -10000000, -10000000, 1667, 2500, 3333.333],
+            "leftImpulseCoeff": [-5000000, 5000000, -10000000, 1667, -2500, -333.3333],
+            "rightImpulseCoeff": [-5000000, -10000000, -5000000, 1667, 2500, 3333.333],
             "translationStepUm": 5000.0,
             "rotationStepDeg": 0.2,
             "translationStepLimitPulse": 4000,
@@ -131,14 +190,8 @@ def base_config(require_clutch: bool) -> dict[str, Any]:
             "requireClutch": require_clutch,
         },
         "motion": {
-            "leftSoftLimits": {
-                "x": {"min": -100.0, "max": 100.0},
-                "y": {"min": -200.0, "max": 200.0},
-                "z": {"min": -300.0, "max": 300.0},
-                "roll": {"min": -10.0, "max": 10.0},
-                "pitch": {"min": -20.0, "max": 20.0},
-                "yaw": {"min": -30.0, "max": 30.0},
-            },
+            "leftSoftLimits": json.loads(json.dumps(motion_soft_limits)),
+            "rightSoftLimits": json.loads(json.dumps(motion_soft_limits)),
         },
     }
 
@@ -200,11 +253,13 @@ def test_native_teleop_start_configures_and_starts_hal_controller(monkeypatch: p
         assert start_payload["rightTranslationScale"] == 1.0
         assert start_payload["leftRotationScale"] == 1.0
         assert start_payload["rightRotationScale"] == 1.0
-        assert start_payload["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
-        assert start_payload["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
-        assert start_payload["leftImpulseCoeff"] == [-5000000, 10000000, -10000000, 1667, -2500, -333.3333]
-        assert start_payload["rightImpulseCoeff"] == [-5000000, -10000000, -10000000, 1667, 2500, 3333.333]
+        assert start_payload["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.08, 0.10]
+        assert start_payload["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.35, 0.08, 0.15]
+        assert start_payload["leftImpulseCoeff"] == [-5000000, 5000000, -10000000, 1667, -2500, -333.3333]
+        assert start_payload["rightImpulseCoeff"] == [-5000000, -10000000, -5000000, 1667, 2500, 3333.333]
         assert start_payload["gripperTeleopEnabled"] is True
+        assert start_payload["leftSourceHand"] == "PhysicalRight"
+        assert start_payload["rightSourceHand"] == "PhysicalLeft"
         assert start_payload["leftWorkOriginValid"] is True
         assert start_payload["rightWorkOriginValid"] is True
         assert start_payload["leftWorkOriginPulse"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
@@ -220,7 +275,7 @@ def test_native_teleop_start_configures_and_starts_hal_controller(monkeypatch: p
     asyncio.run(run())
 
 
-def test_native_teleop_connect_enables_gripper_follow(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_native_teleop_connect_enables_hal_gripper_follow(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
 
     async def run() -> None:
@@ -233,6 +288,169 @@ def test_native_teleop_connect_enables_gripper_follow(monkeypatch: pytest.Monkey
 
         configure_payloads = [payload for name, payload in hal.commands if name == "teleop.native.configure"]
         assert configure_payloads[-1]["gripperTeleopEnabled"] is True
+
+    asyncio.run(run())
+
+
+def test_native_gripper_teleop_start_enables_hal_gripper_follow(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def run() -> None:
+        hal = FakeHal()
+        config = start_config(engine="hal_native")
+        mapper = TeleopMappingService(settings=FakeSettings(config), hal=hal, logs=LogService())
+
+        await mapper.start("manual-gripper", pre_home=False)
+
+        configure_payloads = [payload for name, payload in hal.commands if name == "teleop.native.configure"]
+        assert configure_payloads[-1]["gripperTeleopEnabled"] is True
+
+    asyncio.run(run())
+
+
+def test_native_teleop_running_update_uses_start_without_extra_configure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def run() -> None:
+        hal = FakeHal()
+        config = start_config(engine="hal_native")
+        config["teleop"]["leftConnected"] = True
+        mapper = TeleopMappingService(settings=FakeSettings(config), hal=hal, logs=LogService())
+
+        await mapper.start("teleop-connect", pre_home=False)
+        first_configure_count = sum(1 for name, _ in hal.commands if name == "teleop.native.configure")
+        config["teleop"]["rightConnected"] = True
+        await mapper.start("teleop-connect", pre_home=False)
+
+        assert sum(1 for name, _ in hal.commands if name == "teleop.native.configure") == first_configure_count
+        assert hal.commands[-1][0] == "teleop.native.start"
+        assert hal.commands[-1][1]["rightConnected"] is True
+
+    asyncio.run(run())
+
+
+def test_native_teleop_running_duplicate_start_skips_same_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def run() -> None:
+        hal = FakeHal()
+        config = start_config(engine="hal_native")
+        config["teleop"]["leftConnected"] = True
+        config["teleop"]["rightConnected"] = True
+        mapper = TeleopMappingService(settings=FakeSettings(config), hal=hal, logs=LogService())
+
+        await mapper.start("teleop-connect", pre_home=False)
+        first_start_count = sum(1 for name, _ in hal.commands if name == "teleop.native.start")
+        await mapper.start("teleop-connect", pre_home=False)
+
+        assert sum(1 for name, _ in hal.commands if name == "teleop.native.start") == first_start_count
+
+    asyncio.run(run())
+
+
+def test_native_teleop_stop_can_remove_aux_source_without_restarting(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def run() -> None:
+        hal = FakeHal()
+        config = start_config(engine="hal_native")
+        mapper = TeleopMappingService(settings=FakeSettings(config), hal=hal, logs=LogService())
+
+        await mapper.start("teleop-connect", pre_home=False)
+        await mapper.start("recording", pre_home=False)
+        hal.commands.clear()
+
+        await mapper.stop("teleop-connect", restart_remaining=False)
+
+        assert hal.commands == []
+        assert mapper.status()["armed"] is True
+        assert mapper.status()["sources"] == ["recording"]
+
+        await mapper.stop("recording")
+
+        assert [name for name, _ in hal.commands] == ["teleop.native.stop"]
+
+    asyncio.run(run())
+
+
+def test_native_teleop_start_failure_rolls_back_arm_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def run() -> None:
+        hal = NativeStartTimeoutHal()
+        config = start_config(engine="hal_native")
+        config["teleop"]["leftConnected"] = True
+        mapper = TeleopMappingService(settings=FakeSettings(config), hal=hal, logs=LogService())
+
+        with pytest.raises(RuntimeError, match="/teleop/native/start: timed out"):
+            await mapper.start("teleop-connect", pre_home=False)
+
+        status = mapper.status()
+        assert status["armed"] is False
+        assert status["sources"] == []
+
+    asyncio.run(run())
+
+
+def test_native_teleop_start_does_not_wait_for_initial_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def run() -> None:
+        hal = StatusTimeoutHal()
+        config = start_config(engine="hal_native", home_before_start=False)
+        config["teleop"]["leftConnected"] = True
+        mapper = TeleopMappingService(settings=FakeSettings(config), hal=hal, logs=LogService())
+
+        await mapper.start("teleop-connect", pre_home=False)
+        try:
+            command_names = [name for name, _ in hal.commands]
+            assert command_names[:2] == ["teleop.native.configure", "teleop.native.start"]
+            assert "teleop.native.status" not in command_names[:2]
+            assert mapper.status()["armed"] is True
+        finally:
+            await mapper.stop("teleop-connect")
+
+    asyncio.run(run())
+
+
+def test_native_teleop_start_and_stop_transitions_are_serialized(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def run() -> None:
+        hal = SlowNativeTransitionHal()
+        config = start_config(engine="hal_native", home_before_start=False)
+        mapper = TeleopMappingService(settings=FakeSettings(config), hal=hal, logs=LogService())
+
+        await asyncio.gather(
+            mapper.start("teleop-connect", pre_home=False),
+            mapper.start("manual-gripper", pre_home=False),
+        )
+        await asyncio.gather(
+            mapper.stop("teleop-connect", restart_remaining=False),
+            mapper.stop("manual-gripper"),
+        )
+
+        assert hal.max_active_transition_commands == 1
+        assert mapper.status()["armed"] is False
+
+    asyncio.run(run())
+
+
+def test_native_teleop_stop_is_idempotent_after_source_already_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def run() -> None:
+        hal = FakeHal()
+        config = start_config(engine="hal_native", home_before_start=False)
+        config["teleop"]["leftConnected"] = True
+        mapper = TeleopMappingService(settings=FakeSettings(config), hal=hal, logs=LogService())
+
+        await mapper.start("recording", pre_home=False)
+        await mapper.stop("recording")
+        await mapper.stop("recording")
+
+        stop_commands = [name for name, _ in hal.commands if name == "teleop.native.stop"]
+        assert stop_commands == ["teleop.native.stop"]
 
     asyncio.run(run())
 
@@ -283,6 +501,35 @@ def test_native_teleop_status_feeds_dataset_action_history(monkeypatch: pytest.M
         assert status["lastAction"]["deltaVector"][6] == 10.0
         assert status["actionHistory"][0]["sourceSide"] == "left"
         assert status["blockers"]["left"]["state"] == "active"
+
+    asyncio.run(run())
+
+
+def test_native_status_loop_uses_gripper_sample_rate_for_recording(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def run() -> None:
+        hal = FakeHal()
+        config = start_config(engine="hal_native")
+        config["gripper"]["sampleHz"] = 30
+        config["teleop"]["commandIntervalMs"] = 10
+        mapper = TeleopMappingService(settings=FakeSettings(config), hal=hal, logs=LogService())
+        mapper._stop_event = asyncio.Event()
+        delays: list[float] = []
+
+        async def fake_refresh() -> None:
+            assert mapper._stop_event is not None
+            mapper._stop_event.set()
+
+        async def fake_sleep(delay: float) -> None:
+            delays.append(delay)
+
+        monkeypatch.setattr(mapper, "_refresh_native_status", fake_refresh)
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        await mapper._run_native_status_loop()
+
+        assert delays == pytest.approx([1.0 / 30.0])
 
     asyncio.run(run())
 
@@ -598,6 +845,38 @@ def test_native_teleop_stop_clears_native_status_cache(monkeypatch: pytest.Monke
     asyncio.run(run())
 
 
+def test_native_teleop_stop_failure_still_clears_local_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def run() -> None:
+        hal = FailingNativeStopHal()
+        config = start_config(engine="hal_native", home_before_start=False)
+        mapper = TeleopMappingService(
+            settings=FakeSettings(config),
+            hal=hal,
+            logs=LogService(),
+        )
+        hal.native_status = {
+            "running": True,
+            "lastAction": {"side": "right", "sourceSide": "left", "deltaVector": [1.0] * 12},
+            "actionHistory": [{"deltaVector": [1.0] * 12}],
+            "blockers": {"left": {"state": "active"}},
+            "lastError": "",
+        }
+        await mapper.start("teleop-connect", pre_home=False)
+
+        with pytest.raises(RuntimeError, match="connection refused"):
+            await mapper.stop("teleop-connect")
+
+        status = mapper.status()
+        assert status["armed"] is False
+        assert status["running"] is False
+        assert status["sources"] == []
+        assert status["nativeStatus"] == {}
+
+    asyncio.run(run())
+
+
 def test_teleop_start_returns_to_work_origin_before_real_mapper(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
 
@@ -611,17 +890,19 @@ def test_teleop_start_returns_to_work_origin_before_real_mapper(monkeypatch: pyt
         assert hal.commands[:3] == [
             (
                 "motion.enable_side",
-                {"side": "left"},
+                {"side": "left", "enabledAxes": [True, True, True, True, True, True]},
             ),
             (
                 "motion.enable_side",
-                {"side": "right"},
+                {"side": "right", "enabledAxes": [True, True, True, True, True, False]},
             ),
             (
                 "motion.home_all",
                 {
                     "leftPulse": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
                     "rightPulse": [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+                    "leftEnabledAxes": [True, True, True, True, True, True],
+                    "rightEnabledAxes": [True, True, True, True, True, False],
                 },
             ),
         ]
@@ -642,13 +923,14 @@ def test_teleop_start_returns_requested_side_to_origin_before_real_mapper(monkey
         assert hal.commands[:2] == [
             (
                 "motion.enable_side",
-                {"side": "right"},
+                {"side": "right", "enabledAxes": [True, True, True, True, True, False]},
             ),
             (
                 "motion.home_origin_side",
                 {
                     "side": "right",
                     "pulse": [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+                    "enabledAxes": [True, True, True, True, True, False],
                 },
             ),
         ]
@@ -705,8 +987,8 @@ def test_teleop_mapper_sends_continuous_six_axis_delta() -> None:
         assert payload["rotationPulseDeadband"] == 2
         assert payload["enabledAxes"] == [True, True, True, True, True, True]
         assert payload["syncZeroDeltaTarget"] is True
-        assert payload["softLimitMin"] == [-1000.0, -2000.0, -3000.0, -40.0, -50.0, -60.0]
-        assert payload["softLimitMax"] == [1000.0, 2000.0, 3000.0, 40.0, 50.0, 60.0]
+        assert payload["softLimitMin"] == [-1000000000.0, -1000000000.0, -1000000000.0, -40.0, -50.0, -60.0]
+        assert payload["softLimitMax"] == [1000000000.0, 1000000000.0, 1000000000.0, 40.0, 50.0, 60.0]
         assert payload["translationVelocityUiPerSec"] == 4000.0
         assert payload["rotationVelocityUiPerSec"] == 6.0
         assert payload["translationStartVelocityUiPerSec"] == 300.0
@@ -727,7 +1009,7 @@ def test_teleop_mapper_sends_continuous_six_axis_delta() -> None:
         ])
         assert mapper.status()["lastAction"]["requestedPulseDeltas"] == {
             "X": -9000.0,
-            "Y": -18000.0,
+            "Y": -9000.0,
             "Z": -300.0,
             "Roll": 83.0,
             "Pitch": 125.0,
@@ -739,7 +1021,7 @@ def test_teleop_mapper_sends_continuous_six_axis_delta() -> None:
     asyncio.run(run())
 
 
-def test_teleop_mapper_falls_back_to_icf_soft_limits_for_invalid_teleop_limits() -> None:
+def test_teleop_mapper_ignores_legacy_teleop_soft_limit_arrays() -> None:
     async def run_case(raw_min: list[float], raw_max: list[float]) -> None:
         hal = FakeHal()
         mapper = TeleopMappingService(settings=None, hal=hal, logs=None)  # type: ignore[arg-type]
@@ -752,14 +1034,14 @@ def test_teleop_mapper_falls_back_to_icf_soft_limits_for_invalid_teleop_limits()
         await mapper._step_side("left", hand, config)
 
         _, payload = hal.commands[0]
-        assert payload["softLimitMin"] == ICF_TELEOP_DEFAULTS["leftSoftLimitMin"]
-        assert payload["softLimitMax"] == ICF_TELEOP_DEFAULTS["leftSoftLimitMax"]
+        assert payload["softLimitMin"] == [-1000000000.0, -1000000000.0, -1000000000.0, -40.0, -50.0, -60.0]
+        assert payload["softLimitMax"] == [1000000000.0, 1000000000.0, 1000000000.0, 40.0, 50.0, 60.0]
 
     asyncio.run(run_case([-1.0] * 5, [1.0] * 6))
     asyncio.run(run_case([10.0] * 6, [9.0] * 6))
 
 
-def test_teleop_mapper_sends_soft_limit_offsets_without_work_origin() -> None:
+def test_teleop_mapper_disables_translation_soft_limits_without_origin_offsets() -> None:
     async def run() -> None:
         hal = FakeHal()
         mapper = TeleopMappingService(settings=None, hal=hal, logs=None)  # type: ignore[arg-type]
@@ -780,8 +1062,8 @@ def test_teleop_mapper_sends_soft_limit_offsets_without_work_origin() -> None:
 
         _, payload = hal.commands[0]
         assert payload["side"] == "right"
-        assert payload["softLimitMin"] == [-1000.0, -2000.0, -3000.0, -40.0, -50.0, -60.0]
-        assert payload["softLimitMax"] == [1000.0, 2000.0, 3000.0, 40.0, 50.0, 60.0]
+        assert payload["softLimitMin"] == [-1000000000.0, -1000000000.0, -1000000000.0, -40.0, -50.0, -60.0]
+        assert payload["softLimitMax"] == [1000000000.0, 1000000000.0, 1000000000.0, 40.0, 50.0, 60.0]
 
     asyncio.run(run())
 
@@ -844,9 +1126,9 @@ def test_teleop_mapper_uses_source_hand_impulse_signs_when_channels_are_swapped(
 
         _, payload = hal.commands[0]
         assert payload["side"] == "right"
-        assert payload["deltas"]["Y"] == -60.0
+        assert payload["deltas"]["Y"] == -30.0
         assert payload["deltas"]["Pitch"] == pytest.approx(-0.0252)
-        assert mapper.status()["lastAction"]["requestedPulseDeltas"]["Y"] == 600.0
+        assert mapper.status()["lastAction"]["requestedPulseDeltas"]["Y"] == 300.0
         assert mapper.status()["lastAction"]["requestedPulseDeltas"]["Pitch"] == -63.0
 
     asyncio.run(run())
@@ -1154,19 +1436,134 @@ def test_teleop_mapper_diag_log_reports_requested_and_applied_motion() -> None:
     asyncio.run(run())
 
 
-def test_hal_native_payload_sends_soft_limit_offsets_without_origin_added() -> None:
+def test_hal_native_payload_disables_translation_soft_limits() -> None:
     config = start_config(engine="hal_native")
-    config["motion"]["origin"]["leftPulse"] = [1000.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0]
-    config["teleop"]["leftSoftLimitMin"] = [-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]
-    config["teleop"]["leftSoftLimitMax"] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    config["motion"]["origin"]["leftPulse"] = [-500.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0]
+    config["motion"]["leftSoftLimits"] = {
+        "x": {"min": -52000.0, "max": -2000.0},
+        "y": {"min": -1000.0, "max": 3000.0},
+        "z": {"min": -500.0, "max": 4500.0},
+        "roll": {"min": -4000.0, "max": 4000.0},
+        "pitch": {"min": -5000.0, "max": 5000.0},
+        "yaw": {"min": -6000.0, "max": 6000.0},
+    }
     mapper = TeleopMappingService(settings=FakeSettings(config), hal=FakeHal(), logs=LogService())
 
     payload = mapper._native_payload(config)
 
     assert payload["leftWorkOriginValid"] is True
-    assert payload["leftWorkOriginPulse"] == [1000.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0]
-    assert payload["leftSoftLimitMin"] == [-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]
-    assert payload["leftSoftLimitMax"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert payload["leftWorkOriginPulse"] == [-500.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0]
+    assert payload["leftSoftLimitMin"] == [-1000000000.0, -1000000000.0, -1000000000.0, -4.0, -5.0, -6.0]
+    assert payload["leftSoftLimitMax"] == [1000000000.0, 1000000000.0, 1000000000.0, 4.0, 5.0, 6.0]
+
+
+def test_hal_native_payload_sends_kalman_filter_toggle() -> None:
+    config = start_config(engine="hal_native")
+    config["teleop"]["kalmanFilterEnabled"] = True
+    config["teleop"]["kalmanBeta"] = 0.12
+    config["teleop"]["kalmanDtMaxSec"] = 0.08
+    config["teleop"]["kalmanTranslationMeasurementVariance"] = 0.000003
+    config["teleop"]["kalmanRotationMeasurementVariance"] = 0.08
+    config["teleop"]["kalmanTranslationIntentVelocityThreshold"] = 0.0007
+    config["teleop"]["kalmanRotationIntentVelocityThreshold"] = 0.7
+    mapper = TeleopMappingService(settings=FakeSettings(config), hal=FakeHal(), logs=LogService())
+
+    payload = mapper._native_payload(config)
+
+    assert payload["kalmanFilterEnabled"] is True
+    assert payload["kalmanBeta"] == 0.12
+    assert payload["kalmanDtMaxSec"] == 0.08
+    assert payload["kalmanTranslationMeasurementVariance"] == 0.000003
+    assert payload["kalmanRotationMeasurementVariance"] == 0.08
+    assert payload["kalmanTranslationIntentVelocityThreshold"] == 0.0007
+    assert payload["kalmanRotationIntentVelocityThreshold"] == 0.7
+
+
+def test_hal_native_payload_enables_isolated_gripper_workers_by_default() -> None:
+    config = start_config(engine="hal_native")
+    config["gripper"]["jodellWorkerExePath"] = "F:/custom/JodellGripperWorker.exe"
+    config["gripper"]["workerCommandTimeoutSec"] = 1.5
+    mapper = TeleopMappingService(settings=FakeSettings(config), hal=FakeHal(), logs=LogService())
+
+    payload = mapper._native_payload(config)
+
+    assert payload["gripperProcessWorkersEnabled"] is True
+    assert payload["jodellWorkerExePath"] == "F:/custom/JodellGripperWorker.exe"
+    assert payload["gripperWorkerCommandTimeoutMs"] == 1500.0
+
+
+def test_hal_native_payload_disables_translation_limits_and_sends_rotation_work_window() -> None:
+    config = start_config(engine="hal_native")
+    config["motion"]["leftSoftLimits"] = {
+        "x": {"min": -101.0, "max": 102.0},
+        "y": {"min": -201.0, "max": 202.0},
+        "z": {"min": -301.0, "max": 302.0},
+        "roll": {"min": 10000.0, "max": 50000.0},
+        "pitch": {"min": 20000.0, "max": 60000.0},
+        "yaw": {"min": -33000.0, "max": -22000.0},
+    }
+    config["motion"]["rotationWorkLimits"] = {
+        "enabled": True,
+        "left": {
+            "roll": {"min": -4.0, "max": 6.0},
+            "pitch": {"min": -5.0, "max": 7.0},
+            "yaw": {"min": -1.0, "max": 1.0},
+        },
+        "right": {
+            "roll": {"min": -8.0, "max": 9.0},
+            "pitch": {"min": -10.0, "max": 11.0},
+            "yaw": {"min": -2.0, "max": 2.0},
+        },
+    }
+    mapper = TeleopMappingService(settings=FakeSettings(config), hal=FakeHal(), logs=LogService())
+
+    payload = mapper._native_payload(config)
+
+    assert payload["leftSoftLimitMin"] == pytest.approx([-1000000000.0, -1000000000.0, -1000000000.0, 10.0, 20.0, -33.0])
+    assert payload["leftSoftLimitMax"] == pytest.approx([1000000000.0, 1000000000.0, 1000000000.0, 50.0, 60.0, -22.0])
+    assert payload["rotationWorkLimitEnabled"] is True
+    assert payload["leftRotationWorkLimitMin"] == [0.0, 0.0, 0.0, -4.0, -5.0, -1.0]
+    assert payload["leftRotationWorkLimitMax"] == [0.0, 0.0, 0.0, 6.0, 7.0, 1.0]
+
+
+def test_python_teleop_payload_uses_effective_rotation_limits() -> None:
+    async def run() -> None:
+        hal = FakeHal()
+        mapper = TeleopMappingService(settings=None, hal=hal, logs=LogService())  # type: ignore[arg-type]
+        config = base_config(require_clutch=False)
+        config["motion"]["origin"] = {
+            "valid": False,
+            "leftValid": True,
+            "rightValid": False,
+            "leftPulse": [0.0, 0.0, 0.0, 4000.0, 0.0, 0.0],
+            "rightPulse": [0.0] * 6,
+            "updatedAt": 1,
+        }
+        config["motion"]["leftSoftLimits"]["roll"] = {"min": 0.0, "max": 5000.0}
+        config["motion"]["rotationWorkLimits"] = {
+            "enabled": True,
+            "left": {
+                "roll": {"min": -1.0, "max": 1.0},
+                "pitch": {"min": -100.0, "max": 100.0},
+                "yaw": {"min": -7.0, "max": 7.0},
+            },
+            "right": {
+                "roll": {"min": -100.0, "max": 100.0},
+                "pitch": {"min": -100.0, "max": 100.0},
+                "yaw": {"min": -7.0, "max": 7.0},
+            },
+        }
+        hand = base_hand(clutch=False)
+
+        await mapper._step_side("left", hand, config)
+        hand["pose"] = [0.0, 0.0, 0.0, 2.0, 0.0, 0.0]
+        await mapper._step_side("left", hand, config)
+
+        update_payload = next(payload for name, payload in hal.commands if name == "motion.teleop_target_update")
+        assert update_payload["softLimitMin"][3] == pytest.approx(1.4, abs=1e-3)
+        assert update_payload["softLimitMax"][3] == pytest.approx(3.4, abs=1e-3)
+
+    asyncio.run(run())
 
 
 def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_path: Any) -> None:
@@ -1178,6 +1575,8 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
     old_config["teleop"]["leftConnected"] = True
     old_config["teleop"]["leftTranslationScale"] = 0.24
     old_config["teleop"]["leftRotationScale"] = 0.18
+    old_config["teleop"]["gripperTeleop"]["leftSourceHand"] = "PhysicalRight"
+    old_config["teleop"]["gripperTeleop"]["rightSourceHand"] = "PhysicalLeft"
     old_config["motion"]["leftSoftLimits"]["yaw"] = {"min": -7.5, "max": 7.5}
     old_config["motion"].pop("workOriginStrategyVersion", None)
     old_config["motion"]["origin"] = {
@@ -1200,8 +1599,8 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
     assert config["teleop"]["leftRotationScale"] == 1.0
     assert config["teleop"]["rightRotationScale"] == 1.0
     assert config["teleop"]["mappingMode"] == "direct"
-    assert config["teleop"]["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
-    assert config["teleop"]["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
+    assert config["teleop"]["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.08, 0.10]
+    assert config["teleop"]["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.35, 0.08, 0.15]
     assert config["teleop"]["translationStepLimitPulse"] == 4000
     assert config["teleop"]["rotationStepLimitPulse"] == 1250
     assert config["teleop"]["translationPulseDeadband"] == 2
@@ -1225,58 +1624,79 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
         -25000.0,
         -37500.0,
         -37500.0,
-        -90.0,
-        -90.0,
+        -5.0,
+        -30.0,
         -7.0,
     ]
     assert config["teleop"]["leftSoftLimitMax"] == [
         25000.0,
         37500.0,
         37500.0,
-        90.0,
-        90.0,
+        95.0,
+        30.0,
         7.0,
     ]
+    assert config["teleop"]["rightEnabledAxes"] == [True, True, True, True, True, False]
     assert config["teleop"]["rightSoftLimitMin"] == [
         -25000.0,
         -37500.0,
         -37500.0,
-        -90.0,
-        -90.0,
+        -95.0,
+        -30.0,
         -7.0,
     ]
     assert config["teleop"]["rightSoftLimitMax"] == [
         25000.0,
         37500.0,
         37500.0,
-        90.0,
-        90.0,
+        5.0,
+        30.0,
         7.0,
     ]
-    assert config["teleop"]["leftImpulseCoeff"] == [-5000000, 10000000, -10000000, 1667, -2500, -333.3333]
-    assert config["teleop"]["rightImpulseCoeff"] == [-5000000, -10000000, -10000000, 1667, 2500, 3333.333]
+    assert config["teleop"]["leftImpulseCoeff"] == [-5000000, 5000000, -10000000, 1667, -2500, -333.3333]
+    assert config["teleop"]["rightImpulseCoeff"] == [-5000000, -10000000, -5000000, 1667, 2500, 3333.333]
     assert config["teleop"]["leftDirectionSign"] == [1, -1, -1, 1, -1, -1]
     assert config["teleop"]["rightDirectionSign"] == [1, 1, -1, 1, 1, 1]
     assert config["teleop"]["syncImpulseCoeffFromKinematics"] is False
-    assert config["motion"]["leftSoftLimits"]["yaw"] == {"min": -7000, "max": 7000}
+    assert config["motion"]["rotationWorkLimits"]["enabled"] is True
+    assert config["motion"]["rotationWorkLimits"]["left"]["roll"] == {"min": -5.0, "max": 95.0}
+    assert config["motion"]["rotationWorkLimits"]["left"]["pitch"] == {"min": -30.0, "max": 30.0}
+    assert config["motion"]["rotationWorkLimits"]["left"]["yaw"] == {"min": -7.0, "max": 7.0}
+    assert config["motion"]["rotationWorkLimits"]["right"]["roll"] == {"min": -95.0, "max": 5.0}
+    assert config["motion"]["rotationWorkLimits"]["right"]["pitch"] == {"min": -30.0, "max": 30.0}
+    assert config["motion"]["leftSoftLimits"]["x"] == {"min": -25000.0, "max": 25000.0}
+    assert config["motion"]["leftSoftLimits"]["y"] == {"min": -37500.0, "max": 37500.0}
+    assert config["motion"]["leftSoftLimits"]["z"] == {"min": -37500.0, "max": 37500.0}
+    assert config["motion"]["rightSoftLimits"]["x"] == {"min": -25000.0, "max": 25000.0}
+    assert config["motion"]["rightSoftLimits"]["y"] == {"min": -37500.0, "max": 37500.0}
+    assert config["motion"]["rightSoftLimits"]["z"] == {"min": -37500.0, "max": 37500.0}
+    assert config["motion"]["leftSoftLimits"]["roll"] == pytest.approx(
+        {"min": 24899.8, "max": 124899.8}
+    )
+    assert config["motion"]["leftSoftLimits"]["pitch"] == pytest.approx(
+        {"min": -63935.6, "max": -3935.6}
+    )
+    assert config["motion"]["leftSoftLimits"]["yaw"] == pytest.approx(
+        {"min": -121330.611, "max": -107330.611}
+    )
     assert config["motion"]["kinematics"]["rightPhysicalAxis"] == [2, 0, 5, 8, 1, 7]
     assert config["motion"]["kinematics"]["rightSignedPulsePerUnit"] == [
         -5000.0,
         -10000.0,
-        -10000.0,
+        -5000.0,
         1666.666667,
         2500.0,
         333.3333,
     ]
     assert config["motion"]["kinematics"]["leftSignedPulsePerUnit"] == [
         -5000.0,
-        10000.0,
+        5000.0,
         -10000.0,
         1666.666667,
         -2500.0,
         -3333.333,
     ]
-    assert config["motion"]["workOriginStrategyVersion"] == "icf_work_origin_20260519"
+    assert config["motion"]["workOriginStrategyVersion"] == ICF_WORK_ORIGIN_VERSION
     assert config["motion"]["origin"]["leftPulse"] == [258494.0, -200013.0, 274821.0, 49833.0, 84839.0, 381102.0]
     assert config["motion"]["origin"]["rightPulse"] == [99772.0, 382486.0, 881207.0, 19527.0, -175127.0, -9668.0]
     assert config["gripper"]["leftPort"] == "COM8"
@@ -1285,6 +1705,204 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
     assert config["teleop"]["gripperTeleop"]["rightSourceHand"] == "PhysicalLeft"
     assert config["teleop"]["gripperTeleop"]["rightGapInvert"] is False
     assert config["teleop"]["gripperTeleop"]["autoGapCalibration"] is True
+
+
+def test_settings_migration_updates_prior_right_roll_negative_only_window(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["motion"]["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
+    config["teleop"]["rightSoftLimitMin"][3] = -100.0
+    config["teleop"]["rightSoftLimitMax"][3] = 0.0
+    config["motion"]["rotationWorkLimits"]["right"]["roll"] = {"min": -100.0, "max": 0.0}
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert migrated["teleop"]["rightSoftLimitMin"][3] == -95.0
+    assert migrated["teleop"]["rightSoftLimitMax"][3] == 5.0
+    assert migrated["motion"]["rotationWorkLimits"]["right"]["roll"] == {"min": -95.0, "max": 5.0}
+    origin = side_origin_ui(migrated, "right")
+    assert origin is not None
+    limits = effective_limits_ui(migrated, "right")
+    assert limits[3].min - origin[3] == pytest.approx(-95.0, abs=1e-6)
+    assert limits[3].max - origin[3] == pytest.approx(5.0, abs=1e-6)
+
+
+def test_settings_migration_reanchors_stale_right_roll_window_to_current_origin(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["motion"]["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
+    config["motion"]["origin"]["rightPulse"][3] = -674_985.0
+    config["motion"]["origin"]["rightValid"] = True
+    config["motion"]["origin"]["valid"] = True
+    config["motion"]["rightSoftLimits"]["roll"] = {
+        "min": -78_283.80000234324,
+        "max": 111_716.19999765676,
+    }
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    origin = side_origin_ui(migrated, "right")
+    assert origin is not None
+    limits = effective_limits_ui(migrated, "right")
+    assert limits[3].min < origin[3] < limits[3].max
+    assert limits[3].min == pytest.approx(origin[3] - 95.0, abs=1e-6)
+    assert limits[3].max == pytest.approx(origin[3] + 5.0, abs=1e-6)
+
+
+def test_settings_migration_reanchors_stale_left_yaw_limit_to_current_origin(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["motion"]["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
+    config["motion"]["origin"]["leftPulse"][5] = 1393.0
+    config["motion"]["origin"]["leftValid"] = True
+    config["motion"]["origin"]["valid"] = True
+    config["motion"]["leftSoftLimits"]["yaw"] = {"min": -121_330.61143306113, "max": -107_330.61143306113}
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    origin = side_origin_ui(migrated, "left")
+    assert origin is not None
+    limits = effective_limits_ui(migrated, "left")
+    assert limits[5].min < origin[5] < limits[5].max
+    assert limits[5].min == pytest.approx(origin[5] - 7.0)
+    assert limits[5].max == pytest.approx(origin[5] + 7.0)
+    assert migrated["teleop"]["leftEnabledAxes"][5] is True
+    assert migrated["teleop"]["rightEnabledAxes"][5] is False
+
+
+def test_settings_migration_adds_home_reference_model_and_reanchors_stale_left_roll(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["motion"]["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
+    config["motion"].pop("homeReferenceVersion", None)
+    config["motion"].pop("homeReference", None)
+    config["motion"].pop("workOriginOffset", None)
+    config["motion"].pop("relativeSoftLimits", None)
+    config["motion"]["origin"]["leftPulse"] = [100686.0, 66003.0, -68716.0, -152667.0, 5073.0, -297.0]
+    config["motion"]["origin"]["leftValid"] = True
+    config["motion"]["origin"]["valid"] = True
+    config["motion"]["leftSoftLimits"]["roll"] = {
+        "min": -70100.20000597996,
+        "max": 129899.79999402004,
+    }
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert migrated["motion"]["homeReferenceVersion"] == ICF_HOME_REFERENCE_VERSION
+    assert migrated["motion"]["homeReference"]["leftPulse"] == config["motion"]["origin"]["leftPulse"]
+    assert migrated["motion"]["homeReference"]["leftValid"] is True
+    assert migrated["motion"]["workOriginOffset"]["leftPulseDelta"] == [0.0] * 6
+    assert migrated["motion"]["workOriginOffset"]["leftValid"] is True
+    assert migrated["motion"]["relativeSoftLimits"]["left"]["roll"] == {"min": -5000.0, "max": 95000.0}
+    origin = side_origin_ui(migrated, "left")
+    assert origin is not None
+    limits = effective_limits_ui(migrated, "left")
+    assert limits[3].min < origin[3] < limits[3].max
+    assert limits[3].min == pytest.approx(origin[3] - 5.0, abs=1e-6)
+    assert limits[3].max == pytest.approx(origin[3] + 95.0, abs=1e-6)
+
+
+def test_settings_migration_updates_prior_right_pitch_window_and_yaw_axis(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["motion"]["workOriginStrategyVersion"] = ICF_WORK_ORIGIN_VERSION
+    config["teleop"]["rightEnabledAxes"] = [True, True, True, True, True, True]
+    config["teleop"]["rightSoftLimitMin"][4] = -100.0
+    config["teleop"]["rightSoftLimitMax"][4] = 100.0
+    config["motion"]["rotationWorkLimits"]["right"]["pitch"] = {"min": -100.0, "max": 100.0}
+    origin = side_origin_ui(config, "right")
+    assert origin is not None
+    config["motion"]["rightSoftLimits"]["pitch"] = {
+        "min": (origin[4] - 100.0) * 1000.0,
+        "max": (origin[4] + 100.0) * 1000.0,
+    }
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert migrated["teleop"]["rightEnabledAxes"] == [True, True, True, True, True, False]
+    assert migrated["teleop"]["rightSoftLimitMin"][4] == -30.0
+    assert migrated["teleop"]["rightSoftLimitMax"][4] == 30.0
+    assert migrated["motion"]["rotationWorkLimits"]["right"]["pitch"] == {"min": -30.0, "max": 30.0}
+    limits = effective_limits_ui(migrated, "right")
+    migrated_origin = side_origin_ui(migrated, "right")
+    assert migrated_origin is not None
+    assert limits[4].min - migrated_origin[4] == pytest.approx(-30.0, abs=1e-6)
+    assert limits[4].max - migrated_origin[4] == pytest.approx(30.0, abs=1e-6)
+
+
+def test_rotation_work_limit_missing_axis_defaults_to_icf_window() -> None:
+    config = default_config()
+    config["motion"]["rotationWorkLimits"]["left"].pop("roll")
+    config["motion"]["rotationWorkLimits"]["right"].pop("roll")
+    config["motion"]["rotationWorkLimits"]["right"].pop("pitch")
+
+    left_limits = rotation_work_limits_ui(config, "left")
+    right_limits = rotation_work_limits_ui(config, "right")
+
+    assert left_limits[3].min == -5.0
+    assert left_limits[3].max == 95.0
+    assert right_limits[3].min == -95.0
+    assert right_limits[3].max == 5.0
+    assert right_limits[4].min == -30.0
+    assert right_limits[4].max == 30.0
+
+
+def test_settings_migration_updates_current_axis_output_defaults_to_slower_wrist_rates(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["teleop"]["leftAxisOutputScale"] = [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
+    config["teleop"]["rightAxisOutputScale"] = [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert migrated["teleop"]["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.08, 0.10]
+    assert migrated["teleop"]["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.35, 0.08, 0.15]
+
+
+def test_settings_migration_updates_prior_pitch_yaw_axis_output_defaults_to_current_tuning(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["teleop"]["leftAxisOutputScale"] = [0.40, 0.25, 0.25, 0.40, 0.10, 0.15]
+    config["teleop"]["rightAxisOutputScale"] = [0.40, 0.25, 0.25, 0.40, 0.10, 0.15]
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert migrated["teleop"]["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.08, 0.10]
+    assert migrated["teleop"]["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.35, 0.08, 0.15]
+
+
+def test_settings_preserves_current_strategy_mechanical_soft_limits_when_origin_changes(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    old_config = default_config()
+    old_config["motion"]["origin"]["leftPulse"][5] = 27504.0
+    old_config["motion"]["leftSoftLimits"]["yaw"] = {"min": -8000.0, "max": 8000.0}
+    (runtime_dir / "config.json").write_text(json.dumps(old_config), encoding="utf-8")
+
+    config = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert config["motion"]["leftSoftLimits"]["yaw"] == {"min": -8000.0, "max": 8000.0}
 
 
 def test_settings_migration_updates_legacy_icf_translation_speed(tmp_path: Any) -> None:
@@ -1315,12 +1933,28 @@ def test_settings_migration_updates_legacy_reversed_wrist_cameras(tmp_path: Any)
 
     config = SettingsService(runtime_dir, LogService()).get_config()
 
-    assert config["cameras"]["global"] == "AR0234 / index 1"
-    assert config["cameras"]["globalIdentity"] == "USB\\VID_1D6B&PID_0102&MI_00\\6&1E9A8698&0&0000"
-    assert config["cameras"]["wristLeft"] == "IMX258 / index 2"
-    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0EDC&PID_3080&MI_00\\7&38B4EA25&0&0000"
-    assert config["cameras"]["wristRight"] == "IMX258 / index 0"
-    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0EDC&PID_3080&MI_00\\6&1BBFDB86&0&0000"
+    assert config["cameras"]["global"] == "IMX335 / index 1"
+    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&124CCBA8&0&0000"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 2"
+    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&7861A93&0&0000"
+    assert config["cameras"]["wristRight"] == "IMX335 / index 0"
+    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
+
+
+def test_settings_migration_updates_previous_imx258_camera_defaults(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    old_config = default_config()
+    old_config["cameras"]["global"] = "AR0234 / index 1"
+    old_config["cameras"]["wristLeft"] = "IMX258 / index 2"
+    old_config["cameras"]["wristRight"] = "IMX258 / index 0"
+    (runtime_dir / "config.json").write_text(json.dumps(old_config), encoding="utf-8")
+
+    config = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert config["cameras"]["global"] == "IMX335 / index 1"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 2"
+    assert config["cameras"]["wristRight"] == "IMX335 / index 0"
 
 
 def test_settings_migration_updates_cyclic_camera_roles(tmp_path: Any) -> None:
@@ -1334,6 +1968,6 @@ def test_settings_migration_updates_cyclic_camera_roles(tmp_path: Any) -> None:
 
     config = SettingsService(runtime_dir, LogService()).get_config()
 
-    assert config["cameras"]["global"] == "AR0234 / index 1"
-    assert config["cameras"]["wristLeft"] == "IMX258 / index 2"
-    assert config["cameras"]["wristRight"] == "IMX258 / index 0"
+    assert config["cameras"]["global"] == "IMX335 / index 1"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 2"
+    assert config["cameras"]["wristRight"] == "IMX335 / index 0"
