@@ -708,6 +708,66 @@ def test_hardware_status_uses_gripper_workers_in_dual_mode(tmp_path: Path, monke
     assert response.json()["gripper"]["message"] == "dual gripper workers"
 
 
+def test_hardware_status_reads_gripper_worker_status_off_event_loop(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    config = client.get("/api/settings").json()
+    config["teleop"]["engine"] = "python_mapper"
+    config["gripper"]["sampleMode"] = "dual_worker"
+    assert client.put("/api/settings", json=config).status_code == 200
+
+    def fake_hardware_status(*, include_gripper: bool = True) -> dict[str, object]:
+        _ = include_gripper
+        return {"camera": {}, "force": {}, "gripper": {"ok": None}, "pico": {}}
+
+    def fake_worker_status(config: dict[str, Any]) -> dict[str, object]:
+        _ = config
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return {"ok": True, "message": "dual gripper workers", "sides": {}}
+        raise AssertionError("gripper worker status ran on the event loop")
+
+    monkeypatch.setattr(client.app.state.hardware, "status", fake_hardware_status)
+    monkeypatch.setattr(client.app.state.gripper_workers, "status", fake_worker_status)
+
+    response = client.get("/api/hardware/status")
+
+    assert response.status_code == 200
+    assert response.json()["gripper"]["message"] == "dual gripper workers"
+
+
+def test_health_reads_gripper_worker_status_off_event_loop(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    config = client.get("/api/settings").json()
+    config["teleop"]["engine"] = "python_mapper"
+    config["gripper"]["sampleMode"] = "dual_worker"
+    assert client.put("/api/settings", json=config).status_code == 200
+
+    def fake_hardware_status(*, include_gripper: bool = True) -> dict[str, object]:
+        _ = include_gripper
+        return {"camera": {}, "force": {}, "gripper": {"ok": None}, "pico": {}}
+
+    def fake_worker_status(config: dict[str, Any]) -> dict[str, object]:
+        _ = config
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return {"ok": True, "message": "dual gripper workers", "sides": {}}
+        raise AssertionError("gripper worker status ran on the event loop")
+
+    monkeypatch.setattr(client.app.state.hardware, "status", fake_hardware_status)
+    monkeypatch.setattr(client.app.state.gripper_workers, "status", fake_worker_status)
+
+    response = client.get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json()["hardware"]["gripper"]["message"] == "dual gripper workers"
+
+
 def test_hardware_status_uses_gripper_workers_in_native_mode_when_configured(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -2197,6 +2257,29 @@ def test_runtime_release_handles_disconnects_teleop_and_grippers(tmp_path: Path,
     assert saved["teleop"]["rightConnected"] is False
 
 
+def test_runtime_release_handles_stops_gripper_workers_off_event_loop(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    calls: list[float] = []
+
+    def fake_stop_all(timeout_sec: float = 1.0) -> None:
+        calls.append(timeout_sec)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        raise AssertionError("gripper worker stop_all ran on the event loop")
+
+    monkeypatch.setattr(client.app.state.gripper_workers, "stop_all", fake_stop_all)
+
+    response = client.post("/api/runtime/release_handles", json={"reason": "unit-test"})
+
+    assert response.status_code == 200
+    assert calls == [1.0]
+
+
 def test_app_shutdown_closes_telemetry_hardware_resources(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     shutdown_calls: list[str] = []
@@ -2205,6 +2288,24 @@ def test_app_shutdown_closes_telemetry_hardware_resources(tmp_path: Path, monkey
         client.app.state.telemetry.shutdown = lambda: shutdown_calls.append("shutdown")
 
     assert shutdown_calls == ["shutdown"]
+
+
+def test_app_shutdown_stops_gripper_workers_off_event_loop(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    calls: list[float] = []
+
+    with TestClient(create_app(tmp_path)) as client:
+        def fake_stop_all(timeout_sec: float = 1.0) -> None:
+            calls.append(timeout_sec)
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            raise AssertionError("gripper worker stop_all ran on the event loop")
+
+        monkeypatch.setattr(client.app.state.gripper_workers, "stop_all", fake_stop_all)
+
+    assert calls == [1.0]
 
 
 def test_teleop_logical_connect_enables_mapped_motion_side(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

@@ -611,7 +611,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         config["gripper"]["leftEnabled"] = False
         config["gripper"]["rightEnabled"] = False
         settings.save_config(config, emit_log=False)
-        gripper_workers.stop_all()
+        await asyncio.to_thread(gripper_workers.stop_all)
         for source in ("teleop-connect", "recording"):
             try:
                 await teleop_mapper.stop(source)
@@ -706,7 +706,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 await task
         app.state.teleop_background_tasks.clear()
         gripper_tele.stop(force=True)
-        gripper_workers.stop_all()
+        await asyncio.to_thread(gripper_workers.stop_all)
         telemetry.shutdown()
 
     # 查询后端、HAL 与硬件健康状态。
@@ -721,7 +721,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             include_gripper=not use_gripper_workers and not native_gripper,
         )
         if use_gripper_workers:
-            hardware_status["gripper"] = gripper_workers.status(health_config)
+            hardware_status["gripper"] = await asyncio.to_thread(gripper_workers.status, health_config)
         elif native_gripper:
             hardware_status["gripper"] = native_gripper_status(health_config)
         attach_gripper_serial_ports(hardware_status, health_config)
@@ -746,7 +746,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             include_gripper=not use_gripper_workers and not native_gripper,
         )
         if use_gripper_workers:
-            status["gripper"] = gripper_workers.status(config)
+            status["gripper"] = await asyncio.to_thread(gripper_workers.status, config)
         elif native_gripper:
             status["gripper"] = native_gripper_status(config)
         attach_gripper_serial_ports(status, config)
