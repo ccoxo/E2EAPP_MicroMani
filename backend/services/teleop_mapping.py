@@ -141,7 +141,7 @@ class TeleopMappingService:
             try:
                 payload = self._native_payload(config)
                 changed_origin_sides = self._native_payload_changed_work_origin_sides(payload)
-                if source_was_present and payload == self._last_native_payload:
+                if payload == self._last_native_payload:
                     return self.status()
                 if changed_origin_sides:
                     await self._stop_and_return_changed_work_origins(config, changed_origin_sides, payload)
@@ -211,7 +211,11 @@ class TeleopMappingService:
         if not force and isinstance(teleop_config, dict) and not bool(teleop_config.get("homeBeforeStart", True)):
             return
         startup_config = config.get("motion", {}).get("homeOnStartup", {})
-        if not force and isinstance(startup_config, dict) and str(startup_config.get("mode", "work_origin")) != "work_origin":
+        if (
+            not force
+            and isinstance(startup_config, dict)
+            and str(startup_config.get("mode", "work_origin")) != "work_origin"
+        ):
             return
         origin = self._normalized_motion_origin(config)
         if side is None and not bool(origin["valid"]):
@@ -315,7 +319,10 @@ class TeleopMappingService:
         if isinstance(teleop_config, dict) and not bool(teleop_config.get("homeBeforeStart", True)):
             return False
         startup_config = config.get("motion", {}).get("homeOnStartup", {})
-        return not (isinstance(startup_config, dict) and str(startup_config.get("mode", "work_origin")) != "work_origin")
+        return not (
+            isinstance(startup_config, dict)
+            and str(startup_config.get("mode", "work_origin")) != "work_origin"
+        )
 
     def _mark_native_rotation_recovery(
         self,
@@ -824,7 +831,11 @@ class TeleopMappingService:
                 if update_return is not None
                 else None
             ),
-            "stopReason": {axis: stop_reason[idx] for idx, axis in enumerate(AXES)} if stop_reason is not None else None,
+            "stopReason": (
+                {axis: stop_reason[idx] for idx, axis in enumerate(AXES)}
+                if stop_reason is not None
+                else None
+            ),
             "axisIoStatus": (
                 {axis: axis_io_status[idx] for idx, axis in enumerate(AXES)}
                 if axis_io_status is not None

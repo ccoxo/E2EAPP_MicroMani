@@ -5,8 +5,9 @@ import contextlib
 import os
 import subprocess
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 from fastapi import Body, FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,11 +36,11 @@ from backend.services.dataset_recorder import DatasetRecorderService, DatasetSav
 from backend.services.gripper_tele_service import GripperTeleService
 from backend.services.gripper_worker_service import GripperWorkerService
 from backend.services.hardware_service import HardwareService
-from backend.services.policy_service import PolicyService
 from backend.services.policy_bridge import build_policy_action_plan, lerobot_state_from_ui
+from backend.services.policy_service import PolicyService
 from backend.services.stability_monitor import StabilityMonitorService
 from backend.services.telemetry_hub import TelemetryHub
-from backend.services.teleop_mapping import TeleopMappingService
+from backend.services.teleop_mapping import SideName, TeleopMappingService
 
 
 def envelope(data: dict[str, Any] | None = None) -> ApiEnvelope:
@@ -302,7 +303,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         return str(teleop.get("engine", "")).lower() == "hal_native"
 
-    def teleop_target_side_for_source(side: str, config: dict[str, Any]) -> str:
+    def teleop_target_side_for_source(side: SideName, config: dict[str, Any]) -> SideName:
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         if bool(teleop.get("swapTeleopChannels", False)):
             return "right" if side == "left" else "left"
@@ -323,7 +324,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
         task.add_done_callback(_cleanup)
 
-    async def sync_teleop_logical_connection(side: str, connected: bool) -> None:
+    async def sync_teleop_logical_connection(side: SideName, connected: bool) -> None:
         config = settings.get_config()
         teleop_config = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         mapped_side = teleop_target_side_for_source(side, config)
@@ -536,7 +537,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         require_gripper: bool = True,
     ) -> None:
         config = settings.get_config()
-        native_gripper = native_teleop_config(config)
+        use_gripper_workers = gripper_workers.is_enabled(config)
+        native_gripper = native_teleop_config(config) and not use_gripper_workers
         hal_health = await hal.health()
         if hal_health.mode != "real":
             return
@@ -550,14 +552,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if not bool(omega_status.get("ok", False)):
             failures.append(str(omega_status.get("message") or "Omega.7 devices not recognized"))
 
-        include_gripper_probe = require_gripper and not native_gripper
+        include_gripper_probe = require_gripper and not native_gripper and not use_gripper_workers
         hardware_status = await asyncio.to_thread(hardware.status, include_gripper=include_gripper_probe)
         camera_status = hardware_status.get("camera", {})
         if require_camera and (
             not isinstance(camera_status, dict) or not bool(camera_status.get("ok", False))
         ):
-            failures.append(str(camera_status.get("message") if isinstance(camera_status, dict) else "cameras not ready"))
-        if require_gripper:
+            failures.append(
+                str(camera_status.get("message") if isinstance(camera_status, dict) else "cameras not ready")
+            )
+        if require_gripper and not use_gripper_workers:
             gripper_probe = hardware_status.get("gripper", {})
             gripper_status = native_gripper_status(config) if native_gripper else gripper_probe
             if not isinstance(gripper_status, dict) or not bool(gripper_status.get("ok", False)):
@@ -948,7 +952,9 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
     # 双侧记录当前工作原点。
     @app.post("/api/motion/origin/capture")
-    async def capture_motion_origin_all(payload: dict[str, Any] | None = Body(default=None)) -> ApiEnvelope:
+    async def capture_motion_origin_all(
+        payload: Annotated[dict[str, Any] | None, Body()] = None,
+    ) -> ApiEnvelope:
         try:
             confirm_large_drift = bool(payload.get("confirmLargeDrift")) if isinstance(payload, dict) else False
             return envelope(await commands.capture_motion_origin(confirm_large_drift=confirm_large_drift))
@@ -987,7 +993,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/motion/{side}/origin/capture")
     async def capture_motion_origin_side(
         side: str,
-        payload: dict[str, Any] | None = Body(default=None),
+        payload: Annotated[dict[str, Any] | None, Body()] = None,
     ) -> ApiEnvelope:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
@@ -1101,12 +1107,15 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 telemetry.motion_positions = list(joint_positions)
             except RuntimeError as exc:
                 logs.error("[POLICY]", f"policy observation failed: {exc}")
-                raise HTTPException(status_code=503, detail={"code": "POLICY_OBSERVATION_UNAVAILABLE", "message": str(exc)}) from exc
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "POLICY_OBSERVATION_UNAVAILABLE", "message": str(exc)},
+                ) from exc
         grippers = _policy_gripper_positions(config)
         return envelope({"state": lerobot_state_from_ui(joint_positions, grippers)})
 
     @app.post("/api/policy/action")
-    async def policy_action(payload: dict[str, Any] = Body(...)) -> ApiEnvelope:
+    async def policy_action(payload: Annotated[dict[str, Any], Body()]) -> ApiEnvelope:
         action = payload.get("action")
         if not isinstance(action, list) or len(action) != 14:
             raise HTTPException(
@@ -1139,11 +1148,19 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     _policy_motion_payload(side, motion_plan, config),
                 )
             for side, target_key in (("left", "leftMm"), ("right", "rightMm")):
-                request = GripperCommandRequest(side=side, command="target", targetMm=plan["grippers"][target_key])
-                results["grippers"][side] = await commands.gripper_command(request)
+                gripper_side = cast(SideName, side)
+                request = GripperCommandRequest(
+                    side=gripper_side,
+                    command="target",
+                    targetMm=plan["grippers"][target_key],
+                )
+                results["grippers"][gripper_side] = await commands.gripper_command(request)
         except RuntimeError as exc:
             logs.error("[POLICY]", f"policy action send failed: {exc}")
-            raise HTTPException(status_code=503, detail={"code": "POLICY_ACTION_UNAVAILABLE", "message": str(exc)}) from exc
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "POLICY_ACTION_UNAVAILABLE", "message": str(exc)},
+            ) from exc
         return envelope({"dryRun": False, "sent": True, "plan": plan, "results": results})
 
     def _real_hardware_mode(config: dict[str, Any]) -> bool:
@@ -1312,10 +1329,11 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def teleop_connect(side: str) -> ApiEnvelope:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
-        config = set_teleop_logical_connection(side, True)
-        mapped_side = teleop_target_side_for_source(side, config)
+        side_name = cast(SideName, side)
+        config = set_teleop_logical_connection(side_name, True)
+        mapped_side = teleop_target_side_for_source(side_name, config)
         schedule_teleop_background(
-            sync_teleop_logical_connection(side, True),
+            sync_teleop_logical_connection(side_name, True),
             f"teleop-{side}-connect-sync",
         )
         logs.info(
@@ -1337,10 +1355,11 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def teleop_disconnect(side: str) -> ApiEnvelope:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
-        config = set_teleop_logical_connection(side, False)
-        mapped_side = teleop_target_side_for_source(side, config)
+        side_name = cast(SideName, side)
+        config = set_teleop_logical_connection(side_name, False)
+        mapped_side = teleop_target_side_for_source(side_name, config)
         schedule_teleop_background(
-            sync_teleop_logical_connection(side, False),
+            sync_teleop_logical_connection(side_name, False),
             f"teleop-{side}-disconnect-sync",
         )
         logs.info("[HAL]", f"{side} Omega.7 logical disconnect accepted; background sync scheduled")
@@ -1448,7 +1467,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 detail={"code": "BAD_CAMERA", "message": "camera must be global, wrist_left, or wrist_right"},
             )
 
-        async def frames():
+        async def frames() -> AsyncIterator[bytes]:
             period = 1.0 / 30.0
             last_sequence = -1
             while True:

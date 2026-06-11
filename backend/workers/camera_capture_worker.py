@@ -10,7 +10,7 @@ import threading
 import time
 from collections import deque
 from multiprocessing.queues import Queue
-from typing import Any
+from typing import Any, cast
 
 CAMERA_CAPTURE_FOURCC = "YUYV"
 
@@ -22,8 +22,8 @@ def run_camera_capture_worker(
     fps: float,
     profile: dict[str, float | bool] | None,
     backend_candidates: list[tuple[int, str]],
-    status_queue: Queue,
-    command_queue: Queue,
+    status_queue: Queue[Any],
+    command_queue: Queue[Any],
     parent_pid: int | None = None,
 ) -> None:
     worker = _CameraCaptureWorker(
@@ -51,6 +51,7 @@ def run_camera_capture_worker_stdio(startup: dict[str, Any]) -> None:
                 break
 
     threading.Thread(target=read_commands, name="camera-worker-stdin", daemon=True).start()
+    parent_pid_value = startup.get("parentPid")
     worker = _CameraCaptureWorker(
         int(startup["index"]),
         int(startup["width"]),
@@ -59,8 +60,8 @@ def run_camera_capture_worker_stdio(startup: dict[str, Any]) -> None:
         startup.get("profile"),
         [(int(backend), str(label)) for backend, label in startup["backendCandidates"]],
         status_queue,
-        command_queue,  # type: ignore[arg-type]
-        int(startup.get("parentPid")) if startup.get("parentPid") is not None else None,
+        command_queue,
+        int(cast(Any, parent_pid_value)) if parent_pid_value is not None else None,
     )
     worker.run()
 
@@ -84,8 +85,8 @@ class _CameraCaptureWorker:
         fps: float,
         profile: dict[str, float | bool] | None,
         backend_candidates: list[tuple[int, str]],
-        status_queue: Queue,
-        command_queue: Queue,
+        status_queue: Any,
+        command_queue: Any,
         parent_pid: int | None,
     ) -> None:
         self.index = int(index)
@@ -291,7 +292,7 @@ class _CameraCaptureWorker:
             if not handle:
                 return False
             try:
-                result = ctypes.windll.kernel32.WaitForSingleObject(handle, 0)
+                result = int(ctypes.windll.kernel32.WaitForSingleObject(handle, 0))
                 return result == wait_object_0
             finally:
                 ctypes.windll.kernel32.CloseHandle(handle)

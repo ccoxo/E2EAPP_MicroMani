@@ -19,6 +19,14 @@ LogChannel = Literal[
 ]
 SnapshotScope = Literal["all", "motion-left", "motion-right"]
 ManualSide = Literal["left", "right"]
+
+
+def _default_motion_enabled() -> dict[ManualSide, bool | None]:
+    return {"left": None, "right": None}
+
+
+def _default_motion_axis_enabled() -> dict[ManualSide, list[bool | None]]:
+    return {"left": [None] * 6, "right": [None] * 6}
 ManualAxis = Literal["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
 ManualSpeedMode = Literal["fine", "medium", "coarse"]
 ManualGripperCommand = Literal["enable", "disable", "open", "close", "home", "target", "stop"]
@@ -89,10 +97,10 @@ class TelemetryFrame(BaseModel):
     jointPositions: list[float] = Field(min_length=12, max_length=12)
     gripperPositions: list[float] = Field(min_length=2, max_length=2)
     motionEnabled: dict[Literal["left", "right"], bool | None] = Field(
-        default_factory=lambda: {"left": None, "right": None}
+        default_factory=_default_motion_enabled
     )
     motionAxisEnabled: dict[Literal["left", "right"], list[bool | None]] = Field(
-        default_factory=lambda: {"left": [None] * 6, "right": [None] * 6}
+        default_factory=_default_motion_axis_enabled
     )
     forceLeft: list[float] = Field(min_length=6, max_length=6)
     forceRight: list[float] = Field(min_length=6, max_length=6)

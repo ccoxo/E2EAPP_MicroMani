@@ -726,7 +726,7 @@ class DatasetRecorderService:
         return sides or {"left"}
 
     def _reset_returned_sides_locked(self) -> set[str]:
-        raw = getattr(self, "_reset_returned_sides", set())
+        raw: Any = getattr(self, "_reset_returned_sides", set())
         return {str(side) for side in raw if str(side) in {"left", "right"}}
 
     def _reset_ready_locked(self) -> bool:
@@ -1067,7 +1067,11 @@ class DatasetRecorderService:
     def push_dataset(self, dataset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """根据配置以 dry-run 或 LeRobot push_to_hub 方式处理数据集上传。"""
         requested_local_path = str(payload.get("localPath") or "").strip()
-        dataset_dir = Path(requested_local_path).expanduser() if requested_local_path else self._dataset_path(dataset_id)
+        dataset_dir = (
+            Path(requested_local_path).expanduser()
+            if requested_local_path
+            else self._dataset_path(dataset_id)
+        )
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
             raise RuntimeError(f"local dataset path is invalid or missing meta/info.json: {dataset_dir}")
@@ -1101,7 +1105,15 @@ class DatasetRecorderService:
             "message": "Hub upload queued",
         }
 
-    def _start_hub_push_job(self, dataset_id: str, repo_id: str, dataset_dir: Path, *, token: str, private: bool) -> str:
+    def _start_hub_push_job(
+        self,
+        dataset_id: str,
+        repo_id: str,
+        dataset_dir: Path,
+        *,
+        token: str,
+        private: bool,
+    ) -> str:
         job_id = uuid.uuid4().hex
         with self._hub_push_jobs_lock:
             self._hub_push_jobs[job_id] = {
@@ -1158,7 +1170,10 @@ class DatasetRecorderService:
             result = subprocess.run(command, cwd=str(repo_root), env=env, capture_output=True, text=True)
         except Exception as exc:  # noqa: BLE001
             self._update_hub_push_job(job_id, status="failed", finishedAt=now_ms(), error=str(exc))
-            self.logs.error("[LEROBOT]", f"hub upload job failed before script exit dataset={dataset_id} job={job_id}: {exc}")
+            self.logs.error(
+                "[LEROBOT]",
+                f"hub upload job failed before script exit dataset={dataset_id} job={job_id}: {exc}",
+            )
             return
         stdout = result.stdout[-4000:] if result.stdout else ""
         stderr = result.stderr[-4000:] if result.stderr else ""
@@ -1591,6 +1606,7 @@ class DatasetRecorderService:
 
     def _sample_force_source_sync(self, config: dict[str, Any], target_s: float) -> TimedSample:
         """同步读取力传感器样本并记录采样耗时和时间戳。"""
+        value: Any
         if not self._real_hardware_mode(config):
             sampled_at = time.monotonic()
             value = SimpleNamespace(
@@ -1987,6 +2003,8 @@ class DatasetRecorderService:
         """从 hal_native teleop 状态中提取最新左右夹爪当前位置。"""
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         if str(teleop.get("engine", "")).lower() != "hal_native":
+            return None
+        if self._gripper_workers_enabled(config):
             return None
         status = self.teleop.status()
         native_status = status.get("nativeStatus") if isinstance(status, dict) else None
@@ -3511,13 +3529,15 @@ class DatasetRecorderService:
         if gripper:
             action[6] = self._float_or_zero(gripper.get("targetLeftMm", base[6]))
             action[13] = self._float_or_zero(gripper.get("targetRightMm", base[13]))
-        native_gripper_targets = self._latest_native_gripper_targets()
+        native_gripper_targets = self._latest_native_gripper_targets(config)
         if native_gripper_targets is not None:
             action[6], action[13] = native_gripper_targets
         return action
 
-    def _latest_native_gripper_targets(self) -> tuple[float, float] | None:
+    def _latest_native_gripper_targets(self, config: dict[str, Any]) -> tuple[float, float] | None:
         """从 native teleop 状态中提取左右夹爪目标值。"""
+        if self._gripper_workers_enabled(config):
+            return None
         status = self.teleop.status()
         native_status = status.get("nativeStatus") if isinstance(status, dict) else None
         if not isinstance(native_status, dict):
@@ -3534,6 +3554,11 @@ class DatasetRecorderService:
         if left is None or right is None:
             return None
         return left, right
+
+    def _gripper_workers_enabled(self, config: dict[str, Any]) -> bool:
+        gripper_workers = getattr(getattr(self, "telemetry", None), "gripper_workers", None)
+        is_enabled = getattr(gripper_workers, "is_enabled", None)
+        return bool(callable(is_enabled) and is_enabled(config))
 
     def _latest_action_delta_vector(self, target_monotonic_s: float | None = None) -> list[float]:
         """汇总目标时间附近 teleop 动作形成 14 维动作增量。"""

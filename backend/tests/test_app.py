@@ -17,6 +17,7 @@ from backend.app import create_app, relative_motion_positions
 from backend.core.defaults import default_config
 from backend.core.logging import LogService
 from backend.core.motion_limits import effective_limits_ui, side_home_reference_ui
+from backend.core.schemas import GripperCommandRequest
 from backend.drivers.camera_opencv import OpenCVCameraDriver
 from backend.hal_client.client import HalHealth, RealHalClient, TestHalClient
 from backend.services.dataset_recorder import DatasetRecorderService
@@ -92,7 +93,6 @@ def _write_dataset_fixture(dataset_root: Path, dataset_id: str = "unit_dataset")
 
 
 def test_backend_app_import_does_not_create_runtime_services(tmp_path: Path) -> None:
-    import os
     import subprocess
     import sys
 
@@ -321,7 +321,14 @@ def test_dataset_push_uses_request_local_path_override(tmp_path: Path, monkeypat
     assert data["queued"] is True
     assert data["jobId"] == "job-2"
     assert data["localPath"] == str(override_dir)
-    assert calls == [{"datasetId": "unit_dataset", "repoId": "org/unit_dataset", "datasetDir": str(override_dir), "private": True}]
+    assert calls == [
+        {
+            "datasetId": "unit_dataset",
+            "repoId": "org/unit_dataset",
+            "datasetDir": str(override_dir),
+            "private": True,
+        }
+    ]
 
 
 def test_dataset_push_script_failure_is_recorded_on_job(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -420,7 +427,7 @@ def test_dataset_heavy_read_routes_use_worker_thread(tmp_path: Path, monkeypatch
         return {"id": episode_id, "datasetId": dataset_id}
 
     def resolve_frame_image(dataset_id: str, episode_id: str, camera: str, frame: int) -> bytes:
-        return f"{dataset_id}:{episode_id}:{camera}:{frame}".encode("utf-8")
+        return f"{dataset_id}:{episode_id}:{camera}:{frame}".encode()
 
     monkeypatch.setattr(client.app.state.recorder, "list_datasets", list_datasets)
     monkeypatch.setattr(client.app.state.recorder, "episode_detail", episode_detail)
@@ -742,6 +749,7 @@ def test_hardware_status_native_mode_does_not_probe_python_gripper_serial(
     client = TestClient(create_app(tmp_path))
     config = client.get("/api/settings").json()
     config["teleop"]["engine"] = "hal_native"
+    config["gripper"]["sampleMode"] = "direct"
     assert client.put("/api/settings", json=config).status_code == 200
 
     include_gripper_values: list[bool] = []
@@ -794,6 +802,7 @@ def test_health_native_mode_does_not_probe_python_gripper_serial(
     client = TestClient(create_app(tmp_path))
     config = client.get("/api/settings").json()
     config["teleop"]["engine"] = "hal_native"
+    config["gripper"]["sampleMode"] = "direct"
     assert client.put("/api/settings", json=config).status_code == 200
 
     include_gripper_values: list[bool] = []
@@ -2201,6 +2210,9 @@ def test_app_shutdown_closes_telemetry_hardware_resources(tmp_path: Path, monkey
 def test_teleop_logical_connect_enables_mapped_motion_side(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     client = TestClient(create_app(tmp_path))
+    config = client.get("/api/settings").json()
+    config["teleop"]["gripperTeleop"]["enabled"] = False
+    assert client.put("/api/settings", json=config).status_code == 200
     gripper_start_calls: list[str] = []
     monkeypatch.setattr(
         client.app.state.gripper_tele,
@@ -2710,6 +2722,81 @@ def test_real_record_session_requires_hardware_recognition_before_start(
     assert "cameras not ready" in response.json()["detail"]["message"]
     assert "COM9" not in response.json()["detail"]["message"]
     assert start_calls == []
+    assert include_gripper_values == [False]
+
+
+def test_native_record_session_ignores_stale_native_gripper_status_when_python_workers_own_gripper(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    class FakeHal:
+        async def health(self) -> HalHealth:
+            return HalHealth(
+                ltdmc_ok=True,
+                omega7_ok=True,
+                version="fake-hal",
+                uptime_s=1.0,
+                connected=True,
+                mode="real",
+            )
+
+        async def omega_state(self) -> dict[str, Any]:
+            return {
+                "hands": [
+                    {"side": "left", "connected": True, "lastReadOk": True, "deviceId": 0, "serial": "L"},
+                    {"side": "right", "connected": True, "lastReadOk": True, "deviceId": 1, "serial": "R"},
+                ]
+            }
+
+        async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
+            return {"command": name, "payload": payload or {}}
+
+    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: FakeHal())
+    client = TestClient(create_app(tmp_path))
+    config = client.get("/api/settings").json()
+    config["teleop"]["engine"] = "hal_native"
+    config["gripper"]["sampleMode"] = "dual_worker"
+    assert client.put("/api/settings", json=config).status_code == 200
+    client.app.state.teleop_mapper._native_status_cache = {
+        "running": True,
+        "gripperTargets": [8.0, 9.0],
+        "grippers": {
+            "left": {"ok": False, "message": "serialOperation open failed COM8, ret=-1", "lastCommandTs": 123},
+            "right": {"ok": True, "message": "ok", "lastCommandTs": 124},
+        },
+    }
+    start_calls: list[str] = []
+    include_gripper_values: list[bool] = []
+
+    async def fake_start_session(_dataset_name: str, _task: str) -> dict[str, Any]:
+        start_calls.append("start")
+        return {"recording": True}
+
+    def fake_hardware_status(*, include_gripper: bool = True) -> dict[str, Any]:
+        include_gripper_values.append(include_gripper)
+        return {
+            "camera": {"ok": True, "message": "cameras ready"},
+            "force": {"ok": True, "message": "force ready"},
+            "gripper": (
+                {"ok": False, "message": "right COM9: serialOperation open ret=-1", "ports": []}
+                if include_gripper
+                else {"ok": None, "message": "Python gripper probe skipped"}
+            ),
+            "pico": {},
+        }
+
+    monkeypatch.setattr(client.app.state.recorder, "start_session", fake_start_session)
+    monkeypatch.setattr(client.app.state.hardware, "status", fake_hardware_status)
+
+    response = client.post(
+        "/api/record/session/create",
+        json={"dataset_name": "unit", "task": "teleop"},
+    )
+
+    assert response.status_code == 200
+    assert start_calls == ["start"]
     assert include_gripper_values == [False]
 
 

@@ -408,6 +408,27 @@ def test_native_teleop_running_update_uses_start_without_extra_configure(monkeyp
     asyncio.run(run())
 
 
+def test_native_manual_gripper_start_does_not_restart_active_arm_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def run() -> None:
+        hal = FakeHal()
+        config = start_config(engine="hal_native")
+        config["teleop"]["leftConnected"] = True
+        mapper = TeleopMappingService(settings=FakeSettings(config), hal=hal, logs=LogService())
+
+        await mapper.start("teleop-connect", pre_home=False)
+        hal.commands.clear()
+        await mapper.start("manual-gripper", pre_home=False)
+
+        assert hal.commands == []
+        assert mapper.status()["sources"] == ["manual-gripper", "teleop-connect"]
+
+    asyncio.run(run())
+
+
 def test_native_teleop_running_origin_change_forces_rehome_before_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2025,7 +2046,9 @@ def test_hal_native_payload_disables_translation_limits_and_sends_rotation_work_
 
     payload = mapper._native_payload(config)
 
-    assert payload["leftSoftLimitMin"] == pytest.approx([-1000000000.0, -1000000000.0, -1000000000.0, 10.0, 20.0, -33.0])
+    assert payload["leftSoftLimitMin"] == pytest.approx(
+        [-1000000000.0, -1000000000.0, -1000000000.0, 10.0, 20.0, -33.0]
+    )
     assert payload["leftSoftLimitMax"] == pytest.approx([1000000000.0, 1000000000.0, 1000000000.0, 50.0, 60.0, -22.0])
     assert payload["rotationWorkLimitEnabled"] is True
     assert payload["leftRotationWorkLimitMin"] == [0.0, 0.0, 0.0, -4.0, -5.0, -1.0]

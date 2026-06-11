@@ -12,7 +12,7 @@ import {
   Upload,
   XCircle,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { CameraPreview } from '../components/CameraPreview'
 import {
   apiBase,
@@ -479,12 +479,8 @@ export function DatasetView() {
   const [hubDryRun, setHubDryRun] = useState(true)
   const [hubUploading, setHubUploading] = useState(false)
   const [hubMessage, setHubMessage] = useState('')
-  const [episodeDetailLoadingKey, setEpisodeDetailLoadingKey] = useState('')
-  const [episodeDetailRequestedKeys, setEpisodeDetailRequestedKeys] = useState<string[]>([])
-
-  useEffect(() => {
-    setHubPushToHub(Boolean(config.storage.pushToHub))
-  }, [config.storage.pushToHub])
+  const episodeDetailLoadingKeyRef = useRef('')
+  const episodeDetailRequestedKeysRef = useRef(new Set<string>())
 
   useEffect(() => {
     if (mockMode) return
@@ -542,8 +538,8 @@ export function DatasetView() {
   useEffect(() => {
     if (mockMode || !selectedDataset || !selectedEpisode || selectedEpisode.samples.length > 0) return
     const detailKey = `${selectedDataset.id}:${selectedEpisode.id}`
-    if (episodeDetailLoadingKey === detailKey || episodeDetailRequestedKeys.includes(detailKey)) return
-    setEpisodeDetailLoadingKey(detailKey)
+    if (episodeDetailLoadingKeyRef.current === detailKey || episodeDetailRequestedKeysRef.current.has(detailKey)) return
+    episodeDetailLoadingKeyRef.current = detailKey
     void fetchDatasetEpisodeApi(selectedDataset.id, selectedEpisode.id)
       .then((episode) => {
         if (!episode) return
@@ -563,14 +559,10 @@ export function DatasetView() {
       })
       .catch((error) => setBackendLoadError(String(error)))
       .finally(() => {
-        setEpisodeDetailRequestedKeys((keys) => (keys.includes(detailKey) ? keys : [...keys, detailKey]))
-        setEpisodeDetailLoadingKey((current) => (current === detailKey ? '' : current))
+        episodeDetailRequestedKeysRef.current.add(detailKey)
+        if (episodeDetailLoadingKeyRef.current === detailKey) episodeDetailLoadingKeyRef.current = ''
       })
-  }, [episodeDetailLoadingKey, episodeDetailRequestedKeys, selectedDataset, selectedEpisode])
-
-  useEffect(() => {
-    if (hubUploadOpen && selectedDataset && !hubRepoId) setHubRepoId(selectedDataset.id)
-  }, [hubRepoId, hubUploadOpen, selectedDataset])
+  }, [selectedDataset, selectedEpisode])
 
   useEffect(() => {
     if (!playing || !selectedEpisode) return

@@ -51,6 +51,7 @@ import {
   type MotionOriginCaptureDrift,
 } from '../api'
 import { refreshCameraStream } from '../hooks/useLiveCameraSnapshot'
+import { isManualAxisDisabled } from '../manualAxisRules'
 import {
   armHardwareSpecs,
   axisHardwareSpecs,
@@ -2541,7 +2542,7 @@ function ManualArmControl({
 }) {
   const sideSpec = armHardwareSpecs[side]
   const selectedAxis = manualControl.selectedSide === side ? manualControl.selectedAxis : 'X'
-  const rightYawDisabled = side === 'right' && selectedAxis === 'Yaw'
+  const rightYawDisabled = isManualAxisDisabled(side, selectedAxis)
   const axisIndex = manualAxisOrder.indexOf(selectedAxis)
   const axisKey = manualAxisSoftKey(selectedAxis)
   const unit = manualAxisUnit(selectedAxis)
@@ -2649,7 +2650,7 @@ function ManualArmControl({
           <div className="manual-axis-chip-grid">
             {manualAxisOrder.map((axis) => {
               const active = manualControl.selectedSide === side && manualControl.selectedAxis === axis
-              const axisDisabled = side === 'right' && axis === 'Yaw'
+              const axisDisabled = isManualAxisDisabled(side, axis)
               return (
                 <Button key={axis} type={active ? 'primary' : 'default'} disabled={axisDisabled} onClick={() => selectManualAxis(side, axis)}>
                   {axis}

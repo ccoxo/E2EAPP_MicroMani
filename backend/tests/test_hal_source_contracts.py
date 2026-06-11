@@ -645,7 +645,10 @@ def test_hal_native_gripper_manual_endpoint_uses_native_controller_queue() -> No
     assert '"teleop.native.gripper_command": "/teleop/native/gripper_command"' in client
     assert 'await self.hal.command("teleop.native.gripper_command", payload)' in command_service
     assert "void configureGripper(const JodellGripperConfig& config);" in controller_header
-    assert "bool commandGripperTarget(Side side, double targetMm, int speed, int torque, std::string* message = nullptr);" in controller_header
+    assert (
+        "bool commandGripperTarget(Side side, double targetMm, int speed, int torque, "
+        "std::string* message = nullptr);"
+    ) in controller_header
     assert "nativeTeleop.configureGripper(config.gripper)" in branch
     assert "nativeTeleop.configure(config)" not in branch
     assert "nativeTeleop.commandGripperTarget(side, targetMm, speed, torque, &message)" in branch
@@ -1070,7 +1073,10 @@ def test_hal_native_incremental_rotation_spike_recaptures_reference_before_motio
     assert "referencePose_[sourceIndex] = semanticPose;" in guard_body
     assert "motion_.stopTeleopSide(targetSide);" in guard_body
     assert "targetActive_[targetIndex] = false;" in guard_body
-    assert 'setBlockerUnlocked(sourceIndex, "blocked", "incremental rotation input spike suppressed; reference recaptured");' in guard_body
+    assert (
+        'setBlockerUnlocked(sourceIndex, "blocked", '
+        '"incremental rotation input spike suppressed; reference recaptured");'
+    ) in guard_body
 
 
 def test_hal_native_throttles_repeated_zero_delta_actions() -> None:
@@ -1275,7 +1281,10 @@ def test_hal_native_kalman_filter_keeps_status_schema_and_gates_pose_source() ->
     assert "kalmanStates_" in header
     assert 'jsonBoolValue(body, "kalmanFilterEnabled", config.kalmanFilterEnabled)' in server
     assert 'jsonNumberValue(body, "kalmanBeta", config.kalmanBeta)' in server
-    assert 'jsonNumberValue(body, "kalmanRotationMeasurementVariance", config.kalmanRotationMeasurementVariance)' in server
+    assert (
+        'jsonNumberValue(body, "kalmanRotationMeasurementVariance", '
+        "config.kalmanRotationMeasurementVariance)"
+    ) in server
     assert 'jsonNumberValue(body, "kalmanTranslationIntentVelocityThreshold"' in server
     assert '"kalmanFilterEnabled": bool(teleop.get("kalmanFilterEnabled", False))' in payload
     assert '"kalmanBeta": float(teleop.get("kalmanBeta", ICF_TELEOP_DEFAULTS["kalmanBeta"]))' in payload
@@ -1384,24 +1393,8 @@ def test_hal_native_gripper_io_is_decoupled_from_motion_loop() -> None:
 
 
 def test_hal_native_gripper_worker_samples_positions_without_commands() -> None:
-    controller_header = (REPO_ROOT / "hal" / "include" / "NativeTeleopController.h").read_text(encoding="utf-8")
-    controller_source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
     gripper_header = (REPO_ROOT / "hal" / "include" / "JodellGripperDriver.h").read_text(encoding="utf-8")
     gripper_source = (REPO_ROOT / "hal" / "src" / "JodellGripperDriver.cpp").read_text(encoding="utf-8")
-    loop_body = controller_source.split("void NativeTeleopController::gripperLoop()", 1)[1].split(
-        "void NativeTeleopController::sampleGripperPosition",
-        1,
-    )[0]
-    sample_body = (
-        controller_source.split("void NativeTeleopController::sampleGripperPosition", 1)[1].split(
-            "double NativeTeleopController::mappedDirection",
-            1,
-        )[0]
-        if "void NativeTeleopController::sampleGripperPosition" in controller_source
-        else ""
-    )
-    normalized_loop = " ".join(loop_body.split())
-    normalized_sample = " ".join(sample_body.split())
 
     assert "bool readPositionMm(Side side, std::string* message = nullptr);" in gripper_header
     assert "bool JodellGripperDriver::readPositionMm(" in gripper_source
@@ -1409,10 +1402,10 @@ def test_hal_native_gripper_worker_samples_positions_without_commands() -> None:
 
 def test_hal_native_gripper_worker_starts_only_when_gripper_teleop_is_enabled() -> None:
     controller_source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
-    start_body = controller_source.split("void NativeTeleopController::start(bool leftConnected, bool rightConnected)", 1)[1].split(
-        "void NativeTeleopController::stop()",
+    start_body = controller_source.split(
+        "void NativeTeleopController::start(bool leftConnected, bool rightConnected)",
         1,
-    )[0]
+    )[1].split("void NativeTeleopController::stop()", 1)[0]
     normalized = " ".join(start_body.split())
 
     assert "gripperTeleopEnabled = config_.gripperTeleopEnabled;" in normalized
@@ -1525,7 +1518,9 @@ def test_hal_native_gripper_teleop_throttles_background_jodell_commands() -> Non
     assert "normalized.gripperMinCommandIntervalMs = std::max(" in source
     assert "int gripperDeadbandCounts{1};" in header
     assert "double gripperMinCommandIntervalMs{20.0};" in header
-    assert "if (gripperLastRaw_[targetIndex] >= 0 && elapsedMs < config_.gripperMinCommandIntervalMs)" in normalized_tick
+    assert (
+        "if (gripperLastRaw_[targetIndex] >= 0 && elapsedMs < config_.gripperMinCommandIntervalMs)"
+    ) in normalized_tick
     assert (
         "if (gripperLastRaw_[targetIndex] >= 0 && std::abs(raw - gripperLastRaw_[targetIndex]) "
         "< config_.gripperDeadbandCounts)"

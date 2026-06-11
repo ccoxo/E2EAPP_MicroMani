@@ -571,8 +571,8 @@ class TelemetryHub:
             return
         if self.gripper_workers is not None and self.gripper_workers.is_enabled(config):
             samples = self.gripper_workers.samples(config)
-            if samples:
-                self.gripper_samples = samples
+            self.gripper_samples = samples
+            self.gripper_positions = [-1.0, -1.0]
             updated = False
             latest_sample_at = 0.0
             for side, idx in (("left", 0), ("right", 1)):
@@ -586,6 +586,8 @@ class TelemetryHub:
                     latest_sample_at = max(latest_sample_at, float(monotonic_ms) / 1000.0)
             if updated:
                 self._last_gripper_sample_at = latest_sample_at or now
+            else:
+                self._last_gripper_sample_at = 0.0
             return
         if not hasattr(self.hardware, "gripper") or not hasattr(self, "_hardware_executor"):
             return

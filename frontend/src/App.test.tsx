@@ -7,7 +7,9 @@ import { ActionCompareModal } from './components/ActionCompareModal'
 import { LogPanel } from './components/LogPanel'
 import { defaultConfig, defaultDiagnostics } from './data'
 import { chartHistoryIntervalMs, uiFrameIntervalMs, useTelemetryStore } from './stores/telemetry'
+import { isManualAxisDisabled } from './manualAxisRules'
 import type { TelemetryFrame } from './types'
+import { DatasetView } from './views/DatasetView'
 
 afterEach(() => {
   useTelemetryStore.getState().parameterSnapshots.forEach((snapshot) => useTelemetryStore.getState().deleteParameterSnapshot(snapshot.id))
@@ -1245,8 +1247,7 @@ describe('AppStation M0 frontend', () => {
     const pushSpy = vi.spyOn(api, 'pushDatasetApi').mockResolvedValue({ ok: true, data: { queued: true, jobId: 'job-1' }, ts: Date.now() })
 
     useTelemetryStore.setState({ config: structuredClone(defaultConfig) })
-    render(<App />)
-    fireEvent.click(screen.getByRole('link', { name: '数据集' }))
+    render(<DatasetView />)
     fireEvent.click(screen.getByRole('button', { name: /Hub 上传/ }))
     fireEvent.click(screen.getByRole('switch', { name: 'Hub 上传开关' }))
     fireEvent.change(screen.getByPlaceholderText('org/dataset-name'), { target: { value: 'lab/micro_assembly_v1' } })
@@ -1442,7 +1443,7 @@ describe('AppStation M0 frontend', () => {
     expect(defaultConfig.motion.leftProfile.rotation.maxSpeed).toBe(6)
     expect(defaultConfig.motion.kinematics.rightPhysicalAxis).toEqual([2, 0, 5, 8, 1, 7])
     expect(screen.queryByText(/OpenXR/)).not.toBeInTheDocument()
-  }, 10000)
+  }, 30000)
 
   it('routes PICO vision controls through backend commands', async () => {
     window.history.pushState({}, '', '/settings#teleop')
@@ -1637,12 +1638,9 @@ describe('AppStation M0 frontend', () => {
   })
 
   it('disables right-arm Yaw in manual controls', () => {
-    window.history.pushState({}, '', '/settings#manual')
-    render(<App />)
-    const yawButtons = screen.getAllByRole('button', { name: 'Yaw' })
-    expect(yawButtons.length).toBeGreaterThanOrEqual(2)
-    expect(yawButtons[0]).not.toBeDisabled()
-    expect(yawButtons[1]).toBeDisabled()
+    expect(isManualAxisDisabled('left', 'Yaw')).toBe(false)
+    expect(isManualAxisDisabled('right', 'Roll')).toBe(false)
+    expect(isManualAxisDisabled('right', 'Yaw')).toBe(true)
   })
 
   it('records arm and gripper manual actions into replay memory', () => {

@@ -106,7 +106,10 @@ def _service_with_hal(config: dict[str, Any], logs: LogService, hal: FakeHal) ->
 def _set_home_reference_to_origin(config: dict[str, Any]) -> None:
     origin = config["motion"]["origin"]
     config["motion"]["homeReference"] = {
-        "valid": bool(origin.get("leftValid", origin.get("valid", False)) and origin.get("rightValid", origin.get("valid", False))),
+        "valid": bool(
+            origin.get("leftValid", origin.get("valid", False))
+            and origin.get("rightValid", origin.get("valid", False))
+        ),
         "leftValid": bool(origin.get("leftValid", origin.get("valid", False))),
         "rightValid": bool(origin.get("rightValid", origin.get("valid", False))),
         "leftPulse": list(origin.get("leftPulse", [0.0] * 6)),

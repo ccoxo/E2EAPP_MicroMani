@@ -4,7 +4,6 @@ import json
 import subprocess
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 VERIFY_SCRIPT = REPO_ROOT / "scripts" / "verify-hal-native-teleop-report.ps1"
 ACCEPT_SCRIPT = REPO_ROOT / "scripts" / "accept-hal-native-teleop.ps1"

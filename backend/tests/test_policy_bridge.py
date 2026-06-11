@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from backend.core.defaults import default_config
-from backend.app import create_app
-from backend.services.policy_bridge import build_policy_action_plan, lerobot_state_from_ui
 from fastapi.testclient import TestClient
+
+from backend.app import create_app
+from backend.core.defaults import default_config
+from backend.services.policy_bridge import build_policy_action_plan, lerobot_state_from_ui
 
 
 def test_lerobot_state_from_ui_inserts_grippers_and_converts_rotation_to_mdeg() -> None:

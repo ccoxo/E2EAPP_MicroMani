@@ -20,8 +20,8 @@ from backend.core.defaults import (
     ICF_ROTATION_WORK_LIMIT_DEFAULTS,
     ICF_TELEOP_DEFAULTS,
     ICF_TELEOP_STRATEGY_VERSION,
-    ICF_WORK_ORIGIN_OFFSET_DEFAULTS,
     ICF_WORK_ORIGIN_DEFAULTS,
+    ICF_WORK_ORIGIN_OFFSET_DEFAULTS,
     ICF_WORK_ORIGIN_VERSION,
     anchored_mechanical_soft_limits,
     default_config,
@@ -72,7 +72,7 @@ def _relative_soft_limits_from_teleop(config: dict[str, Any], side: str) -> dict
     maxes = teleop.get(f"{side}SoftLimitMax")
     fallback = ICF_LEFT_MOTION_SOFT_LIMITS if side == "left" else ICF_RIGHT_MOTION_SOFT_LIMITS
     if not isinstance(mins, list) or not isinstance(maxes, list) or len(mins) < 6 or len(maxes) < 6:
-        return json.loads(json.dumps(fallback))
+        return cast(dict[str, Any], json.loads(json.dumps(fallback)))
     try:
         return {
             axis: {
@@ -82,7 +82,7 @@ def _relative_soft_limits_from_teleop(config: dict[str, Any], side: str) -> dict
             for index, axis in enumerate(AXIS_KEYS)
         }
     except (TypeError, ValueError):
-        return json.loads(json.dumps(fallback))
+        return cast(dict[str, Any], json.loads(json.dumps(fallback)))
 
 
 def _six_float_list(value: Any, fallback: list[float] | None = None) -> list[float]:
@@ -346,13 +346,15 @@ def _normalize_left_yaw_window(config: dict[str, Any]) -> None:
         return
     try:
         origin_deg = (float(next_limits["min"]) / 1000.0) + 7.0
-        current_min = float(left_yaw_soft.get("min")) / 1000.0
-        current_max = float(left_yaw_soft.get("max")) / 1000.0
+        current_min = float(cast(Any, left_yaw_soft.get("min"))) / 1000.0
+        current_max = float(cast(Any, left_yaw_soft.get("max"))) / 1000.0
     except (TypeError, ValueError):
         left_soft_limits["yaw"] = next_limits
         return
     current_width = current_max - current_min
-    if current_min > current_max or (_float_close(current_width, 14.0, 1e-3) and not (current_min <= origin_deg <= current_max)):
+    if current_min > current_max or (
+        _float_close(current_width, 14.0, 1e-3) and not (current_min <= origin_deg <= current_max)
+    ):
         left_soft_limits["yaw"] = next_limits
 
 
@@ -409,8 +411,8 @@ def _normalize_right_roll_window(config: dict[str, Any]) -> None:
     if not isinstance(right_roll_soft, dict) or next_limits is None:
         return
     try:
-        current_min = float(right_roll_soft.get("min")) / 1000.0
-        current_max = float(right_roll_soft.get("max")) / 1000.0
+        current_min = float(cast(Any, right_roll_soft.get("min"))) / 1000.0
+        current_max = float(cast(Any, right_roll_soft.get("max"))) / 1000.0
     except (TypeError, ValueError):
         right_soft_limits["roll"] = next_limits
         return

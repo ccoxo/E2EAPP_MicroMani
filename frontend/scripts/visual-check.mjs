@@ -7,8 +7,11 @@ import { chromium } from 'playwright'
 
 const port = 5174
 const baseUrl = `http://127.0.0.1:${port}`
+const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 
-const build = spawnSync('npm', ['run', 'build'], { stdio: 'inherit' })
+const build = process.platform === 'win32'
+  ? spawnSync(`${npmCommand} run build`, { shell: true, stdio: 'inherit' })
+  : spawnSync(npmCommand, ['run', 'build'], { stdio: 'inherit' })
 if (build.status !== 0) {
   throw new Error('build failed before visual check')
 }

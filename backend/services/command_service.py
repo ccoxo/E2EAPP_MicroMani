@@ -313,7 +313,10 @@ class CommandService:
     async def home_motion_side(self, side: str) -> dict[str, object]:
         self._validate_side(side)
         self._ensure_origin_mutation_allowed()
-        result = await self.hal.command("motion.home_side", {"side": side, "enabledAxes": self._home_enabled_axes(side)})
+        result = await self.hal.command(
+            "motion.home_side",
+            {"side": side, "enabledAxes": self._home_enabled_axes(side)},
+        )
         state = await self.hal.motion_state()
         pulses = self._motion_state_pulses(state)
         config = self.settings.get_config()
@@ -389,7 +392,7 @@ class CommandService:
             origin["previousValid"] = True
             origin["previousLeftPulse"] = list(cast(list[float], origin["leftPulse"]))
             origin["previousRightPulse"] = list(cast(list[float], origin["rightPulse"]))
-            origin["previousUpdatedAt"] = int(origin["updatedAt"])
+            origin["previousUpdatedAt"] = int(cast(Any, origin["updatedAt"]))
         home_reference = self._normalized_home_reference(config)
         work_origin_offset = self._normalized_work_origin_offset(config)
         captured_at = now_ms()
@@ -426,10 +429,10 @@ class CommandService:
         current_valid = bool(origin["valid"])
         current_left = list(cast(list[float], origin["leftPulse"]))
         current_right = list(cast(list[float], origin["rightPulse"]))
-        current_updated_at = int(origin["updatedAt"])
+        current_updated_at = int(cast(Any, origin["updatedAt"]))
         origin["leftPulse"] = list(cast(list[float], origin["previousLeftPulse"]))
         origin["rightPulse"] = list(cast(list[float], origin["previousRightPulse"]))
-        origin["updatedAt"] = int(origin["previousUpdatedAt"])
+        origin["updatedAt"] = int(cast(Any, origin["previousUpdatedAt"]))
         origin["leftValid"] = True
         origin["rightValid"] = True
         origin["valid"] = True
@@ -586,7 +589,14 @@ class CommandService:
 
     async def gripper_command(self, request: GripperCommandRequest) -> dict[str, object]:
         config = self.settings.get_config()
-        if self.hardware is not None and self._real_hardware_mode(config) and self._hal_native_teleop(config):
+        gripper_workers = self.gripper_workers
+        use_gripper_workers = gripper_workers is not None and gripper_workers.is_enabled(config)
+        if (
+            self.hardware is not None
+            and self._real_hardware_mode(config)
+            and self._hal_native_teleop(config)
+            and not use_gripper_workers
+        ):
             target = self._gripper_command_target(config, request)
             side_label = "left gripper" if request.side == "left" else "right gripper"
             if target is None:
@@ -676,12 +686,13 @@ class CommandService:
         self._validate_gripper_command_enabled(config, request)
         if self.hardware is not None and self._real_hardware_mode(config):
             # 真机成功响应后才保存目标开合度，避免 UI 记住未执行的硬件状态。
-            use_gripper_workers = self.gripper_workers is not None and self.gripper_workers.is_enabled(config)
             gripper_backend = "dual_worker" if use_gripper_workers else "python_rs485"
             target = self._gripper_command_target(config, request)
             dispatch_command, dispatch_target = self._gripper_dispatch_command(config, request, target)
             if use_gripper_workers:
-                result = self.gripper_workers.command(config, request.side, dispatch_command, dispatch_target)
+                if gripper_workers is None:
+                    raise RuntimeError("gripper worker service is not available")
+                result = gripper_workers.command(config, request.side, dispatch_command, dispatch_target)
             else:
                 result = self.hardware.gripper.command(config, request.side, dispatch_command, dispatch_target)
             if not result.ok:
@@ -707,10 +718,10 @@ class CommandService:
             )
             side_label = "left gripper" if request.side == "left" else "right gripper"
             self.logs.info("[GRIPPER]", f"{side_label} {request.command}: {result.message}")
-            response: dict[str, object] = {"message": result.message}
+            worker_response: dict[str, object] = {"message": result.message}
             if target is not None:
-                response["targetMm"] = target
-            return response
+                worker_response["targetMm"] = target
+            return worker_response
         config = self.settings.get_config()
         target = self._gripper_command_target(config, request)
         if target is None:
@@ -742,7 +753,7 @@ class CommandService:
         busy: bool = False,
         clip: str = "none",
         soft_limit: dict[str, float] | None = None,
-    ) -> dict[str, object]:
+    ) -> dict[str, Any]:
         axis_index = AXIS_ORDER.index(request.axis)
         side_offset = 0 if request.side == "left" else 6
         motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
@@ -1137,7 +1148,11 @@ class CommandService:
             limits = effective_limits_ui(config, side)
         except WorkOriginMissing as exc:
             raise RuntimeError(str(exc)) from exc
-        axes = enabled_axes if isinstance(enabled_axes, list) and len(enabled_axes) >= 6 else self._home_enabled_axes(side)
+        axes = (
+            enabled_axes
+            if isinstance(enabled_axes, list) and len(enabled_axes) >= 6
+            else self._home_enabled_axes(side)
+        )
         for axis_index, axis_name in enumerate(AXIS_ORDER):
             if not axes[axis_index]:
                 continue
@@ -1167,7 +1182,9 @@ class CommandService:
         elif isinstance(raw_enabled, dict):
             value = raw_enabled.get(side)
             if value is not True:
-                disabled_axes = [axis_name for axis_index, axis_name in enumerate(AXIS_ORDER) if enabled_axes[axis_index]]
+                disabled_axes = [
+                    axis_name for axis_index, axis_name in enumerate(AXIS_ORDER) if enabled_axes[axis_index]
+                ]
         else:
             raise RuntimeError("HAL motion state does not include enabled feedback")
         if disabled_axes:

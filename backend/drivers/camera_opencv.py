@@ -12,7 +12,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from importlib import import_module
 from threading import Event, Lock, Thread, current_thread
-from typing import Any
+from typing import Any, cast
 
 from backend.core.schemas import CameraTelemetry, ConnectionState
 
@@ -236,9 +236,9 @@ class _ProcessCameraCapture:
 
     def exitcode(self) -> int | None:
         if hasattr(self.process, "exitcode"):
-            return self.process.exitcode
+            return cast(int | None, self.process.exitcode)
         if hasattr(self.process, "poll"):
-            return self.process.poll()
+            return cast(int | None, self.process.poll())
         return None
 
     def get(self, prop: int) -> float:
@@ -592,6 +592,7 @@ class OpenCVCameraDriver:
             capture = self._get_capture(cv2, index, width, height, fps_config, camera, config)
             if capture is None:
                 raise RuntimeError(f"{camera} index {index} open failed")
+            actual: dict[str, float | None]
             if getattr(capture, "is_process_capture", False):
                 actual = {
                     "autoExposure": None,
@@ -1357,7 +1358,7 @@ class OpenCVCameraDriver:
 
     def _clamp_float(self, value: object, low: float, high: float, fallback: float) -> float:
         try:
-            parsed = float(value)
+            parsed = float(cast(Any, value))
         except (TypeError, ValueError):
             parsed = fallback
         return min(high, max(low, parsed))
@@ -1437,7 +1438,7 @@ class OpenCVCameraDriver:
                         continue
                     monotonic_ms = status.get("monotonicMs")
                     try:
-                        frame_time = float(monotonic_ms) / 1000.0
+                        frame_time = float(cast(Any, monotonic_ms)) / 1000.0
                     except (TypeError, ValueError):
                         frame_time = time.monotonic()
                     self._record_frame_timestamp(index, frame_time)
