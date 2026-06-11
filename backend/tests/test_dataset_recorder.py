@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import queue
 import time
@@ -323,6 +324,36 @@ def test_lerobot_writer_keeps_dataset_open_after_saved_episode() -> None:
     assert fake_dataset.save_calls == 1
     assert fake_dataset.finalize_calls == 0
     assert writer._dataset is fake_dataset
+
+
+def test_native_writer_command_times_out_when_writer_does_not_complete() -> None:
+    class StalledWriter:
+        def __init__(self) -> None:
+            self.future: Future[object] | None = None
+
+        def is_alive(self) -> bool:
+            return True
+
+        def submit(self, _kind: str) -> Future[object]:
+            self.future = Future()
+            return self.future
+
+    async def run_case() -> None:
+        writer = StalledWriter()
+        recorder = object.__new__(DatasetRecorderService)
+        recorder._writer_thread = writer
+        recorder._native_writer_command_timeout_s = 0.01
+        task = asyncio.create_task(recorder._native_writer_command("save_episode"))
+        try:
+            with pytest.raises(RuntimeError, match="native LeRobot writer command timed out"):
+                await asyncio.wait_for(task, timeout=0.2)
+        finally:
+            if writer.future is not None and not writer.future.done():
+                writer.future.set_result(None)
+            with contextlib.suppress(BaseException):
+                await task
+
+    asyncio.run(run_case())
 
 
 def test_dataset_recorder_configures_native_chunk_settings_for_independent_episode_files() -> None:

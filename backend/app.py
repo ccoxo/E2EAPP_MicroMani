@@ -1557,8 +1557,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def save_episode() -> ApiEnvelope:
         try:
             await stop_aux_native_teleop_sources("record episode save")
-            result = await recorder.save_episode()
-            gripper_tele.stop("recording")
+            try:
+                result = await recorder.save_episode()
+            finally:
+                gripper_tele.stop("recording")
             return envelope(result)
         except DatasetSaveError as exc:
             raise HTTPException(status_code=500, detail={"code": "RECORDING_SAVE_FAILED", "message": str(exc)}) from exc

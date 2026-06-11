@@ -20,7 +20,7 @@ from backend.core.motion_limits import effective_limits_ui, side_home_reference_
 from backend.core.schemas import GripperCommandRequest
 from backend.drivers.camera_opencv import OpenCVCameraDriver
 from backend.hal_client.client import HalHealth, RealHalClient, TestHalClient
-from backend.services.dataset_recorder import DatasetRecorderService
+from backend.services.dataset_recorder import DatasetRecorderService, DatasetSaveError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -2288,6 +2288,34 @@ def test_record_session_controls_gripper_teleop_recording_source(tmp_path: Path,
     assert start_response.status_code == 200
     assert save_response.status_code == 200
     assert start_calls == ["recording"]
+    assert stop_calls == ["recording"]
+
+
+def test_record_save_failure_stops_gripper_teleop_recording_source(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    config = client.app.state.settings.get_config()
+    config["teleop"]["engine"] = "python_mapper"
+    client.app.state.settings.save_config(config, emit_log=False)
+    stop_calls: list[str] = []
+
+    async def fake_save_episode() -> dict[str, Any]:
+        raise DatasetSaveError("writer failed")
+
+    monkeypatch.setattr(client.app.state.recorder, "save_episode", fake_save_episode)
+    monkeypatch.setattr(
+        client.app.state.gripper_tele,
+        "stop",
+        lambda source="manual", force=False: stop_calls.append("force" if force else source),
+    )
+
+    response = client.post("/api/record/episode/save")
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["code"] == "RECORDING_SAVE_FAILED"
     assert stop_calls == ["recording"]
 
 

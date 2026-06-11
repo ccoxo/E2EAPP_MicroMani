@@ -17,6 +17,7 @@ import uuid
 from bisect import bisect_left
 from collections import deque
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -111,6 +112,7 @@ WRITE_QUEUE_MAX_FRAMES = 1200
 WRITE_QUEUE_PUT_TIMEOUT_S = 1.0
 ASSEMBLY_QUEUE_MAX_FRAMES = 120
 ASSEMBLY_QUEUE_PUT_TIMEOUT_S = 1.0
+NATIVE_WRITER_COMMAND_TIMEOUT_S = 5.0
 SAMPLER_START_LEAD_S = 0.05
 RECORDER_HARDWARE_WARMUP_S = 0.5
 MAX_SAMPLE_JITTER_S = 0.10
@@ -193,6 +195,10 @@ class LeRobotWriterThread:
     def join(self, timeout: float | None = None) -> None:
         """等待写入线程结束，支持可选超时。"""
         self._thread.join(timeout=timeout)
+
+    def is_alive(self) -> bool:
+        """返回写线程是否仍在消费命令。"""
+        return self._thread.is_alive()
 
     def submit(self, kind: str) -> Future[Any]:
         """向写线程投递控制命令，并返回用于等待结果的 Future。"""
@@ -1378,8 +1384,14 @@ class DatasetRecorderService:
         writer = self._writer_thread
         if writer is None:
             return None
+        if not writer.is_alive():
+            raise RuntimeError("native LeRobot writer is not running")
         future = writer.submit(kind)
-        return await asyncio.to_thread(future.result)
+        timeout_s = float(getattr(self, "_native_writer_command_timeout_s", NATIVE_WRITER_COMMAND_TIMEOUT_S))
+        try:
+            return await asyncio.to_thread(future.result, timeout=timeout_s)
+        except FutureTimeoutError as exc:
+            raise RuntimeError(f"native LeRobot writer command timed out: {kind}") from exc
 
     async def _try_begin_native_dataset(self, config: dict[str, Any]) -> bool:
         """在写线程中打开或恢复 native 数据集，失败时记录错误原因。"""
