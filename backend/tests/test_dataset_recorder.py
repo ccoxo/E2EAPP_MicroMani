@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from backend.core.defaults import default_config
+from backend.services import dataset_recorder as dataset_recorder_module
 from backend.services.dataset_recorder import (
     DatasetRecorderService,
     DatasetSaveError,
@@ -1053,6 +1054,189 @@ def test_dataset_recorder_starts_recording_teleop_without_pre_home(
             assert teleop.start_calls == [("recording", False)]
         finally:
             await recorder.finish_session()
+
+    asyncio.run(run_case())
+
+
+def test_dataset_recorder_rejects_concurrent_start_while_native_dataset_opens(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_case() -> None:
+        config = default_config()
+        config["hal"]["mode"] = "mock"
+        config["storage"]["datasetRoot"] = str(tmp_path / "datasets")
+
+        class CapturingTeleop:
+            async def start(
+                self,
+                source: str = "recording",
+                home_side: str | None = None,
+                *,
+                pre_home: bool = True,
+            ) -> dict[str, object]:
+                _ = (source, home_side, pre_home)
+                return {}
+
+            async def stop(self, source: str) -> None:
+                _ = source
+
+            def status(self) -> dict[str, object]:
+                return {}
+
+        class FakeWriterThread:
+            def __init__(self, _recorder: object, _queue: object) -> None:
+                self.alive = False
+
+            def start(self) -> None:
+                self.alive = True
+
+            def join(self, timeout: float | None = None) -> None:
+                _ = timeout
+                self.alive = False
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+            def submit(self, _kind: str) -> Future[object]:
+                future: Future[object] = Future()
+                future.set_result(None)
+                return future
+
+        recorder = DatasetRecorderService(
+            SimpleNamespace(get_config=lambda: config),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(recording=False, episode_count=0, frame_count=0),
+            SimpleNamespace(info=lambda *_args: None, warning=lambda *_args: None, error=lambda *_args: None),
+            CapturingTeleop(),
+        )
+        monkeypatch.setattr(dataset_recorder_module, "LeRobotWriterThread", FakeWriterThread)
+        monkeypatch.setattr(recorder, "_write_appstation_info", lambda *_args: None)
+        monkeypatch.setattr(recorder, "_next_episode_index", lambda _dataset_dir: 0)
+        monkeypatch.setattr(recorder, "_native_writer_active", lambda: False)
+        monkeypatch.setattr(recorder, "_start_sampler_tasks_locked", lambda: None)
+        monkeypatch.setattr(recorder, "_record_loop", lambda: asyncio.sleep(0))
+        monkeypatch.setattr(recorder, "_frame_assembler_loop", lambda: asyncio.sleep(0))
+        monkeypatch.setattr(recorder, "_wait_for_episode_warmup", lambda: asyncio.sleep(0))
+        monkeypatch.setattr(recorder, "_stop_assembler_task", lambda: asyncio.sleep(0))
+        monkeypatch.setattr(recorder, "_stop_sampler_tasks", lambda: asyncio.sleep(0))
+        monkeypatch.setattr(recorder, "_finalize_native_dataset", lambda: asyncio.sleep(0))
+        monkeypatch.setattr(recorder, "_stop_writer_task", lambda: asyncio.sleep(0))
+
+        native_entered = asyncio.Event()
+        native_release = asyncio.Event()
+        native_attempts = 0
+
+        async def begin_native(_config: dict[str, object]) -> bool:
+            nonlocal native_attempts
+            native_attempts += 1
+            if native_attempts == 1:
+                native_entered.set()
+                await native_release.wait()
+            return True
+
+        monkeypatch.setattr(recorder, "_try_begin_native_dataset", begin_native)
+
+        first = asyncio.create_task(recorder.start_session("unit-a", "task"))
+        await native_entered.wait()
+        try:
+            with pytest.raises(RuntimeError, match="record session already active"):
+                await recorder.start_session("unit-b", "task")
+        finally:
+            native_release.set()
+            with contextlib.suppress(BaseException):
+                await first
+            await recorder.finish_session()
+
+        assert native_attempts == 1
+
+    asyncio.run(run_case())
+
+
+def test_dataset_recorder_start_session_runs_blocking_setup_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_case() -> None:
+        config = default_config()
+        config["hal"]["mode"] = "mock"
+        config["storage"]["datasetRoot"] = str(tmp_path / "datasets")
+        to_thread_calls: list[str] = []
+
+        class FakeSettings:
+            def get_config(self) -> dict[str, object]:
+                return config
+
+        class CapturingTeleop:
+            async def start(
+                self,
+                source: str = "recording",
+                home_side: str | None = None,
+                *,
+                pre_home: bool = True,
+            ) -> dict[str, object]:
+                _ = (source, home_side, pre_home)
+                return {}
+
+            async def stop(self, source: str) -> None:
+                _ = source
+
+            def status(self) -> dict[str, object]:
+                return {}
+
+        class FakeWriterThread:
+            def __init__(self, _recorder: object, _queue: object) -> None:
+                self.alive = False
+
+            def start(self) -> None:
+                self.alive = True
+
+            def join(self, timeout: float | None = None) -> None:
+                _ = timeout
+                self.alive = False
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+            def submit(self, _kind: str) -> Future[object]:
+                future: Future[object] = Future()
+                future.set_result(None)
+                return future
+
+        async def fake_to_thread(func: object, *args: object, **kwargs: object) -> object:
+            to_thread_calls.append(getattr(func, "__name__", type(func).__name__))
+            return func(*args, **kwargs)  # type: ignore[operator]
+
+        recorder = DatasetRecorderService(
+            FakeSettings(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(recording=False, episode_count=0, frame_count=0),
+            SimpleNamespace(info=lambda *_args: None, warning=lambda *_args: None, error=lambda *_args: None),
+            CapturingTeleop(),
+        )
+        monkeypatch.setattr(dataset_recorder_module, "LeRobotWriterThread", FakeWriterThread)
+        monkeypatch.setattr(dataset_recorder_module.asyncio, "to_thread", fake_to_thread)
+        monkeypatch.setattr(recorder, "_try_begin_native_dataset", lambda _config: asyncio.sleep(0, result=True))
+        monkeypatch.setattr(recorder, "_write_appstation_info", lambda *_args: None)
+        monkeypatch.setattr(recorder, "_next_episode_index", lambda _dataset_dir: 0)
+        monkeypatch.setattr(recorder, "_native_writer_active", lambda: True)
+        monkeypatch.setattr(recorder, "_start_sampler_tasks_locked", lambda: None)
+        monkeypatch.setattr(recorder, "_record_loop", lambda: asyncio.sleep(0))
+        monkeypatch.setattr(recorder, "_frame_assembler_loop", lambda: asyncio.sleep(0))
+        monkeypatch.setattr(recorder, "_wait_for_episode_warmup", lambda: asyncio.sleep(0))
+        monkeypatch.setattr(recorder, "_stop_assembler_task", lambda: asyncio.sleep(0))
+        monkeypatch.setattr(recorder, "_stop_sampler_tasks", lambda: asyncio.sleep(0))
+        monkeypatch.setattr(recorder, "_finalize_native_dataset", lambda: asyncio.sleep(0))
+        monkeypatch.setattr(recorder, "_stop_writer_task", lambda: asyncio.sleep(0))
+
+        try:
+            await recorder.start_session("unit", "task")
+        finally:
+            await recorder.finish_session()
+
+        assert to_thread_calls[:4] == ["get_config", "mkdir", "<lambda>", "<lambda>"]
 
     asyncio.run(run_case())
 

@@ -463,6 +463,7 @@ class DatasetRecorderService:
         self._write_enqueue_idle = asyncio.Event()
         self._write_enqueue_idle.set()
         self._session_active = False
+        self._session_starting = False
         self._recording = False
         self._accepting_frame_jobs = False
         self._samplers_paused = False
@@ -523,41 +524,64 @@ class DatasetRecorderService:
     async def start_session(self, dataset_name: str, task: str) -> dict[str, Any]:
         """创建录制会话，初始化 native 写入路径、采样线程和组帧任务。"""
         async with self._lock:
-            if self._session_active:
+            if self._session_active or self._session_starting:
                 raise RuntimeError("record session already active")
-            config = self.settings.get_config()
-            self._recording_config_snapshot = deepcopy(config)
-            self._dataset_name = dataset_name.strip() or "micro_assembly_v1"
-            self._dataset_id = self._safe_id(self._dataset_name)
-            self._task = task.strip() or "unspecified task"
-            self._session_id = f"session-{now_ms()}"
-            self._last_saved_episode = None
-            self._reset_pending = False
-            self._reset_required_sides = {"left"}
-            self._reset_returned_sides = set()
-            self._record_fps_hz = self._record_fps_from_config(config)
-            self._force_sample_hz = self._force_sample_hz_from_config(config)
-            dataset_root = self._dataset_root(config)
-            dataset_root.mkdir(parents=True, exist_ok=True)
-            self._dataset_dir = dataset_root / self._dataset_id
-            self._native_dataset = None
-            self._native_error = ""
-            self._native_total_frames_cached = 0
-            self._last_native_camera_frames = {}
-            self._assembly_queue = asyncio.Queue(maxsize=ASSEMBLY_QUEUE_MAX_FRAMES)
-            self._write_queue = queue.Queue(maxsize=WRITE_QUEUE_MAX_FRAMES)
-            self._writer_thread = LeRobotWriterThread(self, self._write_queue)
-            self._writer_thread.start()
-        native_started = await self._try_begin_native_dataset(config)
-        if not native_started:
-            await self._stop_writer_task()
-            raise RuntimeError(self._native_required_message())
+            self._session_starting = True
+
         try:
+            config = await asyncio.to_thread(self.settings.get_config)
+            next_dataset_name = dataset_name.strip() or "micro_assembly_v1"
+            next_dataset_id = self._safe_id(next_dataset_name)
+            next_task = task.strip() or "unspecified task"
+            dataset_root = self._dataset_root(config)
+            dataset_dir = dataset_root / next_dataset_id
+            await asyncio.to_thread(dataset_root.mkdir, parents=True, exist_ok=True)
+
             async with self._lock:
-                self._write_appstation_info(self._require_dataset_dir(), config)
-                self._episode_index = self._next_episode_index(self._dataset_dir)
+                self._recording_config_snapshot = deepcopy(config)
+                self._dataset_name = next_dataset_name
+                self._dataset_id = next_dataset_id
+                self._task = next_task
+                self._session_id = f"session-{now_ms()}"
+                self._last_saved_episode = None
+                self._reset_pending = False
+                self._reset_required_sides = {"left"}
+                self._reset_returned_sides = set()
+                self._record_fps_hz = self._record_fps_from_config(config)
+                self._force_sample_hz = self._force_sample_hz_from_config(config)
+                self._dataset_dir = dataset_dir
+                self._native_dataset = None
+                self._native_error = ""
+                self._native_total_frames_cached = 0
+                self._last_native_camera_frames = {}
+                self._assembly_queue = asyncio.Queue(maxsize=ASSEMBLY_QUEUE_MAX_FRAMES)
+                self._write_queue = queue.Queue(maxsize=WRITE_QUEUE_MAX_FRAMES)
+                self._writer_thread = LeRobotWriterThread(self, self._write_queue)
+                self._writer_thread.start()
+        except (asyncio.CancelledError, Exception):
+            async with self._lock:
+                self._session_starting = False
+            raise
+
+        try:
+            native_started = await self._try_begin_native_dataset(config)
+            if not native_started:
+                await self._stop_writer_task()
+                raise RuntimeError(self._native_required_message())
+        except (asyncio.CancelledError, Exception):
+            async with self._lock:
+                self._session_starting = False
+            raise
+
+        try:
+            await asyncio.to_thread(self._write_appstation_info, dataset_dir, config)
+            episode_index = await asyncio.to_thread(self._next_episode_index, dataset_dir)
+            async with self._lock:
+                self._dataset_dir = dataset_dir
+                self._episode_index = episode_index
                 self._session_started_at = time.monotonic()
                 self._session_active = True
+                self._session_starting = False
                 self._write_enqueue_pending = 0
                 self._write_enqueue_idle.set()
                 self._begin_episode_locked()
@@ -572,10 +596,12 @@ class DatasetRecorderService:
             await self.teleop.start("recording", pre_home=False)
             await self._wait_for_episode_warmup()
         except (asyncio.CancelledError, Exception):
+            async with self._lock:
+                self._session_starting = False
             await self._rollback_failed_start()
             raise
         self.logs.info("[LEROBOT]", f"record session started: {self._dataset_name} episode={self._episode_index:06d}")
-        return self.status()
+        return await asyncio.to_thread(self.status)
 
     async def save_episode(self) -> dict[str, Any]:
         """停止当前 episode 采集，等待队列落盘并保存 episode 元数据。"""
@@ -610,7 +636,7 @@ class DatasetRecorderService:
             raise
         await self.teleop.stop("recording")
         self.logs.info("[LEROBOT]", f"record episode saved: {episode['id']}")
-        return {"episode": episode, "status": self.status()}
+        return {"episode": episode, "status": await asyncio.to_thread(self.status)}
 
     async def discard_episode(self) -> dict[str, Any]:
         """丢弃正在录制或刚保存的 episode，并暂停到复位等待。"""
@@ -639,7 +665,7 @@ class DatasetRecorderService:
             self.telemetry.recording = False
         await self.teleop.stop("recording")
         self.logs.warning("[LEROBOT]", f"record episode discarded; waiting for reset episode={self._episode_index:06d}")
-        return self.status()
+        return await asyncio.to_thread(self.status)
 
     async def skip_reset(self) -> dict[str, Any]:
         """跳过复位等待，清理已保存标记并启动下一条 episode 录制。"""
@@ -688,7 +714,7 @@ class DatasetRecorderService:
                 await self.teleop.stop("recording")
             raise
         self.logs.info("[LEROBOT]", f"reset skipped; recording episode={self._episode_index:06d}")
-        return self.status()
+        return await asyncio.to_thread(self.status)
 
     async def finish_session(self) -> dict[str, Any]:
         """结束当前录制会话，停止采样、组帧、写入和 teleop 任务。"""
@@ -706,6 +732,7 @@ class DatasetRecorderService:
             self._recording = False
             self._accepting_frame_jobs = False
             self._session_active = False
+            self._session_starting = False
             self._last_saved_episode = None
             self._reset_pending = False
             self._reset_returned_sides = set()
@@ -738,7 +765,7 @@ class DatasetRecorderService:
         if cleanup_error is not None:
             raise cleanup_error
         self.logs.info("[LEROBOT]", "record session finished")
-        return self.status()
+        return await asyncio.to_thread(self.status)
 
     def _ordered_reset_sides(self, sides: set[str]) -> list[str]:
         return [side for side in ("left", "right") if side in sides]
@@ -807,7 +834,7 @@ class DatasetRecorderService:
 
     def origin_mutation_locked(self) -> bool:
         """录制会话存在时禁止修改硬件零点记录，保持 episode 坐标系可追溯。"""
-        return bool(self._session_active or self._recording)
+        return bool(getattr(self, "_session_starting", False) or self._session_active or self._recording)
 
     def list_datasets(self) -> list[dict[str, Any]]:
         """扫描数据集根目录，返回按更新时间排序的本地数据集摘要。"""
