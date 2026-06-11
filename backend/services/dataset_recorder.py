@@ -16,6 +16,7 @@ import time
 import uuid
 from bisect import bisect_left
 from collections import deque
+from collections.abc import Awaitable
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from copy import deepcopy
@@ -113,6 +114,7 @@ WRITE_QUEUE_PUT_TIMEOUT_S = 1.0
 ASSEMBLY_QUEUE_MAX_FRAMES = 120
 ASSEMBLY_QUEUE_PUT_TIMEOUT_S = 1.0
 NATIVE_WRITER_COMMAND_TIMEOUT_S = 5.0
+RECORDING_QUEUE_DRAIN_TIMEOUT_S = 30.0
 SAMPLER_START_LEAD_S = 0.05
 RECORDER_HARDWARE_WARMUP_S = 0.5
 MAX_SAMPLE_JITTER_S = 0.10
@@ -1463,19 +1465,29 @@ class DatasetRecorderService:
         self._sampler_threads = {}
 
     async def _drain_recording_queues(self) -> None:
-        # 内部说明。
         """等待组帧队列和写盘队列全部处理完成。"""
         assembly_queue = self._assembly_queue
         if assembly_queue is not None:
-            await assembly_queue.join()
-        await self._write_enqueue_idle.wait()
-        await asyncio.to_thread(self._write_queue.join)
+            await self._wait_recording_queue_drain(assembly_queue.join(), "frame assembly")
+        await self._wait_recording_queue_drain(self._write_enqueue_idle.wait(), "writer enqueue")
+        await self._wait_recording_queue_drain(asyncio.to_thread(self._write_queue.join), "writer queue")
+
+    def _recording_queue_drain_timeout_seconds(self) -> float:
+        return float(getattr(self, "_recording_queue_drain_timeout_s", RECORDING_QUEUE_DRAIN_TIMEOUT_S))
+
+    async def _wait_recording_queue_drain(self, awaitable: Awaitable[Any], label: str) -> None:
+        try:
+            await asyncio.wait_for(awaitable, timeout=self._recording_queue_drain_timeout_seconds())
+        except TimeoutError as exc:
+            message = f"recording queue drain timed out: {label}"
+            self._native_error = message
+            raise RuntimeError(message) from exc
 
     async def _stop_assembler_task(self) -> None:
         """排空组帧队列后取消组帧任务并清理队列引用。"""
         assembly_queue = self._assembly_queue
         if assembly_queue is not None:
-            await assembly_queue.join()
+            await self._wait_recording_queue_drain(assembly_queue.join(), "frame assembly")
         task = self._assembler_task
         if task is not None and not task.done():
             task.cancel()
@@ -1489,8 +1501,8 @@ class DatasetRecorderService:
     async def _stop_writer_task(self) -> None:
         # 停止 writer 前必须先排空队列，保证 metadata 的帧数和磁盘内容一致。
         """排空写入队列，发送停止哨兵并等待写线程退出。"""
-        await self._write_enqueue_idle.wait()
-        await asyncio.to_thread(self._write_queue.join)
+        await self._wait_recording_queue_drain(self._write_enqueue_idle.wait(), "writer enqueue")
+        await self._wait_recording_queue_drain(asyncio.to_thread(self._write_queue.join), "writer queue")
         writer = self._writer_thread
         if writer is None:
             return

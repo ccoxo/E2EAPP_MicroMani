@@ -356,6 +356,48 @@ def test_native_writer_command_times_out_when_writer_does_not_complete() -> None
     asyncio.run(run_case())
 
 
+def test_recording_queue_drain_times_out_when_write_enqueue_never_idles() -> None:
+    async def run_case() -> None:
+        recorder = object.__new__(DatasetRecorderService)
+        recorder._assembly_queue = None
+        recorder._write_enqueue_idle = asyncio.Event()
+        recorder._write_queue = queue.Queue()
+        recorder._recording_queue_drain_timeout_s = 0.01
+
+        with pytest.raises(RuntimeError, match="recording queue drain timed out: writer enqueue"):
+            await asyncio.wait_for(recorder._drain_recording_queues(), timeout=0.2)
+
+    asyncio.run(run_case())
+
+
+def test_recording_queue_drain_times_out_when_write_queue_does_not_join() -> None:
+    class BlockingWriteQueue:
+        def __init__(self) -> None:
+            self.release = Event()
+
+        def join(self) -> None:
+            self.release.wait()
+
+    async def run_case() -> None:
+        write_queue = BlockingWriteQueue()
+        recorder = object.__new__(DatasetRecorderService)
+        recorder._assembly_queue = None
+        recorder._write_enqueue_idle = asyncio.Event()
+        recorder._write_enqueue_idle.set()
+        recorder._write_queue = write_queue
+        recorder._recording_queue_drain_timeout_s = 0.01
+        task = asyncio.create_task(recorder._drain_recording_queues())
+        try:
+            with pytest.raises(RuntimeError, match="recording queue drain timed out: writer queue"):
+                await asyncio.wait_for(task, timeout=0.2)
+        finally:
+            write_queue.release.set()
+            with contextlib.suppress(BaseException):
+                await task
+
+    asyncio.run(run_case())
+
+
 def test_dataset_recorder_configures_native_chunk_settings_for_independent_episode_files() -> None:
     recorder = object.__new__(DatasetRecorderService)
     calls: list[dict[str, float]] = []
