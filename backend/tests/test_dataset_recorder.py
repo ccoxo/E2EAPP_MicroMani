@@ -755,6 +755,100 @@ def test_dataset_recorder_save_drains_queued_assembly_before_closing_episode() -
     asyncio.run(run_case())
 
 
+def test_dataset_recorder_save_persists_episode_metadata_off_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_case() -> None:
+        recorder = object.__new__(DatasetRecorderService)
+        to_thread_calls: list[str] = []
+        recorder._session_active = True
+        recorder._recording = True
+        recorder._accepting_frame_jobs = True
+        recorder._episode_index = 0
+        recorder._reset_pending = False
+        recorder._samplers_paused = False
+        recorder._lock = asyncio.Lock()
+        recorder.telemetry = SimpleNamespace(recording=True, episode_count=0)
+        recorder._native_writer_active = lambda: False
+        recorder.logs = SimpleNamespace(info=lambda *_args: None)
+
+        async def fake_to_thread(func: object, *args: object, **kwargs: object) -> object:
+            to_thread_calls.append(getattr(func, "__name__", type(func).__name__))
+            return func(*args, **kwargs)  # type: ignore[operator]
+
+        async def drain() -> None:
+            return None
+
+        def finalize_episode(*, status: str, deleted: bool) -> dict[str, object]:
+            assert status == "review"
+            assert deleted is False
+            return {"id": "episode_000000", "episodeIndex": 0}
+
+        async def stop(source: str) -> None:
+            assert source == "recording"
+
+        def record_status() -> dict[str, object]:
+            return {"recording": recorder._recording}
+
+        monkeypatch.setattr(dataset_recorder_module.asyncio, "to_thread", fake_to_thread)
+        recorder._drain_recording_queues = drain
+        recorder._finalize_episode_locked = finalize_episode
+        recorder.teleop = SimpleNamespace(stop=stop)
+        recorder.status = record_status
+
+        result = await recorder.save_episode()
+
+        assert result["episode"]["id"] == "episode_000000"
+        assert to_thread_calls == ["finalize_episode", "record_status"]
+
+    asyncio.run(run_case())
+
+
+def test_dataset_recorder_discard_marks_saved_episode_off_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_case() -> None:
+        recorder = object.__new__(DatasetRecorderService)
+        to_thread_calls: list[str] = []
+        saved_episode = {"id": "episode_000001", "episodeIndex": 1}
+        recorder._session_active = True
+        recorder._recording = False
+        recorder._last_saved_episode = saved_episode
+        recorder._episode_index = 2
+        recorder._reset_pending = False
+        recorder._samplers_paused = False
+        recorder._lock = asyncio.Lock()
+        recorder.telemetry = SimpleNamespace(recording=False, episode_count=2)
+        recorder.logs = SimpleNamespace(warning=lambda *_args: None)
+
+        async def fake_to_thread(func: object, *args: object, **kwargs: object) -> object:
+            to_thread_calls.append(getattr(func, "__name__", type(func).__name__))
+            return func(*args, **kwargs)  # type: ignore[operator]
+
+        def mark_saved_episode_deleted(episode: dict[str, object]) -> None:
+            assert episode is saved_episode
+
+        async def stop(source: str) -> None:
+            assert source == "recording"
+
+        def record_status() -> dict[str, object]:
+            return {"recording": recorder._recording}
+
+        monkeypatch.setattr(dataset_recorder_module.asyncio, "to_thread", fake_to_thread)
+        recorder._mark_saved_episode_deleted_locked = mark_saved_episode_deleted
+        recorder.teleop = SimpleNamespace(stop=stop)
+        recorder.status = record_status
+
+        result = await recorder.discard_episode()
+
+        assert result["recording"] is False
+        assert recorder._episode_index == 1
+        assert recorder._last_saved_episode is None
+        assert to_thread_calls == ["mark_saved_episode_deleted", "record_status"]
+
+    asyncio.run(run_case())
+
+
 def test_dataset_recorder_save_failure_stops_recording_source() -> None:
     async def run_case() -> None:
         recorder = object.__new__(DatasetRecorderService)

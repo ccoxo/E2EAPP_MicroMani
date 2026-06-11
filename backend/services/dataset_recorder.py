@@ -617,7 +617,7 @@ class DatasetRecorderService:
             async with self._lock:
                 self._recording = False
                 self._accepting_frame_jobs = False
-                episode = self._finalize_episode_locked(status="review", deleted=False)
+                episode = await asyncio.to_thread(self._finalize_episode_locked, status="review", deleted=False)
                 self._last_saved_episode = episode
                 self._enter_reset_pending_locked()
                 self._samplers_paused = True
@@ -655,7 +655,7 @@ class DatasetRecorderService:
         async with self._lock:
             if not was_recording and self._last_saved_episode is not None:
                 episode_index = int(self._last_saved_episode.get("episodeIndex", self._episode_index))
-                self._mark_saved_episode_deleted_locked(self._last_saved_episode)
+                await asyncio.to_thread(self._mark_saved_episode_deleted_locked, self._last_saved_episode)
                 if episode_index < self._episode_index:
                     self._episode_index = episode_index
                     self.telemetry.episode_count = episode_index
