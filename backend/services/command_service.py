@@ -692,9 +692,21 @@ class CommandService:
             if use_gripper_workers:
                 if gripper_workers is None:
                     raise RuntimeError("gripper worker service is not available")
-                result = gripper_workers.command(config, request.side, dispatch_command, dispatch_target)
+                result = await asyncio.to_thread(
+                    gripper_workers.command,
+                    config,
+                    request.side,
+                    dispatch_command,
+                    dispatch_target,
+                )
             else:
-                result = self.hardware.gripper.command(config, request.side, dispatch_command, dispatch_target)
+                result = await asyncio.to_thread(
+                    self.hardware.gripper.command,
+                    config,
+                    request.side,
+                    dispatch_command,
+                    dispatch_target,
+                )
             if not result.ok:
                 self._log_gripper_command(
                     config,
