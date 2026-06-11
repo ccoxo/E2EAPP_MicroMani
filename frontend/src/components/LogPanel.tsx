@@ -1,12 +1,34 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { Button, Checkbox, Input, Select, Space, Typography } from 'antd'
-import { ChevronDown, ChevronUp, Download, Search, TriangleAlert } from 'lucide-react'
+import { Activity, ChevronDown, ChevronUp, Download, RotateCw, Search, TriangleAlert } from 'lucide-react'
 import { useMemo, useRef, useState } from 'react'
 import { channelColor, logChannels } from '../data'
 import { useTelemetryStore } from '../stores/telemetry'
 import type { LogLevel } from '../types'
 
 const levelOptions: Array<LogLevel | 'ALL'> = ['ALL', 'DEBUG', 'INFO', 'WARNING', 'ERROR']
+const quickFilters = [
+  {
+    label: 'Teleop',
+    query: 'event=teleop_(axis_trace|status|origin_transition|mode|profile)',
+    icon: <Activity size={13} />,
+  },
+  {
+    label: 'Axis',
+    query: 'event=teleop_axis_trace',
+    icon: <Activity size={13} />,
+  },
+  {
+    label: 'Roll',
+    query: 'event=teleop_(axis_trace|status).*axis=Roll|axis=Roll.*event=teleop_(axis_trace|status)',
+    icon: <RotateCw size={13} />,
+  },
+  {
+    label: 'Motion err',
+    query: 'updateRet=\\[[^\\]]*[1-9][^\\]]*\\]|clipped=\\[[^\\]]+:1\\]|clip=(?!-|""|\\s)',
+    icon: <TriangleAlert size={13} />,
+  },
+]
 /** 格式化对应数值用于界面展示。 */
 function formatLogTime(ts: number) {
   const date = new Date(ts)
@@ -81,6 +103,19 @@ export function LogPanel() {
             <>
               <Checkbox.Group options={logChannels} value={selectedChannels} onChange={(value) => setSelectedChannels(value.map(String))} />
               <Select size="small" value={level} options={levelOptions.map((item) => ({ value: item, label: item }))} onChange={setLevel} />
+              <Space size={4} className="log-quick-filters">
+                {quickFilters.map((item) => (
+                  <Button
+                    key={item.label}
+                    size="small"
+                    type={search === item.query ? 'primary' : 'default'}
+                    icon={item.icon}
+                    onClick={() => setSearch(item.query)}
+                  >
+                    {item.label}
+                  </Button>
+                ))}
+              </Space>
               <Input size="small" prefix={<Search size={14} />} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="regex / keyword" />
             </>
           )}

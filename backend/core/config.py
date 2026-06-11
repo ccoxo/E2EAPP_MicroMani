@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, cast
 
@@ -26,7 +28,12 @@ from backend.core.defaults import (
     rotation_work_limits_from_soft_limits,
 )
 from backend.core.logging import LogService, now_ms, stable_config_hash
-from backend.core.motion_limits import WorkOriginMissing, effective_limits_ui, side_origin_ui, ui_limit_to_config
+from backend.core.motion_limits import (
+    WorkOriginMissing,
+    effective_limits_ui,
+    side_origin_ui,
+    ui_limit_to_config,
+)
 from backend.core.schemas import (
     AppConfig,
     MotionCardSnapshotConfig,
@@ -203,23 +210,43 @@ def _reanchor_stale_origin_windows(config: dict[str, Any]) -> None:
             reanchor_motion_soft_limits_to_current_origin(config, side)
 
 
-def reanchor_motion_soft_limits_to_current_origin(config: dict[str, Any], side: str | None = None) -> None:
+def _invalidate_origin_sides_outside_effective_limits(config: dict[str, Any]) -> None:
     motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
     origin = motion.get("origin", {}) if isinstance(motion, dict) else {}
+    offset = motion.get("workOriginOffset", {}) if isinstance(motion, dict) else {}
+    if not isinstance(origin, dict):
+        return
+    for side in ("left", "right"):
+        valid_key = "leftValid" if side == "left" else "rightValid"
+        if not bool(origin.get(valid_key, origin.get("valid", False))):
+            continue
+        if not _origin_outside_effective_limits(config, side):
+            continue
+        origin[valid_key] = False
+        if isinstance(offset, dict):
+            offset[valid_key] = False
+    origin["valid"] = bool(origin.get("leftValid", False) and origin.get("rightValid", False))
+    if isinstance(offset, dict):
+        offset["valid"] = bool(offset.get("leftValid", False) and offset.get("rightValid", False))
+
+
+def reanchor_motion_soft_limits_to_current_origin(config: dict[str, Any], side: str | None = None) -> None:
+    motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+    home_reference = motion.get("homeReference", {}) if isinstance(motion, dict) else {}
     kinematics = motion.get("kinematics", {}) if isinstance(motion, dict) else {}
-    if not isinstance(origin, dict) or not isinstance(kinematics, dict):
+    if not isinstance(home_reference, dict) or not isinstance(kinematics, dict):
         return
     sides = ("left", "right") if side is None else (side,)
     for active_side in sides:
         valid_key = "leftValid" if active_side == "left" else "rightValid"
         pulse_key = "leftPulse" if active_side == "left" else "rightPulse"
         signed_key = "leftSignedPulsePerUnit" if active_side == "left" else "rightSignedPulsePerUnit"
-        origin_pulse = origin.get(pulse_key)
+        reference_pulse = home_reference.get(pulse_key)
         signed_pulse_per_unit = kinematics.get(signed_key)
         if (
-            not bool(origin.get(valid_key, origin.get("valid", False)))
-            or not isinstance(origin_pulse, list)
-            or len(origin_pulse) < 6
+            not bool(home_reference.get(valid_key, home_reference.get("valid", False)))
+            or not isinstance(reference_pulse, list)
+            or len(reference_pulse) < 6
             or not isinstance(signed_pulse_per_unit, list)
             or len(signed_pulse_per_unit) < 6
         ):
@@ -227,7 +254,7 @@ def reanchor_motion_soft_limits_to_current_origin(config: dict[str, Any], side: 
         try:
             next_limits = anchored_mechanical_soft_limits(
                 _relative_soft_limits_from_motion(config, active_side),
-                [float(value) for value in origin_pulse[:6]],
+                [float(value) for value in reference_pulse[:6]],
                 [float(value) for value in signed_pulse_per_unit[:6]],
             )
             current_limits = motion.get(f"{active_side}SoftLimits")
@@ -261,16 +288,16 @@ def _side_axis_limits_for_current_origin(
     config: dict[str, Any], side: str, axis_index: int, min_deg: float, max_deg: float
 ) -> dict[str, float] | None:
     motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
-    origin = motion.get("origin", {}) if isinstance(motion, dict) else {}
+    home_reference = motion.get("homeReference", {}) if isinstance(motion, dict) else {}
     kinematics = motion.get("kinematics", {}) if isinstance(motion, dict) else {}
     valid_key = "leftValid" if side == "left" else "rightValid"
     pulse_key = "leftPulse" if side == "left" else "rightPulse"
     signed_key = "leftSignedPulsePerUnit" if side == "left" else "rightSignedPulsePerUnit"
-    side_pulse = origin.get(pulse_key) if isinstance(origin, dict) else None
+    side_pulse = home_reference.get(pulse_key) if isinstance(home_reference, dict) else None
     side_signed = kinematics.get(signed_key) if isinstance(kinematics, dict) else None
     if (
-        not isinstance(origin, dict)
-        or not bool(origin.get(valid_key, origin.get("valid", False)))
+        not isinstance(home_reference, dict)
+        or not bool(home_reference.get(valid_key, home_reference.get("valid", False)))
         or not isinstance(side_pulse, list)
         or len(side_pulse) <= axis_index
         or not isinstance(side_signed, list)
@@ -382,7 +409,6 @@ def _normalize_right_roll_window(config: dict[str, Any]) -> None:
     if not isinstance(right_roll_soft, dict) or next_limits is None:
         return
     try:
-        origin_deg = (float(next_limits["min"]) / 1000.0) + 95.0
         current_min = float(right_roll_soft.get("min")) / 1000.0
         current_max = float(right_roll_soft.get("max")) / 1000.0
     except (TypeError, ValueError):
@@ -390,7 +416,7 @@ def _normalize_right_roll_window(config: dict[str, Any]) -> None:
         return
     current_width = current_max - current_min
     stale_width = _float_close(current_width, 100.0, 1e-3) or _float_close(current_width, 190.0, 1e-3)
-    if current_min > current_max or (stale_width and not (current_min <= origin_deg <= current_max)):
+    if current_min > current_max or stale_width:
         right_soft_limits["roll"] = next_limits
 
 
@@ -422,9 +448,11 @@ class SettingsService:
         self.runtime_dir = runtime_dir
         self.config_path = runtime_dir / "config.json"
         self.snapshot_dir = runtime_dir / "snapshots"
+        self.work_origin_backup_dir = runtime_dir / "_work_origin_backups"
         self.logs = logs
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        self.work_origin_backup_dir.mkdir(parents=True, exist_ok=True)
         if not self.config_path.exists():
             self.save_config(default_config(), emit_log=False)
 
@@ -488,7 +516,8 @@ class SettingsService:
         validated = AppConfig.model_validate(config).model_dump(mode="json")
         old_hash = stable_config_hash(old_config) if old_config else "-"
         new_hash = stable_config_hash(validated)
-        self.config_path.write_text(json.dumps(validated, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._backup_current_work_origin(old_config)
+        self._atomic_write_json(self.config_path, validated)
         if emit_log:
             changes = _changed_config_leaves(old_config, validated)
             for key, old, new in changes[:50]:
@@ -621,6 +650,58 @@ class SettingsService:
             encoding="utf-8",
         )
 
+    def _backup_current_work_origin(self, config: dict[str, Any]) -> None:
+        motion = config.get("motion") if isinstance(config, dict) else None
+        if not isinstance(motion, dict):
+            return
+        origin = motion.get("origin")
+        if not isinstance(origin, dict):
+            return
+        if not bool(origin.get("valid") or origin.get("leftValid") or origin.get("rightValid")):
+            return
+        origin_copy = json.loads(json.dumps(origin))
+        origin_hash = stable_config_hash({"origin": origin_copy})
+        backup_path = self.work_origin_backup_dir / f"work-origin-{origin_hash[:12]}.json"
+        if backup_path.exists():
+            return
+        payload: dict[str, Any] = {
+            "createdAt": now_ms(),
+            "sourceConfigPath": str(self.config_path),
+            "sourceConfigHash": stable_config_hash(config),
+            "originHash": origin_hash,
+            "origin": origin_copy,
+        }
+        home_reference = motion.get("homeReference")
+        if isinstance(home_reference, dict):
+            payload["homeReference"] = json.loads(json.dumps(home_reference))
+        work_origin_offset = motion.get("workOriginOffset")
+        if isinstance(work_origin_offset, dict):
+            payload["workOriginOffset"] = json.loads(json.dumps(work_origin_offset))
+        self._atomic_write_json(backup_path, payload)
+
+    def _atomic_write_json(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f"{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_file:
+                temp_name = temp_file.name
+                temp_file.write(json.dumps(payload, ensure_ascii=False, indent=2))
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            os.replace(temp_name, path)
+        finally:
+            if temp_name is not None:
+                temp_path = Path(temp_name)
+                if temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+
     def _read_snapshot(self, snapshot_id: str) -> ParameterSnapshot:
         path = self._snapshot_path(snapshot_id)
         if not path.exists():
@@ -716,15 +797,35 @@ class SettingsService:
             if teleop.get("swapTeleopChannels") is False:
                 teleop["swapTeleopChannels"] = ICF_TELEOP_DEFAULTS["swapTeleopChannels"]
             try:
-                has_legacy_icf_translation_speed = (
-                    float(teleop.get("translationStartVelocityUmS", 0.0)) == 400.0
-                    and float(teleop.get("translationMaxVelocityUmS", 0.0)) == 5000.0
+                translation_speed = (
+                    float(teleop.get("translationStartVelocityUmS", 0.0)),
+                    float(teleop.get("translationMaxVelocityUmS", 0.0)),
                 )
             except (TypeError, ValueError):
-                has_legacy_icf_translation_speed = False
-            if has_legacy_icf_translation_speed:
+                translation_speed = (0.0, 0.0)
+            if translation_speed in {(400.0, 5000.0), (600.0, 8000.0), (900.0, 12000.0)}:
                 teleop["translationStartVelocityUmS"] = ICF_TELEOP_DEFAULTS["translationStartVelocityUmS"]
                 teleop["translationMaxVelocityUmS"] = ICF_TELEOP_DEFAULTS["translationMaxVelocityUmS"]
+            try:
+                rotation_speed = (
+                    float(teleop.get("rotationStartVelocityDegS", 0.0)),
+                    float(teleop.get("rotationMaxVelocityDegS", 0.0)),
+                )
+            except (TypeError, ValueError):
+                rotation_speed = (0.0, 0.0)
+            if rotation_speed in {(1.0, 12.0), (1.5, 18.0)}:
+                teleop["rotationStartVelocityDegS"] = ICF_TELEOP_DEFAULTS["rotationStartVelocityDegS"]
+                teleop["rotationMaxVelocityDegS"] = ICF_TELEOP_DEFAULTS["rotationMaxVelocityDegS"]
+            try:
+                profile_times = (
+                    float(teleop.get("motionProfileAccSec", 0.0)),
+                    float(teleop.get("motionProfileDecSec", 0.0)),
+                )
+            except (TypeError, ValueError):
+                profile_times = (0.0, 0.0)
+            if profile_times in {(0.05, 0.05), (0.04, 0.04)}:
+                teleop["motionProfileAccSec"] = ICF_TELEOP_DEFAULTS["motionProfileAccSec"]
+                teleop["motionProfileDecSec"] = ICF_TELEOP_DEFAULTS["motionProfileDecSec"]
             if teleop.get("leftAxisOutputScale") == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]:
                 teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
             if teleop.get("rightAxisOutputScale") == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]:
@@ -753,11 +854,11 @@ class SettingsService:
                 teleop["translationDeadzone"] = ICF_TELEOP_DEFAULTS["translationDeadzone"]
             if float(teleop.get("rotationDeadzone", 0.0)) == 0.02:
                 teleop["rotationDeadzone"] = ICF_TELEOP_DEFAULTS["rotationDeadzone"]
-            if float(teleop.get("translationInputEpsilon", 0.0)) == 1e-7:
+            if float(teleop.get("translationInputEpsilon", 0.0)) in {1e-7, 0.00002}:
                 teleop["translationInputEpsilon"] = ICF_TELEOP_DEFAULTS["translationInputEpsilon"]
-            if float(teleop.get("rotationInputEpsilon", 0.0)) in {0.001, 0.03}:
+            if float(teleop.get("rotationInputEpsilon", 0.0)) in {0.001, 0.03, 0.12}:
                 teleop["rotationInputEpsilon"] = ICF_TELEOP_DEFAULTS["rotationInputEpsilon"]
-            if int(teleop.get("continuousMicroConfirmTicks", 0)) == 2:
+            if int(teleop.get("continuousMicroConfirmTicks", 0)) < ICF_TELEOP_DEFAULTS["continuousMicroConfirmTicks"]:
                 teleop["continuousMicroConfirmTicks"] = ICF_TELEOP_DEFAULTS["continuousMicroConfirmTicks"]
             if teleop.get("leftDirectionSign") != ICF_TELEOP_DEFAULTS["leftDirectionSign"]:
                 teleop["leftDirectionSign"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftDirectionSign"]))
@@ -853,6 +954,10 @@ class SettingsService:
         _normalize_left_yaw_window(config)
         _normalize_right_roll_window(config)
         _normalize_right_pitch_window(config)
+        if isinstance(motion, dict):
+            reanchor_motion_soft_limits_to_current_origin(config)
+            if has_current_home_reference_strategy:
+                _invalidate_origin_sides_outside_effective_limits(config)
         if not has_current_home_reference_strategy:
             _reanchor_stale_origin_windows(config)
         gripper_teleop = teleop.get("gripperTeleop", {})

@@ -33,12 +33,17 @@ function Promote-HalCandidate {
   if (!$shouldPromote) {
     return
   }
-  if (Test-Path $TargetExe) {
-    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $backupName = "{0}.backup-{1}.exe" -f [System.IO.Path]::GetFileNameWithoutExtension($TargetExe), $stamp
-    Copy-Item -LiteralPath $TargetExe -Destination (Join-Path $halBuild $backupName) -Force
+  try {
+    if (Test-Path $TargetExe) {
+      $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+      $backupName = "{0}.backup-{1}.exe" -f [System.IO.Path]::GetFileNameWithoutExtension($TargetExe), $stamp
+      Copy-Item -LiteralPath $TargetExe -Destination (Join-Path $halBuild $backupName) -Force
+    }
+    Copy-Item -LiteralPath $CandidateExe -Destination $TargetExe -Force
+  } catch {
+    Write-Warning "HAL runtime promotion skipped for ${TargetExe}: $($_.Exception.Message)"
+    return
   }
-  Copy-Item -LiteralPath $CandidateExe -Destination $TargetExe -Force
   Write-Host "Promoted newer HAL build: $CandidateExe -> $TargetExe"
 }
 
@@ -88,6 +93,7 @@ if (Test-Path $runtimeConfig) {
 $env:APPSTATION_OMEGA7_LEFT_OPEN_ID = "$omegaLeftOpenId"
 $env:APPSTATION_OMEGA7_RIGHT_OPEN_ID = "$omegaRightOpenId"
 $env:APPSTATION_OMEGA7_SWAP_HANDS = if ($omegaSwapHands) { "true" } else { "false" }
+$env:APPSTATION_HAL_PORT = "$Port"
 $process = Start-Process -FilePath $halExe -WorkingDirectory $halBuild -WindowStyle Hidden -PassThru
 Start-Sleep -Seconds 2
 

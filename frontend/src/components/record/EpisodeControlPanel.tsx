@@ -1,6 +1,7 @@
 import { Button, Card, Divider, Form, Input, Progress, Select, Spin } from 'antd'
 import { Crosshair } from 'lucide-react'
 import React from 'react'
+import { motionSideReturnOriginReady } from '../../motionReturnReady'
 import { useTelemetryStore } from '../../stores/telemetry'
 
 const PRESET_TASKS = [
@@ -32,7 +33,7 @@ const HINTS = [
   { key: 'Ctrl', desc: '离合器切换' },
   { key: '1/2/3', desc: '速度粗/中/细' },
   { key: 'T', desc: '力觉 Tare' },
-  { key: 'R', desc: '回已记录零点' },
+  { key: 'R', desc: '回工作原点' },
   { key: 'P', desc: '暂停遥操作' },
 ]
 /** 格式化对应数值用于界面展示。 */
@@ -62,11 +63,18 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
   const toggleRecordClutch = useTelemetryStore((s) => s.toggleRecordClutch)
   const setRecordSpeedMode = useTelemetryStore((s) => s.setRecordSpeedMode)
   const returnRecordMotionOrigin = useTelemetryStore((s) => s.returnRecordMotionOrigin)
+  const motionEnabled = useTelemetryStore((s) => s.frame.motionEnabled)
+  const motionAxisEnabled = useTelemetryStore((s) => s.frame.motionAxisEnabled)
+  const resetReady = useTelemetryStore((s) => s.recordSession.resetReady)
+  const returnOriginInFlight = useTelemetryStore((s) => s.recordSession.returnOriginInFlight)
   const [pendingOriginSide, setPendingOriginSide] = React.useState<'left' | 'right' | null>(null)
 
   const cfg = phaseConfig[phase]
   const busy = phase === 'starting' || phase === 'saving' || phase === 'finishing'
+  const leftReturnReady = motionSideReturnOriginReady('left', motionEnabled, motionAxisEnabled)
+  const rightReturnReady = motionSideReturnOriginReady('right', motionEnabled, motionAxisEnabled)
   const handleReturnOrigin = async (side: 'left' | 'right') => {
+    if (!motionSideReturnOriginReady(side, motionEnabled, motionAxisEnabled)) return
     setPendingOriginSide(side)
     try {
       await returnRecordMotionOrigin(side)
@@ -172,7 +180,7 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
 
       {phase === 'resetting' && (
         <div className="record-action-stack">
-          <Button type="primary" block onClick={skipRecordReset} disabled={busy}>
+          <Button type="primary" block onClick={skipRecordReset} disabled={busy || returnOriginInFlight || !resetReady}>
             跳过复位，立即开始
           </Button>
           <Button danger block size="small" onClick={finishRecordSession} disabled={busy}>
@@ -209,19 +217,19 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
           size="small"
           icon={<Crosshair size={13} />}
           loading={pendingOriginSide === 'left'}
-          disabled={busy || pendingOriginSide !== null}
+          disabled={busy || returnOriginInFlight || pendingOriginSide !== null || !leftReturnReady}
           onClick={() => void handleReturnOrigin('left')}
         >
-          左从臂回已记录零点
+          左从臂回工作原点
         </Button>
         <Button
           size="small"
           icon={<Crosshair size={13} />}
           loading={pendingOriginSide === 'right'}
-          disabled={busy || pendingOriginSide !== null}
+          disabled={busy || returnOriginInFlight || pendingOriginSide !== null || !rightReturnReady}
           onClick={() => void handleReturnOrigin('right')}
         >
-          右从臂回已记录零点
+          右从臂回工作原点
         </Button>
       </div>
     </Card>

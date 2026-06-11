@@ -1,6 +1,6 @@
 import { Alert, Button, Checkbox, Modal, Steps } from 'antd'
 import { useEffect, useState } from 'react'
-import { homeAll } from '../../api'
+import { motionSideReturnOriginReady } from '../../motionReturnReady'
 import { useTelemetryStore } from '../../stores/telemetry'
 import type { DiagnosticItem, RecordSessionState, TelemetryFrame } from '../../types'
 
@@ -10,7 +10,10 @@ interface StepDef {
   autoCheck: boolean
   check: ((frame: TelemetryFrame, recordSession: RecordSessionState, diagnostics: DiagnosticItem[]) => boolean) | null
   required?: boolean
-  actionButton?: { label: string; apiCall: () => void }
+  actionButton?: {
+    label: string
+    disabled?: (frame: TelemetryFrame, recordSession: RecordSessionState) => boolean
+  }
 }
 /** 计算对应的业务值或展示值。 */
 function diagnosticReady(diagnostics: DiagnosticItem[], key: string) {
@@ -23,6 +26,24 @@ function teleopHandsReady(frame: TelemetryFrame) {
   )
   return requiredHands.length > 0 && requiredHands.every((hand) => hand.connected && hand.lastReadOk)
 }
+function requiredResetSides(recordSession: RecordSessionState) {
+  return recordSession.resetRequiredSides.length > 0 ? recordSession.resetRequiredSides : ['left' as const]
+}
+function requiredMotionReturnReady(frame: TelemetryFrame, recordSession: RecordSessionState) {
+  return requiredResetSides(recordSession).every((side) =>
+    motionSideReturnOriginReady(side, frame.motionEnabled, frame.motionAxisEnabled),
+  )
+}
+function cameraWarnings(frame: TelemetryFrame) {
+  return frame.cameras
+    .map((camera) => {
+      const backend = typeof camera.backend === 'string' ? camera.backend.toLowerCase() : ''
+      const workerFallback = camera.workerActive === false && backend.includes('fallback')
+      return { camera, workerFallback }
+    })
+    .filter(({ camera, workerFallback }) => camera.health === 'ok' && (camera.fps < 25 || workerFallback))
+    .map(({ camera, workerFallback }) => `${camera.label}: ${camera.fps.toFixed(1)} Hz${workerFallback ? ' fallback' : ''}`)
+}
 
 const STEPS: StepDef[] = [
   {
@@ -32,17 +53,20 @@ const STEPS: StepDef[] = [
     check: (frame, _recordSession, diagnostics) =>
       frame.halOk &&
       frame.wsOk &&
-      frame.cameras.every((camera) => camera.fps >= 15 && camera.health === 'ok') &&
+      frame.cameras.every((camera) => camera.health === 'ok') &&
       diagnosticReady(diagnostics, 'omega7') &&
       teleopHandsReady(frame) &&
       diagnosticReady(diagnostics, 'gripper'),
   },
   {
-    title: '自动回到硬件零点',
-    description: '点击自动回零，将左右从臂移动到已记录的硬件零点；确认停止后勾选完成。',
+    title: '自动回到工作原点',
+    description: '点击自动回工作原点，将左右从臂移动到已记录的工作原点；确认停止后勾选完成。',
     autoCheck: false,
     check: null,
-    actionButton: { label: '自动回零', apiCall: () => { void homeAll().catch(() => undefined) } },
+    actionButton: {
+      label: '自动回工作原点',
+      disabled: (frame, recordSession) => !requiredMotionReturnReady(frame, recordSession),
+    },
   },
   {
     title: '力觉 Tare',
@@ -76,6 +100,7 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
   const diagnostics = useTelemetryStore((s) => s.diagnostics)
   const recordSession = useTelemetryStore((s) => s.recordSession)
   const tareRecordForceSensors = useTelemetryStore((s) => s.tareRecordForceSensors)
+  const homeRecordArms = useTelemetryStore((s) => s.homeRecordArms)
   const refreshHardwareStatus = useTelemetryStore((s) => s.refreshHardwareStatus)
   const [manualChecked, setManualChecked] = useState<Record<number, boolean>>({})
 
@@ -89,6 +114,7 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
     }
     return manualChecked[i] ?? false
   })
+  const warnings = cameraWarnings(frame)
 
   const allDone = STEPS.every((step, i) => step.required === false || stepStatuses[i])
   const currentStep = STEPS.findIndex((step, i) => step.required !== false && !stepStatuses[i])
@@ -122,6 +148,14 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
         </Button>,
       ]}
     >
+      {warnings.length > 0 && (
+        <Alert
+          type="warning"
+          message={warnings.join(' · ')}
+          style={{ marginBottom: 8, padding: '2px 8px', fontSize: 11 }}
+          showIcon={false}
+        />
+      )}
       <Steps
         direction="vertical"
         size="small"
@@ -165,7 +199,13 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
                 )}
 
                 {step.actionButton && (
-                  <Button size="small" style={{ marginTop: 6 }} onClick={step.actionButton.apiCall}>
+                  <Button
+                    size="small"
+                    style={{ marginTop: 6 }}
+                    disabled={recordSession.returnOriginInFlight || (step.actionButton.disabled?.(frame, recordSession) ?? false)}
+                    loading={recordSession.returnOriginInFlight}
+                    onClick={homeRecordArms}
+                  >
                     {step.actionButton.label}
                   </Button>
                 )}

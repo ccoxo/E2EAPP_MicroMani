@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import inspect
 import json
@@ -305,7 +306,7 @@ class FrameAssembler:
         """从各源对齐样本组装一帧 LeRobot 训练数据。"""
         recorder = self._recorder
         motion_positions = list(recorder.telemetry.motion_positions)
-        motion_pulses = [0.0] * 12
+        motion_pulses = recorder._latest_motion_pulses()
         force_left = list(recorder.telemetry.force_left)
         force_right = list(recorder.telemetry.force_right)
         hal_sample = recorder._aligned_sample("hal", target_monotonic_s)
@@ -319,6 +320,7 @@ class FrameAssembler:
         raw_pulses = motion_state.get("pulses") if isinstance(motion_state, dict) else None
         if isinstance(raw_pulses, list) and len(raw_pulses) == 12:
             motion_pulses = [float(value) for value in raw_pulses]
+            recorder._remember_motion_pulses(motion_pulses)
         motion_positions = recorder._recording_motion_positions(config, motion_positions, motion_pulses)
         force_values = recorder._force_values_from_sample(force_sample.value)
         if force_values is not None:
@@ -471,6 +473,8 @@ class DatasetRecorderService:
         self._queued_episode_frames = 0
         self._episode_late_frames = 0
         self._camera_drops = {key: 0 for key in CAMERA_KEYS}
+        self._camera_min_fps: dict[str, float] = {}
+        self._camera_worker_fallbacks: set[str] = set()
         self._tick_target_monotonic_s = 0.0
         self._tick_capture_monotonic_s = 0.0
         self._tick_skews_ms: list[float] = []
@@ -494,12 +498,15 @@ class DatasetRecorderService:
         self._record_fps_hz = 30
         self._force_sample_hz = 200.0
         self._recording_config_snapshot: dict[str, Any] = {}
+        self._last_motion_pulses = [0.0] * 12
         self._source_sample_indices: dict[str, int] = {key: 0 for key in SOURCE_KEYS}
         self._sample_buffers: dict[str, TimedRingBuffer] = self._new_sample_buffers({})
         self._frame_assembler = FrameAssembler(self)
         self._quality_tracker = RecordingQualityTracker(self)
         self._last_saved_episode: dict[str, Any] | None = None
         self._reset_pending = False
+        self._reset_required_sides: set[str] = {"left"}
+        self._reset_returned_sides: set[str] = set()
         self._hub_push_jobs: dict[str, dict[str, Any]] = {}
         self._hub_push_jobs_lock = Lock()
 
@@ -516,6 +523,8 @@ class DatasetRecorderService:
             self._session_id = f"session-{now_ms()}"
             self._last_saved_episode = None
             self._reset_pending = False
+            self._reset_required_sides = {"left"}
+            self._reset_returned_sides = set()
             self._record_fps_hz = self._record_fps_from_config(config)
             self._force_sample_hz = self._force_sample_hz_from_config(config)
             dataset_root = self._dataset_root(config)
@@ -565,20 +574,30 @@ class DatasetRecorderService:
                 raise RuntimeError("record session is not active")
             self._accepting_frame_jobs = False
             self.telemetry.recording = False
-        await self._drain_recording_queues()
         try:
+            await self._drain_recording_queues()
             if self._native_writer_active():
                 await self._save_native_episode()
-        finally:
             async with self._lock:
                 self._recording = False
                 self._accepting_frame_jobs = False
-        async with self._lock:
-            episode = self._finalize_episode_locked(status="review", deleted=False)
-            self._last_saved_episode = episode
-            self._reset_pending = True
-            self._samplers_paused = True
-            self.telemetry.episode_count = self._episode_index + 1
+                episode = self._finalize_episode_locked(status="review", deleted=False)
+                self._last_saved_episode = episode
+                self._enter_reset_pending_locked()
+                self._samplers_paused = True
+                self.telemetry.episode_count = self._episode_index + 1
+        except Exception:
+            async with self._lock:
+                self._recording = False
+                self._accepting_frame_jobs = False
+                self._enter_reset_pending_locked()
+                self._samplers_paused = True
+                self.telemetry.recording = False
+            if self._native_writer_active():
+                with contextlib.suppress(Exception):
+                    await self._clear_native_episode_buffer()
+            await self.teleop.stop("recording")
+            raise
         await self.teleop.stop("recording")
         self.logs.info("[LEROBOT]", f"record episode saved: {episode['id']}")
         return {"episode": episode, "status": self.status()}
@@ -605,7 +624,7 @@ class DatasetRecorderService:
                     self._episode_index = episode_index
                     self.telemetry.episode_count = episode_index
                 self._last_saved_episode = None
-            self._reset_pending = True
+            self._enter_reset_pending_locked()
             self._samplers_paused = True
             self.telemetry.recording = False
         await self.teleop.stop("recording")
@@ -620,14 +639,44 @@ class DatasetRecorderService:
             reset_pending = getattr(self, "_reset_pending", self._last_saved_episode is not None)
             if self._recording or not reset_pending:
                 raise RuntimeError("record reset is not ready")
-        async with self._lock:
-            self._last_saved_episode = None
-            self._reset_pending = False
-            self._begin_episode_locked()
-            self.telemetry.recording = True
-            self.telemetry.frame_count = 0
-        await self.teleop.start("recording", pre_home=False)
-        await self._wait_for_episode_warmup()
+            if not self._reset_ready_locked():
+                raise RuntimeError("record reset work origin is not ready")
+            previous_last_saved_episode = self._last_saved_episode
+            previous_reset_pending = bool(getattr(self, "_reset_pending", reset_pending))
+            previous_reset_required_sides = self._reset_required_sides_locked()
+            previous_reset_returned_sides = self._reset_returned_sides_locked()
+            previous_samplers_paused = bool(getattr(self, "_samplers_paused", False))
+            try:
+                self._last_saved_episode = None
+                self._reset_pending = False
+                self._reset_returned_sides = set()
+                self._begin_episode_locked()
+                self.telemetry.recording = True
+                self.telemetry.frame_count = 0
+            except (asyncio.CancelledError, Exception):
+                self._last_saved_episode = previous_last_saved_episode
+                self._reset_pending = previous_reset_pending
+                self._reset_required_sides = previous_reset_required_sides
+                self._reset_returned_sides = previous_reset_returned_sides
+                self._samplers_paused = previous_samplers_paused
+                raise
+        try:
+            await self.teleop.start("recording", pre_home=False)
+            await self._wait_for_episode_warmup()
+        except (asyncio.CancelledError, Exception):
+            async with self._lock:
+                self._recording = False
+                self._accepting_frame_jobs = False
+                self._last_saved_episode = previous_last_saved_episode
+                self._reset_pending = previous_reset_pending
+                self._reset_required_sides = previous_reset_required_sides
+                self._reset_returned_sides = previous_reset_returned_sides
+                self._samplers_paused = previous_samplers_paused
+                self.telemetry.recording = False
+                self.telemetry.frame_count = 0
+            with contextlib.suppress(Exception):
+                await self.teleop.stop("recording")
+            raise
         self.logs.info("[LEROBOT]", f"reset skipped; recording episode={self._episode_index:06d}")
         return self.status()
 
@@ -649,6 +698,7 @@ class DatasetRecorderService:
             self._session_active = False
             self._last_saved_episode = None
             self._reset_pending = False
+            self._reset_returned_sides = set()
             self.telemetry.recording = False
             self.telemetry.frame_count = 0
         await self.teleop.stop("recording")
@@ -667,9 +717,48 @@ class DatasetRecorderService:
         self.logs.info("[LEROBOT]", "record session finished")
         return self.status()
 
+    def _ordered_reset_sides(self, sides: set[str]) -> list[str]:
+        return [side for side in ("left", "right") if side in sides]
+
+    def _reset_required_sides_locked(self) -> set[str]:
+        raw = getattr(self, "_reset_required_sides", {"left"})
+        sides = {str(side) for side in raw if str(side) in {"left", "right"}}
+        return sides or {"left"}
+
+    def _reset_returned_sides_locked(self) -> set[str]:
+        raw = getattr(self, "_reset_returned_sides", set())
+        return {str(side) for side in raw if str(side) in {"left", "right"}}
+
+    def _reset_ready_locked(self) -> bool:
+        if not bool(getattr(self, "_reset_pending", False)):
+            return False
+        required = self._reset_required_sides_locked()
+        returned = self._reset_returned_sides_locked()
+        return required.issubset(returned)
+
+    def _enter_reset_pending_locked(self) -> None:
+        self._reset_pending = True
+        self._reset_required_sides = {"left"}
+        self._reset_returned_sides = set()
+
+    def mark_reset_origin_returned(self, side: str) -> None:
+        if side not in {"left", "right"} or not bool(getattr(self, "_reset_pending", False)):
+            return
+        returned = self._reset_returned_sides_locked()
+        returned.add(side)
+        self._reset_returned_sides = returned
+
+    def mark_reset_origin_all_returned(self) -> None:
+        if not bool(getattr(self, "_reset_pending", False)):
+            return
+        self._reset_returned_sides = self._reset_required_sides_locked()
+
     def status(self) -> dict[str, Any]:
         """返回当前会话、episode、队列写入格式和 teleop 状态。"""
         elapsed = max(0.0, time.monotonic() - self._episode_started_at) if self._recording else 0.0
+        reset_pending = bool(getattr(self, "_reset_pending", False))
+        reset_required_sides = self._reset_required_sides_locked()
+        reset_returned_sides = self._reset_returned_sides_locked()
         return {
             "session": self._session_id,
             "datasetId": self._dataset_id,
@@ -687,6 +776,10 @@ class DatasetRecorderService:
             "format": "lerobot-v3-native" if self._native_writer_active() else "lerobot-v3-native-required",
             "nativeError": self._native_error,
             "teleop": self.teleop.status(),
+            "resetPending": reset_pending,
+            "resetRequiredSides": self._ordered_reset_sides(reset_required_sides),
+            "resetReturnedSides": self._ordered_reset_sides(reset_returned_sides),
+            "resetReady": reset_pending and reset_required_sides.issubset(reset_returned_sides),
         }
 
     def origin_mutation_locked(self) -> bool:
@@ -1299,7 +1392,7 @@ class DatasetRecorderService:
             self._native_total_frames_cached = int(total_frames or 0)
         except Exception as exc:  # noqa: BLE001
             self._native_error = str(exc)
-            raise RuntimeError(f"native LeRobot save_episode failed: {exc}") from exc
+            raise DatasetSaveError(f"native LeRobot save_episode failed: {exc}") from exc
 
     async def _clear_native_episode_buffer(self) -> None:
         """请求写线程清空未保存的 native episode 缓冲区。"""
@@ -1556,6 +1649,7 @@ class DatasetRecorderService:
                 raise RuntimeError("native LeRobot writer is not open")
             value, sampled_at = self._camera_recording_frame_with_time(config, camera)
             self._last_native_camera_frames[feature_key] = value
+            self._record_camera_quality_sample(camera)
             ok = True
             message = ""
         except Exception as exc:  # noqa: BLE001
@@ -1607,7 +1701,7 @@ class DatasetRecorderService:
         """为缺失或失败的源生成 telemetry 或占位图像样本。"""
         value: Any = None
         if source == "hal":
-            value = {"positions": list(self.telemetry.motion_positions), "pulses": [0.0] * 12}
+            value = {"positions": list(self.telemetry.motion_positions), "pulses": self._latest_motion_pulses()}
         elif source == "force":
             value = SimpleNamespace(
                 ok=True,
@@ -1629,6 +1723,20 @@ class DatasetRecorderService:
             stale=True,
             cache_used=source in CAMERA_KEY_BY_SOURCE,
         )
+
+    def _latest_motion_pulses(self) -> list[float]:
+        raw = getattr(self, "_last_motion_pulses", None)
+        if isinstance(raw, list) and len(raw) == 12:
+            try:
+                return [float(value) for value in raw]
+            except (TypeError, ValueError):
+                pass
+        return [0.0] * 12
+
+    def _remember_motion_pulses(self, pulses: list[float]) -> None:
+        if len(pulses) != 12:
+            return
+        self._last_motion_pulses = [float(value) for value in pulses]
 
     async def _record_loop(self) -> None:
         # 硬件采样由后台 sampler 产生，本循环只做时间对齐、组帧和入队。
@@ -2092,6 +2200,22 @@ class DatasetRecorderService:
         if streak >= 3:
             self._source_warnings.append(f"{sample.source} consecutive failures: {streak}")
 
+    def _record_camera_quality_sample(self, camera: str) -> None:
+        cached = getattr(self.telemetry, "_cached_cameras", [])
+        for item in cached:
+            key = item.get("key") if isinstance(item, dict) else getattr(item, "key", None)
+            if key != camera:
+                continue
+            fps = self._coerce_float(item.get("fps") if isinstance(item, dict) else getattr(item, "fps", None))
+            if fps is not None and fps > 0:
+                previous = self._camera_min_fps.get(camera)
+                self._camera_min_fps[camera] = fps if previous is None else min(previous, fps)
+            backend = item.get("backend") if isinstance(item, dict) else getattr(item, "backend", None)
+            worker_active = item.get("workerActive") if isinstance(item, dict) else getattr(item, "workerActive", None)
+            if worker_active is False and isinstance(backend, str) and "fallback" in backend.lower():
+                self._camera_worker_fallbacks.add(camera)
+            return
+
     def _native_frame_payload(self, frame: dict[str, Any]) -> dict[str, Any]:
         """将内部帧结构转换为 LeRobotDataset.add_frame 需要的 native payload。"""
         native_frame = {
@@ -2172,6 +2296,8 @@ class DatasetRecorderService:
         self._queued_episode_frames = 0
         self._episode_late_frames = 0
         self._camera_drops = {key: 0 for key in CAMERA_KEYS}
+        self._camera_min_fps = {}
+        self._camera_worker_fallbacks = set()
         self._tick_target_monotonic_s = 0.0
         self._tick_capture_monotonic_s = 0.0
         self._tick_skews_ms = []
@@ -2224,6 +2350,8 @@ class DatasetRecorderService:
             "native": native,
             "lateFrames": self._episode_late_frames,
             "cameraDrops": dict(self._camera_drops),
+            "cameraMinFps": dict(getattr(self, "_camera_min_fps", {})),
+            "cameraWorkerFallbacks": sorted(getattr(self, "_camera_worker_fallbacks", set())),
             "dropCounts": dict(self._drop_counts),
             "staleCounts": dict(self._stale_counts),
             "cacheCounts": dict(self._cache_counts),
@@ -2484,6 +2612,7 @@ class DatasetRecorderService:
         repo_id = f"local/{self._dataset_id}"
         self._native_use_videos = self._native_use_videos_requested()
         try:
+            self._cleanup_native_tmp_dirs(dataset_dir)
             if self._is_native_dataset(dataset_dir, self._read_json(dataset_dir / "meta" / "info.json")):
                 if self._native_dataset_is_empty(dataset_dir):
                     # 空的原生目录可能来自上次初始化失败，重建可以修复损坏的 meta。
@@ -2545,6 +2674,13 @@ class DatasetRecorderService:
             and not any(episode_meta_dir.glob("chunk-*/*.parquet"))
             and not self._read_episodes(dataset_dir)
         )
+
+    def _cleanup_native_tmp_dirs(self, dataset_dir: Path) -> None:
+        if not dataset_dir.exists():
+            return
+        for item in dataset_dir.glob("tmp*"):
+            if item.is_dir() and any(item.glob("*_streaming.mp4")):
+                shutil.rmtree(item, ignore_errors=True)
 
     def _native_features(self, config: dict[str, Any]) -> dict[str, Any]:
         # 这些 feature 名称需要和 LeRobot 数据集字段保持稳定，前后端按它们读取图像。
@@ -3287,6 +3423,11 @@ class DatasetRecorderService:
         for key, count in self._camera_drops.items():
             if count:
                 warnings.append(f"{key} camera drops: {count}")
+        for key, fps in getattr(self, "_camera_min_fps", {}).items():
+            if fps < 25.0:
+                warnings.append(f"{key} camera low fps: {round(float(fps), 1)}Hz")
+        for key in sorted(getattr(self, "_camera_worker_fallbacks", set())):
+            warnings.append(f"{key} camera worker fallback")
         return warnings
 
     def _source_latency_warnings(self) -> list[str]:

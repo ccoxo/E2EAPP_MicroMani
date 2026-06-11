@@ -1,6 +1,7 @@
 param(
   [int]$BackendPort = 18082,
   [int]$FrontendPort = 5174,
+  [int]$HalPort = 8091,
   [switch]$SkipStartupHome
 )
 
@@ -64,8 +65,6 @@ function Stop-BackendProcessTrees {
   }
 }
 
-& (Join-Path $PSScriptRoot "start-hal.ps1") -Restart | Out-Host
-
 Stop-BackendProcessTrees
 
 $backendPid = Get-NetTCPConnection -LocalPort $BackendPort -State Listen -ErrorAction SilentlyContinue |
@@ -87,10 +86,23 @@ if ($frontendPid) {
   Stop-Process -Id $frontendPid -Force -ErrorAction SilentlyContinue
 }
 
+$activeHalPort = $HalPort
+try {
+  & (Join-Path $PSScriptRoot "start-hal.ps1") -Restart -Port $activeHalPort | Out-Host
+} catch {
+  $halStartError = $_.Exception.Message
+  if ($HalPort -ne 8091 -or $halStartError -notmatch "/health failed") {
+    throw
+  }
+  Write-Warning "HAL start on port 8091 failed; retrying on 8092. $halStartError"
+  $activeHalPort = 8092
+  & (Join-Path $PSScriptRoot "start-hal.ps1") -Restart -Port $activeHalPort | Out-Host
+}
+
 Start-Sleep -Seconds 1
 
 $env:APPSTATION_HAL_MODE = "real"
-$env:APPSTATION_HAL_BASE_URL = "http://127.0.0.1:8091"
+$env:APPSTATION_HAL_BASE_URL = "http://127.0.0.1:$activeHalPort"
 $env:APPSTATION_SKIP_STARTUP_HOME = if ($SkipStartupHome) { "true" } else { "false" }
 $backend = Start-Process `
   -FilePath (Join-Path $repo "backend\.venv\Scripts\python.exe") `
@@ -114,6 +126,6 @@ Start-Sleep -Seconds 3
   frontendLauncherPid = $frontend.Id
   backend = "http://127.0.0.1:$BackendPort"
   frontend = "http://127.0.0.1:$FrontendPort"
-  hal = "http://127.0.0.1:8091"
+  hal = "http://127.0.0.1:$activeHalPort"
   skipStartupHome = [bool]$SkipStartupHome
 }

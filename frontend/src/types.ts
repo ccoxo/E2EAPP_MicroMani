@@ -49,6 +49,8 @@ export interface CameraTelemetry {
   timestampSkewMs: number
   frameAgeMs: number
   health: ConnectionState
+  backend?: string | null
+  workerActive?: boolean | null
 }
 
 export interface CameraTuningProfile {
@@ -256,6 +258,11 @@ export interface RecordSessionState {
   recorderLateFrames: number
   recorderElapsedS: number
   recorderTotalS: number
+  resetPending: boolean
+  resetRequiredSides: ManualControlSide[]
+  resetReturnedSides: ManualControlSide[]
+  resetReady: boolean
+  returnOriginInFlight: boolean
   forceTareActive: boolean
   speedMode: ManualSpeedMode
 }

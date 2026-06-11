@@ -430,6 +430,10 @@ export interface RecordStatusApi {
   frameCount?: number
   elapsedS?: number
   fps?: number
+  resetPending?: boolean
+  resetRequiredSides?: Array<'left' | 'right'>
+  resetReturnedSides?: Array<'left' | 'right'>
+  resetReady?: boolean
 }
 
 export interface RecordSessionCommandResponse {

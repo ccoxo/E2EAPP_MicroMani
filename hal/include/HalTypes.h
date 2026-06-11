@@ -45,6 +45,8 @@ struct TeleopTargetUpdateResult {
   std::array<double, 6> currentPulse{};
   std::array<double, 6> launchDeltaPulse{};
   std::array<double, 6> updateReturn{};
+  std::array<double, 6> stopReason{};
+  std::array<double, 6> axisIoStatus{};
   std::array<bool, 6> movingBefore{};
   std::array<bool, 6> moveStarted{};
   std::array<bool, 6> clipped{};

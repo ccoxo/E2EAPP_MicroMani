@@ -62,6 +62,8 @@ class CameraTelemetry(BaseModel):
     timestampSkewMs: float
     frameAgeMs: float
     health: ConnectionState
+    backend: str | None = None
+    workerActive: bool | None = None
 
 
 class Omega7Telemetry(BaseModel):

@@ -25,15 +25,15 @@ struct NativeTeleopConfig {
   bool leftGravityCompensation{true};
   bool rightGravityCompensation{true};
 
-  std::array<double, 2> translationScale{{1.0, 1.0}};
-  std::array<double, 2> rotationScale{{1.0, 1.0}};
+  std::array<double, 2> translationScale{{1.25, 1.25}};
+  std::array<double, 2> rotationScale{{1.20, 1.20}};
   std::array<std::array<double, 6>, 2> axisOutputScale{{
-      {0.40, 0.25, 0.25, 0.40, 0.10, 0.15},
-      {0.40, 0.25, 0.25, 0.40, 0.10, 0.15},
+      {0.65, 0.45, 0.45, 0.60, 0.16, 0.20},
+      {0.65, 0.45, 0.45, 0.55, 0.16, 0.25},
   }};
   std::array<std::array<double, 6>, 2> impulseCoeff{{
-      {-5000000.0, 5000000.0, -10000000.0, 1667.0, -2500.0, -333.3333},
-      {-5000000.0, -10000000.0, -5000000.0, 1667.0, 2500.0, 3333.333},
+      {-5000000.0, -5000000.0, -10000000.0, 1667.0, 2500.0, -333.3333},
+      {-5000000.0, 10000000.0, -5000000.0, 1667.0, -2500.0, 3333.333},
   }};
   std::array<std::array<bool, 6>, 2> enabledAxes{{
       {true, true, true, true, true, true},
@@ -44,17 +44,19 @@ struct NativeTeleopConfig {
   std::array<std::array<AxisLimit, 6>, 2> rotationWorkLimits{};
   std::array<std::array<double, 6>, 2> workOriginPulse{};
   std::array<bool, 2> workOriginValid{{false, false}};
+  std::array<std::array<double, 6>, 2> homeReferencePulse{};
+  std::array<bool, 2> homeReferenceValid{{false, false}};
 
   double translationStepLimitPulse{4000.0};
   double rotationStepLimitPulse{1250.0};
   double translationPulseDeadband{2.0};
   double rotationPulseDeadband{2.0};
-  double translationStartVelocityUmS{600.0};
-  double translationMaxVelocityUmS{8000.0};
-  double rotationStartVelocityDegS{1.0};
-  double rotationMaxVelocityDegS{12.0};
-  double accTimeSec{0.05};
-  double decTimeSec{0.05};
+  double translationStartVelocityUmS{1500.0};
+  double translationMaxVelocityUmS{20000.0};
+  double rotationStartVelocityDegS{2.5};
+  double rotationMaxVelocityDegS{30.0};
+  double accTimeSec{0.03};
+  double decTimeSec{0.03};
 
   double nativeTranslationDeadzoneM{0.002};
   double nativeTranslationFullScaleM{0.040};
@@ -103,14 +105,14 @@ struct NativeTeleopConfig {
   double incrementalTranslationMinEffectiveDeltaM{0.000025};
   double incrementalTranslationReverseDeadzoneM{0.00005};
   bool continuousIncrementMode{true};
-  double translationInputEpsilonM{0.00002};
-  double rotationInputEpsilonDeg{0.03};
+  double translationInputEpsilonM{0.000005};
+  double rotationInputEpsilonDeg{0.08};
   double translationMinActivePulse{3.0};
   double rotationMinActivePulse{3.0};
-  int continuousMicroConfirmTicks{0};
+  int continuousMicroConfirmTicks{2};
 
   JodellGripperConfig gripper{};
-  bool gripperTeleopEnabled{true};
+  bool gripperTeleopEnabled{false};
   std::array<double, 2> gripperGapMinMm{{0.0, 0.0}};
   std::array<double, 2> gripperGapMaxMm{{25.0, 25.0}};
   std::array<bool, 2> gripperGapInvert{{false, false}};
@@ -137,6 +139,8 @@ struct NativeTeleopAction {
   std::array<double, 6> currentPulse{};
   std::array<double, 6> launchDeltaPulse{};
   std::array<double, 6> updateReturn{};
+  std::array<double, 6> stopReason{};
+  std::array<double, 6> axisIoStatus{};
   std::array<bool, 6> movingBefore{};
   std::array<bool, 6> moveStarted{};
   std::array<bool, 6> clipped{};
@@ -222,13 +226,24 @@ class NativeTeleopController {
       int targetIndex,
       const std::array<double, 6>& semanticPose,
       const std::string& message);
+  bool suppressIncrementalRotationSpikeUnlocked(
+      Side sourceSide,
+      Side targetSide,
+      int sourceIndex,
+      int targetIndex,
+      const std::array<double, 6>& semanticPose);
   std::array<double, 6> velocityDeltasUi(
       int sourceIndex,
       Side targetSide,
       const std::array<double, 6>& pose,
       double dtSec);
   std::array<double, 6> incrementalDeltasUi(int sourceIndex, Side targetSide, const std::array<double, 6>& pose);
-  long applyContinuousPulseGate(int sourceIndex, int axisIndex, long requestedPulse, double requestedPulseFloat);
+  long applyContinuousPulseGate(
+      int sourceIndex,
+      int axisIndex,
+      long requestedPulse,
+      double requestedPulseFloat,
+      bool requiresConfirmation);
   double mappedDirection(int sourceIndex, Side targetSide, int axisIndex) const;
   std::array<AxisLimit, 6> effectiveSoftLimits(Side targetSide, int targetIndex) const;
   int gripperSourceIndex(int targetIndex) const;

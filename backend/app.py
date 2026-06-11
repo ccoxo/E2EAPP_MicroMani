@@ -256,8 +256,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     gripper_workers = GripperWorkerService(settings, logs)
     telemetry = TelemetryHub(settings, hardware, gripper_workers)
     hal = make_hal_client(startup_config, logs)
-    commands = CommandService(settings, telemetry, hal, logs, hardware, gripper_workers)
     teleop_mapper = TeleopMappingService(settings, hal, logs)
+    commands = CommandService(settings, telemetry, hal, logs, hardware, gripper_workers, teleop=teleop_mapper)
     gripper_tele = GripperTeleService(settings, hal, hardware, logs, gripper_workers)
     recorder = DatasetRecorderService(settings, hardware, hal, telemetry, logs, teleop_mapper)
     commands.set_origin_mutation_lock_checker(recorder.origin_mutation_locked)
@@ -290,8 +290,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     def gripper_teleop_enabled() -> bool:
         config = settings.get_config()
         teleop = config.get("teleop", {})
-        if isinstance(teleop, dict) and str(teleop.get("engine", "")).lower() == "hal_native":
-            return False
         gripper_teleop = teleop.get("gripperTeleop", {}) if isinstance(teleop, dict) else {}
         return isinstance(gripper_teleop, dict) and bool(gripper_teleop.get("enabled", False))
 
@@ -345,10 +343,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 await commands.enable_motion_side(mapped_side)
             except RuntimeError as exc:
                 logs.error("[HAL]", f"teleop connect enable mapped {mapped_side} failed: {exc}")
-            if native_teleop_config(config):
-                gripper_tele.stop(force=True)
-                gripper_workers.stop_all()
-            await teleop_mapper.start("teleop-connect", pre_home=False)
+            await teleop_mapper.start("teleop-connect", pre_home=False, home_side=mapped_side)
             start_gripper_teleop_source("teleop-connect")
             logs.info("[HAL]", f"{side} Omega.7 logical connect background sync completed")
             return
@@ -359,8 +354,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             logs.error("[HAL]", f"teleop disconnect stop mapped {mapped_side} failed: {exc}")
         if not bool(teleop_config.get("leftConnected", False)) and not bool(teleop_config.get("rightConnected", False)):
             await teleop_mapper.stop("teleop-connect")
-            if not stop_python_gripper_teleop_for_native("teleop disconnect"):
-                gripper_tele.stop("teleop-connect")
+            gripper_tele.stop("teleop-connect")
             logs.info("[HAL]", f"{side} Omega.7 logical disconnect background stop completed")
             return
         if native_teleop_config(config):
@@ -582,17 +576,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 detail={"code": "HARDWARE_PRECHECK_FAILED", "message": message},
             )
 
-    def stop_python_gripper_teleop_for_native(reason: str) -> bool:
-        if not native_teleop_enabled():
-            return False
-        gripper_tele.stop(force=True)
-        gripper_workers.stop_all()
-        logs.info("[GRIPPER]", f"Python gripper teleop disabled in HAL-native mode: {reason}")
-        return True
-
     def start_gripper_teleop_source(source: str) -> None:
-        if native_teleop_enabled():
-            return
         if gripper_teleop_enabled():
             gripper_tele.start(source)
 
@@ -703,6 +687,13 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
     @app.on_event("shutdown")
     async def stop_gripper_workers() -> None:
+        try:
+            record_status = recorder.status()
+            if record_status.get("active") or record_status.get("recording"):
+                await recorder.finish_session()
+        except Exception as exc:  # noqa: BLE001
+            logs.error("[LEROBOT]", f"shutdown record session finish failed: {exc}")
+
         tasks = set(app.state.teleop_background_tasks)
         for task in tasks:
             task.cancel()
@@ -719,16 +710,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def health() -> dict[str, Any]:
         hal_health = await hal.health()
         health_config = settings.get_config()
-        native_gripper = native_teleop_config(health_config)
         use_gripper_workers = gripper_workers.is_enabled(health_config)
+        native_gripper = native_teleop_config(health_config) and not use_gripper_workers
         hardware_status = await asyncio.to_thread(
             hardware.status,
             include_gripper=not use_gripper_workers and not native_gripper,
         )
-        if native_gripper:
-            hardware_status["gripper"] = native_gripper_status(health_config)
-        elif use_gripper_workers:
+        if use_gripper_workers:
             hardware_status["gripper"] = gripper_workers.status(health_config)
+        elif native_gripper:
+            hardware_status["gripper"] = native_gripper_status(health_config)
         attach_gripper_serial_ports(hardware_status, health_config)
         hardware_status["omega7"] = await omega7_serial_status(health_config, hal_health)
         return {
@@ -744,16 +735,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.get("/api/hardware/status")
     async def hardware_status() -> dict[str, Any]:
         config = settings.get_config()
-        native_gripper = native_teleop_config(config)
         use_gripper_workers = gripper_workers.is_enabled(config)
+        native_gripper = native_teleop_config(config) and not use_gripper_workers
         status = await asyncio.to_thread(
             hardware.status,
             include_gripper=not use_gripper_workers and not native_gripper,
         )
-        if native_gripper:
-            status["gripper"] = native_gripper_status(config)
-        elif use_gripper_workers:
+        if use_gripper_workers:
             status["gripper"] = gripper_workers.status(config)
+        elif native_gripper:
+            status["gripper"] = native_gripper_status(config)
         attach_gripper_serial_ports(status, config)
         status["omega7"] = await omega7_serial_status(config)
         return status
@@ -933,23 +924,29 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 触发运动急停。
     @app.post("/api/motion/emergency_stop")
     async def emergency_stop() -> ApiEnvelope:
-        return envelope(await commands.emergency_stop())
+        auto_stop_task = asyncio.create_task(policy.auto_stop())
+        try:
+            return envelope(await commands.emergency_stop())
+        finally:
+            await auto_stop_task
 
     # 所有运动轴执行回零。
     @app.post("/api/motion/home_all")
     async def home_all() -> ApiEnvelope:
         try:
-            return envelope(await commands.home_all())
+            result = await commands.home_all()
+            recorder.mark_reset_origin_all_returned()
+            return envelope(result)
         except RuntimeError as exc:
             logs.error("[HAL]", f"home_all failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
 
-    # 查询运动硬件零点状态。
+    # 查询运动工作原点状态。
     @app.get("/api/motion/origin")
     async def motion_origin_status() -> ApiEnvelope:
         return envelope(commands.motion_origin_status())
 
-    # 双侧硬件回零并记录硬件零点。
+    # 双侧记录当前工作原点。
     @app.post("/api/motion/origin/capture")
     async def capture_motion_origin_all(payload: dict[str, Any] | None = Body(default=None)) -> ApiEnvelope:
         try:
@@ -968,7 +965,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             logs.error("[HAL]", f"capture_motion_origin failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
 
-    # 清除双侧运动硬件零点记录。
+    # 清除双侧运动工作原点记录。
     @app.post("/api/motion/origin/clear")
     async def clear_motion_origin_all() -> ApiEnvelope:
         try:
@@ -977,16 +974,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             logs.error("[HAL]", f"clear_motion_origin failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
 
-    # 恢复上一次运动硬件零点记录。
+    # 恢复上一次运动工作原点记录。
     @app.post("/api/motion/origin/restore_previous")
     async def restore_previous_motion_origin() -> ApiEnvelope:
         try:
-            return envelope(commands.restore_previous_motion_origin())
+            return envelope(await commands.restore_previous_motion_origin())
         except RuntimeError as exc:
             logs.error("[HAL]", f"restore_previous_motion_origin failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
 
-    # 指定侧硬件回零并记录硬件零点。
+    # 指定侧记录当前工作原点。
     @app.post("/api/motion/{side}/origin/capture")
     async def capture_motion_origin_side(
         side: str,
@@ -1010,7 +1007,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             logs.error("[HAL]", f"capture_motion_origin failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
 
-    # 清除指定侧运动硬件零点记录。
+    # 清除指定侧运动工作原点记录。
     @app.post("/api/motion/{side}/origin/clear")
     async def clear_motion_origin_side(side: str) -> ApiEnvelope:
         if side not in {"left", "right"}:
@@ -1065,13 +1062,15 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             logs.error("[HAL]", f"home_motion_side failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
 
-    # 指定侧返回硬件零点。
+    # 指定侧返回已记录工作原点。
     @app.post("/api/motion/{side}/return_origin")
     async def return_motion_origin_side(side: str) -> ApiEnvelope:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         try:
-            return envelope(await commands.return_motion_origin_side(side))
+            result = await commands.return_motion_origin_side(side)
+            recorder.mark_reset_origin_returned(side)
+            return envelope(result)
         except RuntimeError as exc:
             logs.error("[HAL]", f"return_motion_origin_side failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1212,8 +1211,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 detail={"code": "BAD_SIDE", "message": "path side and body side differ"},
             )
         try:
-            if native_teleop_enabled() and request.command in {"enable", "open", "close", "home", "target"}:
-                await teleop_mapper.start("manual-gripper", pre_home=False)
             result = envelope(await commands.gripper_command(request))
             gripper_tele.reset_side(side)
             return result
@@ -1226,7 +1223,9 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         config = settings.get_config()
-        if native_teleop_config(config):
+        if gripper_workers.is_enabled(config):
+            result = await asyncio.to_thread(gripper_workers.position, config, side)
+        elif native_teleop_config(config):
             status = native_gripper_status(config)
             positions = status["positionMm"]
             return envelope(
@@ -1238,8 +1237,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     "details": status,
                 }
             )
-        if gripper_workers.is_enabled(config):
-            result = await asyncio.to_thread(gripper_workers.position, config, side)
         else:
             result = await asyncio.to_thread(hardware.gripper.position, config, side)
         if not result.ok:
@@ -1252,18 +1249,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         config = settings.get_config()
-        if native_teleop_config(config):
-            status = native_gripper_status(config)
-            positions = status["positionMm"]
-            return envelope(
-                {
-                    "ok": True,
-                    "message": status["message"],
-                    "position_mm": positions.get(side, 0.0) if isinstance(positions, dict) else 0.0,
-                    "nativeManaged": True,
-                    "details": status,
-                }
-            )
         if gripper_workers.is_enabled(config):
             worker_status = await asyncio.to_thread(gripper_workers.status, config)
             side_status = worker_status.get("sides", {}).get(side, {})
@@ -1276,6 +1261,18 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     "details": side_status,
                 }
             )
+        if native_teleop_config(config):
+            status = native_gripper_status(config)
+            positions = status["positionMm"]
+            return envelope(
+                {
+                    "ok": True,
+                    "message": status["message"],
+                    "position_mm": positions.get(side, 0.0) if isinstance(positions, dict) else 0.0,
+                    "nativeManaged": True,
+                    "details": status,
+                }
+            )
         result = await asyncio.to_thread(hardware.gripper.diagnose, config, side)
         logs.info("[GRIPPER]" if result.ok else "[GRIPPER]", result.message)
         return envelope(result.__dict__)
@@ -1283,40 +1280,18 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 启动夹爪遥操作。
     @app.post("/api/teleop/gripper/start")
     async def gripper_tele_start() -> ApiEnvelope:
-        if native_teleop_enabled():
-            await require_hardware_recognized("native gripper teleop", require_camera=False)
-            stop_python_gripper_teleop_for_native("manual start")
-            try:
-                mapper_status = await teleop_mapper.start("manual-gripper", pre_home=False)
-            except RuntimeError as exc:
-                logs.error("[HAL]", f"HAL-native gripper teleop start failed: {exc}")
-                raise HTTPException(
-                    status_code=503,
-                    detail={"code": "GRIPPER_UNAVAILABLE", "message": str(exc)},
-                ) from exc
-            status = native_gripper_status()
-            status["requestedRunning"] = bool(mapper_status.get("running", status.get("requestedRunning", False)))
-            return envelope(status)
         gripper_tele.start("manual")
         return envelope(gripper_tele.get_status())
 
     # 停止夹爪遥操作。
     @app.post("/api/teleop/gripper/stop")
     async def gripper_tele_stop() -> ApiEnvelope:
-        if stop_python_gripper_teleop_for_native("manual stop"):
-            mapper_status = await teleop_mapper.stop("manual-gripper")
-            status = native_gripper_status()
-            status["requestedRunning"] = bool(mapper_status.get("running", status.get("requestedRunning", False)))
-            return envelope(status)
         gripper_tele.stop("manual")
         return envelope(gripper_tele.get_status())
 
     # 查询夹爪遥操作状态。
     @app.get("/api/teleop/gripper/status")
     async def gripper_tele_status() -> ApiEnvelope:
-        config = settings.get_config()
-        if native_teleop_config(config):
-            return envelope(native_gripper_status(config))
         return envelope(gripper_tele.get_status())
 
     # 切换遥操作离合状态。
@@ -1546,8 +1521,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         try:
             await require_hardware_recognized("record", require_camera=True)
             if native_teleop_enabled():
-                gripper_tele.stop(force=True)
-                gripper_workers.stop_all()
                 await stop_aux_native_teleop_sources("record session create")
             result = await recorder.start_session(str(dataset_name), str(task))
             start_gripper_teleop_source("recording")
@@ -1578,8 +1551,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def discard_episode() -> ApiEnvelope:
         try:
             if native_teleop_enabled():
-                gripper_tele.stop(force=True)
-                gripper_workers.stop_all()
                 await stop_aux_native_teleop_sources("record episode discard")
             result = await recorder.discard_episode()
             gripper_tele.stop("recording")
@@ -1600,14 +1571,26 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def skip_reset() -> ApiEnvelope:
         try:
             if native_teleop_enabled():
-                gripper_tele.stop(force=True)
-                gripper_workers.stop_all()
+                record_state = recorder.status()
+                if bool(record_state.get("resetPending")) and not bool(record_state.get("resetReady")):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "RECORD_RESET_NOT_READY",
+                            "message": "record reset work origin is not ready",
+                        },
+                    )
                 await stop_aux_native_teleop_sources("record reset skip")
             result = await recorder.skip_reset()
             start_gripper_teleop_source("recording")
             return envelope(result)
         except RuntimeError as exc:
-            code = "RECORD_RESET_NOT_READY" if "reset is not ready" in str(exc) else "RECORDING_NOT_ACTIVE"
+            message = str(exc)
+            code = (
+                "RECORD_RESET_NOT_READY"
+                if "reset is not ready" in message or "reset work origin" in message
+                else "RECORDING_NOT_ACTIVE"
+            )
             raise HTTPException(status_code=409, detail={"code": code, "message": str(exc)}) from exc
 
     # 查询录制状态。
@@ -1874,6 +1857,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         omega_hands = cached_omega_hands
                     hal_ok = hal_health.connected and (hal_health.mode != "real" or hal_health.ltdmc_ok)
                     active_config = settings.get_config()
+                    use_gripper_workers = gripper_workers.is_enabled(active_config)
                     frame = telemetry.next_frame(
                         motion_positions,
                         motion_estop_active=motion_estop_active,
@@ -1882,7 +1866,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         omega_hands=omega_hands,
                         native_gripper_status=(
                             native_gripper_status(active_config)
-                            if native_teleop_config(active_config)
+                            if native_teleop_config(active_config) and not use_gripper_workers
                             else None
                         ),
                         hal_ok=hal_ok,

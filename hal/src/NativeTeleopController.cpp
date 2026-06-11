@@ -14,6 +14,11 @@ constexpr const char* kVelocityAdmittanceMode = "velocity_admittance";
 constexpr const char* kIncrementalPositionMode = "incremental_position";
 constexpr int kGripperTeleopDeadbandFloorCounts = 1;
 constexpr double kGripperTeleopMinCommandIntervalFloorMs = 10.0;
+constexpr double kRotationInputEpsilonFloorDeg = 0.08;
+constexpr double kTranslationMicroConfirmUpperM = 0.00002;
+constexpr double kRotationMicroConfirmUpperDeg = 0.18;
+constexpr int kContinuousMicroConfirmTicksFloor = 2;
+constexpr double kIncrementalRotationSpikeGuardDeg = 5.0;
 constexpr auto kGripperPositionSampleInterval = std::chrono::microseconds(33333);
 
 std::int64_t unixTimeMs() {
@@ -113,6 +118,10 @@ void appendAction(std::ostringstream& out, const NativeTeleopAction& action) {
   appendArray(out, action.launchDeltaPulse);
   out << ",\"updateReturn\":";
   appendArray(out, action.updateReturn);
+  out << ",\"stopReason\":";
+  appendArray(out, action.stopReason);
+  out << ",\"axisIoStatus\":";
+  appendArray(out, action.axisIoStatus);
   out << ",\"movingBefore\":";
   appendBoolArray(out, action.movingBefore);
   out << ",\"moveStarted\":";
@@ -131,6 +140,7 @@ void appendInputDiagnostic(
     bool referenceValid,
     bool inputActive,
     const std::array<double, 6>& semanticPose,
+    const std::array<double, 6>& referencePose,
     const std::array<double, 6>& rawDelta,
     const std::array<double, 6>& filteredDelta,
     const std::array<double, 6>& requestedPulse,
@@ -141,6 +151,8 @@ void appendInputDiagnostic(
       << ",\"inputActive\":" << (inputActive ? "true" : "false")
       << ",\"semanticPose\":";
   appendArray(out, semanticPose);
+  out << ",\"referencePose\":";
+  appendArray(out, referencePose);
   out << ",\"rawDelta\":";
   appendArray(out, rawDelta);
   out << ",\"filteredDelta\":";
@@ -232,10 +244,10 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config) {
   normalized.translationDeadzoneM = std::max(0.0, normalized.translationDeadzoneM);
   normalized.rotationDeadzoneDeg = std::max(0.0, normalized.rotationDeadzoneDeg);
   normalized.translationInputEpsilonM = std::max(0.0, normalized.translationInputEpsilonM);
-  normalized.rotationInputEpsilonDeg = std::max(0.0, normalized.rotationInputEpsilonDeg);
+  normalized.rotationInputEpsilonDeg = std::max(kRotationInputEpsilonFloorDeg, normalized.rotationInputEpsilonDeg);
   normalized.translationMinActivePulse = std::max(0.0, normalized.translationMinActivePulse);
   normalized.rotationMinActivePulse = std::max(0.0, normalized.rotationMinActivePulse);
-  normalized.continuousMicroConfirmTicks = std::max(0, normalized.continuousMicroConfirmTicks);
+  normalized.continuousMicroConfirmTicks = std::max(kContinuousMicroConfirmTicksFloor, normalized.continuousMicroConfirmTicks);
   // kalmanBeta：遗忘因子 beta，限制在 [0,1] 内，保证 Q/R 的凸组合更新有效。
   normalized.kalmanBeta = std::clamp(normalized.kalmanBeta, 0.0, 1.0);
   // kalmanMinVariance：所有方差/协方差的保护下限，避免数值退化。
@@ -325,6 +337,9 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config) {
     }
   }
   gripper_.configure(normalized.gripper);
+  if (!normalized.gripperTeleopEnabled) {
+    stopGripperWorker();
+  }
   omega_.setGravityCompensation(normalized.leftGravityCompensation, normalized.rightGravityCompensation);
 }
 
@@ -350,9 +365,11 @@ void NativeTeleopController::configureGripperProtection(bool enabled, double min
 }
 
 void NativeTeleopController::start(bool leftConnected, bool rightConnected) {
+  bool gripperTeleopEnabled = false;
   {
     std::scoped_lock lock(mutex_);
     logicalConnected_ = {leftConnected, rightConnected};
+    gripperTeleopEnabled = config_.gripperTeleopEnabled;
     referenceValid_ = {false, false};
     targetActive_ = {false, false};
     velocityUiPerSec_ = {};
@@ -386,7 +403,11 @@ void NativeTeleopController::start(bool leftConnected, bool rightConnected) {
     gripperLastMessage_ = {};
     gripperLastCommandTs_ = {0, 0};
   }
-  startGripperWorker();
+  if (gripperTeleopEnabled) {
+    startGripperWorker();
+  } else {
+    stopGripperWorker();
+  }
   if (running_.exchange(true)) {
     return;
   }
@@ -606,6 +627,7 @@ std::string NativeTeleopController::statusJson() const {
       referenceValid_[0],
       incrementalInputActive_[0],
       lastSemanticPose_[0],
+      referencePose_[0],
       lastRawDelta_[0],
       lastFilteredDelta_[0],
       lastRequestedPulse_[0],
@@ -619,6 +641,7 @@ std::string NativeTeleopController::statusJson() const {
       referenceValid_[1],
       incrementalInputActive_[1],
       lastSemanticPose_[1],
+      referencePose_[1],
       lastRawDelta_[1],
       lastFilteredDelta_[1],
       lastRequestedPulse_[1],
@@ -795,6 +818,11 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
   }
 
   // deltas：由当前姿态计算出的从手 UI 增量；随后按 w2 意图权重进行软门控。
+  if (config_.controlMode == kIncrementalPositionMode &&
+      suppressIncrementalRotationSpikeUnlocked(sourceSide, targetSide, sourceIndex, targetIndex, semanticPose)) {
+    return;
+  }
+
   auto deltas = config_.controlMode == kIncrementalPositionMode
       ? incrementalDeltasUi(sourceIndex, targetSide, semanticPose)
       : velocityDeltasUi(sourceIndex, targetSide, semanticPose, dtSec);
@@ -1089,12 +1117,51 @@ void NativeTeleopController::resetKalmanSideUnlocked(int sourceIndex) {
   lastIntentWeight_[sourceIndex].fill(1.0);
 }
 
+bool NativeTeleopController::suppressIncrementalRotationSpikeUnlocked(
+    Side sourceSide,
+    Side targetSide,
+    int sourceIndex,
+    int targetIndex,
+    const std::array<double, 6>& semanticPose) {
+  for (int axisIndex = 3; axisIndex < 6; ++axisIndex) {
+    if (!config_.enabledAxes[targetIndex][axisIndex]) {
+      continue;
+    }
+    const double rawDelta = semanticPose[axisIndex] - referencePose_[sourceIndex][axisIndex];
+    if (std::abs(rawDelta) <= kIncrementalRotationSpikeGuardDeg) {
+      continue;
+    }
+    referencePose_[sourceIndex] = semanticPose;
+    velocityUiPerSec_[sourceIndex] = {};
+    incrementalCarry_[sourceIndex] = {};
+    incrementalDirection_[sourceIndex] = {};
+    incrementalInputActive_[sourceIndex] = false;
+    continuousPulseCarry_[sourceIndex] = {};
+    continuousDirection_[sourceIndex] = {};
+    continuousStreak_[sourceIndex] = {};
+    lastRawDelta_[sourceIndex] = {};
+    lastFilteredDelta_[sourceIndex] = {};
+    lastRequestedPulse_[sourceIndex] = {};
+    lastEmittedPulse_[sourceIndex] = {};
+    lastOutputDeltaUi_[sourceIndex] = {};
+    lastRawDelta_[sourceIndex][axisIndex] = rawDelta;
+    if (targetActive_[targetIndex]) {
+      motion_.stopTeleopSide(targetSide);
+      targetActive_[targetIndex] = false;
+      recordZeroStopActionUnlocked(sourceSide, targetSide);
+    }
+    setBlockerUnlocked(sourceIndex, "blocked", "incremental rotation input spike suppressed; reference recaptured");
+    return true;
+  }
+  return false;
+}
+
 std::array<AxisLimit, 6> NativeTeleopController::effectiveSoftLimits(Side targetSide, int targetIndex) const {
   auto limits = config_.softLimits[targetIndex];
-  if (config_.workOriginValid[targetIndex]) {
+  if (config_.homeReferenceValid[targetIndex]) {
     for (int axisIndex = 0; axisIndex < 3; ++axisIndex) {
       const auto axis = static_cast<SemanticAxis>(axisIndex);
-      const double originUi = pulseToUi(config_.workOriginPulse[targetIndex][axisIndex], targetSide, axis);
+      const double originUi = pulseToUi(config_.homeReferencePulse[targetIndex][axisIndex], targetSide, axis);
       limits[axisIndex].min += originUi;
       limits[axisIndex].max += originUi;
     }
@@ -1102,15 +1169,15 @@ std::array<AxisLimit, 6> NativeTeleopController::effectiveSoftLimits(Side target
   if (!config_.rotationWorkLimitEnabled) {
     return limits;
   }
-  if (!config_.workOriginValid[targetIndex]) {
-    throw std::runtime_error("work_origin_missing: rotation work limit requires captured work origin");
+  if (!config_.homeReferenceValid[targetIndex]) {
+    throw std::runtime_error("home_reference_missing: rotation work limit requires captured hardware zero");
   }
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     if (axisIndex < 3) {
       continue;
     }
     const auto axis = static_cast<SemanticAxis>(axisIndex);
-    const double originUi = pulseToUi(config_.workOriginPulse[targetIndex][axisIndex], targetSide, axis);
+    const double originUi = pulseToUi(config_.homeReferencePulse[targetIndex][axisIndex], targetSide, axis);
     const auto workLimit = config_.rotationWorkLimits[targetIndex][axisIndex];
     limits[axisIndex].min = std::max(limits[axisIndex].min, originUi + workLimit.min);
     limits[axisIndex].max = std::min(limits[axisIndex].max, originUi + workLimit.max);
@@ -1219,7 +1286,7 @@ std::array<double, 6> NativeTeleopController::incrementalDeltasUi(
     lastFilteredDelta_[sourceIndex][axisIndex] = filteredDelta;
     const double scale = (rotation ? config_.rotationScale[sourceIndex] : config_.translationScale[sourceIndex])
         * config_.axisOutputScale[targetIndex][axisIndex];
-    const double impulsePulse = filteredDelta * config_.impulseCoeff[sourceIndex][axisIndex];
+    const double impulsePulse = filteredDelta * config_.impulseCoeff[targetIndex][axisIndex];
     const double requestedPulseFloat = impulsePulse * scale;
     lastRequestedPulse_[sourceIndex][axisIndex] = requestedPulseFloat;
     double requestedPulse = requestedPulseFloat;
@@ -1227,11 +1294,14 @@ std::array<double, 6> NativeTeleopController::incrementalDeltasUi(
       auto& pulseCarry = continuousPulseCarry_[sourceIndex][axisIndex];
       if (std::abs(requestedPulseFloat) > 1e-12) {
         pulseCarry += requestedPulseFloat;
+        const bool requiresConfirmation =
+            std::abs(filteredDelta) < (rotation ? kRotationMicroConfirmUpperDeg : kTranslationMicroConfirmUpperM);
         requestedPulse = static_cast<double>(applyContinuousPulseGate(
             sourceIndex,
             axisIndex,
             static_cast<long>(std::llround(pulseCarry)),
-            pulseCarry));
+            pulseCarry,
+            requiresConfirmation));
         if (std::abs(requestedPulse) > 1e-12) {
           const int emittedSign = signOfValue(requestedPulse);
           pulseCarry -= requestedPulse;
@@ -1263,7 +1333,8 @@ long NativeTeleopController::applyContinuousPulseGate(
     int sourceIndex,
     int axisIndex,
     long requestedPulse,
-    double requestedPulseFloat) {
+    double requestedPulseFloat,
+    bool requiresConfirmation) {
   if (std::abs(requestedPulseFloat) <= 1e-12) {
     continuousDirection_[sourceIndex][axisIndex] = 0;
     continuousStreak_[sourceIndex][axisIndex] = 0;
@@ -1280,6 +1351,21 @@ long NativeTeleopController::applyContinuousPulseGate(
   });
   auto& direction = continuousDirection_[sourceIndex][axisIndex];
   auto& streak = continuousStreak_[sourceIndex][axisIndex];
+  if (requiresConfirmation) {
+    if (direction == sign) {
+      ++streak;
+    } else {
+      direction = sign;
+      streak = 1;
+    }
+    if (config_.continuousMicroConfirmTicks <= 0 || streak < config_.continuousMicroConfirmTicks) {
+      return 0;
+    }
+    if (std::abs(requestedPulse) >= minimum) {
+      return requestedPulse;
+    }
+    return sign * minimum;
+  }
   if (std::abs(requestedPulse) >= minimum) {
     direction = sign;
     streak = config_.continuousMicroConfirmTicks;
@@ -1365,9 +1451,11 @@ void NativeTeleopController::enqueueGripperCommand(
 }
 
 double NativeTeleopController::mappedDirection(int sourceIndex, Side targetSide, int axisIndex) const {
+  (void)sourceIndex;
+  const int targetIndex = sideIndex(targetSide);
   const bool rotation = axisIndex >= 3;
   const double sourceUnit = rotation ? 1.0 : 1e-6;
-  const double pulse = sourceUnit * config_.impulseCoeff[sourceIndex][axisIndex];
+  const double pulse = sourceUnit * config_.impulseCoeff[targetIndex][axisIndex];
   const auto axis = static_cast<SemanticAxis>(axisIndex);
   const double ui = rotation ? pulse / pulsePerUnit(targetSide, axis) : pulse / pulsePerUnit(targetSide, axis) * 1000.0;
   return ui >= 0.0 ? 1.0 : -1.0;
@@ -1409,6 +1497,8 @@ void NativeTeleopController::recordActionUnlocked(
   action.currentPulse = result.currentPulse;
   action.launchDeltaPulse = result.launchDeltaPulse;
   action.updateReturn = result.updateReturn;
+  action.stopReason = result.stopReason;
+  action.axisIoStatus = result.axisIoStatus;
   action.movingBefore = result.movingBefore;
   action.moveStarted = result.moveStarted;
   action.clipped = result.clipped;

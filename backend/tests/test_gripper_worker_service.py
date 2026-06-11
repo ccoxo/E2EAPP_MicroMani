@@ -754,13 +754,13 @@ def test_gripper_worker_sync_keeps_workers_when_enabled() -> None:
     assert calls == []
 
 
-def test_gripper_workers_disabled_when_hal_native_owns_gripper() -> None:
+def test_gripper_workers_remain_enabled_in_hal_native_for_python_gripper_teleop() -> None:
     config = default_config()
     config["teleop"]["engine"] = "hal_native"
     config["gripper"]["sampleMode"] = "dual_worker"
     service = GripperWorkerService(FakeSettings(config), FakeLogs())
 
-    assert service.is_enabled(config) is False
+    assert service.is_enabled(config) is True
 
 
 def test_hal_native_gripper_command_routes_manual_target_through_hal() -> None:
@@ -894,7 +894,7 @@ def test_hal_native_gripper_enable_updates_state_without_python_com() -> None:
     assert settings.config["gripper"]["leftEnabled"] is True
 
 
-def test_telemetry_skips_python_gripper_sampling_when_hal_native_owns_gripper() -> None:
+def test_telemetry_uses_python_gripper_worker_samples_in_hal_native_mode() -> None:
     class FakeWorkerSamples:
         calls = 0
 
@@ -914,7 +914,7 @@ def test_telemetry_skips_python_gripper_sampling_when_hal_native_owns_gripper() 
 
     telemetry.refresh_gripper_positions(config, now=999.0)
 
-    assert worker.calls == 0
+    assert worker.calls == 1
 
 
 def test_telemetry_shutdown_closes_hardware_executor_and_cameras() -> None:

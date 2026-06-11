@@ -431,6 +431,8 @@ class OpenCVCameraDriver:
                             timestampSkewMs=0,
                             frameAgeMs=9999,
                             health="error",
+                            backend=None,
+                            workerActive=None,
                         )
                     )
                     continue
@@ -440,6 +442,8 @@ class OpenCVCameraDriver:
                 latest_at = self._latest_at.get(index)
                 frame_age = 0 if latest_at is None else round((time.monotonic() - latest_at) * 1000)
                 has_frame = index in self._latest_jpegs
+                backend_label = self._capture_backend_labels.get(index)
+                worker_active = bool(getattr(capture, "is_process_capture", False))
             cameras.append(
                 CameraTelemetry(
                     key=key,  # type: ignore[arg-type]
@@ -448,6 +452,8 @@ class OpenCVCameraDriver:
                     timestampSkewMs=0,
                     frameAgeMs=frame_age,
                     health="ok" if has_frame else "checking",
+                    backend=backend_label,
+                    workerActive=worker_active,
                 )
             )
         message = "; ".join(errors) if errors else f"OpenCV {self._backend_label} cameras available"
@@ -952,11 +958,13 @@ class OpenCVCameraDriver:
 
         capture = None
         backend_label = ""
+        worker_fallback = False
         profile = self._camera_tuning(config, camera) if config is not None and camera is not None else None
         backend_candidates = _backend_candidates(cv2)
         if self._process_capture_enabled(cv2, backend_candidates):
             capture = self._start_process_capture(cv2, index, width, height, fps, camera, profile, backend_candidates)
             if capture is None:
+                worker_fallback = True
                 self._event(
                     "warning",
                     "camera_worker_unavailable",
@@ -978,7 +986,7 @@ class OpenCVCameraDriver:
                 self._capture_opened_at[index] = time.monotonic()
                 if camera is not None:
                     self._capture_roles[index] = camera
-                self._capture_backend_labels[index] = backend_label
+                self._capture_backend_labels[index] = f"{backend_label} worker"
                 self._stale_indices.discard(index)
                 self._frame_locks[index] = Lock()
                 self._frame_events[index] = Event()
@@ -1067,7 +1075,7 @@ class OpenCVCameraDriver:
         self._capture_opened_at[index] = time.monotonic()
         if camera is not None:
             self._capture_roles[index] = camera
-        self._capture_backend_labels[index] = backend_label
+        self._capture_backend_labels[index] = f"{backend_label} fallback" if worker_fallback else backend_label
         self._stale_indices.discard(index)
         self._frame_locks[index] = Lock()
         self._frame_events[index] = Event()

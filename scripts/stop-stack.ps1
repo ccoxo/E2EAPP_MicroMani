@@ -64,7 +64,7 @@ function Stop-BackendProcessTrees {
   }
 }
 
-foreach ($port in @(5173, 5174, 18080, 18082, 8091)) {
+foreach ($port in @(5173, 5174, 18080, 18082, 8091, 8092)) {
   $pidsOnPort = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
     Select-Object -ExpandProperty OwningProcess |
     Sort-Object -Unique)

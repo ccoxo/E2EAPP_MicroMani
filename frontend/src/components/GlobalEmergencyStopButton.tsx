@@ -28,12 +28,12 @@ export function GlobalEmergencyStopButton() {
       {active && (
         <Tooltip title="只确认安全态，不恢复运动" placement="left">
           <Button
-            aria-label="确认安全复位"
+            aria-label="确认安全态"
             className="floating-safety-reset"
             icon={<RotateCcw size={16} />}
             onClick={acknowledgeSafety}
           >
-            确认复位
+            确认安全态
           </Button>
         </Tooltip>
       )}

@@ -145,8 +145,20 @@ std::string jsonTeleopTargetUpdateResult(
   appendDoubleArray(out, result.appliedDeltaPulse);
   out << ",\"targetPulse\":";
   appendDoubleArray(out, result.targetPulse);
+  out << ",\"currentPulse\":";
+  appendDoubleArray(out, result.currentPulse);
+  out << ",\"launchDeltaPulse\":";
+  appendDoubleArray(out, result.launchDeltaPulse);
   out << ",\"updateReturn\":";
   appendDoubleArray(out, result.updateReturn);
+  out << ",\"stopReason\":";
+  appendDoubleArray(out, result.stopReason);
+  out << ",\"axisIoStatus\":";
+  appendDoubleArray(out, result.axisIoStatus);
+  out << ",\"movingBefore\":";
+  appendBoolArray(out, result.movingBefore);
+  out << ",\"moveStarted\":";
+  appendBoolArray(out, result.moveStarted);
   out << ",\"clipped\":";
   appendBoolArray(out, result.clipped);
   out << "}";
@@ -570,6 +582,10 @@ appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& bo
   config.workOriginValid[1] = jsonBoolValue(body, "rightWorkOriginValid", config.workOriginValid[1]);
   config.workOriginPulse[0] = jsonNumberArray6(body, "leftWorkOriginPulse", config.workOriginPulse[0]);
   config.workOriginPulse[1] = jsonNumberArray6(body, "rightWorkOriginPulse", config.workOriginPulse[1]);
+  config.homeReferenceValid[0] = jsonBoolValue(body, "leftHomeReferenceValid", config.homeReferenceValid[0]);
+  config.homeReferenceValid[1] = jsonBoolValue(body, "rightHomeReferenceValid", config.homeReferenceValid[1]);
+  config.homeReferencePulse[0] = jsonNumberArray6(body, "leftHomeReferencePulse", config.homeReferencePulse[0]);
+  config.homeReferencePulse[1] = jsonNumberArray6(body, "rightHomeReferencePulse", config.homeReferencePulse[1]);
   config.translationStepLimitPulse =
       jsonNumberValue(body, "translationStepLimitPulse", config.translationStepLimitPulse);
   config.rotationStepLimitPulse = jsonNumberValue(body, "rotationStepLimitPulse", config.rotationStepLimitPulse);
@@ -862,19 +878,18 @@ void serveConnection(
         motion.emergencyStop();
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/home_all ", 0) == 0) {
+        motion.ensureMotionReturnAllowed();
         const auto bodyText = requestBody(request);
         const auto enabledAxes = jsonHomeAllEnabledAxes(bodyText);
         nativeTeleop.stop();
-        motion.enableHomeAxes(appstation::hal::Side::Left, enabledAxes[0]);
-        motion.enableHomeAxes(appstation::hal::Side::Right, enabledAxes[1]);
         motion.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes);
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/home_origin_side ", 0) == 0) {
+        motion.ensureMotionReturnAllowed();
         const auto bodyText = requestBody(request);
         const auto side = parseSide(jsonStringValue(bodyText, "side"));
         const auto enabledAxes = jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled);
         nativeTeleop.stop();
-        motion.enableHomeAxes(side, enabledAxes);
         motion.homeOriginSide(
             side,
             jsonSideWorkOriginPulse(bodyText),
@@ -977,6 +992,7 @@ int main() {
   Omega7Driver omega;
   JodellGripperDriver gripper;
   const bool motionOk = motion.initialize();
+  const int halPort = envIntValue("APPSTATION_HAL_PORT", 8091);
   const int leftOpenId = envIntValue("APPSTATION_OMEGA7_LEFT_OPEN_ID", 0);
   const int rightOpenId = envIntValue("APPSTATION_OMEGA7_RIGHT_OPEN_ID", 1);
   const bool swapHands = envBoolValue("APPSTATION_OMEGA7_SWAP_HANDS", false);
@@ -1000,16 +1016,16 @@ int main() {
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  address.sin_port = htons(8091);
+  address.sin_port = htons(static_cast<u_short>(halPort));
   if (bind(server, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR ||
       listen(server, SOMAXCONN) == SOCKET_ERROR) {
-    std::cerr << "Failed to bind HalServer on 127.0.0.1:8091\n";
+    std::cerr << "Failed to bind HalServer on 127.0.0.1:" << halPort << "\n";
     closesocket(server);
     WSACleanup();
     return 1;
   }
 
-  std::cout << "HalServer listening on http://127.0.0.1:8091\n";
+  std::cout << "HalServer listening on http://127.0.0.1:" << halPort << "\n";
   while (true) {
     SOCKET client = accept(server, nullptr, nullptr);
     if (client == INVALID_SOCKET) {

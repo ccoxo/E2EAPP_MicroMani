@@ -1,6 +1,7 @@
 param(
   [int]$BackendPort = 18082,
-  [int]$FrontendPort = 5174
+  [int]$FrontendPort = 5174,
+  [int]$HalPort = 8091
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,9 +45,18 @@ function Test-HttpOk([string]$Url, [int]$TimeoutSeconds) {
   }
 }
 
+function Get-RecordStatus([int]$TimeoutSeconds) {
+  try {
+    $response = Invoke-RestMethod "http://127.0.0.1:$BackendPort/api/record/status" -TimeoutSec $TimeoutSeconds
+    return $response.data
+  } catch {
+    return $null
+  }
+}
+
 function Restart-AppStack([string]$Reason) {
   Write-Warning $Reason
-  & (Join-Path $PSScriptRoot "start-stack.ps1") -BackendPort $BackendPort -FrontendPort $FrontendPort | Out-Host
+  & (Join-Path $PSScriptRoot "start-stack.ps1") -BackendPort $BackendPort -FrontendPort $FrontendPort -HalPort $HalPort | Out-Host
   Wait-HttpOk $appUrl 45
 }
 
@@ -63,7 +73,7 @@ New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
 
 try {
   Write-Host "Starting HAL, backend, and frontend..."
-  & (Join-Path $PSScriptRoot "start-stack.ps1") -BackendPort $BackendPort -FrontendPort $FrontendPort | Out-Host
+  & (Join-Path $PSScriptRoot "start-stack.ps1") -BackendPort $BackendPort -FrontendPort $FrontendPort -HalPort $HalPort | Out-Host
   Wait-HttpOk $appUrl 45
 
   $processes = @(Get-AppBrowserProcesses)
@@ -95,10 +105,24 @@ try {
   }
 
   Write-Host "App is running. Close the App window to stop frontend, backend, and HAL."
+  $backendHealthFailures = 0
+  $backendHealthFailureLimit = 15
   while (@(Get-AppBrowserProcesses).Count -gt 0) {
     $backendHealthUrl = "http://127.0.0.1:$BackendPort/docs"
-    if (-not (Test-HttpOk $backendHealthUrl 3)) {
-      Restart-AppStack "backend health check failed; restarting stack"
+    if (Test-HttpOk $backendHealthUrl 3) {
+      $backendHealthFailures = 0
+    } else {
+      $recordStatus = Get-RecordStatus 2
+      if ($recordStatus -and ($recordStatus.active -or $recordStatus.recording)) {
+        $backendHealthFailures = 0
+        Write-Warning "backend health check skipped during active recording"
+      } else {
+        $backendHealthFailures += 1
+        if ($backendHealthFailures -ge $backendHealthFailureLimit) {
+          Restart-AppStack "backend health check failed; restarting stack"
+          $backendHealthFailures = 0
+        }
+      }
     }
     Start-Sleep -Seconds 1
   }

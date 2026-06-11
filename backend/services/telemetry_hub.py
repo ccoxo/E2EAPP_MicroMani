@@ -569,10 +569,6 @@ class TelemetryHub:
         now = time.monotonic() if now is None else now
         if self.hardware is None or getattr(self, "_shutdown", False):
             return
-        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
-        hal_native = str(teleop.get("engine", "")).lower() == "hal_native"
-        if hal_native:
-            return
         if self.gripper_workers is not None and self.gripper_workers.is_enabled(config):
             samples = self.gripper_workers.samples(config)
             if samples:

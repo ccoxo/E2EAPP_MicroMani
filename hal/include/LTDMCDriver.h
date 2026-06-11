@@ -17,9 +17,9 @@ class LTDMCDriver {
   MotionState readState();
   std::string axisDiagnosticsJson();
   void emergencyStop();
+  void ensureMotionReturnAllowed() const;
   std::string enableSide(Side side, bool enabled = true);
   std::string enableSide(Side side, bool enabled, const std::array<bool, 6>& enabledAxes);
-  std::string enableHomeAxes(Side side, const std::array<bool, 6>& enabledAxes);
   void homeSide(Side side);
   void homeSide(Side side, const std::array<bool, 6>& enabledAxes);
   void homeAll(const std::array<double, 12>& workOriginPulse);
@@ -66,10 +66,16 @@ class LTDMCDriver {
   void configureStageAxes(Side side);
   void checkLimits(const std::array<double, 12>& targetUi, const std::array<AxisLimit, 12>& limits) const;
   bool axisMotionEnabled(Side side, SemanticAxis axis) const;
+  MotionState cachedStateSnapshot() const;
+  HalHealth cachedHealth(double uptimeS) const;
+  void publishStateSnapshotLocked();
+  void publishStateSnapshotLocked(const MotionState& state);
   void stopAllAxesBestEffort() noexcept;
+  void disableAllAxesBestEffort() noexcept;
   void clearEstopIfUnchanged(std::uint64_t sequenceAtStart);
 
   mutable std::mutex mutex_;
+  mutable std::mutex snapshotMutex_;
   bool initialized_{false};
   std::atomic_bool estopActive_{false};
   std::atomic_uint64_t estopSequence_{0};
@@ -79,6 +85,9 @@ class LTDMCDriver {
   std::array<bool, 12> commandedEnabled_{};
   std::array<double, 12> teleopTargetPulse_{};
   std::array<bool, 12> teleopTargetActive_{};
+  MotionState cachedState_{};
+  bool cachedInitialized_{false};
+  std::string cachedLastError_;
 };
 
 }  // namespace appstation::hal
