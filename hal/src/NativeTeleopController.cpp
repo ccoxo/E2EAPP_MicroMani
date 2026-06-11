@@ -514,9 +514,6 @@ void NativeTeleopController::gripperLoop() {
         gripperLastCommandOk_[command.targetIndex] = ok;
         gripperLastMessage_[command.targetIndex] = message;
         gripperLastCommandTs_[command.targetIndex] = unixTimeMs();
-        if (!ok) {
-          lastError_ = std::string("native gripper ") + sideName(command.side) + ": " + message;
-        }
       }
     }
     if (shouldSample) {
@@ -529,10 +526,12 @@ void NativeTeleopController::gripperLoop() {
 void NativeTeleopController::sampleGripperPosition(Side side) {
   std::string message;
   const bool ok = gripper_.readPositionMm(side, &message);
+  const int index = sideIndex(side);
   std::scoped_lock lock(mutex_);
   gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);
-  if (!ok && !message.empty()) {
-    lastError_ = std::string("native gripper ") + sideName(side) + " position: " + message;
+  gripperLastCommandOk_[index] = ok;
+  if (!message.empty()) {
+    gripperLastMessage_[index] = message;
   }
 }
 
@@ -576,9 +575,6 @@ bool NativeTeleopController::commandGripperTarget(
     gripperLastCommandOk_[index] = ok;
     gripperLastMessage_[index] = driverMessage;
     gripperLastCommandTs_[index] = unixTimeMs();
-    if (!ok) {
-      lastError_ = std::string("native gripper ") + sideName(side) + ": " + driverMessage;
-    }
   }
   if (message) {
     *message = driverMessage;

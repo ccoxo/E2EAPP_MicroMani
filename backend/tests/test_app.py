@@ -599,11 +599,16 @@ def test_dataset_heavy_read_routes_use_worker_thread(tmp_path: Path, monkeypatch
     def resolve_frame_image(dataset_id: str, episode_id: str, camera: str, frame: int) -> bytes:
         return f"{dataset_id}:{episode_id}:{camera}:{frame}".encode()
 
+    def record_status() -> dict[str, Any]:
+        return {"active": False, "recording": False}
+
     monkeypatch.setattr(client.app.state.recorder, "list_datasets", list_datasets)
     monkeypatch.setattr(client.app.state.recorder, "episode_detail", episode_detail)
     monkeypatch.setattr(client.app.state.recorder, "resolve_frame_image", resolve_frame_image)
+    monkeypatch.setattr(client.app.state.recorder, "status", record_status)
     monkeypatch.setattr("backend.app.asyncio.to_thread", fake_to_thread)
 
+    assert client.get("/api/record/status").status_code == 200
     assert client.get("/api/datasets").status_code == 200
     assert client.get("/api/datasets/unit_dataset/episodes/episode_000001").status_code == 200
     image_response = client.get(
@@ -612,9 +617,24 @@ def test_dataset_heavy_read_routes_use_worker_thread(tmp_path: Path, monkeypatch
     )
 
     assert image_response.status_code == 200
-    assert [name for name, _ in calls] == ["list_datasets", "episode_detail", "resolve_frame_image"]
-    assert calls[1][1] == ("unit_dataset", "episode_000001")
-    assert calls[2][1] == ("unit_dataset", "episode_000001", "global", 3)
+    assert [name for name, _ in calls] == ["record_status", "list_datasets", "episode_detail", "resolve_frame_image"]
+    assert calls[2][1] == ("unit_dataset", "episode_000001")
+    assert calls[3][1] == ("unit_dataset", "episode_000001", "global", 3)
+
+
+def test_device_routes_read_config_on_worker_thread(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path / "runtime"))
+    calls: list[str] = []
+
+    async def fake_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append(func.__name__)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("backend.app.asyncio.to_thread", fake_to_thread)
+
+    assert client.post("/api/pico/status/check").status_code == 200
+    assert calls[:2] == ["get_config", "status"]
 
 
 def test_startup_emits_session_and_axis_config_logs(tmp_path: Path) -> None:

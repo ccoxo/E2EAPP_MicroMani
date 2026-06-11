@@ -1485,6 +1485,8 @@ class OpenCVCameraDriver:
                         ok, frame = capture.read()
                     except Exception:
                         ok, frame = False, None
+                    if stop.is_set():
+                        break
                     if ok and frame is not None:
                         consecutive_failures = 0
                         now = time.monotonic()

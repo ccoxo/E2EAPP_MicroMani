@@ -288,20 +288,23 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         config["teleop"][f"{side}Connected"] = connected
         return settings.save_config(config, emit_log=False)
 
-    def gripper_teleop_enabled() -> bool:
-        config = settings.get_config()
+    def native_teleop_config(config: dict[str, Any]) -> bool:
+        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
+        return str(teleop.get("engine", "")).lower() == "hal_native"
+
+    def _gripper_teleop_enabled(config: dict[str, Any]) -> bool:
         teleop = config.get("teleop", {})
         gripper_teleop = teleop.get("gripperTeleop", {}) if isinstance(teleop, dict) else {}
         return isinstance(gripper_teleop, dict) and bool(gripper_teleop.get("enabled", False))
 
-    def native_teleop_enabled() -> bool:
-        config = settings.get_config()
-        teleop = config.get("teleop", {})
-        return isinstance(teleop, dict) and str(teleop.get("engine", "")).lower() == "hal_native"
+    async def get_config_async() -> dict[str, Any]:
+        return await asyncio.to_thread(settings.get_config)
 
-    def native_teleop_config(config: dict[str, Any]) -> bool:
-        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
-        return str(teleop.get("engine", "")).lower() == "hal_native"
+    async def gripper_teleop_enabled_async() -> bool:
+        return _gripper_teleop_enabled(await get_config_async())
+
+    async def native_teleop_enabled_async() -> bool:
+        return native_teleop_config(await get_config_async())
 
     def teleop_target_side_for_source(side: SideName, config: dict[str, Any]) -> SideName:
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
@@ -324,8 +327,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
         task.add_done_callback(_cleanup)
 
-    async def sync_teleop_logical_connection(side: SideName, connected: bool) -> None:
-        config = settings.get_config()
+    async def sync_teleop_logical_connection(
+        side: SideName,
+        connected: bool,
+        config: dict[str, Any] | None = None,
+    ) -> None:
+        config = config if config is not None else await get_config_async()
         teleop_config = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         mapped_side = teleop_target_side_for_source(side, config)
         if connected:
@@ -345,7 +352,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             except RuntimeError as exc:
                 logs.error("[HAL]", f"teleop connect enable mapped {mapped_side} failed: {exc}")
             await teleop_mapper.start("teleop-connect", pre_home=False, home_side=mapped_side)
-            start_gripper_teleop_source("teleop-connect")
+            await start_gripper_teleop_source("teleop-connect", config)
             logs.info("[HAL]", f"{side} Omega.7 logical connect background sync completed")
             return
 
@@ -536,7 +543,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         require_camera: bool,
         require_gripper: bool = True,
     ) -> None:
-        config = settings.get_config()
+        config = await get_config_async()
         use_gripper_workers = gripper_workers.is_enabled(config)
         native_gripper = native_teleop_config(config) and not use_gripper_workers
         hal_health = await hal.health()
@@ -580,12 +587,17 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 detail={"code": "HARDWARE_PRECHECK_FAILED", "message": message},
             )
 
-    def start_gripper_teleop_source(source: str) -> None:
-        if gripper_teleop_enabled():
+    async def start_gripper_teleop_source(source: str, config: dict[str, Any] | None = None) -> None:
+        enabled = (
+            _gripper_teleop_enabled(config)
+            if config is not None
+            else await gripper_teleop_enabled_async()
+        )
+        if enabled:
             gripper_tele.start(source)
 
     async def stop_aux_native_teleop_sources(reason: str) -> None:
-        if not native_teleop_enabled():
+        if not await native_teleop_enabled_async():
             return
         for source in ("teleop-connect", "manual-gripper"):
             try:
@@ -607,7 +619,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 gripper_errors[side] = str(exc)
                 logs.error("[GRIPPER]", f"{side} gripper close-release failed: {exc}")
             await asyncio.to_thread(set_teleop_logical_connection, side, False)
-        config = settings.get_config()
+        config = await get_config_async()
         config["gripper"]["leftEnabled"] = False
         config["gripper"]["rightEnabled"] = False
         await asyncio.to_thread(settings.save_config, config, emit_log=False)
@@ -656,7 +668,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.on_event("startup")
     async def reconcile_startup_hal_state() -> None:
         skip_startup_home = os.environ.get("APPSTATION_SKIP_STARTUP_HOME", "").strip().lower()
-        config = settings.get_config()
+        config = await get_config_async()
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         if (
             native_teleop_config(config)
@@ -692,7 +704,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.on_event("shutdown")
     async def stop_gripper_workers() -> None:
         try:
-            record_status = recorder.status()
+            record_status = await asyncio.to_thread(recorder.status)
             if record_status.get("active") or record_status.get("recording"):
                 await recorder.finish_session()
         except Exception as exc:  # noqa: BLE001
@@ -713,7 +725,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
         hal_health = await hal.health()
-        health_config = settings.get_config()
+        health_config = await get_config_async()
         use_gripper_workers = gripper_workers.is_enabled(health_config)
         native_gripper = native_teleop_config(health_config) and not use_gripper_workers
         hardware_status = await asyncio.to_thread(
@@ -738,7 +750,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 查询当前硬件连接与设备状态。
     @app.get("/api/hardware/status")
     async def hardware_status() -> dict[str, Any]:
-        config = settings.get_config()
+        config = await get_config_async()
         use_gripper_workers = gripper_workers.is_enabled(config)
         native_gripper = native_teleop_config(config) and not use_gripper_workers
         status = await asyncio.to_thread(
@@ -756,7 +768,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 获取当前应用配置。
     @app.get("/api/settings")
     async def get_settings() -> dict[str, Any]:
-        return settings.get_config()
+        return await get_config_async()
 
     # 保存新的应用配置。
     @app.put("/api/settings")
@@ -1098,7 +1110,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/policy/observation")
     async def policy_observation() -> ApiEnvelope:
-        config = settings.get_config()
+        config = await get_config_async()
         joint_positions = list(telemetry.motion_positions)
         if _real_hardware_mode(config):
             try:
@@ -1129,7 +1141,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 detail={"code": "BAD_POLICY_ACTION", "message": "action must be a 14-element list"},
             )
         dry_run = bool(payload.get("dryRun", True))
-        config = settings.get_config()
+        config = await get_config_async()
         current_state = lerobot_state_from_ui(list(telemetry.motion_positions), _policy_gripper_positions(config))
         try:
             plan = build_policy_action_plan(
@@ -1245,7 +1257,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def gripper_position(side: str) -> ApiEnvelope:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
-        config = settings.get_config()
+        config = await get_config_async()
         if gripper_workers.is_enabled(config):
             result = await asyncio.to_thread(gripper_workers.position, config, side)
         elif native_teleop_config(config):
@@ -1271,7 +1283,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def gripper_diagnose(side: str) -> ApiEnvelope:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
-        config = settings.get_config()
+        config = await get_config_async()
         if gripper_workers.is_enabled(config):
             worker_status = await asyncio.to_thread(gripper_workers.status, config)
             side_status = worker_status.get("sides", {}).get(side, {})
@@ -1339,7 +1351,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         config = await asyncio.to_thread(set_teleop_logical_connection, side_name, True)
         mapped_side = teleop_target_side_for_source(side_name, config)
         schedule_teleop_background(
-            sync_teleop_logical_connection(side_name, True),
+            sync_teleop_logical_connection(side_name, True, config),
             f"teleop-{side}-connect-sync",
         )
         logs.info(
@@ -1365,7 +1377,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         config = await asyncio.to_thread(set_teleop_logical_connection, side_name, False)
         mapped_side = teleop_target_side_for_source(side_name, config)
         schedule_teleop_background(
-            sync_teleop_logical_connection(side_name, False),
+            sync_teleop_logical_connection(side_name, False, config),
             f"teleop-{side}-disconnect-sync",
         )
         logs.info("[HAL]", f"{side} Omega.7 logical disconnect accepted; background sync scheduled")
@@ -1376,7 +1388,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def teleop_state() -> ApiEnvelope:
         try:
             omega_state = await hal.omega_state()
-            return envelope(mask_omega_state_for_logical_connection(omega_state, settings.get_config()))
+            config = await get_config_async()
+            return envelope(mask_omega_state_for_logical_connection(omega_state, config))
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail={"code": "OMEGA_UNAVAILABLE", "message": str(exc)}) from exc
 
@@ -1391,7 +1404,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         enabled = bool((payload or {}).get("enabled", True))
-        config = settings.get_config()
+        config = await get_config_async()
         config["teleop"][f"{side}GravityCompensation"] = enabled
         config["teleop"][f"{side}ForceFeedback"] = enabled
         saved = await asyncio.to_thread(settings.save_config, config, emit_log=False)
@@ -1410,7 +1423,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def teleop_zero_force_feedback(side: str) -> ApiEnvelope:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
-        config = settings.get_config()
+        config = await get_config_async()
         open_id = int(config["teleop"].get(f"{side}OpenId", 0 if side == "left" else 1))
         await hal.command("omega7.zero_force_feedback", {"openId": open_id})
         logs.info("[HAL]", f"{side} Omega.7 zero force feedback requested")
@@ -1419,14 +1432,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 探测指定相机可用性。
     @app.post("/api/cameras/{camera}/enumerate")
     async def camera_enumerate(camera: str) -> ApiEnvelope:
-        probe = await asyncio.to_thread(hardware.cameras.probe, settings.get_config())
+        config = await get_config_async()
+        probe = await asyncio.to_thread(hardware.cameras.probe, config)
         logs.info("[CAMERA]", f"{camera} enumerate requested: {probe.message}")
         return envelope({"camera": camera, "ok": probe.ok, "message": probe.message})
 
     # 重新连接指定相机。
     @app.post("/api/cameras/{camera}/reconnect")
     async def camera_reconnect(camera: str) -> ApiEnvelope:
-        probe = await asyncio.to_thread(hardware.cameras.reconnect, settings.get_config(), camera)
+        config = await get_config_async()
+        probe = await asyncio.to_thread(hardware.cameras.reconnect, config, camera)
         logs.info("[CAMERA]", f"{camera} reconnect requested: {probe.message}")
         return envelope({"camera": camera, "ok": probe.ok, "message": probe.message})
 
@@ -1441,7 +1456,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         active = (
             await asyncio.to_thread(settings.save_config, config.model_dump(mode="json"), emit_log=False)
             if config is not None
-            else settings.get_config()
+            else await get_config_async()
         )
         try:
             result = await asyncio.to_thread(hardware.cameras.apply_tuning, active, camera)
@@ -1459,7 +1474,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 detail={"code": "BAD_CAMERA", "message": "camera must be global, wrist_left, or wrist_right"},
             )
         try:
-            jpeg = await asyncio.to_thread(hardware.cameras.snapshot, settings.get_config(), camera)
+            config = await get_config_async()
+            jpeg = await asyncio.to_thread(hardware.cameras.snapshot, config, camera)
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail={"code": "CAMERA_UNAVAILABLE", "message": str(exc)}) from exc
         return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
@@ -1479,9 +1495,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             while True:
                 started = time.monotonic()
                 try:
+                    config = await get_config_async()
                     last_sequence, jpeg = await asyncio.to_thread(
                         hardware.cameras.wait_for_frame,
-                        settings.get_config(),
+                        config,
                         camera,
                         last_sequence,
                         2.0,
@@ -1507,34 +1524,39 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 枚举系统相机设备。
     @app.get("/api/cameras/enumerate")
     async def camera_enumerate_all() -> ApiEnvelope:
-        devices = await asyncio.to_thread(hardware.cameras.enumerate_devices, settings.get_config())
+        config = await get_config_async()
+        devices = await asyncio.to_thread(hardware.cameras.enumerate_devices, config)
         return envelope({"devices": devices})
 
     # 连接 PICO ADB 设备。
     @app.post("/api/pico/adb/connect")
     async def pico_adb_connect() -> ApiEnvelope:
-        result = await asyncio.to_thread(hardware.pico.connect, settings.get_config())
+        config = await get_config_async()
+        result = await asyncio.to_thread(hardware.pico.connect, config)
         logs.info("[CAMERA]", result.message)
         return envelope(result.__dict__)
 
     # 启动 PICO 视觉服务。
     @app.post("/api/pico/vision/start")
     async def pico_vision_start() -> ApiEnvelope:
-        result = await asyncio.to_thread(hardware.pico.start_vision, settings.get_config())
+        config = await get_config_async()
+        result = await asyncio.to_thread(hardware.pico.start_vision, config)
         logs.info("[CAMERA]", result.message)
         return envelope(result.__dict__)
 
     # 停止 PICO 视觉服务。
     @app.post("/api/pico/vision/stop")
     async def pico_vision_stop() -> ApiEnvelope:
-        result = await asyncio.to_thread(hardware.pico.stop_vision, settings.get_config())
+        config = await get_config_async()
+        result = await asyncio.to_thread(hardware.pico.stop_vision, config)
         logs.info("[CAMERA]", result.message)
         return envelope(result.__dict__)
 
     # 检查 PICO 设备状态。
     @app.post("/api/pico/status/check")
     async def pico_status_check() -> ApiEnvelope:
-        result = await asyncio.to_thread(hardware.pico.status, settings.get_config())
+        config = await get_config_async()
+        result = await asyncio.to_thread(hardware.pico.status, config)
         logs.info("[CAMERA]", result.message)
         return envelope(result.__dict__)
 
@@ -1545,10 +1567,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         task = payload.get("task", "")
         try:
             await require_hardware_recognized("record", require_camera=True)
-            if native_teleop_enabled():
+            if await native_teleop_enabled_async():
                 await stop_aux_native_teleop_sources("record session create")
             result = await recorder.start_session(str(dataset_name), str(task))
-            start_gripper_teleop_source("recording")
+            await start_gripper_teleop_source("recording")
             return envelope(result)
         except RuntimeError as exc:
             if "native LeRobot dataset is required" in str(exc):
@@ -1577,7 +1599,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/record/episode/discard")
     async def discard_episode() -> ApiEnvelope:
         try:
-            if native_teleop_enabled():
+            if await native_teleop_enabled_async():
                 await stop_aux_native_teleop_sources("record episode discard")
             try:
                 result = await recorder.discard_episode()
@@ -1601,8 +1623,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/record/reset/skip")
     async def skip_reset() -> ApiEnvelope:
         try:
-            if native_teleop_enabled():
-                record_state = recorder.status()
+            if await native_teleop_enabled_async():
+                record_state = await asyncio.to_thread(recorder.status)
                 if bool(record_state.get("resetPending")) and not bool(record_state.get("resetReady")):
                     raise HTTPException(
                         status_code=409,
@@ -1613,7 +1635,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     )
                 await stop_aux_native_teleop_sources("record reset skip")
             result = await recorder.skip_reset()
-            start_gripper_teleop_source("recording")
+            await start_gripper_teleop_source("recording")
             return envelope(result)
         except RuntimeError as exc:
             message = str(exc)
@@ -1627,7 +1649,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 查询录制状态。
     @app.get("/api/record/status")
     async def record_status() -> ApiEnvelope:
-        return envelope(recorder.status())
+        return envelope(await asyncio.to_thread(recorder.status))
 
     # 列出数据集。
     @app.get("/api/datasets")
@@ -1808,6 +1830,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                             logs.error("[HAL]", f"health refresh failed: {exc}")
                         last_health_at = now
                     hal_health = cached_health
+                    active_config = await get_config_async()
 
                     motion_state: dict[str, Any] | None = None
                     if hal_health.connected and hal_health.ltdmc_ok:
@@ -1834,7 +1857,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                             motion_pulses = [float(value) for value in raw_pulses]
                         if motion_positions is not None:
                             motion_positions = relative_motion_positions(
-                                settings.get_config(),
+                                active_config,
                                 motion_positions,
                                 motion_pulses,
                             )
@@ -1881,13 +1904,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                                     item for item in raw_hands if isinstance(item, dict)
                                 ] if isinstance(raw_hands, list) else None
                                 if cached_omega_hands is not None:
-                                    emit_omega_device_logs(logs, settings.get_config(), cached_omega_hands)
+                                    emit_omega_device_logs(logs, active_config, cached_omega_hands)
                             except RuntimeError as exc:
                                 cached_omega_hands = None
                                 logs.error("[HAL]", f"omega state failed: {exc}")
                         omega_hands = cached_omega_hands
                     hal_ok = hal_health.connected and (hal_health.mode != "real" or hal_health.ltdmc_ok)
-                    active_config = settings.get_config()
                     use_gripper_workers = gripper_workers.is_enabled(active_config)
                     frame = telemetry.next_frame(
                         motion_positions,

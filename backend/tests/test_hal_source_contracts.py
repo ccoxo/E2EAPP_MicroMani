@@ -1363,7 +1363,7 @@ def test_hal_native_gripper_surfaces_command_status_and_retries_port_open() -> N
     assert "const auto gripperPositions = gripper_.positionMm();" not in controller_source
     assert "std::array<double, 2> positionMm_" in gripper_header
     assert "getClawCurrentLocation_(slave)" in gripper_source
-    assert "lastError_ = std::string(\"native gripper \")" in normalized_controller
+    assert "lastError_ = std::string(\"native gripper \")" not in normalized_controller
     assert "constexpr auto kPortSwitchSettleMs = std::chrono::milliseconds(50);" in gripper_source
     assert "for (int attempt = 0; attempt < 5; ++attempt)" in normalized_gripper
     assert "std::this_thread::sleep_for(kPortSwitchSettleMs);" in normalized_gripper
@@ -1474,6 +1474,33 @@ def test_hal_native_gripper_uses_isolated_jodell_worker_processes() -> None:
     assert "sampleGripperPosition(sideFromIndex(sampleIndex));" not in normalized_loop
     assert "const bool ok = gripper_.readPositionMm(side, &message);" in normalized_sample
     assert "gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);" in normalized_sample
+    assert "gripperLastCommandOk_[index] = ok;" in normalized_sample
+    assert "gripperLastMessage_[index] = message;" in normalized_sample
+
+
+def test_hal_native_gripper_errors_do_not_pollute_arm_teleop_last_error() -> None:
+    controller_source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
+    normalized = " ".join(controller_source.split())
+    command_loop_body = controller_source.split("void NativeTeleopController::gripperLoop()", 1)[1].split(
+        "void NativeTeleopController::sampleGripperPosition",
+        1,
+    )[0]
+    sample_body = controller_source.split("void NativeTeleopController::sampleGripperPosition", 1)[1].split(
+        "bool NativeTeleopController::running() const",
+        1,
+    )[0]
+    direct_command_body = controller_source.split("bool NativeTeleopController::commandGripperTarget(", 1)[1].split(
+        "std::string NativeTeleopController::statusJson() const",
+        1,
+    )[0]
+
+    assert "lastError_ = std::string(\"native gripper \")" not in normalized
+    assert "gripperLastCommandOk_[command.targetIndex] = ok;" in command_loop_body
+    assert "gripperLastMessage_[command.targetIndex] = message;" in command_loop_body
+    assert "gripperLastCommandOk_[index] = ok;" in sample_body
+    assert "gripperLastMessage_[index] = message;" in sample_body
+    assert "gripperLastCommandOk_[index] = ok;" in direct_command_body
+    assert "gripperLastMessage_[index] = driverMessage;" in direct_command_body
 
 
 def test_hal_native_jodell_driver_closes_other_active_port_before_switching() -> None:
