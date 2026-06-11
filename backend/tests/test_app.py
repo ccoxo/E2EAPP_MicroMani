@@ -7,7 +7,7 @@ import os
 import time
 from pathlib import Path
 from threading import Barrier, BrokenBarrierError, Event, Thread
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -19,6 +19,7 @@ from backend.core.logging import LogService
 from backend.core.motion_limits import effective_limits_ui, side_home_reference_ui
 from backend.core.schemas import GripperCommandRequest
 from backend.drivers.camera_opencv import OpenCVCameraDriver
+from backend.drivers.pico_adb import PicoResult
 from backend.hal_client.client import HalHealth, RealHalClient, TestHalClient
 from backend.services.dataset_recorder import DatasetRecorderService, DatasetSaveError
 
@@ -60,6 +61,10 @@ def _clear_camera_identities(config: dict) -> None:
 def _avoid_camera_index_conflicts(config: dict) -> None:
     config["cameras"]["wristLeft"] = "IMX258 / index 1"
     config["cameras"]["wristRight"] = "IMX258 / index 2"
+
+
+def _app_state(client: TestClient) -> Any:
+    return cast(Any, client.app).state
 
 
 def _write_dataset_fixture(dataset_root: Path, dataset_id: str = "unit_dataset") -> Path:
@@ -203,6 +208,103 @@ def test_settings_round_trip(tmp_path: Path) -> None:
     assert put_response.json()["hal"]["apiConfirmed"] is True
 
     assert client.get("/api/settings").json()["hal"]["apiConfirmed"] is True
+
+
+def test_settings_save_and_apply_run_config_methods_off_event_loop(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    client = TestClient(create_app(tmp_path))
+    config = client.get("/api/settings").json()
+    calls: list[str] = []
+
+    def assert_off_event_loop(method_name: str) -> None:
+        calls.append(method_name)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        raise AssertionError(f"{method_name} ran on the event loop")
+
+    def fake_save_config(next_config: dict[str, Any], emit_log: bool = True) -> dict[str, Any]:
+        _ = emit_log
+        assert_off_event_loop("save_config")
+        return next_config
+
+    def fake_apply_config(next_config: dict[str, Any] | None = None) -> dict[str, Any]:
+        assert_off_event_loop("apply_config")
+        return next_config or config
+
+    app_state = _app_state(client)
+    monkeypatch.setattr(app_state.settings, "save_config", fake_save_config)
+    monkeypatch.setattr(app_state.settings, "apply_config", fake_apply_config)
+
+    put_response = client.put("/api/settings", json=config)
+    apply_response = client.post("/api/settings/apply", json=config)
+
+    assert put_response.status_code == 200
+    assert apply_response.status_code == 200
+    assert calls == ["save_config", "apply_config"]
+
+
+def test_settings_snapshot_endpoints_run_snapshot_methods_off_event_loop(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    client = TestClient(create_app(tmp_path))
+    config = client.get("/api/settings").json()
+    snapshot = {"id": "snap-1", "name": "Unit", "scope": "all", "config": config, "createdAt": 1}
+    calls: list[str] = []
+
+    def assert_off_event_loop(method_name: str) -> None:
+        calls.append(method_name)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        raise AssertionError(f"{method_name} ran on the event loop")
+
+    def fake_list_snapshots(scope: str | None = None) -> list[dict[str, Any]]:
+        _ = scope
+        assert_off_event_loop("list_snapshots")
+        return [snapshot]
+
+    def fake_create_snapshot(request: object) -> dict[str, Any]:
+        _ = request
+        assert_off_event_loop("create_snapshot")
+        return snapshot
+
+    def fake_apply_snapshot(snapshot_id: str) -> dict[str, Any]:
+        _ = snapshot_id
+        assert_off_event_loop("apply_snapshot")
+        return config
+
+    def fake_delete_snapshot(snapshot_id: str) -> None:
+        _ = snapshot_id
+        assert_off_event_loop("delete_snapshot")
+
+    app_state = _app_state(client)
+    monkeypatch.setattr(app_state.settings, "list_snapshots", fake_list_snapshots)
+    monkeypatch.setattr(app_state.settings, "create_snapshot", fake_create_snapshot)
+    monkeypatch.setattr(app_state.settings, "apply_snapshot", fake_apply_snapshot)
+    monkeypatch.setattr(app_state.settings, "delete_snapshot", fake_delete_snapshot)
+
+    list_response = client.get("/api/settings/snapshots")
+    create_response = client.post("/api/settings/snapshots", json={"scope": "all", "name": "Unit"})
+    apply_response = client.post("/api/settings/snapshots/snap-1/apply")
+    delete_response = client.delete("/api/settings/snapshots/snap-1")
+
+    assert list_response.status_code == 200
+    assert create_response.status_code == 200
+    assert apply_response.status_code == 200
+    assert delete_response.status_code == 200
+    assert calls == [
+        "list_snapshots",
+        "create_snapshot",
+        "list_snapshots",
+        "apply_snapshot",
+        "list_snapshots",
+        "delete_snapshot",
+        "list_snapshots",
+    ]
 
 
 def test_dataset_hub_toggle_updates_upload_switch(tmp_path: Path) -> None:
@@ -625,6 +727,32 @@ def test_teleop_force_controls_forward_to_hal(tmp_path: Path, monkeypatch: Monke
     zero_response = client.post("/api/teleop/right/zero_force_feedback")
     assert zero_response.status_code == 200
     assert zero_response.json()["data"]["openId"] == 1
+
+
+def test_teleop_gravity_compensation_saves_config_off_event_loop(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    calls: list[str] = []
+
+    def fake_save_config(config: dict[str, Any], emit_log: bool = True) -> dict[str, Any]:
+        _ = emit_log
+        calls.append("save_config")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return config
+        raise AssertionError("teleop gravity save_config ran on the event loop")
+
+    app_state = _app_state(client)
+    monkeypatch.setattr(app_state.settings, "save_config", fake_save_config)
+
+    response = client.post("/api/teleop/right/gravity_compensation", json={"enabled": False})
+
+    assert response.status_code == 200
+    assert response.json()["data"]["enabled"] is False
+    assert calls == ["save_config"]
 
 
 def test_websocket_telemetry_compatibility_and_log_shape(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -2411,6 +2539,36 @@ def test_teleop_logical_connect_enables_mapped_motion_side(tmp_path: Path, monke
         json={"side": "right", "axis": "X", "direction": 1, "step": 100, "speedMode": "fine"},
     )
     assert command_response.status_code == 200
+
+
+def test_teleop_logical_connection_saves_config_off_event_loop(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    config = client.get("/api/settings").json()
+    config["teleop"]["gripperTeleop"]["enabled"] = False
+    assert client.put("/api/settings", json=config).status_code == 200
+    calls: list[bool] = []
+
+    def fake_save_config(next_config: dict[str, Any], emit_log: bool = True) -> dict[str, Any]:
+        _ = emit_log
+        calls.append(bool(next_config["teleop"]["leftConnected"]))
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return next_config
+        raise AssertionError("teleop logical save_config ran on the event loop")
+
+    app_state = _app_state(client)
+    monkeypatch.setattr(app_state.settings, "save_config", fake_save_config)
+
+    connect_response = client.post("/api/teleop/left/connect")
+    disconnect_response = client.post("/api/teleop/left/disconnect")
+
+    assert connect_response.status_code == 200
+    assert disconnect_response.status_code == 200
+    assert calls == [True, False]
 
 
 def test_teleop_logical_connect_starts_native_without_return_to_work_origin() -> None:
@@ -4990,6 +5148,71 @@ def test_camera_tuning_apply_endpoint_saves_config(tmp_path: Path) -> None:
     assert calls == [("global", -6.5)]
     assert response.json()["data"]["profile"]["exposure"] == -6.5
     assert client.get("/api/settings").json()["cameras"]["tuning"]["global"]["exposure"] == -6.5
+
+
+def test_camera_tuning_apply_saves_config_off_event_loop(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    client = TestClient(create_app(tmp_path))
+    calls: list[str] = []
+
+    def fake_save_config(config: dict[str, Any], emit_log: bool = True) -> dict[str, Any]:
+        _ = emit_log
+        calls.append("save_config")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return config
+        raise AssertionError("camera tuning save_config ran on the event loop")
+
+    def fake_apply(config: dict[str, Any], camera: str) -> dict[str, object]:
+        return {
+            "camera": camera,
+            "index": 1,
+            "profile": config["cameras"]["tuning"][camera],
+            "actual": {"exposure": -6.5},
+        }
+
+    app_state = _app_state(client)
+    monkeypatch.setattr(app_state.settings, "save_config", fake_save_config)
+    monkeypatch.setattr(app_state.hardware.cameras, "apply_tuning", fake_apply)
+    config = client.get("/api/settings").json()
+    config["cameras"]["tuning"]["global"]["exposure"] = -6.5
+
+    response = client.post("/api/cameras/global/tuning/apply", json=config)
+
+    assert response.status_code == 200
+    assert response.json()["data"]["profile"]["exposure"] == -6.5
+    assert calls == ["save_config"]
+
+
+def test_pico_endpoints_run_driver_methods_off_event_loop(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    client = TestClient(create_app(tmp_path))
+    calls: list[str] = []
+
+    def fake_pico_call(method_name: str) -> PicoResult:
+        calls.append(method_name)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return PicoResult(True, f"{method_name} ok")
+        raise AssertionError(f"pico {method_name} ran on the event loop")
+
+    app_state = _app_state(client)
+    monkeypatch.setattr(app_state.hardware.pico, "connect", lambda _config: fake_pico_call("connect"))
+    monkeypatch.setattr(app_state.hardware.pico, "start_vision", lambda _config: fake_pico_call("start_vision"))
+    monkeypatch.setattr(app_state.hardware.pico, "stop_vision", lambda _config: fake_pico_call("stop_vision"))
+    monkeypatch.setattr(app_state.hardware.pico, "status", lambda _config: fake_pico_call("status"))
+
+    responses = [
+        client.post("/api/pico/adb/connect"),
+        client.post("/api/pico/vision/start"),
+        client.post("/api/pico/vision/stop"),
+        client.post("/api/pico/status/check"),
+    ]
+
+    assert [response.status_code for response in responses] == [200, 200, 200, 200]
+    assert calls == ["connect", "start_vision", "stop_vision", "status"]
 
 
 def test_camera_wait_for_frame_returns_cached_encoded_jpeg(monkeypatch: MonkeyPatch) -> None:

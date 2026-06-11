@@ -606,11 +606,11 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             except RuntimeError as exc:
                 gripper_errors[side] = str(exc)
                 logs.error("[GRIPPER]", f"{side} gripper close-release failed: {exc}")
-            set_teleop_logical_connection(side, False)
+            await asyncio.to_thread(set_teleop_logical_connection, side, False)
         config = settings.get_config()
         config["gripper"]["leftEnabled"] = False
         config["gripper"]["rightEnabled"] = False
-        settings.save_config(config, emit_log=False)
+        await asyncio.to_thread(settings.save_config, config, emit_log=False)
         await asyncio.to_thread(gripper_workers.stop_all)
         for source in ("teleop-connect", "recording"):
             try:
@@ -761,7 +761,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 保存新的应用配置。
     @app.put("/api/settings")
     async def put_settings(config: AppConfig) -> dict[str, Any]:
-        saved = settings.save_config(config.model_dump(mode="json"))
+        saved = await asyncio.to_thread(settings.save_config, config.model_dump(mode="json"))
         await asyncio.to_thread(gripper_workers.sync_config, saved)
         return saved
 
@@ -769,7 +769,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/settings/apply")
     async def apply_settings(config: AppConfig | None = None) -> ApiEnvelope:
         try:
-            active = settings.apply_config(config.model_dump(mode="json") if config is not None else None)
+            active = await asyncio.to_thread(
+                settings.apply_config,
+                config.model_dump(mode="json") if config is not None else None,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": str(exc)}) from exc
         await asyncio.to_thread(gripper_workers.sync_config, active)
@@ -778,31 +781,34 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 列出配置快照。
     @app.get("/api/settings/snapshots")
     async def list_snapshots(scope: Annotated[SnapshotScope | None, Query()] = None) -> list[dict[str, Any]]:
-        return settings.list_snapshots(scope)
+        return await asyncio.to_thread(settings.list_snapshots, scope)
 
     # 创建配置快照。
     @app.post("/api/settings/snapshots")
     async def create_snapshot(request: SnapshotCreateRequest) -> ApiEnvelope:
-        snapshot = settings.create_snapshot(request)
-        return envelope({"snapshot": snapshot, "snapshots": settings.list_snapshots(request.scope)})
+        snapshot = await asyncio.to_thread(settings.create_snapshot, request)
+        snapshots = await asyncio.to_thread(settings.list_snapshots, request.scope)
+        return envelope({"snapshot": snapshot, "snapshots": snapshots})
 
     # 应用指定配置快照。
     @app.post("/api/settings/snapshots/{snapshot_id}/apply")
     async def apply_snapshot(snapshot_id: str) -> ApiEnvelope:
         try:
-            config = settings.apply_snapshot(snapshot_id)
+            config = await asyncio.to_thread(settings.apply_snapshot, snapshot_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "snapshot not found"}) from exc
-        return envelope({"config": config, "snapshots": settings.list_snapshots()})
+        snapshots = await asyncio.to_thread(settings.list_snapshots)
+        return envelope({"config": config, "snapshots": snapshots})
 
     # 删除指定配置快照。
     @app.delete("/api/settings/snapshots/{snapshot_id}")
     async def delete_snapshot(snapshot_id: str) -> ApiEnvelope:
         try:
-            settings.delete_snapshot(snapshot_id)
+            await asyncio.to_thread(settings.delete_snapshot, snapshot_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "snapshot not found"}) from exc
-        return envelope({"snapshots": settings.list_snapshots()})
+        snapshots = await asyncio.to_thread(settings.list_snapshots)
+        return envelope({"snapshots": snapshots})
 
     # 记录设置页通用命令日志。
     @app.post("/api/settings/log_command")
@@ -1330,7 +1336,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         side_name = cast(SideName, side)
-        config = set_teleop_logical_connection(side_name, True)
+        config = await asyncio.to_thread(set_teleop_logical_connection, side_name, True)
         mapped_side = teleop_target_side_for_source(side_name, config)
         schedule_teleop_background(
             sync_teleop_logical_connection(side_name, True),
@@ -1356,7 +1362,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         side_name = cast(SideName, side)
-        config = set_teleop_logical_connection(side_name, False)
+        config = await asyncio.to_thread(set_teleop_logical_connection, side_name, False)
         mapped_side = teleop_target_side_for_source(side_name, config)
         schedule_teleop_background(
             sync_teleop_logical_connection(side_name, False),
@@ -1388,7 +1394,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         config = settings.get_config()
         config["teleop"][f"{side}GravityCompensation"] = enabled
         config["teleop"][f"{side}ForceFeedback"] = enabled
-        saved = settings.save_config(config, emit_log=False)
+        saved = await asyncio.to_thread(settings.save_config, config, emit_log=False)
         await hal.command(
             "omega7.gravity_compensation",
             {
@@ -1433,7 +1439,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 detail={"code": "BAD_CAMERA", "message": "camera must be global, wrist_left, or wrist_right"},
             )
         active = (
-            settings.save_config(config.model_dump(mode="json"), emit_log=False)
+            await asyncio.to_thread(settings.save_config, config.model_dump(mode="json"), emit_log=False)
             if config is not None
             else settings.get_config()
         )
@@ -1507,28 +1513,28 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 连接 PICO ADB 设备。
     @app.post("/api/pico/adb/connect")
     async def pico_adb_connect() -> ApiEnvelope:
-        result = hardware.pico.connect(settings.get_config())
+        result = await asyncio.to_thread(hardware.pico.connect, settings.get_config())
         logs.info("[CAMERA]", result.message)
         return envelope(result.__dict__)
 
     # 启动 PICO 视觉服务。
     @app.post("/api/pico/vision/start")
     async def pico_vision_start() -> ApiEnvelope:
-        result = hardware.pico.start_vision(settings.get_config())
+        result = await asyncio.to_thread(hardware.pico.start_vision, settings.get_config())
         logs.info("[CAMERA]", result.message)
         return envelope(result.__dict__)
 
     # 停止 PICO 视觉服务。
     @app.post("/api/pico/vision/stop")
     async def pico_vision_stop() -> ApiEnvelope:
-        result = hardware.pico.stop_vision(settings.get_config())
+        result = await asyncio.to_thread(hardware.pico.stop_vision, settings.get_config())
         logs.info("[CAMERA]", result.message)
         return envelope(result.__dict__)
 
     # 检查 PICO 设备状态。
     @app.post("/api/pico/status/check")
     async def pico_status_check() -> ApiEnvelope:
-        result = hardware.pico.status(settings.get_config())
+        result = await asyncio.to_thread(hardware.pico.status, settings.get_config())
         logs.info("[CAMERA]", result.message)
         return envelope(result.__dict__)
 
