@@ -18,7 +18,6 @@ from bisect import bisect_left
 from collections import deque
 from collections.abc import Awaitable
 from concurrent.futures import Future
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -205,7 +204,10 @@ class LeRobotWriterThread:
     def submit(self, kind: str) -> Future[Any]:
         """向写线程投递控制命令，并返回用于等待结果的 Future。"""
         future: Future[Any] = Future()
-        self._queue.put(WriterCommand(kind, future))
+        try:
+            self._queue.put_nowait(WriterCommand(kind, future))
+        except queue.Full as exc:
+            raise RuntimeError("native LeRobot writer command queue is full") from exc
         return future
 
     def _run(self) -> None:
@@ -1391,8 +1393,8 @@ class DatasetRecorderService:
         future = writer.submit(kind)
         timeout_s = float(getattr(self, "_native_writer_command_timeout_s", NATIVE_WRITER_COMMAND_TIMEOUT_S))
         try:
-            return await asyncio.to_thread(future.result, timeout=timeout_s)
-        except FutureTimeoutError as exc:
+            return await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(future)), timeout=timeout_s)
+        except TimeoutError as exc:
             raise RuntimeError(f"native LeRobot writer command timed out: {kind}") from exc
 
     async def _try_begin_native_dataset(self, config: dict[str, Any]) -> bool:
@@ -1508,6 +1510,10 @@ class DatasetRecorderService:
             return
         await asyncio.to_thread(self._write_queue.put, None)
         await asyncio.to_thread(writer.join, 2.0)
+        if writer.is_alive():
+            message = "native LeRobot writer thread did not stop"
+            self._native_error = message
+            raise RuntimeError(message)
         self._writer_thread = None
 
     async def _rollback_failed_start(self) -> None:

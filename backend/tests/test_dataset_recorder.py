@@ -326,6 +326,33 @@ def test_lerobot_writer_keeps_dataset_open_after_saved_episode() -> None:
     assert writer._dataset is fake_dataset
 
 
+def test_native_writer_command_submit_does_not_block_when_queue_is_full() -> None:
+    recorder = SimpleNamespace(logs=SimpleNamespace(error=lambda *_args: None))
+    work_queue = queue.Queue(maxsize=1)
+    work_queue.put(None)
+    writer = LeRobotWriterThread(recorder, work_queue)  # type: ignore[arg-type]
+    result: dict[str, object] = {}
+
+    def submit_command() -> None:
+        try:
+            result["future"] = writer.submit("save_episode")
+        except BaseException as exc:  # noqa: BLE001
+            result["error"] = exc
+
+    thread = Thread(target=submit_command)
+    thread.start()
+    thread.join(0.1)
+    try:
+        assert not thread.is_alive(), "writer command submit blocked on a full queue"
+        assert isinstance(result.get("error"), RuntimeError)
+        assert "native LeRobot writer command queue is full" in str(result["error"])
+    finally:
+        if thread.is_alive():
+            work_queue.get_nowait()
+            work_queue.task_done()
+            thread.join(1.0)
+
+
 def test_native_writer_command_times_out_when_writer_does_not_complete() -> None:
     class StalledWriter:
         def __init__(self) -> None:
@@ -366,6 +393,35 @@ def test_recording_queue_drain_times_out_when_write_enqueue_never_idles() -> Non
 
         with pytest.raises(RuntimeError, match="recording queue drain timed out: writer enqueue"):
             await asyncio.wait_for(recorder._drain_recording_queues(), timeout=0.2)
+
+    asyncio.run(run_case())
+
+
+def test_stop_writer_task_fails_when_writer_thread_does_not_exit() -> None:
+    class StalledWriter:
+        def __init__(self) -> None:
+            self.join_calls: list[float | None] = []
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_calls.append(timeout)
+
+        def is_alive(self) -> bool:
+            return True
+
+    async def run_case() -> None:
+        writer = StalledWriter()
+        recorder = object.__new__(DatasetRecorderService)
+        recorder._write_enqueue_idle = asyncio.Event()
+        recorder._write_enqueue_idle.set()
+        recorder._write_queue = queue.Queue()
+        recorder._writer_thread = writer
+        recorder._recording_queue_drain_timeout_s = 1.0
+
+        with pytest.raises(RuntimeError, match="native LeRobot writer thread did not stop"):
+            await recorder._stop_writer_task()
+
+        assert writer.join_calls == [2.0]
+        assert recorder._writer_thread is writer
 
     asyncio.run(run_case())
 

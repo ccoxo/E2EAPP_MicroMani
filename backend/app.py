@@ -1573,8 +1573,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         try:
             if native_teleop_enabled():
                 await stop_aux_native_teleop_sources("record episode discard")
-            result = await recorder.discard_episode()
-            gripper_tele.stop("recording")
+            try:
+                result = await recorder.discard_episode()
+            finally:
+                gripper_tele.stop("recording")
             return envelope(result)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail={"code": "RECORDING_NOT_ACTIVE", "message": str(exc)}) from exc
@@ -1583,8 +1585,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/record/session/finish")
     async def finish_session() -> ApiEnvelope:
         await stop_aux_native_teleop_sources("record session finish")
-        result = await recorder.finish_session()
-        gripper_tele.stop("recording")
+        try:
+            result = await recorder.finish_session()
+        finally:
+            gripper_tele.stop("recording")
         return envelope(result)
 
     # 跳过录制重置步骤。

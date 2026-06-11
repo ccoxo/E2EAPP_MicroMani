@@ -2351,6 +2351,61 @@ def test_record_discard_pauses_gripper_teleop_recording_source(tmp_path: Path, m
     assert stop_calls == ["recording"]
 
 
+def test_record_discard_failure_stops_gripper_teleop_recording_source(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    config = client.app.state.settings.get_config()
+    config["teleop"]["engine"] = "python_mapper"
+    client.app.state.settings.save_config(config, emit_log=False)
+    stop_calls: list[str] = []
+
+    async def fake_discard_episode() -> dict[str, Any]:
+        raise RuntimeError("discard failed")
+
+    monkeypatch.setattr(client.app.state.recorder, "discard_episode", fake_discard_episode)
+    monkeypatch.setattr(
+        client.app.state.gripper_tele,
+        "stop",
+        lambda source="manual", force=False: stop_calls.append("force" if force else source),
+    )
+
+    response = client.post("/api/record/episode/discard")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "RECORDING_NOT_ACTIVE"
+    assert stop_calls == ["recording"]
+
+
+def test_record_finish_failure_stops_gripper_teleop_recording_source(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path), raise_server_exceptions=False)
+    config = client.app.state.settings.get_config()
+    config["teleop"]["engine"] = "python_mapper"
+    client.app.state.settings.save_config(config, emit_log=False)
+    stop_calls: list[str] = []
+
+    async def fake_finish_session() -> dict[str, Any]:
+        raise RuntimeError("finish failed")
+
+    monkeypatch.setattr(client.app.state.recorder, "finish_session", fake_finish_session)
+    monkeypatch.setattr(
+        client.app.state.gripper_tele,
+        "stop",
+        lambda source="manual", force=False: stop_calls.append("force" if force else source),
+    )
+
+    response = client.post("/api/record/session/finish")
+
+    assert response.status_code == 500
+    assert stop_calls == ["recording"]
+
+
 def test_native_record_save_releases_aux_teleop_sources_without_restart(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
