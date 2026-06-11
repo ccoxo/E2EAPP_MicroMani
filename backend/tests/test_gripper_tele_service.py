@@ -30,6 +30,26 @@ class FakeHardware:
         self.gripper = FakeGripperHardware()
 
 
+class BlockingOmegaHal:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def omega_state(self) -> dict:
+        self.entered.set()
+        await self.release.wait()
+        return {
+            "hands": [
+                {
+                    "side": "left",
+                    "connected": True,
+                    "lastReadOk": True,
+                    "gripperGapMm": 12.0,
+                }
+            ]
+        }
+
+
 def test_gripper_teleop_maps_gap_to_continuous_target() -> None:
     cfg = default_config()["teleop"]["gripperTeleop"]
     follower = FollowGripper("left")
@@ -128,6 +148,42 @@ def test_gripper_teleop_keeps_running_until_all_sources_stop() -> None:
         service.stop("recording")
         await asyncio.sleep(0.02)
         assert service.get_status()["sources"] == []
+
+    asyncio.run(run())
+
+
+def test_gripper_teleop_restarts_when_started_while_previous_loop_is_stopping() -> None:
+    async def run() -> None:
+        service = GripperTeleService(FakeSettings(), None, None, LogService())  # type: ignore[arg-type]
+
+        service.start("manual")
+        service.stop("manual")
+        service.start("recording")
+        await asyncio.sleep(0.02)
+
+        assert service.get_status()["sources"] == ["recording"]
+        assert service.is_running() is True
+
+        service.stop("recording")
+
+    asyncio.run(run())
+
+
+def test_gripper_teleop_stop_drops_in_flight_omega_sample_before_command() -> None:
+    async def run() -> None:
+        settings = FakeSettings()
+        settings.config["teleop"]["gripperTeleop"]["enabled"] = True
+        hal = BlockingOmegaHal()
+        hardware = FakeHardware()
+        service = GripperTeleService(settings, hal, hardware, LogService())  # type: ignore[arg-type]
+
+        service.start("manual")
+        await asyncio.wait_for(hal.entered.wait(), timeout=1.0)
+        service.stop("manual")
+        hal.release.set()
+        await asyncio.sleep(0.02)
+
+        assert hardware.gripper.calls == []
 
     asyncio.run(run())
 

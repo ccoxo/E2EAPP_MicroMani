@@ -163,7 +163,8 @@ class GripperTeleService:
 
     def start(self, source: str = "manual") -> None:
         self._arm_sources.add(source)
-        if self._task is not None and not self._task.done():
+        stopping = self._stop_event is not None and self._stop_event.is_set()
+        if self._task is not None and not self._task.done() and not stopping:
             return
         self._stop_event = asyncio.Event()
         self._task = asyncio.get_running_loop().create_task(self._loop())
@@ -203,8 +204,9 @@ class GripperTeleService:
         }
 
     async def _loop(self) -> None:
-        assert self._stop_event is not None
-        while not self._stop_event.is_set():
+        stop_event = self._stop_event
+        assert stop_event is not None
+        while not stop_event.is_set():
             config = self._settings.get_config()
             gt_cfg: dict[str, Any] = config.get("teleop", {}).get("gripperTeleop", {})
             loop_hz = max(1.0, float(gt_cfg.get("loopHz", 100)))
@@ -217,6 +219,8 @@ class GripperTeleService:
 
             try:
                 omega = await self._hal.omega_state()
+                if stop_event.is_set():
+                    break
                 hands = {
                     h["side"]: h
                     for h in omega.get("hands", [])
