@@ -426,6 +426,59 @@ def test_stop_writer_task_fails_when_writer_thread_does_not_exit() -> None:
     asyncio.run(run_case())
 
 
+def test_stop_writer_task_times_out_when_stop_sentinel_cannot_enqueue() -> None:
+    class FullStopQueue:
+        def __init__(self) -> None:
+            self.release = Event()
+            self.put_nowait_calls: list[object] = []
+
+        def join(self) -> None:
+            return
+
+        def put(self, _item: object) -> None:
+            self.release.wait()
+
+        def put_nowait(self, item: object) -> None:
+            self.put_nowait_calls.append(item)
+            raise queue.Full
+
+    class IdleWriter:
+        def __init__(self) -> None:
+            self.join_calls: list[float | None] = []
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_calls.append(timeout)
+
+        def is_alive(self) -> bool:
+            return False
+
+    async def run_case() -> None:
+        write_queue = FullStopQueue()
+        writer = IdleWriter()
+        recorder = object.__new__(DatasetRecorderService)
+        recorder._write_enqueue_idle = asyncio.Event()
+        recorder._write_enqueue_idle.set()
+        recorder._write_queue = write_queue
+        recorder._writer_thread = writer
+        recorder._recording_queue_drain_timeout_s = 1.0
+        recorder._native_error = ""
+        task = asyncio.create_task(recorder._stop_writer_task())
+        try:
+            with pytest.raises(RuntimeError, match="recording queue drain timed out: writer stop"):
+                await asyncio.wait_for(task, timeout=0.2)
+        finally:
+            write_queue.release.set()
+            with contextlib.suppress(BaseException):
+                await task
+
+        assert write_queue.put_nowait_calls == [None]
+        assert writer.join_calls == []
+        assert recorder._writer_thread is writer
+        assert recorder._native_error == "recording queue drain timed out: writer stop"
+
+    asyncio.run(run_case())
+
+
 def test_recording_queue_drain_times_out_when_write_queue_does_not_join() -> None:
     class BlockingWriteQueue:
         def __init__(self) -> None:

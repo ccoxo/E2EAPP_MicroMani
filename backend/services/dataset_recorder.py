@@ -1527,7 +1527,12 @@ class DatasetRecorderService:
         writer = self._writer_thread
         if writer is None:
             return
-        await asyncio.to_thread(self._write_queue.put, None)
+        try:
+            self._write_queue.put_nowait(None)
+        except queue.Full as exc:
+            message = "recording queue drain timed out: writer stop"
+            self._native_error = message
+            raise RuntimeError(message) from exc
         await asyncio.to_thread(writer.join, 2.0)
         if writer.is_alive():
             message = "native LeRobot writer thread did not stop"
