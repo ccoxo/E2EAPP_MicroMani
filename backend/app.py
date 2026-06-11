@@ -1633,7 +1633,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/datasets")
     async def create_dataset(payload: dict[str, Any]) -> ApiEnvelope:
         try:
-            return envelope(recorder.create_dataset(payload))
+            return envelope(await asyncio.to_thread(recorder.create_dataset, payload))
         except RuntimeError as exc:
             raise HTTPException(
                 status_code=503,
@@ -1643,13 +1643,13 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 更新 Hugging Face Hub 上传开关，不接收或保存 token。
     @app.patch("/api/datasets/hub")
     async def update_dataset_hub(payload: dict[str, Any]) -> ApiEnvelope:
-        return envelope(recorder.update_hub_settings(payload))
+        return envelope(await asyncio.to_thread(recorder.update_hub_settings, payload))
 
     # 更新指定数据集元信息。
     @app.patch("/api/datasets/{dataset_id}")
     async def update_dataset(dataset_id: str, payload: dict[str, Any]) -> ApiEnvelope:
         try:
-            return envelope(recorder.update_dataset(dataset_id, payload))
+            return envelope(await asyncio.to_thread(recorder.update_dataset, dataset_id, payload))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "DATASET_NOT_FOUND", "message": dataset_id}) from exc
 
@@ -1657,7 +1657,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.delete("/api/datasets/{dataset_id}")
     async def delete_dataset(dataset_id: str) -> ApiEnvelope:
         try:
-            return envelope(recorder.delete_dataset(dataset_id))
+            return envelope(await asyncio.to_thread(recorder.delete_dataset, dataset_id))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "DATASET_NOT_FOUND", "message": dataset_id}) from exc
         except RuntimeError as exc:
@@ -1670,7 +1670,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/datasets/{dataset_id}/review/save")
     async def save_dataset_review(dataset_id: str) -> ApiEnvelope:
         try:
-            return envelope(recorder.save_review(dataset_id))
+            return envelope(await asyncio.to_thread(recorder.save_review, dataset_id))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "DATASET_NOT_FOUND", "message": dataset_id}) from exc
 
@@ -1678,7 +1678,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/datasets/{dataset_id}/export")
     async def export_dataset(dataset_id: str) -> ApiEnvelope:
         try:
-            return envelope(recorder.export_dataset(dataset_id))
+            return envelope(await asyncio.to_thread(recorder.export_dataset, dataset_id))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "DATASET_NOT_FOUND", "message": dataset_id}) from exc
 
@@ -1686,7 +1686,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.get("/api/datasets/{dataset_id}/stats")
     async def dataset_stats(dataset_id: str) -> ApiEnvelope:
         try:
-            return envelope(recorder.dataset_stats(dataset_id))
+            return envelope(await asyncio.to_thread(recorder.dataset_stats, dataset_id))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "DATASET_NOT_FOUND", "message": dataset_id}) from exc
 
@@ -1694,7 +1694,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/datasets/{dataset_id}/split")
     async def split_dataset(dataset_id: str, payload: dict[str, Any]) -> ApiEnvelope:
         try:
-            return envelope(recorder.split_dataset(dataset_id, payload))
+            return envelope(await asyncio.to_thread(recorder.split_dataset, dataset_id, payload))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "DATASET_NOT_FOUND", "message": dataset_id}) from exc
 
@@ -1702,7 +1702,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/datasets/{dataset_id}/clean")
     async def clean_dataset(dataset_id: str, payload: dict[str, Any]) -> ApiEnvelope:
         try:
-            return envelope(recorder.clean_dataset(dataset_id, payload))
+            return envelope(await asyncio.to_thread(recorder.clean_dataset, dataset_id, payload))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "DATASET_NOT_FOUND", "message": dataset_id}) from exc
 
@@ -1710,7 +1710,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/datasets/{dataset_id}/push")
     async def push_dataset(dataset_id: str, payload: dict[str, Any]) -> ApiEnvelope:
         try:
-            return envelope(recorder.push_dataset(dataset_id, payload))
+            return envelope(await asyncio.to_thread(recorder.push_dataset, dataset_id, payload))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "DATASET_NOT_FOUND", "message": dataset_id}) from exc
         except RuntimeError as exc:
@@ -1729,7 +1729,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.patch("/api/datasets/{dataset_id}/episodes/{episode_id}")
     async def update_dataset_episode(dataset_id: str, episode_id: str, payload: dict[str, Any]) -> ApiEnvelope:
         try:
-            return envelope(recorder.update_episode(dataset_id, episode_id, payload))
+            return envelope(await asyncio.to_thread(recorder.update_episode, dataset_id, episode_id, payload))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "EPISODE_NOT_FOUND", "message": episode_id}) from exc
 
@@ -1737,7 +1737,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.delete("/api/datasets/{dataset_id}/episodes/{episode_id}")
     async def delete_dataset_episode(dataset_id: str, episode_id: str) -> ApiEnvelope:
         try:
-            return envelope(recorder.delete_episode(dataset_id, episode_id))
+            return envelope(await asyncio.to_thread(recorder.delete_episode, dataset_id, episode_id))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "EPISODE_NOT_FOUND", "message": episode_id}) from exc
 
@@ -1745,7 +1745,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.get("/api/datasets/{dataset_id}/file")
     async def dataset_file(dataset_id: str, path: str) -> FileResponse:
         try:
-            target = recorder.resolve_file(dataset_id, path)
+            target = await asyncio.to_thread(recorder.resolve_file, dataset_id, path)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "FILE_NOT_FOUND", "message": path}) from exc
         except RuntimeError as exc:

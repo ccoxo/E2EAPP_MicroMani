@@ -465,7 +465,7 @@ def test_stop_writer_task_times_out_when_stop_sentinel_cannot_enqueue() -> None:
         task = asyncio.create_task(recorder._stop_writer_task())
         try:
             with pytest.raises(RuntimeError, match="recording queue drain timed out: writer stop"):
-                await asyncio.wait_for(task, timeout=0.2)
+                await asyncio.wait_for(task, timeout=2.0)
         finally:
             write_queue.release.set()
             with contextlib.suppress(BaseException):

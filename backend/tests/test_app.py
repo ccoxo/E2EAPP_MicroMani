@@ -215,6 +215,74 @@ def test_dataset_hub_toggle_updates_upload_switch(tmp_path: Path) -> None:
     assert client.get("/api/settings").json()["storage"]["pushToHub"] is True
 
 
+@pytest.mark.parametrize(
+    ("method_name", "http_method", "path", "payload"),
+    [
+        ("create_dataset", "post", "/api/datasets", {"name": "unit"}),
+        ("update_hub_settings", "patch", "/api/datasets/hub", {"pushToHub": True}),
+        ("update_dataset", "patch", "/api/datasets/unit_dataset", {"name": "Unit"}),
+        ("delete_dataset", "delete", "/api/datasets/unit_dataset", None),
+        ("save_review", "post", "/api/datasets/unit_dataset/review/save", None),
+        ("export_dataset", "post", "/api/datasets/unit_dataset/export", None),
+        ("dataset_stats", "get", "/api/datasets/unit_dataset/stats", None),
+        ("split_dataset", "post", "/api/datasets/unit_dataset/split", {"ratios": {"train": 1.0}}),
+        ("clean_dataset", "post", "/api/datasets/unit_dataset/clean", {"apply": False}),
+        ("push_dataset", "post", "/api/datasets/unit_dataset/push", {"dryRun": True}),
+        ("update_episode", "patch", "/api/datasets/unit_dataset/episodes/episode_000001", {"status": "review"}),
+        ("delete_episode", "delete", "/api/datasets/unit_dataset/episodes/episode_000001", None),
+    ],
+)
+def test_dataset_management_endpoints_run_recorder_methods_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    method_name: str,
+    http_method: str,
+    path: str,
+    payload: dict[str, Any] | None,
+) -> None:
+    client = TestClient(create_app(tmp_path))
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_recorder_method(*args: Any, **kwargs: Any) -> dict[str, object]:
+        calls.append((args, kwargs))
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return {"method": method_name}
+        raise AssertionError(f"{method_name} ran on the event loop")
+
+    monkeypatch.setattr(client.app.state.recorder, method_name, fake_recorder_method)
+    request = getattr(client, http_method)
+    response = request(path, json=payload) if payload is not None else request(path)
+
+    assert response.status_code == 200
+    assert response.json()["data"]["method"] == method_name
+    assert len(calls) == 1
+
+
+def test_dataset_file_endpoint_resolves_path_off_event_loop(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    client = TestClient(create_app(tmp_path))
+    target = tmp_path / "download.txt"
+    target.write_text("ok", encoding="utf-8")
+    calls: list[tuple[str, str]] = []
+
+    def fake_resolve_file(dataset_id: str, path: str) -> Path:
+        calls.append((dataset_id, path))
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return target
+        raise AssertionError("resolve_file ran on the event loop")
+
+    monkeypatch.setattr(client.app.state.recorder, "resolve_file", fake_resolve_file)
+
+    response = client.get("/api/datasets/unit_dataset/file", params={"path": "download.txt"})
+
+    assert response.status_code == 200
+    assert response.text == "ok"
+    assert calls == [("unit_dataset", "download.txt")]
+
+
 def test_dataset_push_uses_request_token_without_persisting(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     client = TestClient(create_app(tmp_path / "runtime"))
     dataset_root = tmp_path / "datasets"

@@ -191,24 +191,26 @@ def test_gripper_command_dual_worker_path_does_not_block_event_loop() -> None:
     service = CommandService(settings, FakeTelemetry(), FakeHal(), FakeLogs(), hardware, workers)
 
     async def run_command_with_ticker() -> None:
+        tick_reached = Event()
+        release_saw_tick: list[bool] = []
+
         def release_worker() -> None:
             assert workers.entered.wait(timeout=1.0)
-            time.sleep(0.2)
+            release_saw_tick.append(tick_reached.wait(timeout=1.0))
             workers.release.set()
 
         releaser = Thread(target=release_worker, daemon=True)
         releaser.start()
-        started = time.perf_counter()
         command_task = asyncio.create_task(
             service.gripper_command(GripperCommandRequest(side="left", command="target", targetMm=7.5))
         )
 
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(0)
+        tick_reached.set()
 
-        elapsed = time.perf_counter() - started
-        assert elapsed < 0.12
-        result = await asyncio.wait_for(command_task, timeout=1.0)
+        result = await asyncio.wait_for(command_task, timeout=2.0)
         releaser.join(timeout=1.0)
+        assert release_saw_tick == [True]
         assert result["message"] == "worker command"
 
     asyncio.run(run_command_with_ticker())
@@ -294,24 +296,26 @@ def test_gripper_command_direct_driver_path_does_not_block_event_loop() -> None:
     service = CommandService(settings, FakeTelemetry(), FakeHal(), FakeLogs(), hardware, workers)
 
     async def run_command_with_ticker() -> None:
+        tick_reached = Event()
+        release_saw_tick: list[bool] = []
+
         def release_driver() -> None:
             assert blocking_gripper.entered.wait(timeout=1.0)
-            time.sleep(0.2)
+            release_saw_tick.append(tick_reached.wait(timeout=1.0))
             blocking_gripper.release.set()
 
         releaser = Thread(target=release_driver, daemon=True)
         releaser.start()
-        started = time.perf_counter()
         command_task = asyncio.create_task(
             service.gripper_command(GripperCommandRequest(side="right", command="target", targetMm=6.0))
         )
 
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(0)
+        tick_reached.set()
 
-        elapsed = time.perf_counter() - started
-        assert elapsed < 0.12
-        result = await asyncio.wait_for(command_task, timeout=1.0)
+        result = await asyncio.wait_for(command_task, timeout=2.0)
         releaser.join(timeout=1.0)
+        assert release_saw_tick == [True]
         assert result["message"] == "direct command"
 
     asyncio.run(run_command_with_ticker())
