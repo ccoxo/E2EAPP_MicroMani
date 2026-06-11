@@ -179,6 +179,8 @@ class GripperTeleService:
             return
         if self._stop_event is not None:
             self._stop_event.set()
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
         self._left.reset()
         self._right.reset()
         self._teleop_enabled_sides.clear()

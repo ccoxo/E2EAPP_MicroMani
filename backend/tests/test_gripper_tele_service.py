@@ -188,6 +188,32 @@ def test_gripper_teleop_stop_drops_in_flight_omega_sample_before_command() -> No
     asyncio.run(run())
 
 
+def test_gripper_teleop_stop_cancels_blocked_omega_read() -> None:
+    async def run() -> None:
+        settings = FakeSettings()
+        settings.config["teleop"]["gripperTeleop"]["enabled"] = True
+        hal = BlockingOmegaHal()
+        service = GripperTeleService(settings, hal, FakeHardware(), LogService())  # type: ignore[arg-type]
+
+        service.start("manual")
+        await asyncio.wait_for(hal.entered.wait(), timeout=1.0)
+        task = service._task
+        assert task is not None
+
+        try:
+            service.stop("manual")
+            await asyncio.sleep(0)
+
+            assert task.done() is True
+            assert service.is_running() is False
+        finally:
+            hal.release.set()
+            if not task.done():
+                await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(run())
+
+
 def test_gripper_teleop_target_bypasses_manual_enable_flag() -> None:
     settings = FakeSettings()
     settings.config["gripper"]["leftEnabled"] = False
