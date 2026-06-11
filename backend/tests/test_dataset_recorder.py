@@ -454,6 +454,83 @@ def test_recording_queue_drain_times_out_when_write_queue_does_not_join() -> Non
     asyncio.run(run_case())
 
 
+def test_stop_sampler_tasks_fails_and_keeps_threads_when_sampler_does_not_exit() -> None:
+    class StalledSamplerThread:
+        def __init__(self) -> None:
+            self.join_calls: list[float | None] = []
+
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_calls.append(timeout)
+
+    async def run_case() -> None:
+        thread = StalledSamplerThread()
+        recorder = object.__new__(DatasetRecorderService)
+        recorder._sampler_stop_event = Event()
+        recorder._sampler_threads = {"hal": thread}
+
+        with pytest.raises(RuntimeError, match="record sampler threads did not stop: hal"):
+            await recorder._stop_sampler_tasks()
+
+        assert thread.join_calls == [1.0]
+        assert recorder._sampler_threads == {"hal": thread}
+
+    asyncio.run(run_case())
+
+
+def test_finish_session_continues_cleanup_when_sampler_threads_do_not_stop() -> None:
+    async def run_case() -> None:
+        calls: list[str] = []
+
+        class FakeTeleop:
+            async def stop(self, source: str) -> None:
+                calls.append(f"teleop:{source}")
+
+            def status(self) -> dict[str, object]:
+                return {}
+
+        recorder = object.__new__(DatasetRecorderService)
+        recorder._lock = asyncio.Lock()
+        recorder._session_active = True
+        recorder._recording = False
+        recorder._accepting_frame_jobs = False
+        recorder._last_saved_episode = None
+        recorder._reset_pending = False
+        recorder._reset_returned_sides = set()
+        recorder.telemetry = SimpleNamespace(recording=True, frame_count=3)
+        recorder.teleop = FakeTeleop()
+        recorder._loop_task = None
+        recorder.logs = SimpleNamespace(info=lambda *_args: calls.append("log"), error=lambda *_args: None)
+        recorder.status = lambda: {"active": recorder._session_active, "recording": recorder._recording}
+
+        async def stop_assembler() -> None:
+            calls.append("assembler")
+
+        async def stop_sampler() -> None:
+            calls.append("sampler")
+            raise RuntimeError("record sampler threads did not stop: hal")
+
+        async def finalize_native() -> None:
+            calls.append("finalize")
+
+        async def stop_writer() -> None:
+            calls.append("writer")
+
+        recorder._stop_assembler_task = stop_assembler
+        recorder._stop_sampler_tasks = stop_sampler
+        recorder._finalize_native_dataset = finalize_native
+        recorder._stop_writer_task = stop_writer
+
+        with pytest.raises(RuntimeError, match="record sampler threads did not stop: hal"):
+            await recorder.finish_session()
+
+        assert calls == ["teleop:recording", "assembler", "sampler", "finalize", "writer"]
+
+    asyncio.run(run_case())
+
+
 def test_dataset_recorder_configures_native_chunk_settings_for_independent_episode_files() -> None:
     recorder = object.__new__(DatasetRecorderService)
     calls: list[dict[str, float]] = []

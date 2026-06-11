@@ -16,7 +16,7 @@ import time
 import uuid
 from bisect import bisect_left
 from collections import deque
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from concurrent.futures import Future
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -720,10 +720,23 @@ class DatasetRecorderService:
             except asyncio.CancelledError:
                 pass
         self._loop_task = None
-        await self._stop_assembler_task()
-        await self._stop_sampler_tasks()
-        await self._finalize_native_dataset()
-        await self._stop_writer_task()
+        cleanup_error: Exception | None = None
+
+        async def run_cleanup(label: str, cleanup: Callable[[], Awaitable[None]]) -> None:
+            nonlocal cleanup_error
+            try:
+                await cleanup()
+            except Exception as exc:  # noqa: BLE001
+                if cleanup_error is None:
+                    cleanup_error = exc
+                self.logs.error("[LEROBOT]", f"record session cleanup {label} failed: {exc}")
+
+        await run_cleanup("frame assembler", self._stop_assembler_task)
+        await run_cleanup("samplers", self._stop_sampler_tasks)
+        await run_cleanup("native dataset", self._finalize_native_dataset)
+        await run_cleanup("writer", self._stop_writer_task)
+        if cleanup_error is not None:
+            raise cleanup_error
         self.logs.info("[LEROBOT]", "record session finished")
         return self.status()
 
@@ -1461,9 +1474,15 @@ class DatasetRecorderService:
     async def _stop_sampler_tasks(self) -> None:
         """通知所有采样线程停止，并等待线程退出。"""
         self._sampler_stop_event.set()
-        threads = [thread for thread in self._sampler_threads.values() if thread.is_alive()]
-        for thread in threads:
+        threads = [(source, thread) for source, thread in self._sampler_threads.items() if thread.is_alive()]
+        for _source, thread in threads:
             await asyncio.to_thread(thread.join, 1.0)
+        alive = {source: thread for source, thread in self._sampler_threads.items() if thread.is_alive()}
+        if alive:
+            self._sampler_threads = alive
+            message = f"record sampler threads did not stop: {', '.join(sorted(alive))}"
+            self._native_error = message
+            raise RuntimeError(message)
         self._sampler_threads = {}
 
     async def _drain_recording_queues(self) -> None:
