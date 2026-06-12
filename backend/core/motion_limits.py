@@ -69,6 +69,24 @@ def side_origin_ui(config: dict[str, Any], side: str) -> list[float] | None:
     return [pulse_to_axis_ui(config, side, axis_index, pulses[axis_index]) for axis_index in range(6)]
 
 
+def side_home_reference_ui(config: dict[str, Any], side: str) -> list[float] | None:
+    reference = config.get("motion", {}).get("homeReference", {})
+    if not isinstance(reference, dict):
+        return None
+    valid_key = "leftValid" if side == "left" else "rightValid"
+    if not bool(reference.get(valid_key, reference.get("valid", False))):
+        return None
+    pulse_key = "leftPulse" if side == "left" else "rightPulse"
+    raw = reference.get(pulse_key)
+    if not isinstance(raw, list) or len(raw) < 6:
+        return None
+    try:
+        pulses = [float(value) for value in raw[:6]]
+    except (TypeError, ValueError):
+        return None
+    return [pulse_to_axis_ui(config, side, axis_index, pulses[axis_index]) for axis_index in range(6)]
+
+
 def mechanical_limits_ui(config: dict[str, Any], side: str) -> list[AxisLimit]:
     motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
     raw_limits = motion.get(f"{side}SoftLimits", {}) if isinstance(motion, dict) else {}
@@ -119,16 +137,18 @@ def effective_limits_ui(config: dict[str, Any], side: str) -> list[AxisLimit]:
         )
     if not rotation_work_limit_enabled(config):
         return limits
-    origin = side_origin_ui(config, side)
-    if origin is None:
-        raise WorkOriginMissing(f"work_origin_missing: {side} rotation work limit requires captured work origin")
+    home_reference = side_home_reference_ui(config, side)
+    if home_reference is None:
+        raise WorkOriginMissing(
+            f"home_reference_missing: {side} rotation work limit requires captured hardware zero"
+        )
     work_limits = rotation_work_limits_ui(config, side)
     effective = list(limits)
     for axis_index in range(3, 6):
         work_limit = work_limits[axis_index]
         effective[axis_index] = AxisLimit(
-            max(limits[axis_index].min, origin[axis_index] + work_limit.min),
-            min(limits[axis_index].max, origin[axis_index] + work_limit.max),
+            max(limits[axis_index].min, home_reference[axis_index] + work_limit.min),
+            min(limits[axis_index].max, home_reference[axis_index] + work_limit.max),
         )
     return effective
 

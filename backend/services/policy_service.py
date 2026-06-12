@@ -29,6 +29,9 @@ class PolicyService:
     def list_models(self) -> dict[str, Any]:
         return {"models": list(self._models.values()), "activeModelId": self._active_model_id}
 
+    async def _get_config_async(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self.settings.get_config)
+
     async def import_model(self, payload: dict[str, Any]) -> dict[str, Any]:
         name = str(payload.get("name") or payload.get("modelId") or "local_checkpoint").strip()
         path = str(payload.get("path") or "").strip()
@@ -63,8 +66,8 @@ class PolicyService:
         self.logs.warning("[POLICY]", "model service stopped")
         return self.list_models()
 
-    def auto_status(self) -> dict[str, Any]:
-        config = self.settings.get_config()
+    def auto_status(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        config = config if config is not None else self.settings.get_config()
         auto_config = config.get("auto", {})
         dispatch_enabled = bool(auto_config.get("allowHardwareDispatch", False))
         return {
@@ -72,7 +75,7 @@ class PolicyService:
             "activeModelId": self._active_model_id,
             "queueDepth": len(self._action_queue),
             "dispatchEnabled": dispatch_enabled,
-            "safetyCaps": self._safety_caps(),
+            "safetyCaps": self._safety_caps(config),
             "lastDispatch": self._last_dispatch,
             "queue": list(self._action_queue[-20:]),
         }
@@ -87,31 +90,42 @@ class PolicyService:
             self._models[model_id]["status"] = "running"
             self._auto_running = True
         self.logs.info("[POLICY]", f"auto execution started with model={model_id}")
-        return self.auto_status()
+        return self.auto_status(await self._get_config_async())
 
     async def auto_stop(self) -> dict[str, Any]:
         async with self._lock:
             self._auto_running = False
             self._action_queue.clear()
         self.logs.warning("[POLICY]", "auto execution stopped; action queue cleared")
-        return self.auto_status()
+        return self.auto_status(await self._get_config_async())
 
     async def queue_action(self, payload: dict[str, Any]) -> dict[str, Any]:
-        action = self._validated_action(payload)
+        config = await self._get_config_async()
+        action = self._validated_action(payload, config)
         async with self._lock:
             self._action_queue.append(action)
             self._action_queue = self._action_queue[-200:]
         self.logs.info("[POLICY]", f"action queued: {action['id']}")
-        return {"action": action, "status": self.auto_status()}
+        return {"action": action, "status": self.auto_status(config)}
 
     async def dispatch_next(self) -> dict[str, Any]:
         async with self._lock:
-            if not self._auto_running:
-                return {"dispatched": False, "reason": "auto execution is not running", "status": self.auto_status()}
-            action = self._action_queue.pop(0) if self._action_queue else None
+            auto_running = self._auto_running
+            if not auto_running:
+                action = None
+            else:
+                action = self._action_queue.pop(0) if self._action_queue else None
+        if not auto_running:
+            config = await self._get_config_async()
+            return {
+                "dispatched": False,
+                "reason": "auto execution is not running",
+                "status": self.auto_status(config),
+            }
         if action is None:
-            return {"dispatched": False, "reason": "action queue is empty", "status": self.auto_status()}
-        config = self.settings.get_config()
+            config = await self._get_config_async()
+            return {"dispatched": False, "reason": "action queue is empty", "status": self.auto_status(config)}
+        config = await self._get_config_async()
         dispatch_enabled = bool(config.get("auto", {}).get("allowHardwareDispatch", False))
         if not dispatch_enabled:
             self._last_dispatch = {"action": action, "mode": "dry-run", "ts": now_ms()}
@@ -119,11 +133,11 @@ class PolicyService:
                 "dispatched": False,
                 "reason": "hardware dispatch disabled",
                 "action": action,
-                "status": self.auto_status(),
+                "status": self.auto_status(config),
             }
         result = await self._dispatch_action_to_hal(action)
         self._last_dispatch = {"action": action, "mode": "hal", "result": result, "ts": now_ms()}
-        return {"dispatched": True, "action": action, "hal": result, "status": self.auto_status()}
+        return {"dispatched": True, "action": action, "hal": result, "status": self.auto_status(config)}
 
     def list_fine_tune_jobs(self) -> dict[str, Any]:
         return {"jobs": list(self._fine_tune_jobs)}
@@ -172,7 +186,7 @@ class PolicyService:
         }
         return await self.hal.command("motion.manual_axis_move", payload)
 
-    def _validated_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _validated_action(self, payload: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
         action_type = str(payload.get("type") or "manual_axis_move")
         side = str(payload.get("side") or "left")
         axis = str(payload.get("axis") or "X")
@@ -187,7 +201,7 @@ class PolicyService:
             raise RuntimeError("axis must be X/Y/Z/Roll/Pitch/Yaw")
         if direction not in {-1, 1}:
             raise RuntimeError("direction must be -1 or 1")
-        caps = self._safety_caps()
+        caps = self._safety_caps(config)
         is_translation = axis in {"X", "Y", "Z"}
         max_step = caps["translationStepUm"] if is_translation else caps["rotationStepDeg"]
         if abs(step) > max_step:
@@ -208,8 +222,8 @@ class PolicyService:
             "createdAt": now_ms(),
         }
 
-    def _safety_caps(self) -> dict[str, float]:
-        config = self.settings.get_config()
+    def _safety_caps(self, config: dict[str, Any] | None = None) -> dict[str, float]:
+        config = config if config is not None else self.settings.get_config()
         auto_config = config.get("auto", {})
         return {
             "translationStepUm": float(auto_config.get("translationStepUm", 200.0)),

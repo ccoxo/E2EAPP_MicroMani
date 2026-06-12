@@ -1,11 +1,15 @@
 param(
   [int]$BackendPort = 18082,
   [int]$FrontendPort = 5174,
+  [int]$HalPort = 8091,
   [switch]$SkipStartupHome
 )
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$logDir = Join-Path $repo "backend\runtime\logs"
+$frontendOutLog = Join-Path $logDir "frontend-launch.out.log"
+$frontendErrLog = Join-Path $logDir "frontend-launch.err.log"
 
 function Stop-ProcessTree {
   param([int]$RootPid)
@@ -64,8 +68,6 @@ function Stop-BackendProcessTrees {
   }
 }
 
-& (Join-Path $PSScriptRoot "start-hal.ps1") -Restart | Out-Host
-
 Stop-BackendProcessTrees
 
 $backendPid = Get-NetTCPConnection -LocalPort $BackendPort -State Listen -ErrorAction SilentlyContinue |
@@ -87,10 +89,26 @@ if ($frontendPid) {
   Stop-Process -Id $frontendPid -Force -ErrorAction SilentlyContinue
 }
 
+$activeHalPort = $HalPort
+try {
+  & (Join-Path $PSScriptRoot "start-hal.ps1") -Restart -Port $activeHalPort | Out-Host
+} catch {
+  $halStartError = $_.Exception.Message
+  if ($HalPort -ne 8091 -or $halStartError -notmatch "/health failed") {
+    throw
+  }
+  Write-Warning "HAL start on port 8091 failed; retrying on 8092. $halStartError"
+  $activeHalPort = 8092
+  & (Join-Path $PSScriptRoot "start-hal.ps1") -Restart -Port $activeHalPort | Out-Host
+}
+
 Start-Sleep -Seconds 1
 
+New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+Remove-Item -LiteralPath $frontendOutLog, $frontendErrLog -Force -ErrorAction SilentlyContinue
+
 $env:APPSTATION_HAL_MODE = "real"
-$env:APPSTATION_HAL_BASE_URL = "http://127.0.0.1:8091"
+$env:APPSTATION_HAL_BASE_URL = "http://127.0.0.1:$activeHalPort"
 $env:APPSTATION_SKIP_STARTUP_HOME = if ($SkipStartupHome) { "true" } else { "false" }
 $backend = Start-Process `
   -FilePath (Join-Path $repo "backend\.venv\Scripts\python.exe") `
@@ -99,12 +117,14 @@ $backend = Start-Process `
   -WindowStyle Hidden `
   -PassThru
 
-$frontendCommand = "`$env:VITE_MOCK_MODE='false'; `$env:VITE_API_BASE='http://127.0.0.1:$BackendPort'; `$env:VITE_WS_URL='ws://127.0.0.1:$BackendPort/ws'; npm run dev -- --host 127.0.0.1 --port $FrontendPort"
+$frontendCommand = "`$env:VITE_MOCK_MODE='false'; `$env:VITE_API_BASE='http://127.0.0.1:$BackendPort'; `$env:VITE_WS_URL='ws://127.0.0.1:$BackendPort/ws'; npm run build; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; node scripts/serve-dist.mjs --host 127.0.0.1 --port $FrontendPort"
 $frontend = Start-Process `
   -FilePath "powershell.exe" `
   -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $frontendCommand) `
   -WorkingDirectory (Join-Path $repo "frontend") `
   -WindowStyle Hidden `
+  -RedirectStandardOutput $frontendOutLog `
+  -RedirectStandardError $frontendErrLog `
   -PassThru
 
 Start-Sleep -Seconds 3
@@ -114,6 +134,8 @@ Start-Sleep -Seconds 3
   frontendLauncherPid = $frontend.Id
   backend = "http://127.0.0.1:$BackendPort"
   frontend = "http://127.0.0.1:$FrontendPort"
-  hal = "http://127.0.0.1:8091"
+  hal = "http://127.0.0.1:$activeHalPort"
+  frontendOutLog = $frontendOutLog
+  frontendErrLog = $frontendErrLog
   skipStartupHome = [bool]$SkipStartupHome
 }

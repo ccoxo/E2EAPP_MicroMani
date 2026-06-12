@@ -83,6 +83,7 @@ class TelemetryHub:
         omega_hands: list[dict[str, Any]] | None = None,
         native_gripper_status: dict[str, Any] | None = None,
         hal_ok: bool = True,
+        config: dict[str, Any] | None = None,
     ) -> TelemetryFrame:
         # 每一帧都合并 HAL、硬件轮询和测试夹具数据，给前端提供单一遥测快照。
         self.tick += 1
@@ -93,7 +94,7 @@ class TelemetryHub:
             instant_hz = 1.0 / interval
             self._ws_hz = instant_hz if self._ws_hz <= 0 else self._ws_hz * 0.8 + instant_hz * 0.2
         self._last_frame_at = now
-        config = self.settings.get_config()
+        config = config if config is not None else self.settings.get_config()
         real_mode = self._real_hardware_mode(config)
         if real_mode:
             if motion_positions is not None and len(motion_positions) == 12:
@@ -160,11 +161,18 @@ class TelemetryHub:
             processStatus=self._process_status(elapsed, real_mode),
         )
 
-    def apply_axis_move(self, side: str, axis: str, direction: int, step: float) -> float:
+    def apply_axis_move(
+        self,
+        side: str,
+        axis: str,
+        direction: int,
+        step: float,
+        config: dict[str, Any] | None = None,
+    ) -> float:
         axis_order = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
         axis_idx = axis_order.index(axis)
         state_idx = (0 if side == "left" else 6) + axis_idx
-        config = self.settings.get_config()
+        config = config if config is not None else self.settings.get_config()
         limit_key = axis.lower()
         limits_key = "leftSoftLimits" if side == "left" else "rightSoftLimits"
         limits = config["motion"][limits_key][limit_key]
@@ -175,8 +183,14 @@ class TelemetryHub:
         self.axis_offsets[state_idx] = next_offset
         return applied
 
-    def apply_gripper(self, side: str, command: str, target_mm: float | None) -> float:
-        config = self.settings.get_config()
+    def apply_gripper(
+        self,
+        side: str,
+        command: str,
+        target_mm: float | None,
+        config: dict[str, Any] | None = None,
+    ) -> float:
+        config = config if config is not None else self.settings.get_config()
         idx = 0 if side == "left" else 1
         stroke = float(config["gripper"]["strokeMm"])
         if command == "open":
@@ -569,14 +583,10 @@ class TelemetryHub:
         now = time.monotonic() if now is None else now
         if self.hardware is None or getattr(self, "_shutdown", False):
             return
-        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
-        hal_native = str(teleop.get("engine", "")).lower() == "hal_native"
-        if hal_native:
-            return
         if self.gripper_workers is not None and self.gripper_workers.is_enabled(config):
             samples = self.gripper_workers.samples(config)
-            if samples:
-                self.gripper_samples = samples
+            self.gripper_samples = samples
+            self.gripper_positions = [-1.0, -1.0]
             updated = False
             latest_sample_at = 0.0
             for side, idx in (("left", 0), ("right", 1)):
@@ -590,6 +600,8 @@ class TelemetryHub:
                     latest_sample_at = max(latest_sample_at, float(monotonic_ms) / 1000.0)
             if updated:
                 self._last_gripper_sample_at = latest_sample_at or now
+            else:
+                self._last_gripper_sample_at = 0.0
             return
         if not hasattr(self.hardware, "gripper") or not hasattr(self, "_hardware_executor"):
             return

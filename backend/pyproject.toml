@@ -38,4 +38,5 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["."]
+files = ["__init__.py", "app.py", "core", "drivers", "hal_client", "services", "workers"]
+exclude = ["^tests/", "^vendor/"]

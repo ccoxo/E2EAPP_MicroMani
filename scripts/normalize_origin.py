@@ -90,16 +90,16 @@ def normalize_dataset(dataset_dir: Path, *, apply: bool = False, target_origin: 
         manual_review.append({"episode": episode_id, "reason": "missing motionOrigin"})
 
     try:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
+        import pyarrow as pa  # type: ignore[import-not-found]
+        import pyarrow.parquet as pq  # type: ignore[import-not-found]
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"pyarrow is required to normalize parquet files: {exc}") from exc
 
-    episodes_by_index = {
-        int(episode.get("episodeIndex")): episode
-        for episode in episodes
-        if isinstance(episode.get("episodeIndex"), int)
-    }
+    episodes_by_index: dict[int, dict[str, Any]] = {}
+    for episode in episodes:
+        episode_index = episode.get("episodeIndex")
+        if isinstance(episode_index, int):
+            episodes_by_index[episode_index] = episode
     changed_rows = 0
     skipped_rows = 0
     files: list[dict[str, Any]] = []
@@ -119,26 +119,26 @@ def normalize_dataset(dataset_dir: Path, *, apply: bool = False, target_origin: 
         file_skipped_rows = 0
 
         for row_index, episode_index in enumerate(episode_indices):
-            episode = episodes_by_index.get(int(episode_index))
-            if episode is None:
+            row_episode = episodes_by_index.get(int(episode_index))
+            if row_episode is None:
                 file_skipped_rows += 1
                 manual_review.append(
                     {"file": str(parquet_path), "row": row_index, "reason": f"missing episode metadata: {episode_index}"}
                 )
                 continue
-            calibration_hash = _calibration_hash(episode)
+            calibration_hash = _calibration_hash(row_episode)
             if target_hash and calibration_hash and calibration_hash != target_hash:
                 file_skipped_rows += 1
                 manual_review.append(
                     {
                         "file": str(parquet_path),
                         "row": row_index,
-                        "episode": episode.get("id"),
+                        "episode": row_episode.get("id"),
                         "reason": "needs_manual_review: motion calibration differs from target origin group",
                     }
                 )
                 continue
-            if not isinstance(episode.get("motionOrigin"), dict):
+            if not isinstance(row_episode.get("motionOrigin"), dict):
                 file_skipped_rows += 1
                 continue
 
@@ -157,7 +157,7 @@ def normalize_dataset(dataset_dir: Path, *, apply: bool = False, target_origin: 
                     {
                         "file": str(parquet_path),
                         "row": row_index,
-                        "episode": episode.get("id"),
+                        "episode": row_episode.get("id"),
                         "reason": f"needs_manual_review: {result['reason']}",
                     }
                 )

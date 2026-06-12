@@ -1,6 +1,7 @@
 param(
   [int]$BackendPort = 18082,
-  [int]$FrontendPort = 5174
+  [int]$FrontendPort = 5174,
+  [int]$HalPort = 8091
 )
 
 $ErrorActionPreference = "Stop"
@@ -8,6 +9,7 @@ $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $cacheBust = [DateTime]::UtcNow.Ticks
 $appUrl = "http://127.0.0.1:$FrontendPort/settings?appver=$cacheBust#manual"
 $profileDir = Join-Path $repo ".app-browser-profile"
+$stackInfo = $null
 
 function Find-Browser {
   $candidates = @(
@@ -32,7 +34,7 @@ function Wait-HttpOk([string]$Url, [int]$TimeoutSeconds) {
     }
     Start-Sleep -Milliseconds 500
   }
-  throw "Timed out waiting for $Url"
+  throw "Timed out waiting for $Url.`n$(Get-LaunchDiagnostics)"
 }
 
 function Test-HttpOk([string]$Url, [int]$TimeoutSeconds) {
@@ -44,10 +46,93 @@ function Test-HttpOk([string]$Url, [int]$TimeoutSeconds) {
   }
 }
 
+function Get-RecordStatus([int]$TimeoutSeconds) {
+  try {
+    $response = Invoke-RestMethod "http://127.0.0.1:$BackendPort/api/record/status" -TimeoutSec $TimeoutSeconds
+    return $response.data
+  } catch {
+    return $null
+  }
+}
+
+function Start-AppStack {
+  $script:stackInfo = & (Join-Path $PSScriptRoot "start-stack.ps1") -BackendPort $BackendPort -FrontendPort $FrontendPort -HalPort $HalPort
+  $script:stackInfo | Out-Host
+}
+
+function Get-ProcessSummary([object]$PidValue) {
+  if (-not $PidValue) {
+    return "pid=<empty>"
+  }
+  try {
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$PidValue)" -ErrorAction SilentlyContinue
+    if (-not $process) {
+      return "pid=$PidValue not running"
+    }
+    return "pid=$($process.ProcessId) name=$($process.Name) parent=$($process.ParentProcessId) commandLine=$($process.CommandLine)"
+  } catch {
+    return "pid=$PidValue lookup failed: $($_.Exception.Message)"
+  }
+}
+
+function Get-PortOwnerSummary([int]$Port) {
+  try {
+    $owners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+      Select-Object -ExpandProperty OwningProcess |
+      Sort-Object -Unique)
+    if ($owners.Count -eq 0) {
+      return "port ${Port}: no listener"
+    }
+    $ownerLines = @($owners | ForEach-Object { Get-ProcessSummary $_ })
+    return "port ${Port}: $($ownerLines -join '; ')"
+  } catch {
+    return "port ${Port}: lookup failed: $($_.Exception.Message)"
+  }
+}
+
+function Get-LogTail([string]$Label, [string]$Path) {
+  if (-not $Path) {
+    return "${Label}: <empty path>"
+  }
+  if (-not (Test-Path -LiteralPath $Path)) {
+    return "${Label}: missing at ${Path}"
+  }
+  try {
+    $tail = @(Get-Content -LiteralPath $Path -Tail 40 -ErrorAction SilentlyContinue)
+    if ($tail.Count -eq 0) {
+      return "${Label}: empty at $Path"
+    }
+    return "${Label} ($Path):`n$($tail -join "`n")"
+  } catch {
+    return "${Label}: read failed at ${Path}: $($_.Exception.Message)"
+  }
+}
+
+function Get-LaunchDiagnostics {
+  $lines = New-Object System.Collections.Generic.List[string]
+  $lines.Add("Launch diagnostics:")
+  $lines.Add("urls: frontend=http://127.0.0.1:$FrontendPort backend=http://127.0.0.1:$BackendPort halPort=$HalPort")
+  $lines.Add((Get-PortOwnerSummary $FrontendPort))
+  $lines.Add((Get-PortOwnerSummary $BackendPort))
+  $lines.Add((Get-PortOwnerSummary $HalPort))
+  if ($script:stackInfo) {
+    foreach ($field in @("backendPid", "frontendLauncherPid", "backend", "frontend", "hal", "frontendOutLog", "frontendErrLog")) {
+      $lines.Add("${field}: $($script:stackInfo.$field)")
+    }
+    $lines.Add("backend process: $(Get-ProcessSummary $script:stackInfo.backendPid)")
+    $lines.Add("frontend launcher process: $(Get-ProcessSummary $script:stackInfo.frontendLauncherPid)")
+    $lines.Add((Get-LogTail "frontend stdout" $script:stackInfo.frontendOutLog))
+    $lines.Add((Get-LogTail "frontend stderr" $script:stackInfo.frontendErrLog))
+  } else {
+    $lines.Add("stackInfo: <not captured>")
+  }
+  return $lines -join "`n"
+}
+
 function Restart-AppStack([string]$Reason) {
   Write-Warning $Reason
-  & (Join-Path $PSScriptRoot "start-stack.ps1") -BackendPort $BackendPort -FrontendPort $FrontendPort | Out-Host
-  Wait-HttpOk $appUrl 45
+  Start-AppStack
+  Wait-HttpOk $appUrl 180
 }
 
 function Get-AppBrowserProcesses {
@@ -63,8 +148,8 @@ New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
 
 try {
   Write-Host "Starting HAL, backend, and frontend..."
-  & (Join-Path $PSScriptRoot "start-stack.ps1") -BackendPort $BackendPort -FrontendPort $FrontendPort | Out-Host
-  Wait-HttpOk $appUrl 45
+  Start-AppStack
+  Wait-HttpOk $appUrl 180
 
   $processes = @(Get-AppBrowserProcesses)
   if ($processes.Count -eq 0) {
@@ -95,10 +180,24 @@ try {
   }
 
   Write-Host "App is running. Close the App window to stop frontend, backend, and HAL."
+  $backendHealthFailures = 0
+  $backendHealthFailureLimit = 15
   while (@(Get-AppBrowserProcesses).Count -gt 0) {
     $backendHealthUrl = "http://127.0.0.1:$BackendPort/docs"
-    if (-not (Test-HttpOk $backendHealthUrl 3)) {
-      Restart-AppStack "backend health check failed; restarting stack"
+    if (Test-HttpOk $backendHealthUrl 3) {
+      $backendHealthFailures = 0
+    } else {
+      $recordStatus = Get-RecordStatus 2
+      if ($recordStatus -and ($recordStatus.active -or $recordStatus.recording)) {
+        $backendHealthFailures = 0
+        Write-Warning "backend health check skipped during active recording"
+      } else {
+        $backendHealthFailures += 1
+        if ($backendHealthFailures -ge $backendHealthFailureLimit) {
+          Restart-AppStack "backend health check failed; restarting stack"
+          $backendHealthFailures = 0
+        }
+      }
     }
     Start-Sleep -Seconds 1
   }

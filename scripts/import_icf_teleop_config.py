@@ -60,7 +60,7 @@ def main() -> int:
         raise FileNotFoundError(icf_config)
 
     parser_ini = configparser.ConfigParser()
-    parser_ini.optionxform = str
+    parser_ini.optionxform = str  # type: ignore[method-assign, assignment]
     parser_ini.read(icf_config, encoding="utf-8-sig")
     config = load_runtime_config(runtime_config)
     apply_icf_config(config, parser_ini, icf_config)
@@ -78,9 +78,10 @@ def load_runtime_config(path: Path) -> dict[str, Any]:
     if not path.exists():
         return default_config()
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return default_config()
+    return value if isinstance(value, dict) else default_config()
 
 
 def apply_icf_config(config: dict[str, Any], ini: configparser.ConfigParser, source_path: Path) -> None:

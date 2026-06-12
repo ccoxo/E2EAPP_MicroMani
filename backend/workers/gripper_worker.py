@@ -7,16 +7,16 @@ import time
 from multiprocessing.queues import Queue
 from typing import Any
 
-from backend.drivers.gripper_rs485 import Rs485GripperDriver
 from backend.core.gripper_protection import icf_target_min_gap_mm
+from backend.drivers.gripper_rs485 import Rs485GripperDriver
 
 
 def run_gripper_worker(
     side: str,
     config: dict[str, Any],
-    command_queue: Queue,
-    status_queue: Queue,
-    response_queue: Queue,
+    command_queue: Queue[Any],
+    status_queue: Queue[Any],
+    response_queue: Queue[Any],
     parent_pid: int | None = None,
 ) -> None:
     worker = _GripperWorker(side, config, command_queue, status_queue, response_queue, parent_pid)
@@ -28,9 +28,9 @@ class _GripperWorker:
         self,
         side: str,
         config: dict[str, Any],
-        command_queue: Queue,
-        status_queue: Queue,
-        response_queue: Queue,
+        command_queue: Queue[Any],
+        status_queue: Queue[Any],
+        response_queue: Queue[Any],
         parent_pid: int | None = None,
     ) -> None:
         self.side = side
@@ -213,7 +213,7 @@ class _GripperWorker:
             if not handle:
                 return False
             try:
-                result = ctypes.windll.kernel32.WaitForSingleObject(handle, 0)
+                result = int(ctypes.windll.kernel32.WaitForSingleObject(handle, 0))
                 return result == wait_object_0
             finally:
                 ctypes.windll.kernel32.CloseHandle(handle)

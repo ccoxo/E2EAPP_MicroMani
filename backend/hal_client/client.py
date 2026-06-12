@@ -67,6 +67,9 @@ class TestHalClient(HalClient):
             side = str((payload or {}).get("side", ""))
             if side in self.motion_enabled:
                 self.motion_enabled[side] = False
+        if name == "motion.emergency_stop":
+            self.motion_enabled["left"] = False
+            self.motion_enabled["right"] = False
         self.logs.info("[HAL]", f"{name} accepted by TestHalClient")
         return {"mode": "test", "command": name, "payload": payload or {}}
 
@@ -144,6 +147,7 @@ class RealHalClient(HalClient):
         self.logs = logs
         self._tls = threading.local()
         self._cmd_lock = threading.Lock()
+        self._long_motion_timeout_s = 75.0
 
     async def health(self) -> HalHealth:
         try:
@@ -195,7 +199,8 @@ class RealHalClient(HalClient):
         method = "GET" if name in {"hal.reconnect", "teleop.native.status"} else "POST"
         request_payload = self._hal_command_payload(name, payload or {})
         try:
-            response = await self._request(method, path, request_payload)
+            timeout_s, attempts = self._command_request_policy(name)
+            response = await self._request(method, path, request_payload, timeout_s=timeout_s, max_attempts=attempts)
         except RuntimeError as exc:
             if name.startswith("motion."):
                 self.logs.event(
@@ -220,6 +225,11 @@ class RealHalClient(HalClient):
         if name not in {"motion.teleop_target_update", "teleop.native.status"}:
             self.logs.info("[HAL]", f"{name} forwarded to real HAL")
         return {"mode": "real", "command": name, "response": response}
+
+    def _command_request_policy(self, name: str) -> tuple[float, int]:
+        if name in {"motion.home_all", "motion.home_origin_side", "motion.home_side"}:
+            return max(self.timeout_s, self._long_motion_timeout_s), 1
+        return self.timeout_s, 2
 
     def _hal_command_payload(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         if name != "motion.teleop_target_update":
@@ -246,14 +256,33 @@ class RealHalClient(HalClient):
         payload["received_monotonic_ms"] = int(time.monotonic() * 1000)
         return payload
 
-    async def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
-        return await asyncio.to_thread(self._request_sync, method, path, body)
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        timeout_s: float | None = None,
+        max_attempts: int = 2,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._request_sync,
+            method,
+            path,
+            body,
+            timeout_s=timeout_s,
+            max_attempts=max_attempts,
+        )
 
-    def _get_connection(self) -> http.client.HTTPConnection:
+    def _get_connection(self, timeout_s: float | None = None) -> http.client.HTTPConnection:
+        timeout = self.timeout_s if timeout_s is None else max(float(timeout_s), 0.001)
         conn: http.client.HTTPConnection | None = getattr(self._tls, "conn", None)
-        if conn is not None:
+        conn_timeout = getattr(self._tls, "conn_timeout_s", None)
+        if conn is not None and conn_timeout == timeout:
             return conn
-        conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout_s)
+        if conn is not None:
+            self._drop_connection()
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
         # 每个工作线程复用自己的连接，避免跨线程共享 socket 带来的竞态。
         # 复用连接并开启 TCP_NODELAY，避免 localhost 上的小 JSON 包被 Nagle 延迟。
         try:
@@ -266,6 +295,7 @@ class RealHalClient(HalClient):
                 pass
             raise
         self._tls.conn = conn
+        self._tls.conn_timeout_s = timeout
         return conn
 
     def _drop_connection(self) -> None:
@@ -276,15 +306,25 @@ class RealHalClient(HalClient):
             except Exception:
                 pass
             self._tls.conn = None
+        self._tls.conn_timeout_s = None
 
-    def _request_sync(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request_sync(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        timeout_s: float | None = None,
+        max_attempts: int = 2,
+    ) -> dict[str, Any]:
         data = None if body is None else json.dumps(body).encode("utf-8")
         headers = {"Content-Type": "application/json", "Connection": "keep-alive"}
 
         # 首次失败通常来自服务端关闭了旧 keep-alive 连接；重建一次即可恢复。
-        for attempt in range(2):  # 旧连接失效时只重试一次
+        attempts = max(1, int(max_attempts))
+        for attempt in range(attempts):
             try:
-                conn = self._get_connection()
+                conn = self._get_connection(timeout_s)
                 conn.request(method, path, body=data, headers=headers)
                 response = conn.getresponse()
                 raw = response.read().decode("utf-8")
@@ -312,7 +352,7 @@ class RealHalClient(HalClient):
             except (http.client.HTTPException, ConnectionError, OSError, TimeoutError) as exc:
                 # 连接已失效，丢弃后用新 socket 重试一次。
                 self._drop_connection()
-                if attempt >= 1:
+                if attempt >= attempts - 1:
                     raise RuntimeError(f"HAL request failed: {self.base_url}{path}: {exc}") from exc
                 time.sleep(0.005)
             except json.JSONDecodeError as exc:

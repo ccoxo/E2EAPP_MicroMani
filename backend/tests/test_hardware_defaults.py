@@ -1,6 +1,17 @@
 from __future__ import annotations
 
+import pytest
+
 from backend.core.defaults import default_config
+
+
+def _target_arm_gain(config: dict, side: str, axis_index: int) -> float:
+    teleop = config["teleop"]
+    kinematics = config["motion"]["kinematics"]
+    coeff = abs(float(teleop[f"{side}ImpulseCoeff"][axis_index]))
+    pulse_per_unit = abs(float(kinematics[f"{side}SignedPulsePerUnit"][axis_index]))
+    scale = float(teleop[f"{side}AxisOutputScale"][axis_index])
+    return coeff / pulse_per_unit * scale
 
 
 def test_hal_defaults_use_backend_hal_boundary() -> None:
@@ -55,7 +66,7 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["kalmanRotationProcessVelocityVariance"] == 1e-3
     assert teleop["kalmanTranslationIntentVelocityThreshold"] == 0.0005
     assert teleop["kalmanRotationIntentVelocityThreshold"] == 0.5
-    assert teleop["strategyVersion"] == "e2e_omega7_native_v27_right_yaw333_com9_20260520"
+    assert teleop["strategyVersion"] == "e2e_omega7_native_v29_stable_feel_lead_20260612"
     assert teleop["mappingMode"] == "direct"
     assert teleop["swapHands"] is False
     assert teleop["swapTeleopChannels"] is True
@@ -66,8 +77,8 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["rightRotationScale"] == 1.0
     assert teleop["leftForceFeedback"] is True
     assert teleop["rightForceFeedback"] is True
-    assert teleop["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.08, 0.10]
-    assert teleop["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.35, 0.08, 0.15]
+    assert teleop["leftAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.10]
+    assert teleop["rightAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.001]
     assert teleop["translationStepLimitPulse"] == 4000
     assert teleop["rotationStepLimitPulse"] == 1250
     assert teleop["translationPulseDeadband"] == 2
@@ -90,8 +101,8 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["leftSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 95.0, 30.0, 7.0]
     assert teleop["rightSoftLimitMin"] == [-25000.0, -37500.0, -37500.0, -95.0, -30.0, -7.0]
     assert teleop["rightSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 5.0, 30.0, 7.0]
-    assert teleop["leftImpulseCoeff"] == [-5000000, 5000000, -10000000, 1667, -2500, -333.3333]
-    assert teleop["rightImpulseCoeff"] == [-5000000, -10000000, -5000000, 1667, 2500, 3333.333]
+    assert teleop["leftImpulseCoeff"] == [-5000000, -5000000, -10000000, 1667, 2500, -333.3333]
+    assert teleop["rightImpulseCoeff"] == [-5000000, 10000000, -5000000, 1667, -2500, 3333.333]
     assert teleop["leftDirectionSign"] == [1, -1, -1, 1, -1, -1]
     assert teleop["rightDirectionSign"] == [1, 1, -1, 1, 1, 1]
     assert teleop["gripperTeleop"]["leftSourceHand"] == "PhysicalRight"
@@ -167,11 +178,11 @@ def test_storage_defaults_separate_recording_fps_from_camera_preview() -> None:
     config = default_config()
 
     assert config["cameras"]["global"] == "IMX335 / index 1"
-    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&124CCBA8&0&0000"
-    assert config["cameras"]["wristLeft"] == "IMX335 / index 2"
-    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&7861A93&0&0000"
-    assert config["cameras"]["wristRight"] == "IMX335 / index 0"
-    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
+    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 0"
+    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
+    assert config["cameras"]["wristRight"] == "IMX335 / index 2"
+    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000"
     assert config["cameras"]["previewResolution"] == "640x480"
     assert config["cameras"]["fps"] == 30
     assert config["storage"]["recordFps"] == 30
@@ -197,12 +208,12 @@ def test_gripper_teleop_defaults_match_omega7_gap_range() -> None:
     assert gripper_teleop["buttonFallback"] is True
 
 
-def test_native_teleop_xy_signs_match_site_verified_stage_direction() -> None:
+def test_native_teleop_xy_signs_match_corrected_right_y_stage_direction() -> None:
     teleop = default_config()["teleop"]
 
     assert teleop["swapTeleopChannels"] is True
-    assert teleop["leftImpulseCoeff"][:2] == [-5000000, 5000000]
-    assert teleop["rightImpulseCoeff"][:2] == [-5000000, -10000000]
+    assert teleop["leftImpulseCoeff"][:2] == [-5000000, -5000000]
+    assert teleop["rightImpulseCoeff"][:2] == [-5000000, 10000000]
 
 
 def test_native_teleop_axis_scales_use_icf_effective_output_scale() -> None:
@@ -212,5 +223,26 @@ def test_native_teleop_axis_scales_use_icf_effective_output_scale() -> None:
     assert teleop["rightTranslationScale"] == 1.0
     assert teleop["leftRotationScale"] == 1.0
     assert teleop["rightRotationScale"] == 1.0
-    assert teleop["leftAxisOutputScale"] == [0.40, 0.25, 0.25, 0.40, 0.08, 0.10]
-    assert teleop["rightAxisOutputScale"] == [0.40, 0.25, 0.25, 0.35, 0.08, 0.15]
+    assert teleop["leftAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.10]
+    assert teleop["rightAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.001]
+
+
+def test_native_teleop_axis_scales_match_requested_left_boost_and_right_feel() -> None:
+    config = default_config()
+    teleop = config["teleop"]
+
+    old_left_gains = [400.0, 250.0, 250.0, 0.40008, 0.08, 0.01]
+    expected_left_gains = [
+        old_left_gains[0] * 1.5,
+        old_left_gains[1] * 2.0,
+        old_left_gains[2] * 1.5,
+        old_left_gains[3] * 1.5,
+        old_left_gains[4],
+        old_left_gains[5],
+    ]
+
+    for axis_index, expected in enumerate(expected_left_gains):
+        assert _target_arm_gain(config, "left", axis_index) == pytest.approx(expected, rel=5e-4)
+        assert _target_arm_gain(config, "right", axis_index) == pytest.approx(expected, rel=5e-4)
+
+    assert teleop["rightEnabledAxes"][5] is False

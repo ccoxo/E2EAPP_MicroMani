@@ -1,21 +1,25 @@
 @echo off
 setlocal
+rem Enter the MSVC x64 environment before invoking cl/link directly.
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 (
   echo vcvars64 setup failed
   exit /b 1
 )
 
+rem Resolve paths from this script so it works from any current directory.
 set REPO=%~dp0
 set BUILD=%REPO%build
 set SRC=%REPO%src
 set INC=%REPO%include
 set LEISHINE_LIB=%REPO%vendor\leishine\lib\x64\LTDMC.lib
+rem /utf-8 keeps C++ Chinese comments and strings parsed consistently by MSVC.
 set CXX_FLAGS=/nologo /utf-8 /std:c++20 /EHsc /O2 /DAPPSTATION_ENABLE_VENDOR_SDKS=1 /D_WIN32_WINNT=0x0601 /I "%INC%"
 
 if not exist "%BUILD%" mkdir "%BUILD%"
 pushd "%BUILD%"
 
+rem Compile into *.next.obj first so failed builds do not overwrite the last usable objects.
 echo Compiling LTDMCDriver.cpp ...
 cl %CXX_FLAGS% /c "%SRC%\LTDMCDriver.cpp" /Fo"LTDMCDriver.next.obj" || goto :err
 
@@ -37,17 +41,20 @@ cl %CXX_FLAGS% /c "%SRC%\HalServer.cpp" /Fo"HalServer.next.obj" || goto :err
 echo Compiling JodellGripperWorker.cpp ...
 cl %CXX_FLAGS% /c "%SRC%\JodellGripperWorker.cpp" /Fo"JodellGripperWorker.next.obj" || goto :err
 
+rem HalServer links motion, master-hand, gripper, and the Winsock HTTP boundary.
 echo Linking HalServer.next.exe ...
 link /nologo /OUT:"HalServer.next.exe" ^
   HalServer.next.obj LTDMCDriver.next.obj JodellGripperDriver.next.obj MotionControlThread.next.obj NativeTeleopController.next.obj Omega7Driver.next.obj ^
   ws2_32.lib ^
   || goto :err
 
+rem The gripper worker is a small isolated process that only links the gripper driver.
 echo Linking JodellGripperWorker.next.exe ...
 link /nologo /OUT:"JodellGripperWorker.next.exe" ^
   JodellGripperWorker.next.obj JodellGripperDriver.next.obj ^
   || goto :err
 
+rem Timestamp backups let a successful build avoid overwriting an executable currently in use.
 for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set BUILD_STAMP=%%I
 if exist "HalServer.exe" copy /Y "HalServer.exe" "HalServer.backup-%BUILD_STAMP%.exe" >nul 2>nul
 if errorlevel 1 (

@@ -34,6 +34,7 @@ import {
   captureMotionOrigin,
   disableMotionSide,
   enableMotionSide,
+  homeMotionSide,
   applyCameraTuning,
   reconnectCamera,
   reconnectHal,
@@ -50,6 +51,7 @@ import {
   type MotionOriginCaptureDrift,
 } from '../api'
 import { refreshCameraStream } from '../hooks/useLiveCameraSnapshot'
+import { isManualAxisDisabled } from '../manualAxisRules'
 import {
   armHardwareSpecs,
   axisHardwareSpecs,
@@ -62,6 +64,7 @@ import {
 } from '../data'
 import { manualAxisStepLimitFromPulse, manualAxisStepLimitPulse } from '../manualMotionLimits'
 import { manualMaxVelocity } from '../manualSpeed'
+import { motionSideReturnOriginReady } from '../motionReturnReady'
 import { useTelemetryStore } from '../stores/telemetry'
 import type {
   AppConfig,
@@ -205,8 +208,8 @@ function formatPulseList(values: number[]) {
 }
 
 /** 格式化对应数值用于界面展示。 */
-function formatHardwareZeroPosition(origin: MotionOriginConfig) {
-  return `硬件零点位置：左[${formatPulseList(origin.leftPulse)}] 右[${formatPulseList(origin.rightPulse)}]`
+function formatWorkOriginPosition(origin: MotionOriginConfig) {
+  return `工作原点位置：左[${formatPulseList(origin.leftPulse)}] 右[${formatPulseList(origin.rightPulse)}]`
 }
 
 /** 格式化对应数值用于界面展示。 */
@@ -517,7 +520,7 @@ function HalCard({
         <Form.Item label="轴数">
           <InputNumber min={12} max={24} value={config.hal.axisCount} onChange={(value) => updateConfig({ hal: { ...config.hal, axisCount: Number(value ?? 12) } })} />
         </Form.Item>
-        <Form.Item label="开机回硬件零点">
+        <Form.Item label="开机回工作原点">
           <div className="motion-startup-row">
             <Switch
               checked={config.motion.homeOnStartup.enabled}
@@ -578,8 +581,8 @@ function SafetyCard({
           <Button danger icon={<AlertTriangle size={15} />} onClick={() => setDangerOverride(0.92)}>
             模拟危险
           </Button>
-          <Button icon={<RotateCcw size={15} />} onClick={() => { acknowledgeSafety(); commandLog(injectLog, '[SAFETY]', '安全状态复位') }}>
-            复位确认
+          <Button icon={<RotateCcw size={15} />} onClick={() => { acknowledgeSafety(); commandLog(injectLog, '[SAFETY]', '确认安全态（不恢复运动）') }}>
+            确认安全态
           </Button>
         </Space>
       }
@@ -666,7 +669,7 @@ function AxisMappingTable({
             <th>语义轴</th>
             <th>物理轴号</th>
             <th>型号 / 行程</th>
-            <th>相对硬件零点位置</th>
+            <th>相对工作原点位置</th>
             <th>脉冲当量</th>
             <th>初始速度</th>
             <th>最大速度</th>
@@ -900,11 +903,11 @@ function MotionCard({
   const originScopeText =
     sideOriginValid
       ? motionOrigin.valid
-        ? '双侧硬件零点都已记录'
-        : '仅当前侧硬件零点已记录'
-      : '当前侧硬件零点未记录'
+        ? '双侧工作原点都已记录'
+        : '仅当前侧工作原点已记录'
+      : '当前侧工作原点未记录'
   const originUpdatedText = motionOrigin.updatedAt > 0 ? `最后更新 ${formatSnapshotTime(motionOrigin.updatedAt)}` : originScopeText
-  const [pendingMotionAction, setPendingMotionAction] = useState<'enable' | 'disable' | null>(null)
+  const [pendingMotionAction, setPendingMotionAction] = useState<'enable' | 'disable' | 'home' | null>(null)
   const [pendingOriginAction, setPendingOriginAction] = useState<'capture' | 'restore' | null>(null)
   const [optimisticEnabled, setOptimisticEnabled] = useState<boolean | null>(null)
   useEffect(() => {
@@ -964,36 +967,56 @@ function MotionCard({
     }
   }
  /** 处理对应的用户交互。 */
+ const handleHome = async () => {
+    setPendingMotionAction('home')
+    try {
+      await homeMotionSide(side)
+      commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel}回硬件零点完成（未写入工作原点）`)
+    } catch (error) {
+      injectLog('ERROR', `${sideSpec.shortLabel}回硬件零点失败：${commandErrorMessage(error)}`, '[HAL]')
+    } finally {
+      setPendingMotionAction(null)
+    }
+  }
+ /** 处理对应的用户交互。 */
  const handleCaptureOrigin = async (confirmLargeDrift = false) => {
     setPendingOriginAction('capture')
     try {
       const response = await captureMotionOrigin(side, confirmLargeDrift ? { confirmLargeDrift: true } : undefined)
-      const nextOrigin = response.data?.origin ?? {
+      const responseMotion = response.data?.config?.motion
+      const nextOrigin = response.data?.origin ?? responseMotion?.origin ?? {
         ...motionOrigin,
         leftValid: side === 'left' ? true : motionOrigin.leftValid,
         rightValid: side === 'right' ? true : motionOrigin.rightValid,
         valid:
           (side === 'left' ? true : motionOrigin.leftValid) &&
           (side === 'right' ? true : motionOrigin.rightValid),
-        updatedAt: Date.now(),
+        updatedAt: motionOrigin.updatedAt,
       }
-      updateConfig({ motion: { ...config.motion, origin: nextOrigin } })
+      updateConfig({
+        motion: responseMotion ?? {
+          ...config.motion,
+          origin: nextOrigin,
+          homeReference: response.data?.homeReference ?? config.motion.homeReference,
+          workOriginOffset: response.data?.workOriginOffset ?? config.motion.workOriginOffset,
+        },
+      })
       const drift = response.data?.originCaptureDrift
-      const positionText = formatHardwareZeroPosition(nextOrigin)
+      const positionText = formatWorkOriginPosition(nextOrigin)
       commandLog(
         injectLog,
         '[HAL]',
         `${drift?.requiresConfirmation
-          ? `${sideSpec.shortLabel}硬件零点已确认大漂移并写入`
-          : `${sideSpec.shortLabel}硬件零点已记录`}；${positionText}`,
+          ? `${sideSpec.shortLabel}工作原点已确认大漂移并写入`
+          : `${sideSpec.shortLabel}工作原点已记录`}；${positionText}`,
       )
     } catch (error) {
       const drift = originDriftFromError(error)
       if (!confirmLargeDrift && drift) {
         requestComparison({
-          title: `${sideSpec.shortLabel}硬件零点漂移过大`,
+          title: `${sideSpec.shortLabel}工作原点漂移过大`,
           tone: 'danger',
-          impact: '本次硬件回零读数与已有硬件零点记录差距超过保护阈值。未再次确认前，后端不会写入新的硬件零点。',
+          impact: '本次当前位置读数与已有工作原点记录差距超过保护阈值。未再次确认前，后端不会写入新的工作原点。',
           expected: `阈值：平移 ${drift.thresholds.translationUm.toFixed(0)} µm，旋转 ${drift.thresholds.rotationDeg.toFixed(3)}°。`,
           current: [
             { label: '当前状态', value: originStatusText },
@@ -1008,7 +1031,7 @@ function MotionCard({
         })
         return false
       }
-      injectLog('ERROR', `${sideSpec.shortLabel}硬件零点记录失败：${commandErrorMessage(error)}`, '[HAL]')
+      injectLog('ERROR', `${sideSpec.shortLabel}工作原点记录失败：${commandErrorMessage(error)}`, '[HAL]')
     } finally {
       setPendingOriginAction(null)
     }
@@ -1019,11 +1042,12 @@ function MotionCard({
     setPendingOriginAction('restore')
     try {
       const response = await restorePreviousMotionOrigin()
-      const nextOrigin = response.data?.origin ?? motionOrigin
-      updateConfig({ motion: { ...config.motion, origin: nextOrigin } })
-      commandLog(injectLog, '[HAL]', '已恢复上个硬件零点')
+      const responseMotion = response.data?.config?.motion
+      const nextOrigin = response.data?.origin ?? responseMotion?.origin ?? motionOrigin
+      updateConfig({ motion: responseMotion ?? { ...config.motion, origin: nextOrigin } })
+      commandLog(injectLog, '[HAL]', '已恢复上个工作原点')
     } catch (error) {
-      injectLog('ERROR', `恢复上个硬件零点失败：${commandErrorMessage(error)}`, '[HAL]')
+      injectLog('ERROR', `恢复上个工作原点失败：${commandErrorMessage(error)}`, '[HAL]')
     } finally {
       setPendingOriginAction(null)
     }
@@ -1031,28 +1055,28 @@ function MotionCard({
  /** 处理对应的用户交互。 */
  const requestHome = () =>
     requestComparison({
-      title: `${sideSpec.shortLabel}硬件回零`,
+      title: `${sideSpec.shortLabel}回硬件零点`,
       tone: 'danger',
-      impact: `将通过 HAL 调用 ${sideSpec.shortLabel} LTDMC HOME 回零流程，并在完成后记录硬件零点。`,
-      expected: '确认前请确认工作区安全；确认后会移动硬件轴并写入硬件零点记录。',
+      impact: `将通过 HAL 调用 ${sideSpec.shortLabel} LTDMC HOME 回零流程；本动作不会写入工作原点记录。`,
+      expected: '确认前请确认工作区安全；确认后只移动硬件轴，不更新 homeReference、工作原点或软限位。',
       current: [
         { label: '使能状态', value: motionStateText },
         { label: '当前位置', value: sidePositionsText || '--' },
       ],
       proposed: [
-        { label: '目标动作', value: '硬件回零并记录' },
-        { label: '命令接口', value: 'dmc_home_move + 读取脉冲' },
+        { label: '目标动作', value: '硬件HOME（不写入）' },
+        { label: '命令接口', value: 'motion.home_side' },
       ],
-      confirmText: '确认硬件回零',
-      onConfirm: handleCaptureOrigin,
+      confirmText: '确认回硬件零点',
+      onConfirm: handleHome,
     })
  /** 处理对应的用户交互。 */
  const requestCaptureOrigin = () =>
     requestComparison({
-      title: `${sideSpec.shortLabel}回零并记录硬件零点`,
+      title: `${sideSpec.shortLabel}记录工作原点`,
       tone: 'warning',
-      impact: `将执行${sideSpec.shortLabel}硬件 HOME 回零，并把回零完成后的实际脉冲保存为硬件零点。`,
-      expected: '确认后会移动硬件轴；不会把任意当前位置手动保存为软件工作位。',
+      impact: `将当前 ${sideSpec.shortLabel} HAL 脉冲记录为工作原点，不执行硬件 HOME。`,
+      expected: '确认前请把从臂移动到期望工作原点；确认后只记录当前位置，不移动硬件。',
       current: [
         { label: '当前状态', value: originStatusText },
         { label: '当前位置', value: sidePositionsText || '--' },
@@ -1061,23 +1085,23 @@ function MotionCard({
         { label: '当前状态', value: '已记录' },
         { label: '更新时间', value: '确认时写入' },
       ],
-      confirmText: '确认回零并记录',
+      confirmText: '确认记录工作原点',
       onConfirm: handleCaptureOrigin,
     })
  /** 处理对应的用户交互。 */
  const requestRestorePreviousOrigin = () =>
     requestComparison({
-      title: '恢复上个硬件零点',
+      title: '恢复上个工作原点',
       tone: 'warning',
-      impact: '将把当前硬件零点记录替换为上一份备份记录。',
-      expected: '确认后只切换硬件零点记录，不会移动硬件。',
+      impact: '将把当前工作原点记录替换为上一份备份记录。',
+      expected: '确认后只切换工作原点记录，不会移动硬件。',
       current: [
         { label: '当前状态', value: originStatusText },
         { label: '范围', value: originScopeText },
       ],
       proposed: [
         { label: '当前状态', value: motionOrigin.previousValid ? '可恢复' : '无备份' },
-        { label: '范围', value: '恢复上一份硬件零点备份' },
+        { label: '范围', value: '恢复上一份工作原点备份' },
       ],
       confirmText: '确认恢复',
       onConfirm: handleRestorePreviousOrigin,
@@ -1107,8 +1131,8 @@ function MotionCard({
           <Button danger icon={<Usb size={15} />} loading={pendingMotionAction === 'disable'} onClick={() => void handleDisable()}>
             断使能
           </Button>
-          <Button icon={<RotateCcw size={15} />} loading={pendingOriginAction === 'capture'} onClick={requestHome}>
-            硬件回零
+          <Button icon={<Crosshair size={15} />} loading={pendingOriginAction === 'capture'} onClick={requestCaptureOrigin}>
+            记录工作原点
           </Button>
           <Button danger icon={<ShieldAlert size={15} />} onClick={triggerEmergencyStop}>
             急停
@@ -1150,20 +1174,20 @@ function MotionCard({
       </Form>
       <div className="motion-origin-panel">
         <div className="hardware-subtitle-row">
-          <b>硬件零点</b>
+          <b>工作原点</b>
           <span>{originScopeText}</span>
         </div>
         <div className="hardware-metric-grid hardware-metric-grid-single">
           <MetricBox label="当前状态" value={originStatusText} hint={originUpdatedText} tone={sideOriginValid ? 'ok' : 'warn'} />
         </div>
-        <Typography.Text type="secondary">{formatHardwareZeroPosition(motionOrigin)}</Typography.Text>
+        <Typography.Text type="secondary">{formatWorkOriginPosition(motionOrigin)}</Typography.Text>
         <Space wrap className="motion-origin-actions">
           <Button
-            icon={<Crosshair size={15} />}
-            loading={pendingOriginAction === 'capture'}
-            onClick={requestCaptureOrigin}
+            icon={<RotateCcw size={15} />}
+            loading={pendingMotionAction === 'home'}
+            onClick={requestHome}
           >
-            回零并记录
+            回硬件零点
           </Button>
           {side === 'left' && (
             <Button
@@ -1171,7 +1195,7 @@ function MotionCard({
               loading={pendingOriginAction === 'restore'}
               onClick={requestRestorePreviousOrigin}
             >
-              恢复上个零点
+              恢复上个工作原点
             </Button>
           )}
         </Space>
@@ -1558,7 +1582,8 @@ function GripperCard({
   const slaveKey = side === 'left' ? 'leftSlaveId' : 'rightSlaveId'
   const enabledKey = side === 'left' ? 'leftEnabled' : 'rightEnabled'
   const gripperEnabled = Boolean(config.gripper[enabledKey])
-  const canCommandGripper = gripperEnabled || config.teleop.engine === 'hal_native'
+  const halNativeGripperTeleop = config.teleop.engine === 'hal_native'
+  const canCommandGripper = gripperEnabled || halNativeGripperTeleop
   const gapMinKey = side === 'left' ? 'leftGapMinMm' : 'rightGapMinMm'
   const gapMaxKey = side === 'left' ? 'leftGapMaxMm' : 'rightGapMaxMm'
   const protectedMinGapMm = config.gripper.icfTargetProtectionEnabled
@@ -1632,12 +1657,22 @@ function GripperCard({
   const teleopPort = gripperTeleopStatus?.ports?.find((port) => port.side === side) ?? fallbackTeleopPort
   const teleopPortSummary = `${teleopPort.port ?? '-'} / slave ${teleopPort.slaveId ?? '-'}`
   const teleopPortDetail = `${teleopPort.baudrate ?? config.gripper.baudrate} baud · ${teleopPort.message || (config.teleop.engine === 'hal_native' ? 'HAL-native 夹爪遥操作串口' : 'Python 夹爪 worker 串口')}`
-  const teleopRunSummary = teleopRunning
-    ? '遥操作运行中'
-    : gripperTeleopStatus?.requestedRunning
-      ? '遥操作等待 HAL 回报'
-      : '遥操作未启动'
-  const teleopRunDetail = gripperTeleopStatus?.message || (objectDetected ? '检测到夹持物体' : '等待 Omega.7 夹爪输入')
+  const teleopRunSummary = halNativeGripperTeleop
+    ? teleopRunning
+      ? '随 Omega.7 自动遥操作'
+      : gripperTeleopStatus?.requestedRunning
+        ? '等待 HAL 接管夹爪'
+        : '等待主手连接'
+    : teleopRunning
+      ? '遥操作运行中'
+      : gripperTeleopStatus?.requestedRunning
+        ? '遥操作等待 HAL 回报'
+        : '遥操作未启动'
+  const teleopRunDetail = gripperTeleopStatus?.message || (
+    halNativeGripperTeleop
+      ? objectDetected ? '检测到夹持物体' : '主手连接后 HAL-native 会自动接管夹爪'
+      : objectDetected ? '检测到夹持物体' : '等待 Omega.7 夹爪输入'
+  )
   const gripperPortTone: InlineStatusTone =
     teleopPort.ok === false ? 'error' : teleopPort.ok === true ? 'ok' : 'pending'
   const gripperRunTone: InlineStatusTone =
@@ -1647,7 +1682,14 @@ function GripperCard({
     gripperPortTone === 'error' ? teleopPort.message || teleopPortDetail : '',
     gripperRunTone === 'error' ? teleopRunDetail : '',
   ].filter(Boolean).join(' · ')
-  const gripperCardState: ConnectionState = gripperHasTeleopError ? 'error' : config.gripper[enabledKey] ? 'ok' : 'pending'
+  const gripperCardState: ConnectionState = gripperHasTeleopError
+    ? 'error'
+    : halNativeGripperTeleop
+      ? teleopRunning || gripperTeleopStatus?.requestedRunning ? 'ok' : 'pending'
+      : config.gripper[enabledKey] ? 'ok' : 'pending'
+  const gripperControlLabel = halNativeGripperTeleop ? '控制状态' : '使能状态'
+  const gripperControlValue = halNativeGripperTeleop ? teleopRunSummary : gripperEnabled ? '已使能' : '未使能'
+  const gripperControlTone = halNativeGripperTeleop ? teleopRunning ? 'ok' : 'warn' : gripperEnabled ? 'ok' : 'warn'
   /** 处理对应的用户交互。 */
   const requestGripperTarget = () =>
     requestComparison({
@@ -1657,7 +1699,7 @@ function GripperCard({
       expected: '确认后仍由现有夹爪安全限制和命令力限制保护。',
       current: [
         { label: '当前开合', value: currentText },
-        { label: '使能状态', value: gripperEnabled ? '已使能' : '未使能' },
+        { label: gripperControlLabel, value: gripperControlValue },
       ],
       proposed: [
         { label: '目标开合', value: `${config.gripper[targetKey].toFixed(1)} mm` },
@@ -1678,6 +1720,7 @@ function GripperCard({
         <>
           <Tag color="processing">0-26 mm</Tag>
           <Tag color="warning">力传感待确认</Tag>
+          {halNativeGripperTeleop && <Tag color={teleopRunning ? 'success' : 'processing'}>HAL-native 接管</Tag>}
         </>
       }
     >
@@ -1721,7 +1764,7 @@ function GripperCard({
         </div>
         <div className="gripper-status-section">
           <div className="hardware-metric-grid gripper-metric-grid">
-            <MetricBox label="使能状态" value={config.gripper[enabledKey] ? '已使能' : '未使能'} tone={config.gripper[enabledKey] ? 'ok' : 'warn'} />
+            <MetricBox label={gripperControlLabel} value={gripperControlValue} tone={gripperControlTone} />
             <MetricBox label="当前开合" value={currentText} />
             <MetricBox label="目标开合" value={`${config.gripper[targetKey].toFixed(1)} mm`} />
             <MetricBox label="Omega.7 映射" value={`${gt[gapMinKey].toFixed(1)}-${gt[gapMaxKey].toFixed(1)} mm`} hint="夹持角 0-0.45 rad" />
@@ -1732,13 +1775,15 @@ function GripperCard({
           <Slider min={protectedMinGapMm} max={config.gripper.strokeMm} step={0.1} value={Math.max(config.gripper[targetKey], protectedMinGapMm)} onChange={(value) => setTarget(Number(value))} />
         </div>
         <div className="gripper-action-section">
-          <Button
-            type={gripperEnabled ? 'default' : 'primary'}
-            icon={<PlugZap size={15} />}
-            onClick={() => issueManualGripperMove(side, gripperEnabled ? 'disable' : 'enable')}
-          >
-            {gripperEnabled ? '断使能' : '使能'}
-          </Button>
+          {!halNativeGripperTeleop && (
+            <Button
+              type={gripperEnabled ? 'default' : 'primary'}
+              icon={<PlugZap size={15} />}
+              onClick={() => issueManualGripperMove(side, gripperEnabled ? 'disable' : 'enable')}
+            >
+              {gripperEnabled ? '断使能' : '使能'}
+            </Button>
+          )}
           <Button disabled={!canCommandGripper} onClick={requestGripperTarget}>执行目标</Button>
           <Button disabled={!canCommandGripper} onClick={() => issueManualGripperMove(side, 'open')}>打开</Button>
           <Button disabled={!canCommandGripper} onClick={() => issueManualGripperMove(side, 'close')}>闭合</Button>
@@ -1749,19 +1794,35 @@ function GripperCard({
             停止
           </Button>
         </div>
+        {halNativeGripperTeleop && (
+          <div className="gripper-manual-command-section">
+            <div className="hardware-subtitle-row">
+              <b>高级手动命令</b>
+              <span>通常无需操作；主手连接后 HAL-native 会自动接管夹爪。</span>
+            </div>
+            <Space size={8} wrap>
+              <Button size="small" icon={<PlugZap size={14} />} onClick={() => issueManualGripperMove(side, 'enable')}>
+                手动下发使能
+              </Button>
+              <Button size="small" danger onClick={() => issueManualGripperMove(side, 'disable')}>
+                手动断使能
+              </Button>
+            </Space>
+          </div>
+        )}
         <div className="gripper-config-section">
           <div className="hardware-subtitle-row">
             <b>Omega7 夹爪遥操作</b>
             <Space size={6}>
               {objectDetected && <Tag color="success">已夹持物体</Tag>}
               <Button
-                type={teleopRunning ? 'default' : 'primary'}
+                type={teleopRunning || halNativeGripperTeleop ? 'default' : 'primary'}
                 danger={teleopRunning}
                 size="small"
                 className={teleopRunning ? 'gripper-teleop-stop-button' : undefined}
                 onClick={handleTeleopToggle}
               >
-                {teleopRunning ? '停止遥操' : '启动遥操'}
+                {teleopRunning ? '停止遥操' : halNativeGripperTeleop ? '手动启动遥操' : '启动遥操'}
               </Button>
             </Space>
           </div>
@@ -2119,14 +2180,18 @@ function TeleopHandCard({
   const targetSide = config.teleop.swapTeleopChannels ? (side === 'left' ? 'right' : 'left') : side
   const targetSideLabel = targetSide === 'left' ? '左臂' : '右臂'
   const teleopRouteHint = config.teleop.swapTeleopChannels ? '交叉遥操作' : '同侧遥操作'
+  const returnOriginReady = motionSideReturnOriginReady(side, frame.motionEnabled, frame.motionAxisEnabled)
   /** 发送或封装对应的后端命令。 */
   const returnToWorkOrigin = () => {
-    if (pendingReturnOriginSide !== null) return
+    if (!returnOriginReady) {
+      injectLog('WARNING', `${sideSpec.shortLabel}未使能，已阻止返回工作原点`, '[HAL]')
+      return
+    }
     setPendingReturnOriginSide(side)
-    commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel}返回已记录硬件零点`)
+    commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel}返回工作原点`)
     void appApi.returnMotionOriginSide(side)
-      .then(() => injectLog('INFO', `${sideSpec.shortLabel}返回已记录硬件零点完成`, '[HAL]'))
-      .catch((error) => injectLog('ERROR', `${sideSpec.shortLabel}返回已记录硬件零点失败: ${commandErrorMessage(error)}`, '[HAL]'))
+      .then(() => injectLog('INFO', `${sideSpec.shortLabel}返回工作原点完成`, '[HAL]'))
+      .catch((error) => injectLog('ERROR', `${sideSpec.shortLabel}返回工作原点失败: ${commandErrorMessage(error)}`, '[HAL]'))
       .finally(() => setPendingReturnOriginSide(null))
   }
   /** 发送或封装对应的后端命令。 */
@@ -2207,9 +2272,9 @@ function TeleopHandCard({
             icon={<RotateCcw size={15} />}
             onClick={returnToWorkOrigin}
             loading={pendingReturnOriginSide === side}
-            disabled={pendingReturnOriginSide !== null && pendingReturnOriginSide !== side}
+            disabled={!returnOriginReady || pendingReturnOriginSide !== null}
           >
-            回硬件零点
+            回工作原点
           </Button>
           <span className="teleop-route-label">
             <small>目标臂</small>
@@ -2331,13 +2396,13 @@ function TeleopHandCard({
         </Form.Item>
         <Form.Item label="Translation speed um/s">
           <Space.Compact>
-            <InputNumber min={0} value={config.teleop.translationStartVelocityUmS} onChange={(value) => updateTeleop({ translationStartVelocityUmS: Number(value ?? 300) })} />
+            <InputNumber min={0} value={config.teleop.translationStartVelocityUmS} onChange={(value) => updateTeleop({ translationStartVelocityUmS: Number(value ?? 600) })} />
             <InputNumber min={1} value={config.teleop.translationMaxVelocityUmS} onChange={(value) => updateTeleop({ translationMaxVelocityUmS: Number(value ?? 8000) })} />
           </Space.Compact>
         </Form.Item>
         <Form.Item label="Rotation speed deg/s">
           <Space.Compact>
-            <InputNumber min={0} step={0.05} value={config.teleop.rotationStartVelocityDegS} onChange={(value) => updateTeleop({ rotationStartVelocityDegS: Number(value ?? 0.5) })} />
+            <InputNumber min={0} step={0.05} value={config.teleop.rotationStartVelocityDegS} onChange={(value) => updateTeleop({ rotationStartVelocityDegS: Number(value ?? 1) })} />
             <InputNumber min={1} step={0.1} value={config.teleop.rotationMaxVelocityDegS} onChange={(value) => updateTeleop({ rotationMaxVelocityDegS: Number(value ?? 12) })} />
           </Space.Compact>
         </Form.Item>
@@ -2477,7 +2542,7 @@ function ManualArmControl({
 }) {
   const sideSpec = armHardwareSpecs[side]
   const selectedAxis = manualControl.selectedSide === side ? manualControl.selectedAxis : 'X'
-  const rightYawDisabled = side === 'right' && selectedAxis === 'Yaw'
+  const rightYawDisabled = isManualAxisDisabled(side, selectedAxis)
   const axisIndex = manualAxisOrder.indexOf(selectedAxis)
   const axisKey = manualAxisSoftKey(selectedAxis)
   const unit = manualAxisUnit(selectedAxis)
@@ -2503,7 +2568,7 @@ function ManualArmControl({
       : `${manualAxisStepLimitPulse} pulse`
   const speedUnit = axisIndex < 3 ? 'um/s' : '°/s'
   const originValid = side === 'left' ? config.motion.origin.leftValid : config.motion.origin.rightValid
-  const originHint = originValid ? '相对硬件零点' : '未记录硬件零点，显示 HAL 绝对位置'
+  const originHint = originValid ? '相对工作原点' : '未记录工作原点，显示 HAL 绝对位置'
   const [pendingMotionAction, setPendingMotionAction] = useState<'enable' | 'disable' | 'stop' | null>(null)
   const [optimisticEnabled, setOptimisticEnabled] = useState<boolean | null>(null)
   useEffect(() => {
@@ -2568,7 +2633,7 @@ function ManualArmControl({
           <Tag color={effectiveMotionEnabled === true ? 'success' : effectiveMotionEnabled === false || partialMotionEnabled ? 'warning' : 'default'}>
             {effectiveMotionEnabled === true ? '已使能' : partialMotionEnabled ? '部分使能' : effectiveMotionEnabled === false ? '未使能' : '使能未知'}
           </Tag>
-          <Tag color={originValid ? 'success' : 'warning'}>{originValid ? '零点已设置' : '零点未设置'}</Tag>
+          <Tag color={originValid ? 'success' : 'warning'}>{originValid ? '工作原点已设置' : '工作原点未设置'}</Tag>
           <Tag>检测通过</Tag>
           <Tag color="processing">{manualControl.speedMode}</Tag>
         </Space>
@@ -2585,7 +2650,7 @@ function ManualArmControl({
           <div className="manual-axis-chip-grid">
             {manualAxisOrder.map((axis) => {
               const active = manualControl.selectedSide === side && manualControl.selectedAxis === axis
-              const axisDisabled = side === 'right' && axis === 'Yaw'
+              const axisDisabled = isManualAxisDisabled(side, axis)
               return (
                 <Button key={axis} type={active ? 'primary' : 'default'} disabled={axisDisabled} onClick={() => selectManualAxis(side, axis)}>
                   {axis}
@@ -2598,7 +2663,7 @@ function ManualArmControl({
         <div className="manual-axis-controls">
           <div className="manual-readout-row">
             <MetricBox label="当前轴" value={selectedAxis} />
-            <MetricBox label="相对硬件零点" value={`${position.toFixed(unit === 'um' ? 1 : 3)} ${unit}`} hint={originHint} tone={originValid ? 'neutral' : 'warn'} />
+            <MetricBox label="相对工作原点" value={`${position.toFixed(unit === 'um' ? 1 : 3)} ${unit}`} hint={originHint} tone={originValid ? 'neutral' : 'warn'} />
             <MetricBox
               label="软限位余量"
               value={translationSoftLimitDisabled ? '已取消' : manualAxisBlocked ? manualAxisBlockedText : `${softMargin.toFixed(unit === 'um' ? 0 : 2)} ${unit}`}

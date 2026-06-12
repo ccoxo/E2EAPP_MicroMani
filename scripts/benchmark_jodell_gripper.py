@@ -12,8 +12,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from backend.core.defaults import default_config
-from backend.drivers.gripper_rs485 import Rs485GripperDriver
+from backend.core.defaults import default_config  # noqa: E402
+from backend.drivers.gripper_rs485 import Rs485GripperDriver  # noqa: E402
 
 
 @dataclass

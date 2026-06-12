@@ -12,7 +12,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from importlib import import_module
 from threading import Event, Lock, Thread, current_thread
-from typing import Any
+from typing import Any, cast
 
 from backend.core.schemas import CameraTelemetry, ConnectionState
 
@@ -41,8 +41,8 @@ CAMERA_DESCRIPTOR_KEYS = {
 }
 CAMERA_INDEX_FALLBACKS = {
     "global": -1,
-    "wrist_left": 2,
-    "wrist_right": 0,
+    "wrist_left": 0,
+    "wrist_right": 2,
 }
 IDENTITY_CACHE_TTL_S = 30.0
 IDENTITY_TOKEN_PATTERN = re.compile(r"[^a-z0-9]+")
@@ -236,9 +236,9 @@ class _ProcessCameraCapture:
 
     def exitcode(self) -> int | None:
         if hasattr(self.process, "exitcode"):
-            return self.process.exitcode
+            return cast(int | None, self.process.exitcode)
         if hasattr(self.process, "poll"):
-            return self.process.poll()
+            return cast(int | None, self.process.poll())
         return None
 
     def get(self, prop: int) -> float:
@@ -431,6 +431,8 @@ class OpenCVCameraDriver:
                             timestampSkewMs=0,
                             frameAgeMs=9999,
                             health="error",
+                            backend=None,
+                            workerActive=None,
                         )
                     )
                     continue
@@ -440,6 +442,8 @@ class OpenCVCameraDriver:
                 latest_at = self._latest_at.get(index)
                 frame_age = 0 if latest_at is None else round((time.monotonic() - latest_at) * 1000)
                 has_frame = index in self._latest_jpegs
+                backend_label = self._capture_backend_labels.get(index)
+                worker_active = bool(getattr(capture, "is_process_capture", False))
             cameras.append(
                 CameraTelemetry(
                     key=key,  # type: ignore[arg-type]
@@ -448,6 +452,8 @@ class OpenCVCameraDriver:
                     timestampSkewMs=0,
                     frameAgeMs=frame_age,
                     health="ok" if has_frame else "checking",
+                    backend=backend_label,
+                    workerActive=worker_active,
                 )
             )
         message = "; ".join(errors) if errors else f"OpenCV {self._backend_label} cameras available"
@@ -586,6 +592,7 @@ class OpenCVCameraDriver:
             capture = self._get_capture(cv2, index, width, height, fps_config, camera, config)
             if capture is None:
                 raise RuntimeError(f"{camera} index {index} open failed")
+            actual: dict[str, float | None]
             if getattr(capture, "is_process_capture", False):
                 actual = {
                     "autoExposure": None,
@@ -952,11 +959,13 @@ class OpenCVCameraDriver:
 
         capture = None
         backend_label = ""
+        worker_fallback = False
         profile = self._camera_tuning(config, camera) if config is not None and camera is not None else None
         backend_candidates = _backend_candidates(cv2)
         if self._process_capture_enabled(cv2, backend_candidates):
             capture = self._start_process_capture(cv2, index, width, height, fps, camera, profile, backend_candidates)
             if capture is None:
+                worker_fallback = True
                 self._event(
                     "warning",
                     "camera_worker_unavailable",
@@ -978,7 +987,7 @@ class OpenCVCameraDriver:
                 self._capture_opened_at[index] = time.monotonic()
                 if camera is not None:
                     self._capture_roles[index] = camera
-                self._capture_backend_labels[index] = backend_label
+                self._capture_backend_labels[index] = f"{backend_label} worker"
                 self._stale_indices.discard(index)
                 self._frame_locks[index] = Lock()
                 self._frame_events[index] = Event()
@@ -1067,7 +1076,7 @@ class OpenCVCameraDriver:
         self._capture_opened_at[index] = time.monotonic()
         if camera is not None:
             self._capture_roles[index] = camera
-        self._capture_backend_labels[index] = backend_label
+        self._capture_backend_labels[index] = f"{backend_label} fallback" if worker_fallback else backend_label
         self._stale_indices.discard(index)
         self._frame_locks[index] = Lock()
         self._frame_events[index] = Event()
@@ -1349,7 +1358,7 @@ class OpenCVCameraDriver:
 
     def _clamp_float(self, value: object, low: float, high: float, fallback: float) -> float:
         try:
-            parsed = float(value)
+            parsed = float(cast(Any, value))
         except (TypeError, ValueError):
             parsed = fallback
         return min(high, max(low, parsed))
@@ -1429,7 +1438,7 @@ class OpenCVCameraDriver:
                         continue
                     monotonic_ms = status.get("monotonicMs")
                     try:
-                        frame_time = float(monotonic_ms) / 1000.0
+                        frame_time = float(cast(Any, monotonic_ms)) / 1000.0
                     except (TypeError, ValueError):
                         frame_time = time.monotonic()
                     self._record_frame_timestamp(index, frame_time)
@@ -1476,6 +1485,8 @@ class OpenCVCameraDriver:
                         ok, frame = capture.read()
                     except Exception:
                         ok, frame = False, None
+                    if stop.is_set():
+                        break
                     if ok and frame is not None:
                         consecutive_failures = 0
                         now = time.monotonic()

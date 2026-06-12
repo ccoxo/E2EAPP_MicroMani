@@ -22,14 +22,17 @@
 
 namespace {
 
+// 默认轴掩码用于没有显式传 enabledAxes 的接口，表示请求作用于全部语义轴。
 constexpr std::array<bool, 6> kAllAxesEnabled{true, true, true, true, true, true};
 
 long long unixTimeMs() {
+  // HTTP 响应里的 timestamp 使用墙钟，便于和后端日志/浏览器时间对齐。
   const auto now = std::chrono::system_clock::now().time_since_epoch();
   return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
 }
 
 long long timestampOrNow(long long value) {
+  // 驱动快照可能尚未带时间戳，兜底用当前时间避免前端看到 0。
   return value > 0 ? value : unixTimeMs();
 }
 
@@ -62,6 +65,7 @@ std::string jsonEscape(const std::string& value) {
 }
 
 std::string jsonHealth(const appstation::hal::HalHealth& motionHealth, bool omegaOk, const std::string& message) {
+  // /health 聚合 LTDMC 与 Omega.7，两者状态独立，message 当前承载 Omega 或 motion 诊断。
   std::ostringstream out;
   out << "{\"ltdmc_ok\":" << (motionHealth.ltdmcOk ? "true" : "false")
       << ",\"omega7_ok\":" << (omegaOk ? "true" : "false")
@@ -72,6 +76,7 @@ std::string jsonHealth(const appstation::hal::HalHealth& motionHealth, bool omeg
 }
 
 std::string jsonMotionState(const appstation::hal::MotionState& state) {
+  // positions/pulses/enabled/moving 都按 MotionState::axes 的 12 轴顺序返回。
   std::ostringstream out;
   out << "{\"timestamp_ms\":" << timestampOrNow(state.readTimestampMs)
       << ",\"estop_active\":" << (state.estopActive ? "true" : "false") << ",\"positions\":[";
@@ -107,6 +112,7 @@ std::string jsonMotionState(const appstation::hal::MotionState& state) {
 }
 
 void appendDoubleArray(std::ostringstream& out, const std::array<double, 6>& values) {
+  // 小型 JSON 拼接 helper，所有 6 轴数组都使用相同顺序。
   out << "[";
   for (size_t i = 0; i < values.size(); ++i) {
     if (i > 0) {
@@ -131,6 +137,7 @@ void appendBoolArray(std::ostringstream& out, const std::array<bool, 6>& values)
 std::string jsonTeleopTargetUpdateResult(
     appstation::hal::Side side,
     const appstation::hal::TeleopTargetUpdateResult& result) {
+  // 返回完整 teleop 诊断而不只返回 ok，便于前端记录本帧是否被限位、死区或重发影响。
   std::ostringstream out;
   out << "{\"ok\":true,\"side\":\"" << (side == appstation::hal::Side::Left ? "left" : "right") << "\"";
   out << ",\"requestedDeltas\":";
@@ -145,8 +152,20 @@ std::string jsonTeleopTargetUpdateResult(
   appendDoubleArray(out, result.appliedDeltaPulse);
   out << ",\"targetPulse\":";
   appendDoubleArray(out, result.targetPulse);
+  out << ",\"currentPulse\":";
+  appendDoubleArray(out, result.currentPulse);
+  out << ",\"launchDeltaPulse\":";
+  appendDoubleArray(out, result.launchDeltaPulse);
   out << ",\"updateReturn\":";
   appendDoubleArray(out, result.updateReturn);
+  out << ",\"stopReason\":";
+  appendDoubleArray(out, result.stopReason);
+  out << ",\"axisIoStatus\":";
+  appendDoubleArray(out, result.axisIoStatus);
+  out << ",\"movingBefore\":";
+  appendBoolArray(out, result.movingBefore);
+  out << ",\"moveStarted\":";
+  appendBoolArray(out, result.moveStarted);
   out << ",\"clipped\":";
   appendBoolArray(out, result.clipped);
   out << "}";
@@ -154,6 +173,7 @@ std::string jsonTeleopTargetUpdateResult(
 }
 
 std::string jsonOmegaState(const std::array<appstation::hal::Omega7State, 2>& state) {
+  // Omega 状态按逻辑左右手输出，不暴露物理接线顺序给前端。
   std::ostringstream out;
   out << "{\"timestamp_ms\":" << timestampOrNow(state[0].readTimestampMs) << ",\"hands\":[";
   for (size_t i = 0; i < state.size(); ++i) {
@@ -282,6 +302,7 @@ std::string readHttpRequest(SOCKET client) {
 #endif
 
 std::string jsonStringValue(const std::string& body, const std::string& key) {
+  // 这里不是通用 JSON 解析器，只服务受控的后端 payload；字符串不处理复杂转义。
   const auto marker = std::string("\"") + key + "\"";
   auto pos = body.find(marker);
   if (pos == std::string::npos) {
@@ -303,6 +324,7 @@ std::string jsonStringValue(const std::string& body, const std::string& key) {
 }
 
 double jsonNumberValue(const std::string& body, const std::string& key, double fallback) {
+  // 缺字段或解析失败时使用 fallback，让新旧后端字段可以渐进兼容。
   const auto marker = std::string("\"") + key + "\"";
   auto pos = body.find(marker);
   if (pos == std::string::npos) {
@@ -319,6 +341,7 @@ double jsonNumberValue(const std::string& body, const std::string& key, double f
 }
 
 bool jsonBoolValue(const std::string& body, const std::string& key, bool fallback) {
+  // 只接受 JSON true/false；没有字段时保留调用方默认值。
   const auto marker = std::string("\"") + key + "\"";
   auto pos = body.find(marker);
   if (pos == std::string::npos) {
@@ -342,6 +365,7 @@ bool jsonBoolValue(const std::string& body, const std::string& key, bool fallbac
 }
 
 bool jsonNumberArrayValue(const std::string& body, const std::string& key, size_t index, double* out) {
+  // 按索引读取数组元素，适合固定长度 6/12 轴 payload，不支持嵌套结构通用解析。
   const auto marker = std::string("\"") + key + "\"";
   auto pos = body.find(marker);
   if (pos == std::string::npos) {
@@ -379,6 +403,7 @@ bool jsonNumberArrayValue(const std::string& body, const std::string& key, size_
 }
 
 bool jsonBoolArrayValue(const std::string& body, const std::string& key, size_t index, bool* out) {
+  // 与 jsonNumberArrayValue 对称，用于 enabledAxes 和左右轴掩码。
   const auto marker = std::string("\"") + key + "\"";
   auto pos = body.find(marker);
   if (pos == std::string::npos) {
@@ -421,6 +446,7 @@ bool jsonBoolArrayValue(const std::string& body, const std::string& key, size_t 
 }
 
 std::array<double, 12> jsonWorkOriginPulse(const std::string& body) {
+  // home_all payload 分左右各 6 轴，最终合并为 MotionState 的 12 轴顺序。
   std::array<double, 12> pulses{};
   for (size_t i = 0; i < 6; ++i) {
     if (!jsonNumberArrayValue(body, "leftPulse", i, &pulses[i])) {
@@ -434,6 +460,7 @@ std::array<double, 12> jsonWorkOriginPulse(const std::string& body) {
 }
 
 std::array<double, 6> jsonSideWorkOriginPulse(const std::string& body) {
+  // 单侧回工作原点只需要该侧 6 个目标脉冲。
   std::array<double, 6> pulses{};
   for (size_t i = 0; i < pulses.size(); ++i) {
     if (!jsonNumberArrayValue(body, "pulse", i, &pulses[i])) {
@@ -444,6 +471,7 @@ std::array<double, 6> jsonSideWorkOriginPulse(const std::string& body) {
 }
 
 std::array<appstation::hal::AxisLimit, 6> jsonTeleopSoftLimits(const std::string& body) {
+  // teleop 目标更新必须带软限位，HAL 在每帧进行裁剪，避免只依赖前端保护。
   std::array<appstation::hal::AxisLimit, 6> limits{};
   for (size_t i = 0; i < limits.size(); ++i) {
     if (!jsonNumberArrayValue(body, "softLimitMin", i, &limits[i].min)
@@ -458,6 +486,7 @@ std::array<appstation::hal::AxisLimit, 6> jsonTeleopSoftLimits(const std::string
 }
 
 std::array<bool, 6> jsonTeleopEnabledAxes(const std::string& body) {
+  // enabledAxes 缺省为全开；存在字段时逐轴覆盖。
   std::array<bool, 6> enabled{true, true, true, true, true, true};
   for (size_t i = 0; i < enabled.size(); ++i) {
     bool value = true;
@@ -472,6 +501,7 @@ std::array<double, 6> jsonNumberArray6(
     const std::string& body,
     const std::string& key,
     const std::array<double, 6>& fallback) {
+  // 配置数组允许部分字段缺失，缺失项沿用 fallback，方便后端只更新某个配置组。
   auto values = fallback;
   for (size_t i = 0; i < values.size(); ++i) {
     double value = values[i];
@@ -497,6 +527,7 @@ std::array<bool, 6> jsonBoolArray6(
 }
 
 std::array<std::array<bool, 6>, 2> jsonHomeAllEnabledAxes(const std::string& body) {
+  // home_all 可分别控制左右参与回原点的轴；缺省两侧全轴参与。
   return {{
       jsonBoolArray6(body, "leftEnabledAxes", kAllAxesEnabled),
       jsonBoolArray6(body, "rightEnabledAxes", kAllAxesEnabled),
@@ -508,6 +539,7 @@ std::array<appstation::hal::AxisLimit, 6> jsonAxisLimits(
     const std::string& minKey,
     const std::string& maxKey,
     const std::array<appstation::hal::AxisLimit, 6>& fallback) {
+  // 读取 min/max 两个数组并覆盖到同一组 AxisLimit，未提供的轴保持默认限位。
   auto limits = fallback;
   for (size_t i = 0; i < limits.size(); ++i) {
     double minValue = limits[i].min;
@@ -531,6 +563,7 @@ appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& bo
   using appstation::hal::AxisLimit;
   using appstation::hal::NativeTeleopConfig;
   NativeTeleopConfig config;
+  // 该函数把后端 JSON payload 转成原生 teleop 配置；所有字段都允许缺省。
   config.controlMode = jsonStringValueOr(body, "controlMode", config.controlMode);
   config.mappingMode = jsonStringValueOr(body, "mappingMode", config.mappingMode);
   config.loopHz = static_cast<int>(jsonNumberValue(body, "nativeLoopHz", config.loopHz));
@@ -558,6 +591,7 @@ appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& bo
       AxisLimit{-100.0, 100.0},
       AxisLimit{-7.0, 7.0},
   };
+  // 默认软限位按 UI 单位表达：平移 um，旋转 degree。
   config.softLimits[0] = jsonAxisLimits(body, "leftSoftLimitMin", "leftSoftLimitMax", defaultLimits);
   config.softLimits[1] = jsonAxisLimits(body, "rightSoftLimitMin", "rightSoftLimitMax", defaultLimits);
   config.rotationWorkLimitEnabled =
@@ -570,6 +604,10 @@ appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& bo
   config.workOriginValid[1] = jsonBoolValue(body, "rightWorkOriginValid", config.workOriginValid[1]);
   config.workOriginPulse[0] = jsonNumberArray6(body, "leftWorkOriginPulse", config.workOriginPulse[0]);
   config.workOriginPulse[1] = jsonNumberArray6(body, "rightWorkOriginPulse", config.workOriginPulse[1]);
+  config.homeReferenceValid[0] = jsonBoolValue(body, "leftHomeReferenceValid", config.homeReferenceValid[0]);
+  config.homeReferenceValid[1] = jsonBoolValue(body, "rightHomeReferenceValid", config.homeReferenceValid[1]);
+  config.homeReferencePulse[0] = jsonNumberArray6(body, "leftHomeReferencePulse", config.homeReferencePulse[0]);
+  config.homeReferencePulse[1] = jsonNumberArray6(body, "rightHomeReferencePulse", config.homeReferencePulse[1]);
   config.translationStepLimitPulse =
       jsonNumberValue(body, "translationStepLimitPulse", config.translationStepLimitPulse);
   config.rotationStepLimitPulse = jsonNumberValue(body, "rotationStepLimitPulse", config.rotationStepLimitPulse);
@@ -709,6 +747,7 @@ appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& bo
 }
 
 double effectiveGripperTargetMm(const appstation::hal::NativeTeleopConfig& config, double targetMm) {
+  // ICF 目标保护会给夹爪留出最小间隙，避免 teleop 或手动命令完全闭合损伤末端。
   const double stroke = (std::max)(0.001, config.gripper.strokeMm);
   const double bounded = std::clamp(targetMm, 0.0, stroke);
   if (!config.gripperIcfTargetProtectionEnabled) {
@@ -742,6 +781,7 @@ appstation::hal::SemanticAxis parseAxis(const std::string& value) {
 }
 
 int envIntValue(const char* key, int fallback) {
+  // 环境变量用于现场部署覆盖端口和 Omega openId；解析失败时回到代码默认值。
   const char* raw = std::getenv(key);
   if (!raw || !*raw) {
     return fallback;
@@ -752,6 +792,7 @@ int envIntValue(const char* key, int fallback) {
 }
 
 bool envBoolValue(const char* key, bool fallback) {
+  // 支持常见布尔写法，便于 PowerShell/cmd 环境设置。
   const char* raw = std::getenv(key);
   if (!raw || !*raw) {
     return fallback;
@@ -761,6 +802,7 @@ bool envBoolValue(const char* key, bool fallback) {
 }
 
 std::string httpResponse(int code, const std::string& body, bool keepAlive) {
+  // 所有响应都按 JSON 返回；状态文本固定 OK，不依赖客户端读取 reason phrase。
   std::ostringstream out;
   out << "HTTP/1.1 " << code << " OK\r\n"
       << "Content-Type: application/json; charset=utf-8\r\n"
@@ -804,6 +846,7 @@ void serveConnection(
       const double uptime =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
       if (request.rfind("GET /health ", 0) == 0) {
+        // health 会尝试懒加载 Omega.7，便于服务启动后再插入主手时恢复。
         omega.ensureReady();
         body = jsonHealth(motion.health(uptime), omega.ok(), omega.lastError());
       } else if (request.rfind("GET /motion/state ", 0) == 0) {
@@ -826,6 +869,7 @@ void serveConnection(
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /teleop/native/start ", 0) == 0) {
         const auto bodyText = requestBody(request);
+        // start 请求同时携带配置，先应用最新配置再启动控制环。
         nativeTeleop.configure(jsonNativeTeleopConfig(bodyText));
         omega.ensureReady();
         nativeTeleop.start(
@@ -840,6 +884,7 @@ void serveConnection(
       } else if (
           request.rfind("POST /teleop/native/gripper_command ", 0) == 0
           || request.rfind("POST /gripper/command ", 0) == 0) {
+        // 手动夹爪命令复用 nativeTeleop 的夹爪队列，避免和自动 teleop 命令并发写串口。
         const auto bodyText = requestBody(request);
         const auto config = jsonNativeTeleopConfig(bodyText);
         nativeTeleop.configureGripper(config.gripper);
@@ -858,23 +903,25 @@ void serveConnection(
         body = "{\"ok\":true,\"message\":\"" + jsonEscape(message) + "\",\"targetMm\":"
             + std::to_string(effectiveTargetMm) + "}";
       } else if (request.rfind("POST /motion/emergency_stop ", 0) == 0) {
+        // 急停前先停 native teleop 线程，避免刚急停又被控制环继续下发目标。
         nativeTeleop.stop();
         motion.emergencyStop();
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/home_all ", 0) == 0) {
+        // 回工作原点属于危险动作，先确认急停已清除，再停止 teleop。
+        motion.ensureMotionReturnAllowed();
         const auto bodyText = requestBody(request);
         const auto enabledAxes = jsonHomeAllEnabledAxes(bodyText);
         nativeTeleop.stop();
-        motion.enableHomeAxes(appstation::hal::Side::Left, enabledAxes[0]);
-        motion.enableHomeAxes(appstation::hal::Side::Right, enabledAxes[1]);
         motion.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes);
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/home_origin_side ", 0) == 0) {
+        // 单侧回工作原点同样会停止原生 teleop，防止回原点与遥操作叠加。
+        motion.ensureMotionReturnAllowed();
         const auto bodyText = requestBody(request);
         const auto side = parseSide(jsonStringValue(bodyText, "side"));
         const auto enabledAxes = jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled);
         nativeTeleop.stop();
-        motion.enableHomeAxes(side, enabledAxes);
         motion.homeOriginSide(
             side,
             jsonSideWorkOriginPulse(bodyText),
@@ -915,6 +962,7 @@ void serveConnection(
             decTime);
         body = "{\"ok\":true}";
       } else if (request.rfind("POST /motion/teleop_target_update ", 0) == 0) {
+        // 低层 teleop_target_update 是后端映射后的目标增量入口，不读取 Omega.7。
         const auto bodyText = requestBody(request);
         const auto side = parseSide(jsonStringValue(bodyText, "side"));
         const std::array<double, 6> deltas{
@@ -951,6 +999,7 @@ void serveConnection(
         keepAlive = false;
       }
     } catch (const std::exception& exc) {
+      // 异常统一转成 JSON 500，让 Python backend 可以把 message 透传到 UI。
       code = 500;
       body = std::string("{\"ok\":false,\"message\":\"") + jsonEscape(exc.what()) + "\"}";
     }
@@ -977,6 +1026,7 @@ int main() {
   Omega7Driver omega;
   JodellGripperDriver gripper;
   const bool motionOk = motion.initialize();
+  const int halPort = envIntValue("APPSTATION_HAL_PORT", 8091);
   const int leftOpenId = envIntValue("APPSTATION_OMEGA7_LEFT_OPEN_ID", 0);
   const int rightOpenId = envIntValue("APPSTATION_OMEGA7_RIGHT_OPEN_ID", 1);
   const bool swapHands = envBoolValue("APPSTATION_OMEGA7_SWAP_HANDS", false);
@@ -1000,16 +1050,16 @@ int main() {
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  address.sin_port = htons(8091);
+  address.sin_port = htons(static_cast<u_short>(halPort));
   if (bind(server, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR ||
       listen(server, SOMAXCONN) == SOCKET_ERROR) {
-    std::cerr << "Failed to bind HalServer on 127.0.0.1:8091\n";
+    std::cerr << "Failed to bind HalServer on 127.0.0.1:" << halPort << "\n";
     closesocket(server);
     WSACleanup();
     return 1;
   }
 
-  std::cout << "HalServer listening on http://127.0.0.1:8091\n";
+  std::cout << "HalServer listening on http://127.0.0.1:" << halPort << "\n";
   while (true) {
     SOCKET client = accept(server, nullptr, nullptr);
     if (client == INVALID_SOCKET) {

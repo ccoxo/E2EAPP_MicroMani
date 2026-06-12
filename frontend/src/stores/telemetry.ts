@@ -2,7 +2,6 @@ import { create } from 'zustand'
 import {
   acknowledgeSafety as acknowledgeSafetyApi,
   applyParameterSnapshotApi,
-  captureMotionOrigin as captureMotionOriginApi,
   createParameterSnapshot as createParameterSnapshotApi,
   createSession as createRecordSessionApi,
   deleteParameterSnapshotApi,
@@ -14,7 +13,6 @@ import {
   fetchRecordStatus,
   finishSession as finishRecordSessionApi,
   gripperCommand as gripperCommandApi,
-  homeAll as homeAllApi,
   manualAxisMove as manualAxisMoveApi,
   mockMode,
   returnMotionOriginSide as returnMotionOriginSideApi,
@@ -28,11 +26,13 @@ import {
   toggleClutch as toggleClutchApi,
   putConfig,
   type RecordEpisodeSaveApi,
+  type RecordStatusApi,
   wsUrl,
 } from '../api/index'
 import { defaultConfig, defaultDiagnostics, logChannels } from '../data'
 import { manualAxisStepLimitFromPulse } from '../manualMotionLimits'
 import { manualMaxVelocity } from '../manualSpeed'
+import { motionSideReturnOriginReady } from '../motionReturnReady'
 import type {
   AppConfig,
   ConnectionState,
@@ -69,6 +69,22 @@ const cameraLabels = {
   wrist_left: '左腕相机',
   wrist_right: '右腕相机',
 } as const
+type RecordResetSide = ManualControlState['selectedSide']
+const defaultRecordResetRequiredSides: RecordResetSide[] = ['left']
+function normalizedRecordResetSides(value: unknown, fallback: RecordResetSide[]): RecordResetSide[] {
+  if (!Array.isArray(value)) return fallback.slice()
+  const sides = value.filter((side): side is RecordResetSide => side === 'left' || side === 'right')
+  return sides.length > 0 ? Array.from(new Set(sides)) : fallback.slice()
+}
+function returnedRecordResetState(session: RecordSessionState, side: RecordResetSide) {
+  const required = normalizedRecordResetSides(session.resetRequiredSides, defaultRecordResetRequiredSides)
+  const returned = normalizedRecordResetSides(session.resetReturnedSides, [])
+  if (!returned.includes(side)) returned.push(side)
+  return {
+    resetReturnedSides: returned,
+    resetReady: required.every((requiredSide) => returned.includes(requiredSide)),
+  }
+}
 let configSaveQueue: Promise<unknown> = Promise.resolve()
 const manualAxisOrder: ManualControlAxis[] = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']
 const manualAxisKeys = ['x', 'y', 'z', 'roll', 'pitch', 'yaw'] as const
@@ -184,6 +200,11 @@ const initialRecordSession: RecordSessionState = {
   recorderLateFrames: 0,
   recorderElapsedS: 0,
   recorderTotalS: -1,
+  resetPending: false,
+  resetRequiredSides: defaultRecordResetRequiredSides,
+  resetReturnedSides: [],
+  resetReady: false,
+  returnOriginInFlight: false,
   forceTareActive: false,
   speedMode: 'fine',
 }
@@ -342,7 +363,6 @@ interface TelemetryStore {
   setRecordSpeedMode: (mode: ManualSpeedMode) => void
   homeRecordArms: () => void
   returnRecordMotionOrigin: (side: ManualControlState['selectedSide']) => Promise<void>
-  captureRecordMotionOrigin: (side: ManualControlState['selectedSide']) => Promise<void>
   triggerEmergencyStop: () => void
   clearRecordSession: () => void
   setClutchActive: (active: boolean) => void
@@ -701,6 +721,7 @@ type TelemetryStoreGet = () => TelemetryStore
 let finishRecordSessionAfterReview = false
 let recordSessionStartInFlight = false
 let recordMotionOriginInFlight = false
+let recordResetSkipInFlight = false
 let pendingBackendFrame: TelemetryFrame | null = null
 let backendFrameDelayTimer: number | null = null
 let backendFrameRaf: number | null = null
@@ -722,6 +743,10 @@ function finishRecordSessionNow(set: TelemetryStoreSet) {
         recorderElapsedS: 0,
         recorderTotalS: -1,
         latestQualityReport: null,
+        resetPending: false,
+        resetReturnedSides: [],
+        resetReady: false,
+        returnOriginInFlight: false,
       },
       logs: appendLog(state.logs, makeLog('INFO', 'record session finished and finalized', '[LEROBOT]')),
     }))
@@ -738,6 +763,37 @@ function finishRecordSessionNow(set: TelemetryStoreSet) {
   }))
 }
 /** 描述当前方法的功能边界。 */
+function recordSessionFromStatus(
+  state: TelemetryStore,
+  status: RecordStatusApi,
+  datasetName: string,
+  task: string,
+  now = Date.now(),
+): RecordSessionState {
+  const backendElapsedS = typeof status.elapsedS === 'number' ? Math.max(0, status.elapsedS) : 0
+  const backendFrameCount = typeof status.frameCount === 'number' ? Math.max(0, status.frameCount) : 0
+  const backendFps = typeof status.fps === 'number' ? Math.max(0, status.fps) : 30
+  const resetRequiredSides = normalizedRecordResetSides(status.resetRequiredSides, defaultRecordResetRequiredSides)
+  const resetReturnedSides = normalizedRecordResetSides(status.resetReturnedSides, [])
+  const resetPending = Boolean(status.resetPending)
+  return {
+    ...state.recordSession,
+    datasetName: status.datasetName ?? datasetName,
+    task: status.task ?? task,
+    latestQualityReport: null,
+    phase: 'recording',
+    phaseStartedAt: now - backendElapsedS * 1000,
+    recorderFps: backendFps,
+    recorderFrameCount: backendFrameCount,
+    recorderLateFrames: 0,
+    recorderElapsedS: backendElapsedS,
+    recorderTotalS: state.recordSession.episodeTimeS,
+    resetPending,
+    resetRequiredSides,
+    resetReturnedSides,
+    resetReady: Boolean(status.resetReady),
+  }
+}
 function backendFrameCommitIsUrgent(previous: TelemetryFrame, next: TelemetryFrame) {
   return previous.wsOk !== next.wsOk
     || previous.halOk !== next.halOk
@@ -870,6 +926,10 @@ export function normalizeConfig(config: AppConfig): AppConfig {
     config.cameras.global === 'AR0234 / index 1'
     && config.cameras.wristLeft === 'IMX258 / index 2'
     && config.cameras.wristRight === 'IMX258 / index 0'
+  const hasPreviousImx335CameraDefaults =
+    config.cameras.global === 'IMX335 / index 1'
+    && config.cameras.wristLeft === 'IMX335 / index 2'
+    && config.cameras.wristRight === 'IMX335 / index 0'
   const hasLegacyReversedWristCameras =
     config.cameras.global === 'AR0234 / index 2'
     && config.cameras.wristLeft === 'IMX258 / index 1'
@@ -879,11 +939,22 @@ export function normalizeConfig(config: AppConfig): AppConfig {
     && config.cameras.wristLeft === 'IMX258 / index 0'
     && config.cameras.wristRight === 'IMX258 / index 1'
   const hasStalePicoIp = config.picoVision.ip === '10.90.132.51'
-  if (!hasPreviousImx258CameraDefaults && !hasLegacyReversedWristCameras && !hasLegacyCyclicCameraRoles && !hasStalePicoIp) {
+  if (
+    !hasPreviousImx258CameraDefaults
+    && !hasPreviousImx335CameraDefaults
+    && !hasLegacyReversedWristCameras
+    && !hasLegacyCyclicCameraRoles
+    && !hasStalePicoIp
+  ) {
     return config
   }
   const next = cloneConfig(config)
-  if (hasPreviousImx258CameraDefaults || hasLegacyReversedWristCameras || hasLegacyCyclicCameraRoles) {
+  if (
+    hasPreviousImx258CameraDefaults
+    || hasPreviousImx335CameraDefaults
+    || hasLegacyReversedWristCameras
+    || hasLegacyCyclicCameraRoles
+  ) {
     next.cameras = {
       ...next.cameras,
       global: defaultConfig.cameras.global,
@@ -1380,6 +1451,10 @@ startRecordSession: (datasetName, task) => {
         recorderLateFrames: 0,
         recorderElapsedS: 0,
         recorderTotalS: -1,
+        resetPending: false,
+        resetReturnedSides: [],
+        resetReady: false,
+        returnOriginInFlight: false,
       },
       logs: appendLog(state.logs, makeLog('INFO', `录制采集会话启动中：${nextDatasetName}`, '[LEROBOT]')),
     }))
@@ -1399,22 +1474,7 @@ startRecordSession: (datasetName, task) => {
       set((state) => {
         const now = Date.now()
         const backendStatus = createResponse.data ?? {}
-        const backendElapsedS = typeof backendStatus.elapsedS === 'number' ? Math.max(0, backendStatus.elapsedS) : 0
-        const backendFrameCount = typeof backendStatus.frameCount === 'number' ? Math.max(0, backendStatus.frameCount) : 0
-        const backendFps = typeof backendStatus.fps === 'number' ? Math.max(0, backendStatus.fps) : 30
-        const nextSession = {
-          ...state.recordSession,
-          datasetName: nextDatasetName,
-          task,
-          latestQualityReport: null,
-          phase: 'recording' as const,
-          phaseStartedAt: now - backendElapsedS * 1000,
-          recorderFps: backendFps,
-          recorderFrameCount: backendFrameCount,
-          recorderLateFrames: 0,
-          recorderElapsedS: backendElapsedS,
-          recorderTotalS: state.recordSession.episodeTimeS,
-        }
+        const nextSession = recordSessionFromStatus(state, backendStatus, nextDatasetName, task, now)
         return {
           recording: true,
           frameCount: 0,
@@ -1423,7 +1483,23 @@ startRecordSession: (datasetName, task) => {
         }
       })
     })()
-      .catch((error) => {
+      .catch(async (error) => {
+        const backendStatus = await fetchRecordStatus().catch(() => null)
+        if (backendStatus?.recording) {
+          set((state) => {
+            const nextSession = recordSessionFromStatus(state, backendStatus, nextDatasetName, task)
+            return {
+              recording: true,
+              frameCount: 0,
+              recordSession: nextSession,
+              logs: appendLog(
+                state.logs,
+                makeLog('WARNING', `record session start reported conflict; synced active backend session: ${String(error)}`, '[LEROBOT]'),
+              ),
+            }
+          })
+          return
+        }
         set((state) => ({
           recording: false,
           recordSession: {
@@ -1485,6 +1561,10 @@ saveRecordEpisode: () => {
               phaseStartedAt: Date.now(),
               recorderElapsedS: 0,
               recorderTotalS: -1,
+              resetPending: true,
+              resetRequiredSides: defaultRecordResetRequiredSides,
+              resetReturnedSides: [],
+              resetReady: false,
               episodeHistory: [report, ...state.recordSession.episodeHistory].slice(0, 20),
             },
             logs: appendLog(state.logs, makeLog('INFO', `Episode #${report.index} save completed; quality report ready`, '[LEROBOT]')),
@@ -1496,21 +1576,44 @@ saveRecordEpisode: () => {
           }))
         }
       })
-      .catch((error) => {
-        set((state) => ({
-          recording: false,
-          recordSession: state.recordSession.phase === 'saving'
-            ? {
-                ...state.recordSession,
-                phase: 'recording',
-                phaseStartedAt: Date.now(),
-                recorderFps: 0,
-                recorderTotalS: -1,
-                latestQualityReport: null,
-              }
-            : state.recordSession,
-          logs: appendLog(state.logs, makeLog('ERROR', `record episode save failed: ${String(error)}`, '[LEROBOT]')),
-        }))
+      .catch(async (error) => {
+        const backendStatus = await fetchRecordStatus().catch(() => null)
+        set((state) => {
+          if (state.recordSession.phase !== 'saving') {
+            return {
+              recording: false,
+              logs: appendLog(state.logs, makeLog('ERROR', `record episode save failed: ${String(error)}`, '[LEROBOT]')),
+            }
+          }
+          const backendRecording = Boolean(backendStatus?.recording)
+          const backendActive = Boolean(backendStatus?.active)
+          return {
+            recording: backendRecording,
+            recordSession: {
+              ...state.recordSession,
+              phase: backendRecording ? 'recording' : backendActive ? 'resetting' : 'idle',
+              phaseStartedAt: backendRecording || backendActive ? Date.now() : null,
+              recorderFps: backendRecording ? state.recordSession.recorderFps : 0,
+              recorderFrameCount: backendRecording ? state.recordSession.recorderFrameCount : 0,
+              recorderLateFrames: backendRecording ? state.recordSession.recorderLateFrames : 0,
+              recorderElapsedS: 0,
+              recorderTotalS: backendRecording
+                ? state.recordSession.episodeTimeS
+                : backendActive
+                  ? state.recordSession.resetTimeS
+                  : -1,
+              latestQualityReport: null,
+              resetPending: backendActive ? Boolean(backendStatus?.resetPending ?? true) : false,
+              resetRequiredSides: normalizedRecordResetSides(
+                backendStatus?.resetRequiredSides,
+                defaultRecordResetRequiredSides,
+              ),
+              resetReturnedSides: normalizedRecordResetSides(backendStatus?.resetReturnedSides, []),
+              resetReady: backendActive ? Boolean(backendStatus?.resetReady) : false,
+            },
+            logs: appendLog(state.logs, makeLog('ERROR', `record episode save failed: ${String(error)}`, '[LEROBOT]')),
+          }
+        })
         if (finishRecordSessionAfterReview) finishRecordSessionNow(set)
       })
   },
@@ -1536,6 +1639,10 @@ discardRecordEpisode: () => {
           recorderElapsedS: 0,
           recorderTotalS: state.recordSession.resetTimeS,
           latestQualityReport: null,
+          resetPending: true,
+          resetRequiredSides: defaultRecordResetRequiredSides,
+          resetReturnedSides: [],
+          resetReady: false,
           episodeHistory: [record, ...state.recordSession.episodeHistory].slice(0, 20),
         },
         logs: appendLog(state.logs, makeLog('WARNING', `Episode #${record.index} 已丢弃，等待复位`, '[LEROBOT]')),
@@ -1567,6 +1674,10 @@ acceptRecordQualityReport: () => {
           recorderFps: 0,
           recorderElapsedS: 0,
           recorderTotalS: state.recordSession.resetTimeS,
+          resetPending: true,
+          resetRequiredSides: defaultRecordResetRequiredSides,
+          resetReturnedSides: [],
+          resetReady: false,
         },
         logs: appendLog(state.logs, makeLog('INFO', '质量报告已接受，进入复位等待', '[LEROBOT]')),
       }
@@ -1600,6 +1711,10 @@ rejectRecordQualityReport: () => {
           recorderLateFrames: 0,
           recorderElapsedS: 0,
           recorderTotalS: state.recordSession.resetTimeS,
+          resetPending: true,
+          resetRequiredSides: defaultRecordResetRequiredSides,
+          resetReturnedSides: [],
+          resetReady: false,
           episodeHistory: state.recordSession.episodeHistory.filter((item) => item.index !== report.index),
         },
         logs: appendLog(state.logs, makeLog('WARNING', `Episode #${report.index} 已退回，等待复位`, '[LEROBOT]')),
@@ -1622,31 +1737,56 @@ finishRecordSession: () => {
 
 /** 描述当前方法的功能边界。 */
 skipRecordReset: () => {
-    if (get().recordSession.phase !== 'resetting') {
+    if (recordResetSkipInFlight) {
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('WARNING', 'record reset skip ignored: request is already pending', '[LEROBOT]')),
+      }))
+      return
+    }
+    const session = get().recordSession
+    if (session.phase !== 'resetting') {
       set((state) => ({
         logs: appendLog(state.logs, makeLog('WARNING', 'record reset skip ignored: reset is not pending', '[LEROBOT]')),
       }))
       return
     }
-    void skipRecordResetApi().catch((error) => {
+    if (!session.resetReady || session.returnOriginInFlight) {
       set((state) => ({
-        logs: appendLog(state.logs, makeLog('ERROR', `record reset skip failed: ${String(error)}`, '[LEROBOT]')),
+        logs: appendLog(state.logs, makeLog('WARNING', 'record reset skip ignored: work origin is not ready', '[LEROBOT]')),
       }))
-    })
-    set((state) => ({
-      recording: true,
-      recordSession: {
-        ...state.recordSession,
-        phase: 'recording',
-        phaseStartedAt: Date.now(),
-        recorderFps: 30,
-        recorderFrameCount: 0,
-        recorderLateFrames: 0,
-        recorderElapsedS: 0,
-        recorderTotalS: state.recordSession.episodeTimeS,
-      },
-      logs: appendLog(state.logs, makeLog('INFO', '已跳过复位，开始下一条录制', '[LEROBOT]')),
-    }))
+      return
+    }
+    recordResetSkipInFlight = true
+    void skipRecordResetApi()
+      .then((payload) => {
+        const status = payload && typeof payload === 'object' && 'data' in payload ? payload.data as RecordStatusApi : {}
+        set((state) => ({
+          recording: true,
+          recordSession: {
+            ...state.recordSession,
+            phase: 'recording',
+            phaseStartedAt: Date.now(),
+            recorderFps: typeof status.fps === 'number' ? status.fps : 30,
+            recorderFrameCount: 0,
+            recorderLateFrames: 0,
+            recorderElapsedS: 0,
+            recorderTotalS: state.recordSession.episodeTimeS,
+            resetPending: false,
+            resetReturnedSides: [],
+            resetReady: false,
+          },
+          logs: appendLog(state.logs, makeLog('INFO', '已跳过复位，开始下一条录制', '[LEROBOT]')),
+        }))
+      })
+      .catch((error) => {
+        set((state) => ({
+          recording: false,
+          logs: appendLog(state.logs, makeLog('ERROR', `record reset skip failed: ${String(error)}`, '[LEROBOT]')),
+        }))
+      })
+      .finally(() => {
+        recordResetSkipInFlight = false
+      })
   },
 
 /** 发送或封装对应的后端命令。 */
@@ -1695,69 +1835,110 @@ setRecordSpeedMode: (mode) => {
 
 /** 发送或封装对应的后端命令。 */
 homeRecordArms: () => {
-    void homeAllApi()
+    if (recordMotionOriginInFlight) {
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('WARNING', 'record arms return-to-work-origin ignored: request is already pending', '[HAL]')),
+      }))
+      return
+    }
+    const snapshot = get()
+    const requiredSides = normalizedRecordResetSides(
+      snapshot.recordSession.resetRequiredSides,
+      defaultRecordResetRequiredSides,
+    )
+    const blockedSide = requiredSides.find(
+      (side) => !motionSideReturnOriginReady(side, snapshot.frame.motionEnabled, snapshot.frame.motionAxisEnabled),
+    )
+    if (blockedSide) {
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('WARNING', `${blockedSide} slave arm return-to-work-origin ignored: motion side is disabled`, '[HAL]')),
+      }))
+      return
+    }
+    recordMotionOriginInFlight = true
     set((state) => ({
-      manualControl: {
-        ...state.manualControl,
-        axisOffsets: {},
+      recordSession: {
+        ...state.recordSession,
+        returnOriginInFlight: true,
       },
-      logs: appendLog(state.logs, makeLog('INFO', '双臂已回硬件零点', '[HAL]')),
     }))
+    void (async () => {
+      try {
+        for (const side of requiredSides) {
+          await returnMotionOriginSideApi(side)
+        }
+        set((state) => ({
+          manualControl: {
+            ...state.manualControl,
+            axisOffsets: {},
+          },
+          recordSession: requiredSides.reduce(
+            (session, side) => ({
+              ...session,
+              ...returnedRecordResetState(session, side),
+            }),
+            state.recordSession,
+          ),
+          logs: appendLog(state.logs, makeLog('INFO', 'record arms returned to work origin', '[HAL]')),
+        }))
+      } catch (error) {
+        set((state) => ({
+          logs: appendLog(state.logs, makeLog('ERROR', `record arms return-to-work-origin failed: ${String(error)}`, '[HAL]')),
+        }))
+      } finally {
+        recordMotionOriginInFlight = false
+        set((state) => ({
+          recordSession: {
+            ...state.recordSession,
+            returnOriginInFlight: false,
+          },
+        }))
+      }
+    })()
   },
 
 /** 描述当前方法的功能边界。 */
 returnRecordMotionOrigin: async (side) => {
     if (recordMotionOriginInFlight) {
       set((state) => ({
-        logs: appendLog(state.logs, makeLog('WARNING', `${side} slave arm return-to-origin ignored: request is already pending`, '[HAL]')),
+        logs: appendLog(state.logs, makeLog('WARNING', `${side} slave arm return-to-work-origin ignored: request is already pending`, '[HAL]')),
+      }))
+      return
+    }
+    const frame = get().frame
+    if (!motionSideReturnOriginReady(side, frame.motionEnabled, frame.motionAxisEnabled)) {
+      set((state) => ({
+        logs: appendLog(state.logs, makeLog('WARNING', `${side} slave arm return-to-work-origin ignored: motion side is disabled`, '[HAL]')),
       }))
       return
     }
     recordMotionOriginInFlight = true
+    set((state) => ({
+      recordSession: {
+        ...state.recordSession,
+        returnOriginInFlight: true,
+      },
+    }))
     try {
       await returnMotionOriginSideApi(side)
       set((state) => ({
-        logs: appendLog(state.logs, makeLog('INFO', `${side} slave arm returned to hardware zero`, '[HAL]')),
+        recordSession: {
+          ...state.recordSession,
+          ...returnedRecordResetState(state.recordSession, side),
+        },
+        logs: appendLog(state.logs, makeLog('INFO', `${side} slave arm returned to work origin`, '[HAL]')),
       }))
     } catch (error) {
       set((state) => ({
-        logs: appendLog(state.logs, makeLog('ERROR', `${side} slave arm return-to-origin failed: ${String(error)}`, '[HAL]')),
+        logs: appendLog(state.logs, makeLog('ERROR', `${side} slave arm return-to-work-origin failed: ${String(error)}`, '[HAL]')),
       }))
     } finally {
       recordMotionOriginInFlight = false
-    }
-  },
-
-/** 鎻忚堪褰撳墠鏂规硶鐨勫姛鑳借竟鐣屻€?*/
-captureRecordMotionOrigin: async (side) => {
-    try {
-      const response = await captureMotionOriginApi(side, undefined)
-      set((state) => {
-        const currentOrigin = state.config.motion.origin
-        const leftValid = side === 'left' ? true : currentOrigin.leftValid
-        const rightValid = side === 'right' ? true : currentOrigin.rightValid
-        const nextOrigin = response.data?.origin ?? {
-          ...currentOrigin,
-          leftValid,
-          rightValid,
-          valid: leftValid && rightValid,
-          updatedAt: Date.now(),
-        }
-        const sideLabel = side === 'left' ? 'left' : 'right'
-        return {
-          config: {
-            ...state.config,
-            motion: {
-              ...state.config.motion,
-              origin: nextOrigin,
-            },
-          },
-          logs: appendLog(state.logs, makeLog('INFO', `${sideLabel} slave arm origin captured`, '[HAL]')),
-        }
-      })
-    } catch (error) {
       set((state) => ({
-        logs: appendLog(state.logs, makeLog('ERROR', `${side} slave arm origin capture failed: ${String(error)}`, '[HAL]')),
+        recordSession: {
+          ...state.recordSession,
+          returnOriginInFlight: false,
+        },
       }))
     }
   },
@@ -1782,13 +1963,18 @@ triggerEmergencyStop: () => {
         recorderFps: 0,
         recorderElapsedS: 0,
         recorderTotalS: -1,
+        resetPending: false,
+        resetReturnedSides: [],
+        resetReady: false,
+        returnOriginInFlight: false,
       },
       logs: appendLog(state.logs, makeLog('ERROR', '操作员触发硬件急停', '[SAFETY]')),
     }))
   },
 
 /** 删除对应数据并同步界面状态。 */
-clearRecordSession: () =>
+clearRecordSession: () => {
+    recordResetSkipInFlight = false
     set((state) => ({
       recordSession: {
         ...initialRecordSession,
@@ -1799,7 +1985,8 @@ clearRecordSession: () =>
         resetTimeS: state.recordSession.resetTimeS,
       },
       logs: appendLog(state.logs, makeLog('INFO', '录制采集会话状态已清空', '[LEROBOT]')),
-    })),
+    }))
+  },
 
 /** 设置当前流程的对应状态。 */
 setClutchActive: (active) =>
@@ -1846,7 +2033,7 @@ acknowledgeSafety: () => {
         ...state.frame,
         dangerIndex: 0,
       },
-      logs: appendLog(state.logs, makeLog('INFO', '操作员确认安全复位', '[SAFETY]')),
+      logs: appendLog(state.logs, makeLog('INFO', '操作员确认安全态（不恢复运动）', '[SAFETY]')),
     }))
   },
 

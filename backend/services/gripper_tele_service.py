@@ -12,6 +12,9 @@ from backend.hal_client.client import HalClient
 from backend.services.hardware_service import HardwareService
 
 
+CommandRequest = tuple[dict[str, Any], str, str, int, int, float | None, int]
+
+
 class FollowGripper:
     """Single-side continuous follower: maps Omega7 gap to a Jodell target."""
 
@@ -160,10 +163,13 @@ class GripperTeleService:
         self._stop_event: asyncio.Event | None = None
         self._arm_sources: set[str] = set()
         self._teleop_enabled_sides: set[str] = set()
+        self._command_tasks: dict[str, asyncio.Task[None]] = {}
+        self._pending_commands: dict[str, CommandRequest] = {}
 
     def start(self, source: str = "manual") -> None:
         self._arm_sources.add(source)
-        if self._task is not None and not self._task.done():
+        stopping = self._stop_event is not None and self._stop_event.is_set()
+        if self._task is not None and not self._task.done() and not stopping:
             return
         self._stop_event = asyncio.Event()
         self._task = asyncio.get_running_loop().create_task(self._loop())
@@ -178,6 +184,12 @@ class GripperTeleService:
             return
         if self._stop_event is not None:
             self._stop_event.set()
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        for task in self._command_tasks.values():
+            task.cancel()
+        self._command_tasks.clear()
+        self._pending_commands.clear()
         self._left.reset()
         self._right.reset()
         self._teleop_enabled_sides.clear()
@@ -202,10 +214,14 @@ class GripperTeleService:
             "rightTargetMm": self._right.target_mm,
         }
 
+    async def _get_config_async(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._settings.get_config)
+
     async def _loop(self) -> None:
-        assert self._stop_event is not None
-        while not self._stop_event.is_set():
-            config = self._settings.get_config()
+        stop_event = self._stop_event
+        assert stop_event is not None
+        while not stop_event.is_set():
+            config = await self._get_config_async()
             gt_cfg: dict[str, Any] = config.get("teleop", {}).get("gripperTeleop", {})
             loop_hz = max(1.0, float(gt_cfg.get("loopHz", 100)))
             diag = bool(gt_cfg.get("diagLog", False))
@@ -217,6 +233,8 @@ class GripperTeleService:
 
             try:
                 omega = await self._hal.omega_state()
+                if stop_event.is_set():
+                    break
                 hands = {
                     h["side"]: h
                     for h in omega.get("hands", [])
@@ -257,23 +275,65 @@ class GripperTeleService:
                     if command is None:
                         continue
                     target_mm, raw_position = command
-                    result = await asyncio.to_thread(
-                        self._issue_command,
-                        config,
-                        side,
-                        "target",
-                        int(gt_cfg.get("gripSpeed", 255)),
-                        int(gt_cfg.get("gripTorque", 1)),
-                        target_mm,
-                    )
-                    self._logs.info(
-                        "[GRIPPER]",
-                        f"{side} target={target_mm:.2f}mm raw={raw_position} -> {result.message}",
+                    self._queue_command(
+                        (
+                            config,
+                            side,
+                            "target",
+                            int(gt_cfg.get("gripSpeed", 255)),
+                            int(gt_cfg.get("gripTorque", 1)),
+                            target_mm,
+                            raw_position,
+                        )
                     )
             except Exception as exc:
                 self._logs.warning("[GRIPPER]", f"loop error: {exc}")
 
             await asyncio.sleep(1.0 / loop_hz)
+
+    def _queue_command(self, request: CommandRequest) -> None:
+        side = request[1]
+        task = self._command_tasks.get(side)
+        if task is not None and not task.done():
+            self._pending_commands[side] = request
+            return
+        self._start_command_task(request)
+
+    def _start_command_task(self, request: CommandRequest) -> None:
+        side = request[1]
+        self._command_tasks[side] = asyncio.create_task(self._run_command_request(request))
+
+    async def _run_command_request(self, request: CommandRequest) -> None:
+        config, side, cmd, speed, torque, target_mm, raw_position = request
+        try:
+            result = await asyncio.to_thread(
+                self._issue_command,
+                config,
+                side,
+                cmd,
+                speed,
+                torque,
+                target_mm,
+            )
+            target_label = "none" if target_mm is None else f"{target_mm:.2f}mm"
+            self._logs.info(
+                "[GRIPPER]",
+                f"{side} target={target_label} raw={raw_position} -> {result.message}",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._logs.warning("[GRIPPER]", f"{side} command error: {exc}")
+        finally:
+            current = asyncio.current_task()
+            if self._command_tasks.get(side) is current:
+                self._command_tasks.pop(side, None)
+                pending = self._pending_commands.pop(side, None)
+                if pending is not None and not self._stopping():
+                    self._start_command_task(pending)
+
+    def _stopping(self) -> bool:
+        return self._stop_event is not None and self._stop_event.is_set()
 
     def _issue_command(
         self,

@@ -9,6 +9,7 @@ $halExe = Join-Path $repo "hal\build\HalServer.exe"
 $halNextExe = Join-Path $repo "hal\build\HalServer.next.exe"
 $workerExe = Join-Path $repo "hal\build\JodellGripperWorker.exe"
 $workerNextExe = Join-Path $repo "hal\build\JodellGripperWorker.next.exe"
+$workerRuntimeExe = $workerExe
 $halBuild = Split-Path -Parent $halExe
 $leishineBin = Join-Path $repo "hal\vendor\leishine\bin"
 $forceDimensionBin = Join-Path $repo "hal\vendor\force_dimension\bin"
@@ -17,6 +18,53 @@ $runtimeConfig = Join-Path $repo "backend\runtime\config.json"
 $omegaLeftOpenId = 0
 $omegaRightOpenId = 1
 $omegaSwapHands = $false
+
+function Stop-ProcessTree {
+  param([int]$RootPid)
+
+  if ($RootPid -eq $PID) {
+    return
+  }
+
+  $allProcesses = Get-CimInstance Win32_Process
+  $children = $allProcesses | Where-Object { $_.ParentProcessId -eq $RootPid }
+  foreach ($child in $children) {
+    Stop-ProcessTree -RootPid $child.ProcessId
+  }
+  Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Milliseconds 200
+  if (Get-Process -Id $RootPid -ErrorAction SilentlyContinue) {
+    & cmd.exe /c "taskkill.exe /PID $RootPid /T /F >nul 2>nul" | Out-Null
+  }
+}
+
+function Stop-HalRuntimeProcessTrees {
+  $allProcesses = Get-CimInstance Win32_Process
+  $escapedHalBuild = [regex]::Escape($halBuild)
+  $runtimeProcesses = @($allProcesses | Where-Object {
+      $process = $_
+      if (-not $process.CommandLine) {
+        return $false
+      }
+      $normalizedCommandLine = $process.CommandLine.Replace('\\', '\')
+      ($process.Name -eq "HalServer.exe" -or $process.Name -like "JodellGripperWorker*.exe") -and
+      $normalizedCommandLine -match $escapedHalBuild
+    })
+  $runtimeIds = @{}
+  foreach ($process in $runtimeProcesses) {
+    $runtimeIds[[int]$process.ProcessId] = $true
+  }
+  $rootPids = @($runtimeProcesses | Where-Object {
+      -not $runtimeIds.ContainsKey([int]$_.ParentProcessId)
+    } | ForEach-Object {
+      [int]$_.ProcessId
+    } | Sort-Object -Unique)
+
+  foreach ($rootPid in $rootPids) {
+    Stop-ProcessTree -RootPid $rootPid
+    Write-Host "Stopped HAL process tree $rootPid for $halBuild"
+  }
+}
 
 function Promote-HalCandidate {
   param(
@@ -33,13 +81,36 @@ function Promote-HalCandidate {
   if (!$shouldPromote) {
     return
   }
-  if (Test-Path $TargetExe) {
-    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $backupName = "{0}.backup-{1}.exe" -f [System.IO.Path]::GetFileNameWithoutExtension($TargetExe), $stamp
-    Copy-Item -LiteralPath $TargetExe -Destination (Join-Path $halBuild $backupName) -Force
+  try {
+    if (Test-Path $TargetExe) {
+      $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+      $backupName = "{0}.backup-{1}.exe" -f [System.IO.Path]::GetFileNameWithoutExtension($TargetExe), $stamp
+      Copy-Item -LiteralPath $TargetExe -Destination (Join-Path $halBuild $backupName) -Force
+    }
+    Copy-Item -LiteralPath $CandidateExe -Destination $TargetExe -Force
+  } catch {
+    if ($TargetExe -eq $workerExe -and (Test-Path $CandidateExe)) {
+      try {
+        $stamp = Get-Date -Format "yyyyMMdd-HHmmss-ffff"
+        $workerRuntimeExe = Join-Path $halBuild "JodellGripperWorker.runtime-$stamp.exe"
+        Copy-Item -LiteralPath $CandidateExe -Destination $workerRuntimeExe -Force
+        $script:workerRuntimeExe = $workerRuntimeExe
+        Write-Host "HAL worker target is locked; using runtime worker copy $workerRuntimeExe"
+        return
+      } catch {
+        Write-Warning "HAL worker runtime copy failed for ${CandidateExe}: $($_.Exception.Message)"
+      }
+    }
+    Write-Warning "HAL runtime promotion skipped for ${TargetExe}: $($_.Exception.Message)"
+    return
   }
-  Copy-Item -LiteralPath $CandidateExe -Destination $TargetExe -Force
   Write-Host "Promoted newer HAL build: $CandidateExe -> $TargetExe"
+}
+
+if ($Restart) {
+  Stop-HalRuntimeProcessTrees
+  Get-ChildItem -LiteralPath $halBuild -Filter "JodellGripperWorker.runtime-*.exe" -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
 $existing = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
@@ -88,6 +159,8 @@ if (Test-Path $runtimeConfig) {
 $env:APPSTATION_OMEGA7_LEFT_OPEN_ID = "$omegaLeftOpenId"
 $env:APPSTATION_OMEGA7_RIGHT_OPEN_ID = "$omegaRightOpenId"
 $env:APPSTATION_OMEGA7_SWAP_HANDS = if ($omegaSwapHands) { "true" } else { "false" }
+$env:APPSTATION_HAL_PORT = "$Port"
+$env:APPSTATION_JODELL_WORKER_EXE = "$workerRuntimeExe"
 $process = Start-Process -FilePath $halExe -WorkingDirectory $halBuild -WindowStyle Hidden -PassThru
 Start-Sleep -Seconds 2
 

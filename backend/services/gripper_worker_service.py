@@ -9,7 +9,7 @@ from multiprocessing import get_context
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from backend.core.config import SettingsService
@@ -23,9 +23,9 @@ class _WorkerHandle:
     side: str
     signature: tuple[Any, ...]
     process: BaseProcess
-    command_queue: Queue
-    status_queue: Queue
-    response_queue: Queue
+    command_queue: Queue[Any]
+    status_queue: Queue[Any]
+    response_queue: Queue[Any]
 
 
 class GripperWorkerService:
@@ -47,9 +47,6 @@ class GripperWorkerService:
 
     def is_enabled(self, config: dict[str, Any] | None = None) -> bool:
         active = config if config is not None else self.settings.get_config()
-        teleop = active.get("teleop", {}) if isinstance(active.get("teleop"), dict) else {}
-        if str(teleop.get("engine", "")).lower() == "hal_native":
-            return False
         return str(active.get("gripper", {}).get("sampleMode", "direct")).lower() == "dual_worker"
 
     def sync_config(self, config: dict[str, Any]) -> None:
@@ -186,7 +183,7 @@ class GripperWorkerService:
         command_queue = self._ctx.Queue()
         status_queue = self._ctx.Queue(maxsize=1)
         response_queue = self._ctx.Queue()
-        process = self._ctx.Process(
+        process = cast(Any, self._ctx).Process(
             target=run_gripper_worker,
             args=(side, config, command_queue, status_queue, response_queue, os.getpid()),
             name=f"gripper-{side}-worker",

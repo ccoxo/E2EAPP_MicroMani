@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 $currentPid = $PID
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$halBuild = Join-Path $repo "hal\build"
 
 function Stop-ProcessTree {
   param([int]$RootPid)
@@ -15,6 +16,10 @@ function Stop-ProcessTree {
     Stop-ProcessTree -RootPid $child.ProcessId
   }
   Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Milliseconds 200
+  if (Get-Process -Id $RootPid -ErrorAction SilentlyContinue) {
+    & cmd.exe /c "taskkill.exe /PID $RootPid /T /F >nul 2>nul" | Out-Null
+  }
 }
 
 function Stop-BackendProcessTrees {
@@ -64,7 +69,35 @@ function Stop-BackendProcessTrees {
   }
 }
 
-foreach ($port in @(5173, 5174, 18080, 18082, 8091)) {
+function Stop-HalRuntimeProcessTrees {
+  $allProcesses = Get-CimInstance Win32_Process
+  $escapedHalBuild = [regex]::Escape($halBuild)
+  $runtimeProcesses = @($allProcesses | Where-Object {
+      $process = $_
+      if (-not $process.CommandLine) {
+        return $false
+      }
+      $normalizedCommandLine = $process.CommandLine.Replace('\\', '\')
+      ($process.Name -eq "HalServer.exe" -or $process.Name -like "JodellGripperWorker*.exe") -and
+      $normalizedCommandLine -match $escapedHalBuild
+    })
+  $runtimeIds = @{}
+  foreach ($process in $runtimeProcesses) {
+    $runtimeIds[[int]$process.ProcessId] = $true
+  }
+  $rootPids = @($runtimeProcesses | Where-Object {
+      -not $runtimeIds.ContainsKey([int]$_.ParentProcessId)
+    } | ForEach-Object {
+      [int]$_.ProcessId
+    } | Sort-Object -Unique)
+
+  foreach ($rootPid in $rootPids) {
+    Stop-ProcessTree -RootPid $rootPid
+    Write-Host "Stopped HAL process tree $rootPid for $halBuild"
+  }
+}
+
+foreach ($port in @(5173, 5174, 18080, 18082, 8091, 8092)) {
   $pidsOnPort = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
     Select-Object -ExpandProperty OwningProcess |
     Sort-Object -Unique)
@@ -86,4 +119,5 @@ foreach ($port in @(5173, 5174, 18080, 18082, 8091)) {
   }
 }
 
+Stop-HalRuntimeProcessTrees
 Stop-BackendProcessTrees

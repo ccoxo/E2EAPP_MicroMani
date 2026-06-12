@@ -10,18 +10,24 @@ namespace appstation::hal {
 
 namespace {
 
+// controlMode 的规范名称；configure 会把旧的 "incremental" 归一化到 incremental_position。
 constexpr const char* kVelocityAdmittanceMode = "velocity_admittance";
 constexpr const char* kIncrementalPositionMode = "incremental_position";
+// 夹爪命令的下限保护，避免配置为 0 后在高频 teleop 中刷爆串口。
 constexpr int kGripperTeleopDeadbandFloorCounts = 1;
 constexpr double kGripperTeleopMinCommandIntervalFloorMs = 10.0;
+// 增量模式中旋转轴如果单帧跳过该阈值，认为是参考切换或采样异常，而不直接下发。
+constexpr double kIncrementalRotationSpikeGuardDeg = 5.0;
 constexpr auto kGripperPositionSampleInterval = std::chrono::microseconds(33333);
 
 std::int64_t unixTimeMs() {
+  // 对外状态和动作历史使用墙钟毫秒，方便和后端事件日志合并。
   const auto now = std::chrono::system_clock::now().time_since_epoch();
   return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
 }
 
 double monotonicSeconds() {
+  // 单调时间用于分析控制环间隔，不受系统时间调整影响。
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
@@ -50,6 +56,7 @@ double wrapKalmanRotationResidualDeg(double residualDeg) {
 }
 
 std::string jsonEscape(const std::string& value) {
+  // statusJson 直接拼 JSON，所有字符串字段都必须先转义。
   std::ostringstream out;
   for (char ch : value) {
     switch (ch) {
@@ -89,6 +96,7 @@ void appendBoolArray(std::ostringstream& out, const std::array<bool, N>& values)
 }
 
 void appendAction(std::ostringstream& out, const NativeTeleopAction& action) {
+  // action 同时包含 UI 增量和 LTDMC 诊断，供前端展示最后一帧 teleop 输出。
   out << "{\"ts\":" << action.ts
       << ",\"monotonicMs\":" << static_cast<std::int64_t>(std::llround(action.monotonicS * 1000.0))
       << ",\"monotonic_s\":" << action.monotonicS
@@ -113,6 +121,10 @@ void appendAction(std::ostringstream& out, const NativeTeleopAction& action) {
   appendArray(out, action.launchDeltaPulse);
   out << ",\"updateReturn\":";
   appendArray(out, action.updateReturn);
+  out << ",\"stopReason\":";
+  appendArray(out, action.stopReason);
+  out << ",\"axisIoStatus\":";
+  appendArray(out, action.axisIoStatus);
   out << ",\"movingBefore\":";
   appendBoolArray(out, action.movingBefore);
   out << ",\"moveStarted\":";
@@ -131,16 +143,20 @@ void appendInputDiagnostic(
     bool referenceValid,
     bool inputActive,
     const std::array<double, 6>& semanticPose,
+    const std::array<double, 6>& referencePose,
     const std::array<double, 6>& rawDelta,
     const std::array<double, 6>& filteredDelta,
     const std::array<double, 6>& requestedPulse,
     const std::array<double, 6>& emittedPulse,
     const std::array<double, 6>& outputDeltaUi) {
+  // 输入诊断保留从主手姿态到最终输出增量的中间量，方便定位死区/滤波/取整问题。
   out << "\"" << sourceName << "\":{\"targetSide\":\"" << sideName(targetSide) << "\""
       << ",\"referenceValid\":" << (referenceValid ? "true" : "false")
       << ",\"inputActive\":" << (inputActive ? "true" : "false")
       << ",\"semanticPose\":";
   appendArray(out, semanticPose);
+  out << ",\"referencePose\":";
+  appendArray(out, referencePose);
   out << ",\"rawDelta\":";
   appendArray(out, rawDelta);
   out << ",\"filteredDelta\":";
@@ -155,6 +171,7 @@ void appendInputDiagnostic(
 }
 
 bool hasMotion(const std::array<double, 6>& deltas) {
+  // 只要任一语义轴有非零输出，就认为本帧存在 motion。
   for (double value : deltas) {
     if (std::abs(value) > 1e-9) {
       return true;
@@ -178,6 +195,7 @@ int signOfValue(double value) {
 }
 
 std::array<double, 6> omegaPoseToSemantic(const std::array<double, 6>& raw, const std::string& mappingMode) {
+  // legacy 模式保留旧版主手轴交换规则；direct 模式按 SDK 原始顺序传递。
   if (mappingMode == "legacy") {
     return {raw[1], raw[0], raw[2], raw[3], raw[5], raw[4]};
   }
@@ -191,6 +209,7 @@ NativeTeleopController::NativeTeleopController(
     Omega7Driver& omega,
     JodellGripperDriver& gripper)
     : motion_(motion), omega_(omega), gripper_(gripper) {
+  // 默认软限位使用 UI 单位：平移 um，旋转 degree。后端配置会在 configure 中覆盖。
   for (auto& sideLimits : config_.softLimits) {
     sideLimits = {
         AxisLimit{-25000.0, 25000.0},
@@ -202,6 +221,7 @@ NativeTeleopController::NativeTeleopController(
     };
   }
   for (auto& sideLimits : config_.rotationWorkLimits) {
+    // 旋转工作限位只对 Roll/Pitch/Yaw 生效，平移位保留 0。
     sideLimits = {
         AxisLimit{0.0, 0.0},
         AxisLimit{0.0, 0.0},
@@ -219,6 +239,7 @@ NativeTeleopController::~NativeTeleopController() {
 
 void NativeTeleopController::configure(const NativeTeleopConfig& config) {
   NativeTeleopConfig normalized = config;
+  // 统一兼容旧字段和非法字段，避免控制环里反复判断多种拼写。
   if (normalized.controlMode == "incremental") {
     normalized.controlMode = kIncrementalPositionMode;
   }
@@ -299,6 +320,7 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config) {
       normalized.incrementalTranslationMinEffectiveDeltaM,
       normalized.incrementalTranslationReverseDeadzoneM);
   for (auto& sideLimits : normalized.softLimits) {
+    // 软限位必须是 min < max；无效项用保守默认区间兜底。
     for (auto& limit : sideLimits) {
       if (limit.min >= limit.max) {
         limit = AxisLimit{-1.0, 1.0};
@@ -315,6 +337,7 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config) {
   }
   {
     std::scoped_lock lock(mutex_);
+    // 配置和诊断状态一起更新，保证控制环看到的是一致快照。
     config_ = normalized;
     // kalmanStates_：配置变化后清空滤波状态，下一帧用新参数重新初始化。
     kalmanStates_ = {};
@@ -324,13 +347,18 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config) {
       weights.fill(1.0);
     }
   }
+  // 夹爪和主手力输出配置下推到底层驱动，避免等待下一次 start。
   gripper_.configure(normalized.gripper);
+  if (!normalized.gripperTeleopEnabled) {
+    stopGripperWorker();
+  }
   omega_.setGravityCompensation(normalized.leftGravityCompensation, normalized.rightGravityCompensation);
 }
 
 void NativeTeleopController::configureGripper(const JodellGripperConfig& config) {
   {
     std::scoped_lock lock(mutex_);
+    // 手动夹爪命令可能只更新夹爪配置，不重置完整 teleop 配置。
     config_.gripper = config;
     config_.gripperIcfTargetMinGapMm = std::clamp(
         config_.gripperIcfTargetMinGapMm,
@@ -350,9 +378,12 @@ void NativeTeleopController::configureGripperProtection(bool enabled, double min
 }
 
 void NativeTeleopController::start(bool leftConnected, bool rightConnected) {
+  bool gripperTeleopEnabled = false;
   {
     std::scoped_lock lock(mutex_);
+    // start 建立一个新的 teleop 会话，所有参考点、残差和诊断历史都从空状态开始。
     logicalConnected_ = {leftConnected, rightConnected};
+    gripperTeleopEnabled = config_.gripperTeleopEnabled;
     referenceValid_ = {false, false};
     targetActive_ = {false, false};
     velocityUiPerSec_ = {};
@@ -386,14 +417,21 @@ void NativeTeleopController::start(bool leftConnected, bool rightConnected) {
     gripperLastMessage_ = {};
     gripperLastCommandTs_ = {0, 0};
   }
-  startGripperWorker();
+  if (gripperTeleopEnabled) {
+    // 夹爪 worker 独立运行，避免夹爪串口读写阻塞运动控制环。
+    startGripperWorker();
+  } else {
+    stopGripperWorker();
+  }
   if (running_.exchange(true)) {
+    // 控制线程已运行时 start 只更新配置/连接状态，不重复创建线程。
     return;
   }
   worker_ = std::thread(&NativeTeleopController::loop, this);
 }
 
 void NativeTeleopController::stop() {
+  // 先停控制线程，再把两侧 teleop 目标同步到当前位置。
   if (running_.exchange(false)) {
     if (worker_.joinable()) {
       worker_.join();
@@ -408,6 +446,7 @@ void NativeTeleopController::stop() {
   }
   stopGripperWorker();
   std::scoped_lock lock(mutex_);
+  // stop 后清空会话状态；下一次 start 重新捕获 referencePose_。
   logicalConnected_ = {false, false};
   referenceValid_ = {false, false};
   targetActive_ = {false, false};
@@ -435,6 +474,7 @@ void NativeTeleopController::stop() {
 void NativeTeleopController::startGripperWorker() {
   bool expected = false;
   if (!gripperWorkerRunning_.compare_exchange_strong(expected, true)) {
+    // 已经有 worker 时保持幂等。
     return;
   }
   gripperWorker_ = std::thread(&NativeTeleopController::gripperLoop, this);
@@ -442,16 +482,19 @@ void NativeTeleopController::startGripperWorker() {
 
 void NativeTeleopController::stopGripperWorker() {
   if (gripperWorkerRunning_.exchange(false)) {
+    // 唤醒正在等待命令或采样时间的 worker，让它尽快退出。
     gripperCv_.notify_all();
   }
   if (gripperWorker_.joinable()) {
     gripperWorker_.join();
   }
   std::scoped_lock lock(gripperMutex_);
+  // 停止 worker 后丢弃未执行命令，避免下次启动时执行过期目标。
   pendingGripperCommands_ = {};
 }
 
 void NativeTeleopController::gripperLoop() {
+  // 单独线程串行处理夹爪命令和低频位置采样。
   auto nextSampleAt = std::chrono::steady_clock::now();
   while (gripperWorkerRunning_.load()) {
     std::array<PendingGripperCommand, 2> commands{};
@@ -466,6 +509,7 @@ void NativeTeleopController::gripperLoop() {
       if (!gripperWorkerRunning_.load()) {
         break;
       }
+      // 取出并清空 pending，后续命令会覆盖为最新目标，避免排队积压。
       commands = pendingGripperCommands_;
       pendingGripperCommands_ = {};
       const auto now = std::chrono::steady_clock::now();
@@ -488,14 +532,12 @@ void NativeTeleopController::gripperLoop() {
           false);
       {
         std::scoped_lock lock(mutex_);
+        // 命令不强制读位置，使用非阻塞快照刷新 UI 状态。
         const auto gripperPositions = gripper_.positionMmSnapshot(gripperPositionsMm_);
         gripperPositionsMm_ = gripperPositions;
         gripperLastCommandOk_[command.targetIndex] = ok;
         gripperLastMessage_[command.targetIndex] = message;
         gripperLastCommandTs_[command.targetIndex] = unixTimeMs();
-        if (!ok) {
-          lastError_ = std::string("native gripper ") + sideName(command.side) + ": " + message;
-        }
       }
     }
     if (shouldSample) {
@@ -506,12 +548,15 @@ void NativeTeleopController::gripperLoop() {
 }
 
 void NativeTeleopController::sampleGripperPosition(Side side) {
+  // 周期性采样夹爪位置，用于 statusJson 展示，不参与运动控制闭环。
   std::string message;
   const bool ok = gripper_.readPositionMm(side, &message);
+  const int index = sideIndex(side);
   std::scoped_lock lock(mutex_);
   gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);
-  if (!ok && !message.empty()) {
-    lastError_ = std::string("native gripper ") + sideName(side) + " position: " + message;
+  gripperLastCommandOk_[index] = ok;
+  if (!message.empty()) {
+    gripperLastMessage_[index] = message;
   }
 }
 
@@ -529,9 +574,11 @@ bool NativeTeleopController::commandGripperTarget(
   double bounded = targetMm;
   {
     std::scoped_lock lock(mutex_);
+    // 手动命令也应用 ICF 最小开口保护，和 teleop 自动命令一致。
     bounded = effectiveGripperTargetMm(targetMm);
   }
   if (gripperWorkerRunning_.load()) {
+    // worker 模式下只入队最新目标，立即返回，避免 HTTP 线程等待串口。
     {
       std::scoped_lock lock(mutex_);
       gripperTargetsMm_[index] = bounded;
@@ -547,6 +594,7 @@ bool NativeTeleopController::commandGripperTarget(
   }
 
   std::string driverMessage;
+  // worker 未运行时退回同步调用，主要用于禁用 worker 的调试场景。
   const bool ok = gripper_.commandTarget(side, bounded, speed, torque, &driverMessage);
   {
     std::scoped_lock lock(mutex_);
@@ -555,9 +603,6 @@ bool NativeTeleopController::commandGripperTarget(
     gripperLastCommandOk_[index] = ok;
     gripperLastMessage_[index] = driverMessage;
     gripperLastCommandTs_[index] = unixTimeMs();
-    if (!ok) {
-      lastError_ = std::string("native gripper ") + sideName(side) + ": " + driverMessage;
-    }
   }
   if (message) {
     *message = driverMessage;
@@ -566,6 +611,7 @@ bool NativeTeleopController::commandGripperTarget(
 }
 
 std::string NativeTeleopController::statusJson() const {
+  // 先读 Omega force 状态，再持有 mutex_ 拼接控制器快照，避免锁顺序反转。
   const auto forceOutput = omega_.forceOutputEnabled();
   std::scoped_lock lock(mutex_);
   const auto gripperPositions = gripper_.positionMmSnapshot(gripperPositionsMm_);
@@ -606,6 +652,7 @@ std::string NativeTeleopController::statusJson() const {
       referenceValid_[0],
       incrementalInputActive_[0],
       lastSemanticPose_[0],
+      referencePose_[0],
       lastRawDelta_[0],
       lastFilteredDelta_[0],
       lastRequestedPulse_[0],
@@ -619,6 +666,7 @@ std::string NativeTeleopController::statusJson() const {
       referenceValid_[1],
       incrementalInputActive_[1],
       lastSemanticPose_[1],
+      referencePose_[1],
       lastRawDelta_[1],
       lastFilteredDelta_[1],
       lastRequestedPulse_[1],
@@ -675,6 +723,7 @@ void NativeTeleopController::loop() {
     const auto dt = std::chrono::duration<double>(started - previous).count();
     previous = started;
     try {
+      // tick 内部按 best-effort 隔离单侧异常，外层只兜底记录未预期异常。
       tick(dt > 0.0 ? dt : 0.01);
     } catch (const std::exception& exc) {
       std::scoped_lock lock(mutex_);
@@ -683,6 +732,7 @@ void NativeTeleopController::loop() {
     int hz = 100;
     {
       std::scoped_lock lock(mutex_);
+      // loopHz 支持运行时更新，下一轮周期立即生效。
       hz = std::max(1, config_.loopHz);
     }
     const auto period = std::chrono::microseconds(1000000 / hz);
@@ -694,6 +744,7 @@ void NativeTeleopController::loop() {
 }
 
 void NativeTeleopController::tick(double dtSec) {
+  // 每帧先读取两只主手状态，再分别处理左右通道，最后处理夹爪映射。
   const auto hands = omega_.readState();
   tickSideBestEffort(0, hands[0], dtSec);
   tickSideBestEffort(1, hands[1], dtSec);
@@ -706,6 +757,7 @@ void NativeTeleopController::tick(double dtSec) {
 }
 
 void NativeTeleopController::tickSideBestEffort(int sourceIndex, const Omega7State& hand, double dtSec) {
+  // 单侧异常不能终止整个 teleop 线程；记录 blocker 后下一帧继续尝试。
   try {
     tickSide(sourceIndex, hand, dtSec);
   } catch (const std::exception& exc) {
@@ -723,11 +775,13 @@ void NativeTeleopController::tickSideBestEffort(int sourceIndex, const Omega7Sta
 void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, double dtSec) {
   std::scoped_lock lock(mutex_);
   const Side sourceSide = sideFromIndex(sourceIndex);
+  // 默认左右交叉映射：左主手控制右从端，右主手控制左从端；配置可关闭交换。
   const Side targetSide = config_.swapTeleopChannels ? sideFromIndex(1 - sourceIndex) : sourceSide;
   const int targetIndex = sideIndex(targetSide);
   const bool logicalConnected = logicalConnected_[sourceIndex];
   lastDiagnosticTargetSide_[sourceIndex] = targetSide;
   if (!logicalConnected) {
+    // 逻辑断开时停掉对应目标侧，防止上一帧运动继续保持。
     setBlockerUnlocked(sourceIndex, "idle", "logical hand is disconnected");
     resetKalmanSideUnlocked(sourceIndex);
     referenceValid_[sourceIndex] = false;
@@ -744,6 +798,7 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
     return;
   }
   if (!hand.connected || !hand.lastReadOk) {
+    // 物理读取失败时同样释放参考和目标，下一次读成功后重新捕获 reference。
     setBlockerUnlocked(sourceIndex, "blocked", hand.lastReadError.empty() ? "Omega.7 read is unavailable" : hand.lastReadError);
     resetKalmanSideUnlocked(sourceIndex);
     referenceValid_[sourceIndex] = false;
@@ -760,6 +815,7 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
     return;
   }
   if (config_.requireClutch && !hand.clutchPressed) {
+    // clutch 是安全门控：未按下时停止输出并清除参考，按下后需要重新捕获。
     setBlockerUnlocked(sourceIndex, "blocked", "clutch is required but not pressed");
     resetKalmanSideUnlocked(sourceIndex);
     referenceValid_[sourceIndex] = false;
@@ -782,6 +838,7 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
   lastSemanticPose_[sourceIndex] = semanticPose;
   lastDiagnosticTargetSide_[sourceIndex] = targetSide;
   if (!referenceValid_[sourceIndex]) {
+    // 第一次有效采样只作为参考点，不立即运动，避免启动瞬间跳变。
     referencePose_[sourceIndex] = semanticPose;
     referenceValid_[sourceIndex] = true;
     velocityUiPerSec_[sourceIndex] = {};
@@ -795,6 +852,11 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
   }
 
   // deltas：由当前姿态计算出的从手 UI 增量；随后按 w2 意图权重进行软门控。
+  if (config_.controlMode == kIncrementalPositionMode &&
+      suppressIncrementalRotationSpikeUnlocked(sourceSide, targetSide, sourceIndex, targetIndex, semanticPose)) {
+    return;
+  }
+
   auto deltas = config_.controlMode == kIncrementalPositionMode
       ? incrementalDeltasUi(sourceIndex, targetSide, semanticPose)
       : velocityDeltasUi(sourceIndex, targetSide, semanticPose, dtSec);
@@ -829,6 +891,7 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
       config_.rotationStartVelocityDegS,
       config_.accTimeSec,
       config_.decTimeSec);
+  // 只要成功下发一帧 motion，就标记目标侧处于 teleop 活跃状态。
   targetActive_[targetIndex] = true;
   setBlockerUnlocked(sourceIndex, "active", "");
   recordActionUnlocked(sourceSide, targetSide, result);
@@ -844,6 +907,7 @@ void NativeTeleopController::syncIncrementalZeroDeltaUnlocked(
     int targetIndex,
     const std::array<double, 6>& semanticPose,
   const std::string& message) {
+  // 增量模式输入归零时主动 stop，把从端保持在当前位置并重置主手参考。
   if (targetActive_[targetIndex]) {
     motion_.stopTeleopSide(targetSide);
     targetActive_[targetIndex] = false;
@@ -1089,12 +1153,54 @@ void NativeTeleopController::resetKalmanSideUnlocked(int sourceIndex) {
   lastIntentWeight_[sourceIndex].fill(1.0);
 }
 
+bool NativeTeleopController::suppressIncrementalRotationSpikeUnlocked(
+    Side sourceSide,
+    Side targetSide,
+    int sourceIndex,
+    int targetIndex,
+    const std::array<double, 6>& semanticPose) {
+  // 只检查旋转轴，因为旋转参考变化更容易因姿态解算或零点切换产生单帧跳变。
+  for (int axisIndex = 3; axisIndex < 6; ++axisIndex) {
+    if (!config_.enabledAxes[targetIndex][axisIndex]) {
+      continue;
+    }
+    const double rawDelta = semanticPose[axisIndex] - referencePose_[sourceIndex][axisIndex];
+    if (std::abs(rawDelta) <= kIncrementalRotationSpikeGuardDeg) {
+      continue;
+    }
+    // 触发保护时重新捕获参考，并清空所有残差/连续脉冲状态。
+    referencePose_[sourceIndex] = semanticPose;
+    velocityUiPerSec_[sourceIndex] = {};
+    incrementalCarry_[sourceIndex] = {};
+    incrementalDirection_[sourceIndex] = {};
+    incrementalInputActive_[sourceIndex] = false;
+    continuousPulseCarry_[sourceIndex] = {};
+    continuousDirection_[sourceIndex] = {};
+    continuousStreak_[sourceIndex] = {};
+    lastRawDelta_[sourceIndex] = {};
+    lastFilteredDelta_[sourceIndex] = {};
+    lastRequestedPulse_[sourceIndex] = {};
+    lastEmittedPulse_[sourceIndex] = {};
+    lastOutputDeltaUi_[sourceIndex] = {};
+    lastRawDelta_[sourceIndex][axisIndex] = rawDelta;
+    if (targetActive_[targetIndex]) {
+      motion_.stopTeleopSide(targetSide);
+      targetActive_[targetIndex] = false;
+      recordZeroStopActionUnlocked(sourceSide, targetSide);
+    }
+    setBlockerUnlocked(sourceIndex, "blocked", "incremental rotation input spike suppressed; reference recaptured");
+    return true;
+  }
+  return false;
+}
+
 std::array<AxisLimit, 6> NativeTeleopController::effectiveSoftLimits(Side targetSide, int targetIndex) const {
   auto limits = config_.softLimits[targetIndex];
-  if (config_.workOriginValid[targetIndex]) {
+  if (config_.homeReferenceValid[targetIndex]) {
+    // 平移软限位以 home reference 为零点平移到当前硬件坐标系。
     for (int axisIndex = 0; axisIndex < 3; ++axisIndex) {
       const auto axis = static_cast<SemanticAxis>(axisIndex);
-      const double originUi = pulseToUi(config_.workOriginPulse[targetIndex][axisIndex], targetSide, axis);
+      const double originUi = pulseToUi(config_.homeReferencePulse[targetIndex][axisIndex], targetSide, axis);
       limits[axisIndex].min += originUi;
       limits[axisIndex].max += originUi;
     }
@@ -1102,15 +1208,16 @@ std::array<AxisLimit, 6> NativeTeleopController::effectiveSoftLimits(Side target
   if (!config_.rotationWorkLimitEnabled) {
     return limits;
   }
-  if (!config_.workOriginValid[targetIndex]) {
-    throw std::runtime_error("work_origin_missing: rotation work limit requires captured work origin");
+  if (!config_.homeReferenceValid[targetIndex]) {
+    // 旋转工作限位必须依赖已捕获的硬件零点，否则限位坐标没有意义。
+    throw std::runtime_error("home_reference_missing: rotation work limit requires captured hardware zero");
   }
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     if (axisIndex < 3) {
       continue;
     }
     const auto axis = static_cast<SemanticAxis>(axisIndex);
-    const double originUi = pulseToUi(config_.workOriginPulse[targetIndex][axisIndex], targetSide, axis);
+    const double originUi = pulseToUi(config_.homeReferencePulse[targetIndex][axisIndex], targetSide, axis);
     const auto workLimit = config_.rotationWorkLimits[targetIndex][axisIndex];
     limits[axisIndex].min = std::max(limits[axisIndex].min, originUi + workLimit.min);
     limits[axisIndex].max = std::min(limits[axisIndex].max, originUi + workLimit.max);
@@ -1123,9 +1230,11 @@ std::array<double, 6> NativeTeleopController::velocityDeltasUi(
     Side targetSide,
     const std::array<double, 6>& pose,
     double dtSec) {
+  // velocity_admittance：主手偏离参考越远，输出速度越大；本函数返回本帧 UI 增量。
   std::array<double, 6> deltas{};
   const int targetIndex = sideIndex(targetSide);
   const double tau = std::max(0.0, config_.nativeVelocitySmoothingMs) / 1000.0;
+  // 一阶低通系数，tau=0 时不平滑。
   const double alpha = tau <= 0.0 ? 1.0 : std::clamp(dtSec / (tau + dtSec), 0.0, 1.0);
   lastRawDelta_[sourceIndex] = {};
   lastFilteredDelta_[sourceIndex] = {};
@@ -1139,6 +1248,7 @@ std::array<double, 6> NativeTeleopController::velocityDeltasUi(
     }
     const bool rotation = axisIndex >= 3;
     const double offset = pose[axisIndex] - referencePose_[sourceIndex][axisIndex];
+    // offset 先经过死区，再按 fullScale 归一化到 [0,1]。
     const double deadzone = rotation ? config_.nativeRotationDeadzoneDeg : config_.nativeTranslationDeadzoneM;
     const double fullScale = std::max(deadzone + 1e-9, rotation ? config_.nativeRotationFullScaleDeg
                                                                  : config_.nativeTranslationFullScaleM);
@@ -1147,6 +1257,7 @@ std::array<double, 6> NativeTeleopController::velocityDeltasUi(
     if (std::abs(offset) > deadzone) {
       const double normalized = std::clamp((std::abs(offset) - deadzone) / (fullScale - deadzone), 0.0, 1.0);
       const double maxVelocity = rotation ? config_.rotationMaxVelocityDegS : config_.translationMaxVelocityUmS;
+      // mappedDirection 把配置中的脉冲方向换算成 UI 方向，避免手写正负号重复。
       const double direction = (offset >= 0.0 ? 1.0 : -1.0) * mappedDirection(sourceIndex, targetSide, axisIndex);
       targetVelocity = direction * normalized * maxVelocity * config_.axisOutputScale[targetIndex][axisIndex];
       lastFilteredDelta_[sourceIndex][axisIndex] = offset;
@@ -1166,6 +1277,7 @@ std::array<double, 6> NativeTeleopController::incrementalDeltasUi(
     int sourceIndex,
     Side targetSide,
     const std::array<double, 6>& pose) {
+  // incremental_position：主手相对 reference 的微小变化直接转换成本帧位置增量。
   std::array<double, 6> deltas{};
   incrementalInputActive_[sourceIndex] = false;
   const int targetIndex = sideIndex(targetSide);
@@ -1191,10 +1303,13 @@ std::array<double, 6> NativeTeleopController::incrementalDeltasUi(
     }
     double filteredDelta = 0.0;
     if (config_.continuousIncrementMode) {
+      // 连续增量模式保留亚脉冲残差，只用 input epsilon 做输入门控。
       filteredDelta = aboveInputThreshold ? rawDelta : 0.0;
     } else if (rotation) {
+      // 非连续模式下旋转轴使用简单死区。
       filteredDelta = applyDeadzone(rawDelta, config_.rotationDeadzoneDeg);
     } else {
+      // 非连续模式下平移轴累积到有效阈值后一次性释放，反向需要更大阈值。
       const double baseFiltered = applyDeadzone(rawDelta, config_.translationDeadzoneM);
       if (std::abs(baseFiltered) >= 1e-12) {
         auto& carry = incrementalCarry_[sourceIndex][axisIndex];
@@ -1219,13 +1334,14 @@ std::array<double, 6> NativeTeleopController::incrementalDeltasUi(
     lastFilteredDelta_[sourceIndex][axisIndex] = filteredDelta;
     const double scale = (rotation ? config_.rotationScale[sourceIndex] : config_.translationScale[sourceIndex])
         * config_.axisOutputScale[targetIndex][axisIndex];
-    const double impulsePulse = filteredDelta * config_.impulseCoeff[sourceIndex][axisIndex];
+    const double impulsePulse = filteredDelta * config_.impulseCoeff[targetIndex][axisIndex];
     const double requestedPulseFloat = impulsePulse * scale;
     lastRequestedPulse_[sourceIndex][axisIndex] = requestedPulseFloat;
     double requestedPulse = requestedPulseFloat;
     if (config_.continuousIncrementMode) {
       auto& pulseCarry = continuousPulseCarry_[sourceIndex][axisIndex];
       if (std::abs(requestedPulseFloat) > 1e-12) {
+        // requestedPulseFloat 可能小于 1 pulse，先累计到 carry，再由 gate 决定是否发出。
         pulseCarry += requestedPulseFloat;
         requestedPulse = static_cast<double>(applyContinuousPulseGate(
             sourceIndex,
@@ -1251,6 +1367,7 @@ std::array<double, 6> NativeTeleopController::incrementalDeltasUi(
     }
     lastEmittedPulse_[sourceIndex][axisIndex] = requestedPulse;
     const auto axis = static_cast<SemanticAxis>(axisIndex);
+    // LTDMCDriver 接收 UI 单位，需把最终脉冲输出换算回 um/degree 增量。
     const double unitPulse = pulsePerUnit(targetSide, axis);
     const double physical = requestedPulse / unitPulse;
     deltas[axisIndex] = rotation ? physical : physical * 1000.0;
@@ -1264,6 +1381,7 @@ long NativeTeleopController::applyContinuousPulseGate(
     int axisIndex,
     long requestedPulse,
     double requestedPulseFloat) {
+  // 连续模式的 gate 保证输出脉冲超过控制卡死区，同时对极小脉冲做确认计数。
   if (std::abs(requestedPulseFloat) <= 1e-12) {
     continuousDirection_[sourceIndex][axisIndex] = 0;
     continuousStreak_[sourceIndex][axisIndex] = 0;
@@ -1281,6 +1399,7 @@ long NativeTeleopController::applyContinuousPulseGate(
   auto& direction = continuousDirection_[sourceIndex][axisIndex];
   auto& streak = continuousStreak_[sourceIndex][axisIndex];
   if (std::abs(requestedPulse) >= minimum) {
+    // 已经达到最小有效脉冲，直接允许发出并刷新方向。
     direction = sign;
     streak = config_.continuousMicroConfirmTicks;
     return requestedPulse;
@@ -1289,6 +1408,7 @@ long NativeTeleopController::applyContinuousPulseGate(
     return 0;
   }
   if (direction == sign) {
+    // 未达到最小脉冲时，只有连续同向微输入累计到确认次数才放行。
     ++streak;
   } else {
     direction = sign;
@@ -1307,6 +1427,7 @@ void NativeTeleopController::tickGrippers(const std::array<Omega7State, 2>& hand
   }
   const auto now = std::chrono::steady_clock::now();
   for (int targetIndex = 0; targetIndex < 2; ++targetIndex) {
+    // 每个目标夹爪可配置从哪只主手读取开口，默认与运动通道相反。
     const int sourceIndex = gripperSourceIndex(targetIndex);
     const auto& hand = hands[sourceIndex];
     if (!hand.connected || !hand.lastReadOk) {
@@ -1315,6 +1436,7 @@ void NativeTeleopController::tickGrippers(const std::array<Omega7State, 2>& hand
     }
     double targetMm = gripperTargetsMm_[targetIndex];
     if (hand.gripperGapAvailable) {
+      // 首选主手真实开口，把 [minGap,maxGap] 线性映射到 Jodell 行程。
       const double gapMm = hand.gripperGap * 1000.0;
       const double minGap = config_.gripperGapMinMm[targetIndex];
       const double maxGap = std::max(minGap + 1e-6, config_.gripperGapMaxMm[targetIndex]);
@@ -1324,6 +1446,7 @@ void NativeTeleopController::tickGrippers(const std::array<Omega7State, 2>& hand
       }
       targetMm = openRatio * std::max(0.001, config_.gripper.strokeMm);
     } else if (config_.gripperButtonFallback) {
+      // 主手无开口传感时，用按钮做全开/全闭兜底。
       targetMm = hand.gripperPressed ? 0.0 : std::max(0.001, config_.gripper.strokeMm);
     } else {
       continue;
@@ -1332,6 +1455,7 @@ void NativeTeleopController::tickGrippers(const std::array<Omega7State, 2>& hand
     const int raw = static_cast<int>(std::lround(
         (std::max(0.001, config_.gripper.strokeMm) - std::clamp(targetMm, 0.0, config_.gripper.strokeMm))
         / std::max(0.001, config_.gripper.strokeMm) * 255.0));
+    // 串口命令按最小间隔和 raw 死区双重限频。
     const auto elapsedMs = std::chrono::duration<double, std::milli>(now - gripperLastCommandAt_[targetIndex]).count();
     if (gripperLastRaw_[targetIndex] >= 0 && elapsedMs < config_.gripperMinCommandIntervalMs) {
       continue;
@@ -1355,19 +1479,24 @@ void NativeTeleopController::enqueueGripperCommand(
     int speed,
     int torque) {
   if (!gripperWorkerRunning_.load()) {
+    // worker 未运行时调用方应走同步 commandGripperTarget 路径。
     return;
   }
   {
     std::scoped_lock lock(gripperMutex_);
+    // 只保存每侧最新目标，避免高频 teleop 造成积压队列。
     pendingGripperCommands_[targetIndex] = PendingGripperCommand{true, targetIndex, side, targetMm, speed, torque};
   }
   gripperCv_.notify_one();
 }
 
 double NativeTeleopController::mappedDirection(int sourceIndex, Side targetSide, int axisIndex) const {
+  (void)sourceIndex;
+  const int targetIndex = sideIndex(targetSide);
+  // 用 impulseCoeff 和 pulsePerUnit 推导方向，确保方向约定与真实脉冲映射一致。
   const bool rotation = axisIndex >= 3;
   const double sourceUnit = rotation ? 1.0 : 1e-6;
-  const double pulse = sourceUnit * config_.impulseCoeff[sourceIndex][axisIndex];
+  const double pulse = sourceUnit * config_.impulseCoeff[targetIndex][axisIndex];
   const auto axis = static_cast<SemanticAxis>(axisIndex);
   const double ui = rotation ? pulse / pulsePerUnit(targetSide, axis) : pulse / pulsePerUnit(targetSide, axis) * 1000.0;
   return ui >= 0.0 ? 1.0 : -1.0;
@@ -1377,6 +1506,7 @@ void NativeTeleopController::setBlockerUnlocked(
     int sourceIndex,
     const std::string& state,
     const std::string& message) {
+  // blocker 描述当前输入通道是否正在输出、等待参考或被安全条件阻断。
   blockerState_[sourceIndex] = state;
   blockerMessage_[sourceIndex] = message;
 }
@@ -1385,11 +1515,13 @@ void NativeTeleopController::recordActionUnlocked(
     Side sourceSide,
     Side targetSide,
     const TeleopTargetUpdateResult& result) {
+  // 连续两个零动作只记录一次，避免 actionHistory 被静止帧填满。
   const bool appliedMotion = hasMotion(result.appliedDeltaUi);
   if (!appliedMotion && hasLastAction_ && !hasMotion(lastAction_.deltas)) {
     return;
   }
   int dominant = 0;
+  // dominant 轴用于前端摘要显示；完整 6 轴数据仍保留在 deltas 中。
   for (int i = 1; i < 6; ++i) {
     if (std::abs(result.appliedDeltaUi[i]) > std::abs(result.appliedDeltaUi[dominant])) {
       dominant = i;
@@ -1409,6 +1541,8 @@ void NativeTeleopController::recordActionUnlocked(
   action.currentPulse = result.currentPulse;
   action.launchDeltaPulse = result.launchDeltaPulse;
   action.updateReturn = result.updateReturn;
+  action.stopReason = result.stopReason;
+  action.axisIoStatus = result.axisIoStatus;
   action.movingBefore = result.movingBefore;
   action.moveStarted = result.moveStarted;
   action.clipped = result.clipped;
@@ -1420,11 +1554,13 @@ void NativeTeleopController::recordActionUnlocked(
   hasLastAction_ = true;
   actionHistory_.push_back(action);
   while (actionHistory_.size() > 1000) {
+    // 控制历史只保留最近窗口，防止长时间运行内存无限增长。
     actionHistory_.pop_front();
   }
 }
 
 void NativeTeleopController::recordZeroStopActionUnlocked(Side sourceSide, Side targetSide) {
+  // 记录一次显式停止动作，帮助前端区分“没有动作”和“刚刚停止”。
   if (hasLastAction_ && !hasMotion(lastAction_.deltas)) {
     return;
   }
@@ -1444,6 +1580,7 @@ void NativeTeleopController::recordZeroStopActionUnlocked(Side sourceSide, Side 
 }
 
 int NativeTeleopController::gripperSourceIndex(int targetIndex) const {
+  // 配置值允许 PhysicalLeft/PhysicalRight 等字符串；这里只按包含 left/right 判断。
   std::string source = config_.gripperSourceHand[targetIndex];
   std::transform(source.begin(), source.end(), source.begin(), [](unsigned char ch) {
     return static_cast<char>(std::tolower(ch));
@@ -1458,6 +1595,7 @@ int NativeTeleopController::gripperSourceIndex(int targetIndex) const {
 }
 
 double NativeTeleopController::effectiveGripperTargetMm(double targetMm) const {
+  // 所有夹爪目标统一经过行程夹紧和 ICF 最小间隙保护。
   const double stroke = std::max(0.001, config_.gripper.strokeMm);
   const double bounded = std::clamp(targetMm, 0.0, stroke);
   if (!config_.gripperIcfTargetProtectionEnabled) {

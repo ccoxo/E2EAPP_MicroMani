@@ -18,17 +18,17 @@ DEFAULT_MOTION_PROFILE: dict[str, Any] = {
     },
 }
 
-ICF_TELEOP_STRATEGY_VERSION = "e2e_omega7_native_v27_right_yaw333_com9_20260520"
+ICF_TELEOP_STRATEGY_VERSION = "e2e_omega7_native_v29_stable_feel_lead_20260612"
 ICF_WORK_ORIGIN_VERSION = "icf_work_origin_20260521_rotation_limit_v2"
 ICF_HOME_REFERENCE_VERSION = "icf_home_reference_20260602_v1"
 
 ICF_CAMERA_DEFAULTS: dict[str, Any] = {
     "global": "IMX335 / index 1",
-    "globalIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&124CCBA8&0&0000",
-    "wristLeft": "IMX335 / index 2",
-    "wristLeftIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&7861A93&0&0000",
-    "wristRight": "IMX335 / index 0",
-    "wristRightIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000",
+    "globalIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000",
+    "wristLeft": "IMX335 / index 0",
+    "wristLeftIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000",
+    "wristRight": "IMX335 / index 2",
+    "wristRightIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000",
     "previewResolution": "640x480",
     "globalResolution": "640x480",
     "wristLeftResolution": "640x480",
@@ -144,8 +144,8 @@ ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "leftRotationScale": 1.0,
     "rightRotationScale": 1.0,
     "homeBeforeStart": True,
-    "leftAxisOutputScale": [0.40, 0.25, 0.25, 0.40, 0.08, 0.10],
-    "rightAxisOutputScale": [0.40, 0.25, 0.25, 0.35, 0.08, 0.15],
+    "leftAxisOutputScale": [0.60, 0.50, 0.375, 0.60, 0.08, 0.10],
+    "rightAxisOutputScale": [0.60, 0.50, 0.375, 0.60, 0.08, 0.001],
     "translationDeadzone": 0.00002,
     "rotationDeadzone": 0.03,
     "incrementalTranslationMinEffectiveDelta": 0.000025,
@@ -176,8 +176,8 @@ ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "leftSoftLimitMax": list(ICF_LEFT_TELEOP_SOFT_LIMIT_MAX),
     "rightSoftLimitMin": list(ICF_RIGHT_TELEOP_SOFT_LIMIT_MIN),
     "rightSoftLimitMax": list(ICF_RIGHT_TELEOP_SOFT_LIMIT_MAX),
-    "leftImpulseCoeff": [-5000000, 5000000, -10000000, 1667, -2500, -333.3333],
-    "rightImpulseCoeff": [-5000000, -10000000, -5000000, 1667, 2500, 3333.333],
+    "leftImpulseCoeff": [-5000000, -5000000, -10000000, 1667, 2500, -333.3333],
+    "rightImpulseCoeff": [-5000000, 10000000, -5000000, 1667, -2500, 3333.333],
     "leftDirectionSign": [1, -1, -1, 1, -1, -1],
     "rightDirectionSign": [1, 1, -1, 1, 1, 1],
     "syncImpulseCoeffFromKinematics": False,

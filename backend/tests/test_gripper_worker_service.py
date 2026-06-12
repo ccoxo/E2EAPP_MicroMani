@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import time
+from threading import Event, Thread
 from typing import Any
 
 from backend.core.defaults import default_config
@@ -34,12 +35,25 @@ class FakeTelemetry:
         self.motion_axis_enabled: dict[str, list[bool | None]] = {}
         self.motion_enabled: dict[str, bool | None] = {}
 
-    def apply_gripper(self, side: str, command: str, target_mm: float | None) -> float:
-        _ = (side, command, target_mm)
+    def apply_gripper(
+        self,
+        side: str,
+        command: str,
+        target_mm: float | None,
+        config: dict[str, Any] | None = None,
+    ) -> float:
+        _ = (side, command, target_mm, config)
         return 0.0
 
-    def apply_axis_move(self, side: str, axis: str, direction: int, step: float) -> float:
-        _ = (side, axis, direction)
+    def apply_axis_move(
+        self,
+        side: str,
+        axis: str,
+        direction: int,
+        step: float,
+        config: dict[str, Any] | None = None,
+    ) -> float:
+        _ = (side, axis, direction, config)
         return step
 
     def set_motion_enabled(self, side: str, enabled: bool | None) -> None:
@@ -167,6 +181,54 @@ def test_gripper_command_uses_dual_worker_when_enabled() -> None:
     assert settings.config["gripper"]["targetLeftMm"] == 7.5
 
 
+def test_gripper_command_dual_worker_path_does_not_block_event_loop() -> None:
+    config = default_config()
+    config["teleop"]["engine"] = "python_mapper"
+    config["gripper"]["sampleMode"] = "dual_worker"
+    config["gripper"]["leftEnabled"] = True
+    settings = FakeSettings(config)
+    hardware = FakeHardware()
+
+    class BlockingWorkers(FakeWorkers):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = Event()
+            self.release = Event()
+
+        def command(self, _config: dict[str, Any], side: str, command: str, target_mm: float | None) -> GripperResult:
+            self.entered.set()
+            self.release.wait(timeout=1.0)
+            return super().command(_config, side, command, target_mm)
+
+    workers = BlockingWorkers()
+    service = CommandService(settings, FakeTelemetry(), FakeHal(), FakeLogs(), hardware, workers)
+
+    async def run_command_with_ticker() -> None:
+        tick_reached = Event()
+        release_saw_tick: list[bool] = []
+
+        def release_worker() -> None:
+            assert workers.entered.wait(timeout=1.0)
+            release_saw_tick.append(tick_reached.wait(timeout=1.0))
+            workers.release.set()
+
+        releaser = Thread(target=release_worker, daemon=True)
+        releaser.start()
+        command_task = asyncio.create_task(
+            service.gripper_command(GripperCommandRequest(side="left", command="target", targetMm=7.5))
+        )
+
+        await asyncio.sleep(0)
+        tick_reached.set()
+
+        result = await asyncio.wait_for(command_task, timeout=2.0)
+        releaser.join(timeout=1.0)
+        assert release_saw_tick == [True]
+        assert result["message"] == "worker command"
+
+    asyncio.run(run_command_with_ticker())
+
+
 def test_gripper_command_close_uses_icf_min_gap_for_worker_path() -> None:
     config = default_config()
     config["teleop"]["engine"] = "python_mapper"
@@ -220,6 +282,56 @@ def test_gripper_command_keeps_direct_driver_when_worker_disabled() -> None:
     assert workers.calls == []
     assert hardware.gripper.calls == [("right", "target", 6.0)]
     assert settings.config["gripper"]["targetRightMm"] == 6.0
+
+
+def test_gripper_command_direct_driver_path_does_not_block_event_loop() -> None:
+    config = default_config()
+    config["teleop"]["engine"] = "python_mapper"
+    config["gripper"]["sampleMode"] = "direct"
+    config["gripper"]["rightEnabled"] = True
+    settings = FakeSettings(config)
+    hardware = FakeHardware()
+
+    class BlockingDirectGripper(FakeDirectGripper):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = Event()
+            self.release = Event()
+
+        def command(self, _config: dict[str, Any], side: str, command: str, target_mm: float | None) -> GripperResult:
+            self.entered.set()
+            self.release.wait(timeout=1.0)
+            return super().command(_config, side, command, target_mm)
+
+    blocking_gripper = BlockingDirectGripper()
+    hardware.gripper = blocking_gripper
+    workers = FakeWorkers()
+    service = CommandService(settings, FakeTelemetry(), FakeHal(), FakeLogs(), hardware, workers)
+
+    async def run_command_with_ticker() -> None:
+        tick_reached = Event()
+        release_saw_tick: list[bool] = []
+
+        def release_driver() -> None:
+            assert blocking_gripper.entered.wait(timeout=1.0)
+            release_saw_tick.append(tick_reached.wait(timeout=1.0))
+            blocking_gripper.release.set()
+
+        releaser = Thread(target=release_driver, daemon=True)
+        releaser.start()
+        command_task = asyncio.create_task(
+            service.gripper_command(GripperCommandRequest(side="right", command="target", targetMm=6.0))
+        )
+
+        await asyncio.sleep(0)
+        tick_reached.set()
+
+        result = await asyncio.wait_for(command_task, timeout=2.0)
+        releaser.join(timeout=1.0)
+        assert release_saw_tick == [True]
+        assert result["message"] == "direct command"
+
+    asyncio.run(run_command_with_ticker())
 
 
 def test_dual_worker_gripper_command_rejects_disabled_side() -> None:
@@ -282,6 +394,7 @@ def test_hal_native_gripper_motion_command_auto_enables_disabled_side() -> None:
     config = default_config()
     config["hal"]["mode"] = "real"
     config["teleop"]["engine"] = "hal_native"
+    config["gripper"]["sampleMode"] = "direct"
     config["gripper"]["rightEnabled"] = False
     settings = FakeSettings(config)
     hal = FakeHal()
@@ -318,6 +431,7 @@ def test_hal_native_gripper_close_payload_uses_icf_min_gap() -> None:
     config = default_config()
     config["hal"]["mode"] = "real"
     config["teleop"]["engine"] = "hal_native"
+    config["gripper"]["sampleMode"] = "direct"
     config["gripper"]["rightEnabled"] = True
     settings = FakeSettings(config)
     hal = FakeHal()
@@ -754,19 +868,40 @@ def test_gripper_worker_sync_keeps_workers_when_enabled() -> None:
     assert calls == []
 
 
-def test_gripper_workers_disabled_when_hal_native_owns_gripper() -> None:
+def test_gripper_workers_remain_enabled_in_hal_native_for_python_gripper_teleop() -> None:
     config = default_config()
     config["teleop"]["engine"] = "hal_native"
     config["gripper"]["sampleMode"] = "dual_worker"
     service = GripperWorkerService(FakeSettings(config), FakeLogs())
 
-    assert service.is_enabled(config) is False
+    assert service.is_enabled(config) is True
 
 
-def test_hal_native_gripper_command_routes_manual_target_through_hal() -> None:
+def test_hal_native_gripper_command_uses_dual_worker_when_enabled() -> None:
     config = default_config()
     config["teleop"]["engine"] = "hal_native"
     config["gripper"]["sampleMode"] = "dual_worker"
+    config["gripper"]["leftEnabled"] = True
+    settings = FakeSettings(config)
+    hardware = FakeHardware()
+    workers = FakeWorkers()
+    hal = FakeHal()
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), hardware, workers)
+
+    result = asyncio.run(service.gripper_command(GripperCommandRequest(side="left", command="open")))
+
+    assert result["message"] == "worker command"
+    assert result["targetMm"] == 26
+    assert workers.calls == [("left", "open", None)]
+    assert hal.commands == []
+    assert hardware.gripper.calls == []
+    assert settings.config["gripper"]["targetLeftMm"] == 26
+
+
+def test_hal_native_direct_gripper_command_routes_manual_target_through_hal() -> None:
+    config = default_config()
+    config["teleop"]["engine"] = "hal_native"
+    config["gripper"]["sampleMode"] = "direct"
     config["gripper"]["leftEnabled"] = True
     settings = FakeSettings(config)
     hardware = FakeHardware()
@@ -806,7 +941,7 @@ def test_hal_native_gripper_command_routes_manual_target_through_hal() -> None:
 def test_hal_native_gripper_command_logs_structured_event() -> None:
     config = default_config()
     config["teleop"]["engine"] = "hal_native"
-    config["gripper"]["sampleMode"] = "dual_worker"
+    config["gripper"]["sampleMode"] = "direct"
     config["gripper"]["leftEnabled"] = True
     settings = FakeSettings(config)
     hardware = FakeHardware()
@@ -831,6 +966,7 @@ def test_hal_native_gripper_command_logs_hal_error_for_com9_failure() -> None:
     config = default_config()
     config["hal"]["mode"] = "real"
     config["teleop"]["engine"] = "hal_native"
+    config["gripper"]["sampleMode"] = "direct"
     config["gripper"]["rightEnabled"] = True
     settings = FakeSettings(config)
     logs = LogService(emit_startup=False)
@@ -859,7 +995,7 @@ def test_hal_native_gripper_command_logs_hal_error_for_com9_failure() -> None:
 def test_hal_native_gripper_enable_updates_state_without_python_com() -> None:
     config = default_config()
     config["teleop"]["engine"] = "hal_native"
-    config["gripper"]["sampleMode"] = "dual_worker"
+    config["gripper"]["sampleMode"] = "direct"
     settings = FakeSettings(config)
     hardware = FakeHardware()
     workers = FakeWorkers()
@@ -894,7 +1030,7 @@ def test_hal_native_gripper_enable_updates_state_without_python_com() -> None:
     assert settings.config["gripper"]["leftEnabled"] is True
 
 
-def test_telemetry_skips_python_gripper_sampling_when_hal_native_owns_gripper() -> None:
+def test_telemetry_uses_python_gripper_worker_samples_in_hal_native_mode() -> None:
     class FakeWorkerSamples:
         calls = 0
 
@@ -914,7 +1050,7 @@ def test_telemetry_skips_python_gripper_sampling_when_hal_native_owns_gripper() 
 
     telemetry.refresh_gripper_positions(config, now=999.0)
 
-    assert worker.calls == 0
+    assert worker.calls == 1
 
 
 def test_telemetry_shutdown_closes_hardware_executor_and_cameras() -> None:

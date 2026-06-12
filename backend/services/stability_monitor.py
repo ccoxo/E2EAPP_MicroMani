@@ -90,6 +90,9 @@ class StabilityMonitorService:
         status["errors"] = list(self._status.get("errors", []))
         return status
 
+    async def _get_config_async(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self.settings.get_config)
+
     async def _run(
         self,
         duration_s: float,
@@ -117,7 +120,7 @@ class StabilityMonitorService:
             self._status["finishedAt"] = now_ms()
 
     async def _sample(self, include_cameras: bool, include_force: bool, attempt_reconnect: bool) -> None:
-        config = self.settings.get_config()
+        config = await self._get_config_async()
         hal_health = await self.hal.health()
         hal_status = self._status["hal"]
         hal_status["samples"] = int(hal_status["samples"]) + 1
