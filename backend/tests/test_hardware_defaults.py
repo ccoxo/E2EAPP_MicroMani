@@ -1,6 +1,17 @@
 from __future__ import annotations
 
+import pytest
+
 from backend.core.defaults import default_config
+
+
+def _target_arm_gain(config: dict, side: str, axis_index: int) -> float:
+    teleop = config["teleop"]
+    kinematics = config["motion"]["kinematics"]
+    coeff = abs(float(teleop[f"{side}ImpulseCoeff"][axis_index]))
+    pulse_per_unit = abs(float(kinematics[f"{side}SignedPulsePerUnit"][axis_index]))
+    scale = float(teleop[f"{side}AxisOutputScale"][axis_index])
+    return coeff / pulse_per_unit * scale
 
 
 def test_hal_defaults_use_backend_hal_boundary() -> None:
@@ -55,33 +66,33 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["kalmanRotationProcessVelocityVariance"] == 1e-3
     assert teleop["kalmanTranslationIntentVelocityThreshold"] == 0.0005
     assert teleop["kalmanRotationIntentVelocityThreshold"] == 0.5
-    assert teleop["strategyVersion"] == "e2e_omega7_native_v28_gripper_python_right_y_20260611"
+    assert teleop["strategyVersion"] == "e2e_omega7_native_v29_stable_feel_lead_20260612"
     assert teleop["mappingMode"] == "direct"
     assert teleop["swapHands"] is False
     assert teleop["swapTeleopChannels"] is True
     assert teleop["stabilityMode"] == "off"
-    assert teleop["leftTranslationScale"] == 1.25
-    assert teleop["rightTranslationScale"] == 1.25
-    assert teleop["leftRotationScale"] == 1.20
-    assert teleop["rightRotationScale"] == 1.20
+    assert teleop["leftTranslationScale"] == 1.0
+    assert teleop["rightTranslationScale"] == 1.0
+    assert teleop["leftRotationScale"] == 1.0
+    assert teleop["rightRotationScale"] == 1.0
     assert teleop["leftForceFeedback"] is True
     assert teleop["rightForceFeedback"] is True
-    assert teleop["leftAxisOutputScale"] == [0.65, 0.45, 0.45, 0.60, 0.16, 0.20]
-    assert teleop["rightAxisOutputScale"] == [0.65, 0.45, 0.45, 0.55, 0.16, 0.25]
+    assert teleop["leftAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.10]
+    assert teleop["rightAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.001]
     assert teleop["translationStepLimitPulse"] == 4000
     assert teleop["rotationStepLimitPulse"] == 1250
     assert teleop["translationPulseDeadband"] == 2
     assert teleop["rotationPulseDeadband"] == 2
-    assert teleop["translationStartVelocityUmS"] == 1500.0
-    assert teleop["translationMaxVelocityUmS"] == 20000.0
-    assert teleop["rotationStartVelocityDegS"] == 2.5
-    assert teleop["rotationMaxVelocityDegS"] == 30.0
+    assert teleop["translationStartVelocityUmS"] == 600.0
+    assert teleop["translationMaxVelocityUmS"] == 8000.0
+    assert teleop["rotationStartVelocityDegS"] == 1.0
+    assert teleop["rotationMaxVelocityDegS"] == 12.0
     assert teleop["continuousIncrementMode"] is True
-    assert teleop["translationInputEpsilon"] == 0.000005
-    assert teleop["rotationInputEpsilon"] == 0.08
+    assert teleop["translationInputEpsilon"] == 0.00002
+    assert teleop["rotationInputEpsilon"] == 0.03
     assert teleop["translationMinActivePulse"] == 3
     assert teleop["rotationMinActivePulse"] == 3
-    assert teleop["continuousMicroConfirmTicks"] == 2
+    assert teleop["continuousMicroConfirmTicks"] == 0
     assert teleop["diagLog"] is False
     assert teleop["leftEnabledAxes"] == [True] * 6
     assert teleop["rightEnabledAxes"] == [True, True, True, True, True, False]
@@ -208,9 +219,30 @@ def test_native_teleop_xy_signs_match_corrected_right_y_stage_direction() -> Non
 def test_native_teleop_axis_scales_use_icf_effective_output_scale() -> None:
     teleop = default_config()["teleop"]
 
-    assert teleop["leftTranslationScale"] == 1.25
-    assert teleop["rightTranslationScale"] == 1.25
-    assert teleop["leftRotationScale"] == 1.20
-    assert teleop["rightRotationScale"] == 1.20
-    assert teleop["leftAxisOutputScale"] == [0.65, 0.45, 0.45, 0.60, 0.16, 0.20]
-    assert teleop["rightAxisOutputScale"] == [0.65, 0.45, 0.45, 0.55, 0.16, 0.25]
+    assert teleop["leftTranslationScale"] == 1.0
+    assert teleop["rightTranslationScale"] == 1.0
+    assert teleop["leftRotationScale"] == 1.0
+    assert teleop["rightRotationScale"] == 1.0
+    assert teleop["leftAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.10]
+    assert teleop["rightAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.001]
+
+
+def test_native_teleop_axis_scales_match_requested_left_boost_and_right_feel() -> None:
+    config = default_config()
+    teleop = config["teleop"]
+
+    old_left_gains = [400.0, 250.0, 250.0, 0.40008, 0.08, 0.01]
+    expected_left_gains = [
+        old_left_gains[0] * 1.5,
+        old_left_gains[1] * 2.0,
+        old_left_gains[2] * 1.5,
+        old_left_gains[3] * 1.5,
+        old_left_gains[4],
+        old_left_gains[5],
+    ]
+
+    for axis_index, expected in enumerate(expected_left_gains):
+        assert _target_arm_gain(config, "left", axis_index) == pytest.approx(expected, rel=5e-4)
+        assert _target_arm_gain(config, "right", axis_index) == pytest.approx(expected, rel=5e-4)
+
+    assert teleop["rightEnabledAxes"][5] is False

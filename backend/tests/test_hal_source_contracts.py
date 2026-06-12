@@ -75,7 +75,7 @@ def test_hal_teleop_target_update_uses_absolute_target_mode() -> None:
         "void LTDMCDriver::stopTeleopSide", 1
     )[0]
 
-    assert "const auto updateTargetPulse = static_cast<long>(std::llround(targetPulse));" in normalized
+    assert "const auto updateTargetPulse = static_cast<long>(std::llround(leadLimitedTargetPulse));" in normalized
     assert "updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse)" in normalized
     assert "TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(" in source
     assert "result.appliedDeltaUi[axisIndex]" in source
@@ -467,20 +467,21 @@ def test_hal_native_teleop_controller_is_wired_to_server_and_build() -> None:
     assert "forceOutputEnabled" in source
 
 
-def test_hal_native_controller_defaults_match_site_corrected_output_and_xy_signs() -> None:
+def test_hal_native_controller_defaults_match_stable_window_output_and_xy_signs() -> None:
     header = (REPO_ROOT / "hal" / "include" / "NativeTeleopController.h").read_text(encoding="utf-8")
     normalized = " ".join(header.split())
 
-    assert "std::array<double, 2> translationScale{{1.25, 1.25}}" in normalized
-    assert "std::array<double, 2> rotationScale{{1.20, 1.20}}" in normalized
-    assert "{0.65, 0.45, 0.45, 0.60, 0.16, 0.20}" in normalized
-    assert "{0.65, 0.45, 0.45, 0.55, 0.16, 0.25}" in normalized
-    assert "double translationStartVelocityUmS{1500.0}" in normalized
-    assert "double translationMaxVelocityUmS{20000.0}" in normalized
-    assert "double rotationStartVelocityDegS{2.5}" in normalized
-    assert "double rotationMaxVelocityDegS{30.0}" in normalized
-    assert "double accTimeSec{0.03}" in normalized
-    assert "double decTimeSec{0.03}" in normalized
+    assert "std::array<double, 2> translationScale{{1.0, 1.0}}" in normalized
+    assert "std::array<double, 2> rotationScale{{1.0, 1.0}}" in normalized
+    assert "{0.60, 0.50, 0.375, 0.60, 0.08, 0.10}" in normalized
+    assert "{0.60, 0.50, 0.375, 0.60, 0.08, 0.001}" in normalized
+    assert "{true, true, true, true, true, false}" in normalized
+    assert "double translationStartVelocityUmS{600.0}" in normalized
+    assert "double translationMaxVelocityUmS{8000.0}" in normalized
+    assert "double rotationStartVelocityDegS{1.0}" in normalized
+    assert "double rotationMaxVelocityDegS{12.0}" in normalized
+    assert "double accTimeSec{0.05}" in normalized
+    assert "double decTimeSec{0.05}" in normalized
     assert "{-5000000.0, -5000000.0, -10000000.0, 1667.0, 2500.0, -333.3333}" in normalized
     assert "{-5000000.0, 10000000.0, -5000000.0, 1667.0, -2500.0, 3333.333}" in normalized
     assert "bool gripperTeleopEnabled{false}" in normalized
@@ -1148,6 +1149,50 @@ def test_ltdmc_native_teleop_reattaches_moving_axis_without_reprofiling_busy_axi
     assert body.index("const bool shouldLaunchMove") < body.index("applyMotionProfile(")
 
 
+def test_ltdmc_native_teleop_accumulates_active_target_with_bounded_lead() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
+    normalized = " ".join(source.split())
+    body = source.split("TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(", 1)[1].split(
+        "void LTDMCDriver::stopTeleopSide",
+        1,
+    )[0]
+
+    assert "long maxTeleopTargetLeadPulse(" in source
+    assert "double clampTeleopTargetLead(" in source
+    assert "const bool reversingTargetLead =" in body
+    assert (
+        "const auto targetBasePulse = teleopTargetActive_[index] && !reversingTargetLead "
+        "? teleopTargetPulse_[index] : actualPulse;"
+        in normalized
+    )
+    assert "const auto targetLeadPulse = maxTeleopTargetLeadPulse(" in body
+    assert "const auto unclippedTargetPulse = targetBasePulse + static_cast<double>(deltaPulse);" in body
+    assert "const auto leadLimitedTargetPulse = clampTeleopTargetLead(actualPulse, targetPulse, targetLeadPulse);" in body
+    assert "const auto launchDeltaPulse = static_cast<long>(std::llround(appliedTargetPulse - actualPulse));" in body
+    assert body.index("const bool reversingTargetLead") < body.index("const auto unclippedTargetPulse")
+
+
+def test_ltdmc_native_teleop_relaunches_when_target_update_misses_pmove_window() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
+    body = source.split("TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(", 1)[1].split(
+        "void LTDMCDriver::stopTeleopSide",
+        1,
+    )[0]
+
+    assert "bool teleopTargetUpdateMissedWindow(int updateReturn)" in source
+    assert "const auto updateReturn = updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse);" in body
+    assert "if (moving && teleopTargetUpdateMissedWindow(updateReturn)) {" in body
+    missed_window_branch = body.split("if (moving && teleopTargetUpdateMissedWindow(updateReturn)) {", 1)[1].split(
+        "#else",
+        1,
+    )[0]
+    assert "const auto relaunchCurrentPulse = static_cast<double>(dmcGetPosition(card, axisNo));" in missed_window_branch
+    assert "const auto relaunchDeltaPulse =" in missed_window_branch
+    assert "applyMotionProfile(card, axisNo, startVelocityPulse, maxVelocityPulse, tacc, tdec, relaunchDeltaPulse)" in missed_window_branch
+    assert "result.moveStarted[axisIndex] = true;" in missed_window_branch
+    assert "result.launchDeltaPulse[axisIndex] = static_cast<double>(relaunchDeltaPulse);" in missed_window_branch
+
+
 def test_omega7_gripper_gap_uses_direct_encoder_and_angle_fallbacks() -> None:
     source = (REPO_ROOT / "hal" / "src" / "Omega7Driver.cpp").read_text(encoding="utf-8")
     read_body = source.split("std::array<Omega7State, 2> Omega7Driver::readState()", 1)[1].split(
@@ -1196,11 +1241,11 @@ def test_hal_native_incremental_honors_continuous_increment_settings() -> None:
     )[0]
 
     assert "bool continuousIncrementMode{true}" in header
-    assert "double translationInputEpsilonM{0.000005}" in header
-    assert "double rotationInputEpsilonDeg{0.08}" in header
+    assert "double translationInputEpsilonM{0.00002}" in header
+    assert "double rotationInputEpsilonDeg{0.03}" in header
     assert "double translationMinActivePulse{3.0}" in header
     assert "double rotationMinActivePulse{3.0}" in header
-    assert "int continuousMicroConfirmTicks{2}" in header
+    assert "int continuousMicroConfirmTicks{0}" in header
     assert "continuousDirection_" in header
     assert "continuousStreak_" in header
     assert "applyContinuousPulseGate" in header
@@ -1212,12 +1257,12 @@ def test_hal_native_incremental_honors_continuous_increment_settings() -> None:
     assert "config_.translationInputEpsilonM" in incremental_body
     assert "config_.rotationInputEpsilonDeg" in incremental_body
     assert "applyContinuousPulseGate(" in incremental_body
-    assert "constexpr double kRotationInputEpsilonFloorDeg = 0.08;" in source
-    assert "constexpr double kTranslationMicroConfirmUpperM = 0.00002;" in source
-    assert "constexpr double kRotationMicroConfirmUpperDeg = 0.18;" in source
-    assert "constexpr int kContinuousMicroConfirmTicksFloor = 2;" in source
-    assert "std::max(kRotationInputEpsilonFloorDeg, normalized.rotationInputEpsilonDeg)" in source
-    assert "std::max(kContinuousMicroConfirmTicksFloor, normalized.continuousMicroConfirmTicks)" in source
+    assert "kRotationInputEpsilonFloorDeg" not in source
+    assert "kTranslationMicroConfirmUpperM" not in source
+    assert "kRotationMicroConfirmUpperDeg" not in source
+    assert "kContinuousMicroConfirmTicksFloor" not in source
+    assert "std::max(0.0, normalized.rotationInputEpsilonDeg)" in source
+    assert "std::max(0, normalized.continuousMicroConfirmTicks)" in source
     assert "if (config_.continuousMicroConfirmTicks <= 0)" in source
 
 
@@ -1449,6 +1494,8 @@ def test_hal_native_gripper_uses_isolated_jodell_worker_processes() -> None:
     assert "ensureProcessWorkerUnlocked" in gripper_source
     assert "CreateProcessA" in gripper_source
     assert "JodellGripperWorker.exe" in gripper_source
+    assert 'std::getenv("APPSTATION_JODELL_WORKER_EXE")' in gripper_source
+    assert "workerOverride[0] != '\\0'" in gripper_source
     assert "commandProcessWorkerUnlocked" in gripper_source
     assert "closeProcessWorkersUnlocked" in gripper_source
     assert "processWorkersEnabled = false" in worker_source

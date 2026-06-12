@@ -799,6 +799,20 @@ class SettingsService:
             if teleop.get("swapTeleopChannels") is False:
                 teleop["swapTeleopChannels"] = ICF_TELEOP_DEFAULTS["swapTeleopChannels"]
             try:
+                scale_defaults = (
+                    float(teleop.get("leftTranslationScale", 0.0)),
+                    float(teleop.get("rightTranslationScale", 0.0)),
+                    float(teleop.get("leftRotationScale", 0.0)),
+                    float(teleop.get("rightRotationScale", 0.0)),
+                )
+            except (TypeError, ValueError):
+                scale_defaults = (0.0, 0.0, 0.0, 0.0)
+            if scale_defaults == (1.25, 1.25, 1.20, 1.20):
+                teleop["leftTranslationScale"] = ICF_TELEOP_DEFAULTS["leftTranslationScale"]
+                teleop["rightTranslationScale"] = ICF_TELEOP_DEFAULTS["rightTranslationScale"]
+                teleop["leftRotationScale"] = ICF_TELEOP_DEFAULTS["leftRotationScale"]
+                teleop["rightRotationScale"] = ICF_TELEOP_DEFAULTS["rightRotationScale"]
+            try:
                 translation_speed = (
                     float(teleop.get("translationStartVelocityUmS", 0.0)),
                     float(teleop.get("translationMaxVelocityUmS", 0.0)),
@@ -828,6 +842,10 @@ class SettingsService:
             if profile_times in {(0.05, 0.05), (0.04, 0.04)}:
                 teleop["motionProfileAccSec"] = ICF_TELEOP_DEFAULTS["motionProfileAccSec"]
                 teleop["motionProfileDecSec"] = ICF_TELEOP_DEFAULTS["motionProfileDecSec"]
+            if teleop.get("leftAxisOutputScale") == [0.65, 0.45, 0.45, 0.60, 0.16, 0.20]:
+                teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
+            if teleop.get("rightAxisOutputScale") == [0.65, 0.45, 0.45, 0.55, 0.16, 0.25]:
+                teleop["rightAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["rightAxisOutputScale"]))
             if teleop.get("leftAxisOutputScale") == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]:
                 teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
             if teleop.get("rightAxisOutputScale") == [0.40, 0.25, 0.25, 0.40, 0.20, 0.20]:
@@ -835,6 +853,10 @@ class SettingsService:
             if teleop.get("leftAxisOutputScale") == [0.40, 0.25, 0.25, 0.40, 0.10, 0.15]:
                 teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
             if teleop.get("rightAxisOutputScale") == [0.40, 0.25, 0.25, 0.40, 0.10, 0.15]:
+                teleop["rightAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["rightAxisOutputScale"]))
+            if teleop.get("leftAxisOutputScale") == [0.40, 0.25, 0.25, 0.40, 0.08, 0.10]:
+                teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
+            if teleop.get("rightAxisOutputScale") == [0.40, 0.25, 0.25, 0.35, 0.08, 0.15]:
                 teleop["rightAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["rightAxisOutputScale"]))
             if teleop.get("leftAxisOutputScale") == [0.20, 0.20, 0.20, 0.25, 0.25, 1.00]:
                 teleop["leftAxisOutputScale"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftAxisOutputScale"]))
@@ -856,11 +878,19 @@ class SettingsService:
                 teleop["translationDeadzone"] = ICF_TELEOP_DEFAULTS["translationDeadzone"]
             if float(teleop.get("rotationDeadzone", 0.0)) == 0.02:
                 teleop["rotationDeadzone"] = ICF_TELEOP_DEFAULTS["rotationDeadzone"]
-            if float(teleop.get("translationInputEpsilon", 0.0)) in {1e-7, 0.00002}:
+            if float(teleop.get("translationPulseDeadband", 0.0)) == 2:
+                teleop["translationPulseDeadband"] = ICF_TELEOP_DEFAULTS["translationPulseDeadband"]
+            if float(teleop.get("rotationPulseDeadband", 0.0)) == 2:
+                teleop["rotationPulseDeadband"] = ICF_TELEOP_DEFAULTS["rotationPulseDeadband"]
+            if float(teleop.get("translationInputEpsilon", 0.0)) in {0.000005, 0.00002}:
                 teleop["translationInputEpsilon"] = ICF_TELEOP_DEFAULTS["translationInputEpsilon"]
-            if float(teleop.get("rotationInputEpsilon", 0.0)) in {0.001, 0.03, 0.12}:
+            if float(teleop.get("rotationInputEpsilon", 0.0)) in {0.03, 0.08, 0.12}:
                 teleop["rotationInputEpsilon"] = ICF_TELEOP_DEFAULTS["rotationInputEpsilon"]
-            if int(teleop.get("continuousMicroConfirmTicks", 0)) < ICF_TELEOP_DEFAULTS["continuousMicroConfirmTicks"]:
+            if float(teleop.get("translationMinActivePulse", 0.0)) == 3:
+                teleop["translationMinActivePulse"] = ICF_TELEOP_DEFAULTS["translationMinActivePulse"]
+            if float(teleop.get("rotationMinActivePulse", 0.0)) == 3:
+                teleop["rotationMinActivePulse"] = ICF_TELEOP_DEFAULTS["rotationMinActivePulse"]
+            if int(teleop.get("continuousMicroConfirmTicks", 0)) == 2:
                 teleop["continuousMicroConfirmTicks"] = ICF_TELEOP_DEFAULTS["continuousMicroConfirmTicks"]
             if teleop.get("leftDirectionSign") != ICF_TELEOP_DEFAULTS["leftDirectionSign"]:
                 teleop["leftDirectionSign"] = json.loads(json.dumps(ICF_TELEOP_DEFAULTS["leftDirectionSign"]))
@@ -972,10 +1002,14 @@ class SettingsService:
                 for key in ("leftGapMaxMm", "rightGapMaxMm"):
                     if float(gripper_teleop.get(key, 25.0)) == 50.0:
                         gripper_teleop[key] = 25.0
-            if gripper_teleop.get("leftSourceHand") != "PhysicalRight":
+            if (
+                gripper_teleop.get("leftSourceHand") == "PhysicalLeft"
+                and gripper_teleop.get("rightSourceHand") == "PhysicalRight"
+            ):
                 gripper_teleop["leftSourceHand"] = "PhysicalRight"
-            if gripper_teleop.get("rightSourceHand") != "PhysicalLeft":
                 gripper_teleop["rightSourceHand"] = "PhysicalLeft"
+            gripper_teleop.setdefault("leftSourceHand", "PhysicalRight")
+            gripper_teleop.setdefault("rightSourceHand", "PhysicalLeft")
             gripper_teleop.setdefault("leftGapInvert", False)
             if teleop.get("engine") == "hal_native" and gripper_teleop.get("rightGapInvert") is True:
                 gripper_teleop["rightGapInvert"] = False

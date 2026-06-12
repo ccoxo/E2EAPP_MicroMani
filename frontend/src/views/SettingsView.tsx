@@ -2396,20 +2396,20 @@ function TeleopHandCard({
         </Form.Item>
         <Form.Item label="Translation speed um/s">
           <Space.Compact>
-            <InputNumber min={0} value={config.teleop.translationStartVelocityUmS} onChange={(value) => updateTeleop({ translationStartVelocityUmS: Number(value ?? 1500) })} />
-            <InputNumber min={1} value={config.teleop.translationMaxVelocityUmS} onChange={(value) => updateTeleop({ translationMaxVelocityUmS: Number(value ?? 20000) })} />
+            <InputNumber min={0} value={config.teleop.translationStartVelocityUmS} onChange={(value) => updateTeleop({ translationStartVelocityUmS: Number(value ?? 600) })} />
+            <InputNumber min={1} value={config.teleop.translationMaxVelocityUmS} onChange={(value) => updateTeleop({ translationMaxVelocityUmS: Number(value ?? 8000) })} />
           </Space.Compact>
         </Form.Item>
         <Form.Item label="Rotation speed deg/s">
           <Space.Compact>
-            <InputNumber min={0} step={0.05} value={config.teleop.rotationStartVelocityDegS} onChange={(value) => updateTeleop({ rotationStartVelocityDegS: Number(value ?? 2.5) })} />
-            <InputNumber min={1} step={0.1} value={config.teleop.rotationMaxVelocityDegS} onChange={(value) => updateTeleop({ rotationMaxVelocityDegS: Number(value ?? 30) })} />
+            <InputNumber min={0} step={0.05} value={config.teleop.rotationStartVelocityDegS} onChange={(value) => updateTeleop({ rotationStartVelocityDegS: Number(value ?? 1) })} />
+            <InputNumber min={1} step={0.1} value={config.teleop.rotationMaxVelocityDegS} onChange={(value) => updateTeleop({ rotationMaxVelocityDegS: Number(value ?? 12) })} />
           </Space.Compact>
         </Form.Item>
         <Form.Item label="Profile acc/dec s">
           <Space.Compact>
-            <InputNumber min={0.001} step={0.01} value={config.teleop.motionProfileAccSec} onChange={(value) => updateTeleop({ motionProfileAccSec: Number(value ?? 0.03) })} />
-            <InputNumber min={0.001} step={0.01} value={config.teleop.motionProfileDecSec} onChange={(value) => updateTeleop({ motionProfileDecSec: Number(value ?? 0.03) })} />
+            <InputNumber min={0.001} step={0.01} value={config.teleop.motionProfileAccSec} onChange={(value) => updateTeleop({ motionProfileAccSec: Number(value ?? 0.05) })} />
+            <InputNumber min={0.001} step={0.01} value={config.teleop.motionProfileDecSec} onChange={(value) => updateTeleop({ motionProfileDecSec: Number(value ?? 0.05) })} />
           </Space.Compact>
         </Form.Item>
         <Form.Item label="诊断日志">

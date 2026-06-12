@@ -84,6 +84,10 @@ std::string quoteWindowsArg(const std::string& value) {
 }
 
 std::string defaultWorkerExePath() {
+  const char* workerOverride = std::getenv("APPSTATION_JODELL_WORKER_EXE");
+  if (workerOverride != nullptr && workerOverride[0] != '\0') {
+    return workerOverride;
+  }
   std::array<char, MAX_PATH> path{};
   const DWORD length = GetModuleFileNameA(nullptr, path.data(), static_cast<DWORD>(path.size()));
   if (length == 0 || length >= path.size()) {

@@ -320,12 +320,12 @@ def test_native_teleop_start_configures_and_starts_hal_controller(monkeypatch: p
         assert start_payload["controlMode"] == "incremental_position"
         assert start_payload["mappingMode"] == "direct"
         assert start_payload["nativeLoopHz"] == 100
-        assert start_payload["leftTranslationScale"] == 1.25
-        assert start_payload["rightTranslationScale"] == 1.25
-        assert start_payload["leftRotationScale"] == 1.20
-        assert start_payload["rightRotationScale"] == 1.20
-        assert start_payload["leftAxisOutputScale"] == [0.65, 0.45, 0.45, 0.60, 0.16, 0.20]
-        assert start_payload["rightAxisOutputScale"] == [0.65, 0.45, 0.45, 0.55, 0.16, 0.25]
+        assert start_payload["leftTranslationScale"] == 1.0
+        assert start_payload["rightTranslationScale"] == 1.0
+        assert start_payload["leftRotationScale"] == 1.0
+        assert start_payload["rightRotationScale"] == 1.0
+        assert start_payload["leftAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.10]
+        assert start_payload["rightAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.001]
         assert start_payload["leftImpulseCoeff"] == [-5000000, -5000000, -10000000, 1667, 2500, -333.3333]
         assert start_payload["rightImpulseCoeff"] == [-5000000, 10000000, -5000000, 1667, -2500, 3333.333]
         assert start_payload["gripperTeleopEnabled"] is False
@@ -336,17 +336,17 @@ def test_native_teleop_start_configures_and_starts_hal_controller(monkeypatch: p
         assert start_payload["leftWorkOriginPulse"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
         assert start_payload["rightWorkOriginPulse"] == [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
         assert start_payload["continuousIncrementMode"] is True
-        assert start_payload["translationStartVelocityUmS"] == pytest.approx(1500.0)
-        assert start_payload["translationMaxVelocityUmS"] == pytest.approx(20000.0)
-        assert start_payload["rotationStartVelocityDegS"] == pytest.approx(2.5)
-        assert start_payload["rotationMaxVelocityDegS"] == pytest.approx(30.0)
-        assert start_payload["motionProfileAccSec"] == pytest.approx(0.03)
-        assert start_payload["motionProfileDecSec"] == pytest.approx(0.03)
-        assert start_payload["translationInputEpsilon"] == pytest.approx(0.000005)
-        assert start_payload["rotationInputEpsilon"] == pytest.approx(0.08)
+        assert start_payload["translationStartVelocityUmS"] == pytest.approx(600.0)
+        assert start_payload["translationMaxVelocityUmS"] == pytest.approx(8000.0)
+        assert start_payload["rotationStartVelocityDegS"] == pytest.approx(1.0)
+        assert start_payload["rotationMaxVelocityDegS"] == pytest.approx(12.0)
+        assert start_payload["motionProfileAccSec"] == pytest.approx(0.05)
+        assert start_payload["motionProfileDecSec"] == pytest.approx(0.05)
+        assert start_payload["translationInputEpsilon"] == pytest.approx(0.00002)
+        assert start_payload["rotationInputEpsilon"] == pytest.approx(0.03)
         assert start_payload["translationMinActivePulse"] == pytest.approx(3.0)
         assert start_payload["rotationMinActivePulse"] == pytest.approx(3.0)
-        assert start_payload["continuousMicroConfirmTicks"] == 2
+        assert start_payload["continuousMicroConfirmTicks"] == 0
         assert hal.commands[-1][0] == "teleop.native.stop"
 
     asyncio.run(run())
@@ -1756,7 +1756,7 @@ def test_teleop_mapper_ignores_tiny_continuous_noise_until_real_icf_increment() 
     asyncio.run(run())
 
 
-def test_teleop_mapper_requires_two_same_direction_rotation_micro_ticks() -> None:
+def test_teleop_mapper_applies_rotation_micro_tick_immediately() -> None:
     async def run() -> None:
         hal = FakeHal()
         mapper = TeleopMappingService(settings=None, hal=hal, logs=None)  # type: ignore[arg-type]
@@ -1767,19 +1767,14 @@ def test_teleop_mapper_requires_two_same_direction_rotation_micro_ticks() -> Non
         await mapper._step_side("left", hand, config)
         hand["pose"] = [0.0, 0.0, 0.0, micro_tick_deg, 0.0, 0.0]
         await mapper._step_side("left", hand, config)
-        hand["pose"] = [0.0, 0.0, 0.0, micro_tick_deg * 2.0, 0.0, 0.0]
-        await mapper._step_side("left", hand, config)
 
         first_payload = hal.commands[0][1]
-        second_payload = hal.commands[1][1]
-        assert first_payload["deltas"]["Roll"] == 0.0
-        assert first_payload["syncZeroDeltaTarget"] is True
-        assert second_payload["deltas"]["Roll"] != 0.0
+        assert first_payload["deltas"]["Roll"] != 0.0
 
     asyncio.run(run())
 
 
-def test_teleop_mapper_resets_rotation_micro_confirmation_on_direction_change() -> None:
+def test_teleop_mapper_applies_reversed_rotation_micro_tick_immediately() -> None:
     async def run() -> None:
         hal = FakeHal()
         mapper = TeleopMappingService(settings=None, hal=hal, logs=None)  # type: ignore[arg-type]
@@ -1790,14 +1785,14 @@ def test_teleop_mapper_resets_rotation_micro_confirmation_on_direction_change() 
         await mapper._step_side("left", hand, config)
         hand["pose"] = [0.0, 0.0, 0.0, micro_tick_deg, 0.0, 0.0]
         await mapper._step_side("left", hand, config)
-        hand["pose"] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        await mapper._step_side("left", hand, config)
         hand["pose"] = [0.0, 0.0, 0.0, -micro_tick_deg, 0.0, 0.0]
         await mapper._step_side("left", hand, config)
 
-        assert hal.commands[0][1]["deltas"]["Roll"] == 0.0
-        assert hal.commands[1][1]["deltas"]["Roll"] == 0.0
-        assert hal.commands[2][1]["deltas"]["Roll"] != 0.0
+        first_roll = hal.commands[0][1]["deltas"]["Roll"]
+        reversed_roll = hal.commands[1][1]["deltas"]["Roll"]
+        assert first_roll != 0.0
+        assert reversed_roll != 0.0
+        assert first_roll * reversed_roll < 0.0
 
     asyncio.run(run())
 
@@ -1818,23 +1813,19 @@ def test_teleop_mapper_applies_large_rotation_input_without_micro_confirmation_d
     asyncio.run(run())
 
 
-def test_teleop_mapper_requires_two_same_direction_translation_micro_ticks() -> None:
+def test_teleop_mapper_applies_stable_translation_increment_without_confirmation_delay() -> None:
     async def run() -> None:
         hal = FakeHal()
         mapper = TeleopMappingService(settings=None, hal=hal, logs=None)  # type: ignore[arg-type]
         config = base_config(require_clutch=False)
-        config["teleop"]["translationInputEpsilon"] = 0.000005
         hand = base_hand(clutch=False)
-        micro_tick_m = 0.000006
+        micro_tick_m = 0.00002
 
         await mapper._step_side("left", hand, config)
         hand["pose"] = [micro_tick_m, 0.0, 0.0, 0.0, 0.0, 0.0]
         await mapper._step_side("left", hand, config)
-        hand["pose"] = [micro_tick_m * 2.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        await mapper._step_side("left", hand, config)
 
-        assert hal.commands[0][1]["deltas"]["X"] == 0.0
-        assert hal.commands[1][1]["deltas"]["X"] != 0.0
+        assert hal.commands[0][1]["deltas"]["X"] != 0.0
 
     asyncio.run(run())
 
@@ -1931,14 +1922,14 @@ def test_teleop_mapper_status_reports_updated_limits() -> None:
         "rotationStepLimitPulse": 1250.0,
         "translationPulseDeadband": 2.0,
         "rotationPulseDeadband": 2.0,
-        "translationVelocityUmS": 20000.0,
-        "rotationVelocityDegS": 30.0,
+        "translationVelocityUmS": 8000.0,
+        "rotationVelocityDegS": 12.0,
         "continuousIncrementMode": True,
-        "translationInputEpsilon": 5e-06,
-        "rotationInputEpsilon": 0.08,
+        "translationInputEpsilon": 0.00002,
+        "rotationInputEpsilon": 0.03,
         "translationMinActivePulse": 3.0,
         "rotationMinActivePulse": 3.0,
-        "continuousMicroConfirmTicks": 2,
+        "continuousMicroConfirmTicks": 0,
     }
 
 
@@ -2189,8 +2180,8 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
     old_config["teleop"]["leftConnected"] = True
     old_config["teleop"]["leftTranslationScale"] = 0.24
     old_config["teleop"]["leftRotationScale"] = 0.18
-    old_config["teleop"]["gripperTeleop"]["leftSourceHand"] = "PhysicalRight"
-    old_config["teleop"]["gripperTeleop"]["rightSourceHand"] = "PhysicalLeft"
+    old_config["teleop"]["gripperTeleop"]["leftSourceHand"] = "PhysicalLeft"
+    old_config["teleop"]["gripperTeleop"]["rightSourceHand"] = "PhysicalRight"
     old_config["motion"]["leftSoftLimits"]["yaw"] = {"min": -7.5, "max": 7.5}
     old_config["motion"].pop("workOriginStrategyVersion", None)
     old_config["motion"]["origin"] = {
@@ -2208,27 +2199,27 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
     assert config["teleop"]["strategyVersion"] == ICF_TELEOP_STRATEGY_VERSION
     assert config["teleop"]["controlMode"] == "incremental_position"
     assert config["teleop"]["leftConnected"] is True
-    assert config["teleop"]["leftTranslationScale"] == 1.25
-    assert config["teleop"]["rightTranslationScale"] == 1.25
-    assert config["teleop"]["leftRotationScale"] == 1.20
-    assert config["teleop"]["rightRotationScale"] == 1.20
+    assert config["teleop"]["leftTranslationScale"] == 1.0
+    assert config["teleop"]["rightTranslationScale"] == 1.0
+    assert config["teleop"]["leftRotationScale"] == 1.0
+    assert config["teleop"]["rightRotationScale"] == 1.0
     assert config["teleop"]["mappingMode"] == "direct"
-    assert config["teleop"]["leftAxisOutputScale"] == [0.65, 0.45, 0.45, 0.60, 0.16, 0.20]
-    assert config["teleop"]["rightAxisOutputScale"] == [0.65, 0.45, 0.45, 0.55, 0.16, 0.25]
+    assert config["teleop"]["leftAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.10]
+    assert config["teleop"]["rightAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.001]
     assert config["teleop"]["translationStepLimitPulse"] == 4000
     assert config["teleop"]["rotationStepLimitPulse"] == 1250
     assert config["teleop"]["translationPulseDeadband"] == 2
     assert config["teleop"]["rotationPulseDeadband"] == 2
-    assert config["teleop"]["translationStartVelocityUmS"] == 1500.0
-    assert config["teleop"]["translationMaxVelocityUmS"] == 20000.0
-    assert config["teleop"]["rotationStartVelocityDegS"] == 2.5
-    assert config["teleop"]["rotationMaxVelocityDegS"] == 30.0
+    assert config["teleop"]["translationStartVelocityUmS"] == 600.0
+    assert config["teleop"]["translationMaxVelocityUmS"] == 8000.0
+    assert config["teleop"]["rotationStartVelocityDegS"] == 1.0
+    assert config["teleop"]["rotationMaxVelocityDegS"] == 12.0
     assert config["teleop"]["continuousIncrementMode"] is True
-    assert config["teleop"]["translationInputEpsilon"] == 0.000005
-    assert config["teleop"]["rotationInputEpsilon"] == 0.08
+    assert config["teleop"]["translationInputEpsilon"] == 0.00002
+    assert config["teleop"]["rotationInputEpsilon"] == 0.03
     assert config["teleop"]["translationMinActivePulse"] == 3
     assert config["teleop"]["rotationMinActivePulse"] == 3
-    assert config["teleop"]["continuousMicroConfirmTicks"] == 2
+    assert config["teleop"]["continuousMicroConfirmTicks"] == 0
     assert config["teleop"]["diagLog"] is False
     assert config["teleop"]["swapHands"] is False
     assert config["teleop"]["swapTeleopChannels"] is True
@@ -2321,32 +2312,74 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
     assert config["teleop"]["gripperTeleop"]["autoGapCalibration"] is True
 
 
-def test_settings_migration_updates_current_strategy_to_safe_rotation_gate(tmp_path: Any) -> None:
+def test_settings_migration_updates_aggressive_teleop_defaults_to_stable_window(tmp_path: Any) -> None:
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
     config = default_config()
-    config["teleop"]["translationStartVelocityUmS"] = 600.0
-    config["teleop"]["translationMaxVelocityUmS"] = 8000.0
-    config["teleop"]["rotationStartVelocityDegS"] = 1.0
-    config["teleop"]["rotationMaxVelocityDegS"] = 12.0
-    config["teleop"]["motionProfileAccSec"] = 0.05
-    config["teleop"]["motionProfileDecSec"] = 0.05
-    config["teleop"]["translationInputEpsilon"] = 0.00002
-    config["teleop"]["rotationInputEpsilon"] = 0.12
+    config["teleop"]["strategyVersion"] = "e2e_omega7_native_v28_gripper_python_right_y_20260611"
+    config["teleop"]["leftTranslationScale"] = 1.25
+    config["teleop"]["rightTranslationScale"] = 1.25
+    config["teleop"]["leftRotationScale"] = 1.20
+    config["teleop"]["rightRotationScale"] = 1.20
+    config["teleop"]["leftAxisOutputScale"] = [0.65, 0.45, 0.45, 0.60, 0.16, 0.20]
+    config["teleop"]["rightAxisOutputScale"] = [0.65, 0.45, 0.45, 0.55, 0.16, 0.25]
+    config["teleop"]["translationStartVelocityUmS"] = 1500.0
+    config["teleop"]["translationMaxVelocityUmS"] = 20000.0
+    config["teleop"]["rotationStartVelocityDegS"] = 2.5
+    config["teleop"]["rotationMaxVelocityDegS"] = 30.0
+    config["teleop"]["motionProfileAccSec"] = 0.03
+    config["teleop"]["motionProfileDecSec"] = 0.03
+    config["teleop"]["translationPulseDeadband"] = 0
+    config["teleop"]["rotationPulseDeadband"] = 0
+    config["teleop"]["translationInputEpsilon"] = 0.0000001
+    config["teleop"]["rotationInputEpsilon"] = 0.001
+    config["teleop"]["translationMinActivePulse"] = 1
+    config["teleop"]["rotationMinActivePulse"] = 1
     config["teleop"]["continuousMicroConfirmTicks"] = 0
     (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
     migrated = SettingsService(runtime_dir, LogService()).get_config()
 
-    assert migrated["teleop"]["translationStartVelocityUmS"] == 1500.0
-    assert migrated["teleop"]["translationMaxVelocityUmS"] == 20000.0
-    assert migrated["teleop"]["rotationStartVelocityDegS"] == 2.5
-    assert migrated["teleop"]["rotationMaxVelocityDegS"] == 30.0
-    assert migrated["teleop"]["motionProfileAccSec"] == 0.03
-    assert migrated["teleop"]["motionProfileDecSec"] == 0.03
-    assert migrated["teleop"]["translationInputEpsilon"] == 0.000005
-    assert migrated["teleop"]["rotationInputEpsilon"] == 0.08
-    assert migrated["teleop"]["continuousMicroConfirmTicks"] == 2
+    assert migrated["teleop"]["leftTranslationScale"] == 1.0
+    assert migrated["teleop"]["rightTranslationScale"] == 1.0
+    assert migrated["teleop"]["leftRotationScale"] == 1.0
+    assert migrated["teleop"]["rightRotationScale"] == 1.0
+    assert migrated["teleop"]["leftAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.10]
+    assert migrated["teleop"]["rightAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.001]
+    assert migrated["teleop"]["translationStartVelocityUmS"] == 600.0
+    assert migrated["teleop"]["translationMaxVelocityUmS"] == 8000.0
+    assert migrated["teleop"]["rotationStartVelocityDegS"] == 1.0
+    assert migrated["teleop"]["rotationMaxVelocityDegS"] == 12.0
+    assert migrated["teleop"]["motionProfileAccSec"] == 0.05
+    assert migrated["teleop"]["motionProfileDecSec"] == 0.05
+    assert migrated["teleop"]["translationPulseDeadband"] == 2
+    assert migrated["teleop"]["rotationPulseDeadband"] == 2
+    assert migrated["teleop"]["translationInputEpsilon"] == 0.00002
+    assert migrated["teleop"]["rotationInputEpsilon"] == 0.03
+    assert migrated["teleop"]["translationMinActivePulse"] == 3
+    assert migrated["teleop"]["rotationMinActivePulse"] == 3
+    assert migrated["teleop"]["continuousMicroConfirmTicks"] == 0
+
+
+def test_settings_migration_updates_sluggish_gate_defaults_to_stable_window(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = "e2e_omega7_native_v28_gripper_python_right_y_20260611"
+    config["teleop"]["translationInputEpsilon"] = 0.000005
+    config["teleop"]["rotationInputEpsilon"] = 0.08
+    config["teleop"]["translationMinActivePulse"] = 3
+    config["teleop"]["rotationMinActivePulse"] = 3
+    config["teleop"]["continuousMicroConfirmTicks"] = 2
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert migrated["teleop"]["translationInputEpsilon"] == 0.00002
+    assert migrated["teleop"]["rotationInputEpsilon"] == 0.03
+    assert migrated["teleop"]["translationMinActivePulse"] == 3
+    assert migrated["teleop"]["rotationMinActivePulse"] == 3
+    assert migrated["teleop"]["continuousMicroConfirmTicks"] == 0
 
 
 def test_settings_migration_preserves_user_tuned_responsiveness_values(tmp_path: Any) -> None:
@@ -2359,8 +2392,13 @@ def test_settings_migration_preserves_user_tuned_responsiveness_values(tmp_path:
     config["teleop"]["rotationMaxVelocityDegS"] = 15.0
     config["teleop"]["motionProfileAccSec"] = 0.06
     config["teleop"]["motionProfileDecSec"] = 0.07
+    config["teleop"]["translationPulseDeadband"] = 1
+    config["teleop"]["rotationPulseDeadband"] = 1
     config["teleop"]["translationInputEpsilon"] = 0.00001
     config["teleop"]["rotationInputEpsilon"] = 0.10
+    config["teleop"]["translationMinActivePulse"] = 2
+    config["teleop"]["rotationMinActivePulse"] = 2
+    config["teleop"]["continuousMicroConfirmTicks"] = 1
     (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
     migrated = SettingsService(runtime_dir, LogService()).get_config()
@@ -2371,8 +2409,28 @@ def test_settings_migration_preserves_user_tuned_responsiveness_values(tmp_path:
     assert migrated["teleop"]["rotationMaxVelocityDegS"] == 15.0
     assert migrated["teleop"]["motionProfileAccSec"] == 0.06
     assert migrated["teleop"]["motionProfileDecSec"] == 0.07
+    assert migrated["teleop"]["translationPulseDeadband"] == 1
+    assert migrated["teleop"]["rotationPulseDeadband"] == 1
     assert migrated["teleop"]["translationInputEpsilon"] == 0.00001
     assert migrated["teleop"]["rotationInputEpsilon"] == 0.10
+    assert migrated["teleop"]["translationMinActivePulse"] == 2
+    assert migrated["teleop"]["rotationMinActivePulse"] == 2
+    assert migrated["teleop"]["continuousMicroConfirmTicks"] == 1
+
+
+def test_settings_migration_preserves_user_tuned_gripper_sources(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["teleop"]["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+    config["teleop"]["gripperTeleop"]["leftSourceHand"] = "LeftHanded"
+    config["teleop"]["gripperTeleop"]["rightSourceHand"] = "RightHanded"
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    migrated = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert migrated["teleop"]["gripperTeleop"]["leftSourceHand"] == "LeftHanded"
+    assert migrated["teleop"]["gripperTeleop"]["rightSourceHand"] == "RightHanded"
 
 
 def test_settings_save_atomically_backs_up_current_work_origin(tmp_path: Any) -> None:
@@ -2582,7 +2640,7 @@ def test_rotation_work_limit_missing_axis_defaults_to_icf_window() -> None:
     assert right_limits[4].max == 30.0
 
 
-def test_settings_migration_updates_current_axis_output_defaults_to_slower_wrist_rates(tmp_path: Any) -> None:
+def test_settings_migration_updates_current_axis_output_defaults_to_stable_window(tmp_path: Any) -> None:
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
     config = default_config()
@@ -2593,11 +2651,11 @@ def test_settings_migration_updates_current_axis_output_defaults_to_slower_wrist
 
     migrated = SettingsService(runtime_dir, LogService()).get_config()
 
-    assert migrated["teleop"]["leftAxisOutputScale"] == [0.65, 0.45, 0.45, 0.60, 0.16, 0.20]
-    assert migrated["teleop"]["rightAxisOutputScale"] == [0.65, 0.45, 0.45, 0.55, 0.16, 0.25]
+    assert migrated["teleop"]["leftAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.10]
+    assert migrated["teleop"]["rightAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.001]
 
 
-def test_settings_migration_updates_prior_pitch_yaw_axis_output_defaults_to_current_tuning(tmp_path: Any) -> None:
+def test_settings_migration_updates_prior_pitch_yaw_axis_output_defaults_to_stable_window(tmp_path: Any) -> None:
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
     config = default_config()
@@ -2608,8 +2666,8 @@ def test_settings_migration_updates_prior_pitch_yaw_axis_output_defaults_to_curr
 
     migrated = SettingsService(runtime_dir, LogService()).get_config()
 
-    assert migrated["teleop"]["leftAxisOutputScale"] == [0.65, 0.45, 0.45, 0.60, 0.16, 0.20]
-    assert migrated["teleop"]["rightAxisOutputScale"] == [0.65, 0.45, 0.45, 0.55, 0.16, 0.25]
+    assert migrated["teleop"]["leftAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.10]
+    assert migrated["teleop"]["rightAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.001]
 
 
 def test_settings_reanchors_current_strategy_mechanical_soft_limits_to_home_reference(tmp_path: Any) -> None:
@@ -2641,8 +2699,8 @@ def test_settings_migration_updates_legacy_icf_translation_speed(tmp_path: Any) 
 
     config = SettingsService(runtime_dir, LogService()).get_config()
 
-    assert config["teleop"]["translationStartVelocityUmS"] == 1500.0
-    assert config["teleop"]["translationMaxVelocityUmS"] == 20000.0
+    assert config["teleop"]["translationStartVelocityUmS"] == 600.0
+    assert config["teleop"]["translationMaxVelocityUmS"] == 8000.0
 
 
 def test_settings_migration_updates_legacy_reversed_wrist_cameras(tmp_path: Any) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 from backend.core.defaults import default_config
 from backend.core.logging import LogService
@@ -30,6 +31,25 @@ class FakeHardware:
         self.gripper = FakeGripperHardware()
 
 
+class BlockingLeftGripperHardware:
+    def __init__(self) -> None:
+        self.calls: list[tuple[dict, str, str, float | None]] = []
+        self.left_entered = threading.Event()
+        self.left_release = threading.Event()
+
+    def command(self, config: dict, side: str, command: str, target_mm: float | None):
+        self.calls.append((config, side, command, target_mm))
+        if side == "left" and command == "target":
+            self.left_entered.set()
+            self.left_release.wait(timeout=1.0)
+        return type("Result", (), {"ok": True, "message": f"{side} ok"})()
+
+
+class BlockingLeftHardware:
+    def __init__(self) -> None:
+        self.gripper = BlockingLeftGripperHardware()
+
+
 class BlockingOmegaHal:
     def __init__(self) -> None:
         self.entered = asyncio.Event()
@@ -46,6 +66,26 @@ class BlockingOmegaHal:
                     "lastReadOk": True,
                     "gripperGapMm": 12.0,
                 }
+            ]
+        }
+
+
+class DualHandOmegaHal:
+    async def omega_state(self) -> dict:
+        return {
+            "hands": [
+                {
+                    "side": "left",
+                    "connected": True,
+                    "lastReadOk": True,
+                    "gripperGapMm": 0.0,
+                },
+                {
+                    "side": "right",
+                    "connected": True,
+                    "lastReadOk": True,
+                    "gripperGapMm": 25.0,
+                },
             ]
         }
 
@@ -210,6 +250,28 @@ def test_gripper_teleop_stop_cancels_blocked_omega_read() -> None:
             hal.release.set()
             if not task.done():
                 await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(run())
+
+
+def test_gripper_teleop_left_command_does_not_block_right_follow() -> None:
+    async def run() -> None:
+        settings = FakeSettings()
+        settings.config["teleop"]["gripperTeleop"]["enabled"] = True
+        settings.config["teleop"]["gripperTeleop"]["loopHz"] = 1000
+        hardware = BlockingLeftHardware()
+        service = GripperTeleService(settings, DualHandOmegaHal(), hardware, LogService())  # type: ignore[arg-type]
+
+        service.start("manual")
+        try:
+            await asyncio.wait_for(asyncio.to_thread(hardware.gripper.left_entered.wait), timeout=1.0)
+            await asyncio.sleep(0.05)
+
+            assert any(side == "right" and command == "target" for _cfg, side, command, _target in hardware.gripper.calls)
+        finally:
+            hardware.gripper.left_release.set()
+            service.stop("manual")
+            await asyncio.sleep(0.05)
 
     asyncio.run(run())
 

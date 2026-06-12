@@ -46,6 +46,32 @@ def test_start_hal_skips_locked_runtime_promotion_without_failing_launch() -> No
     assert "return" in promote_body.split("catch", 1)[1]
 
 
+def test_start_hal_restart_cleans_repo_hal_workers_before_runtime_promotion() -> None:
+    script = (REPO_ROOT / "scripts" / "start-hal.ps1").read_text(encoding="utf-8")
+
+    assert "function Stop-HalRuntimeProcessTrees" in script
+    assert '$process.Name -eq "HalServer.exe"' in script
+    assert '$process.Name -like "JodellGripperWorker*.exe"' in script
+    assert r"$normalizedCommandLine = $process.CommandLine.Replace('\\', '\')" in script
+    assert "$normalizedCommandLine -match $escapedHalBuild" in script
+    assert "taskkill.exe" in script
+    assert "/T" in script
+    assert "/F" in script
+    cleanup_call = script.split("if ($Restart) {", 1)[1].split("$existing =", 1)[0]
+    assert "Stop-HalRuntimeProcessTrees" in cleanup_call
+    assert script.index("Stop-HalRuntimeProcessTrees") < script.index("Promote-HalCandidate")
+
+
+def test_start_hal_uses_runtime_worker_copy_when_worker_target_is_locked() -> None:
+    script = (REPO_ROOT / "scripts" / "start-hal.ps1").read_text(encoding="utf-8")
+
+    assert "$workerRuntimeExe" in script
+    assert "JodellGripperWorker.runtime-" in script
+    assert 'JodellGripperWorker.runtime-*.exe' in script
+    assert "Copy-Item -LiteralPath $CandidateExe -Destination $workerRuntimeExe -Force" in script
+    assert '$env:APPSTATION_JODELL_WORKER_EXE = "$workerRuntimeExe"' in script
+
+
 def test_start_stack_retries_hal_on_fallback_port_and_propagates_active_url() -> None:
     script = (REPO_ROOT / "scripts" / "start-stack.ps1").read_text(encoding="utf-8")
 
@@ -59,15 +85,31 @@ def test_start_stack_retries_hal_on_fallback_port_and_propagates_active_url() ->
 
 def test_launch_app_forwards_hal_port_to_initial_start_and_restart() -> None:
     script = (REPO_ROOT / "scripts" / "launch-app.ps1").read_text(encoding="utf-8")
+    start_app_stack = script.split("function Start-AppStack", 1)[1].split("function Get-ProcessSummary", 1)[0]
 
     assert "[int]$HalPort = 8091" in script
-    assert script.count("-HalPort $HalPort") >= 2
+    assert "-HalPort $HalPort" in start_app_stack
+    assert script.count("Start-AppStack") >= 3
 
 
 def test_stop_stack_stops_default_and_fallback_hal_ports() -> None:
     script = (REPO_ROOT / "scripts" / "stop-stack.ps1").read_text(encoding="utf-8")
 
     assert "8091, 8092" in script
+
+
+def test_stop_stack_cleans_orphaned_hal_workers_from_repo_build() -> None:
+    script = (REPO_ROOT / "scripts" / "stop-stack.ps1").read_text(encoding="utf-8")
+
+    assert "function Stop-HalRuntimeProcessTrees" in script
+    assert '$process.Name -eq "HalServer.exe"' in script
+    assert '$process.Name -like "JodellGripperWorker*.exe"' in script
+    assert r"$normalizedCommandLine = $process.CommandLine.Replace('\\', '\')" in script
+    assert "$normalizedCommandLine -match $escapedHalBuild" in script
+    assert "taskkill.exe" in script
+    assert "/T" in script
+    assert "/F" in script
+    assert script.rindex("Stop-HalRuntimeProcessTrees") > script.index("foreach ($port")
 
 
 def test_launch_app_restarts_stack_when_backend_stops_responding_while_window_is_open() -> None:
@@ -97,6 +139,43 @@ def test_launch_app_uses_cache_busting_url_before_the_hash_fragment() -> None:
         r'\$appUrl\s*=\s*"http://127\.0\.0\.1:\$FrontendPort/settings\?[^"#]+#manual"',
         script,
     )
+
+
+def test_launch_app_waits_long_enough_for_cold_frontend_build() -> None:
+    script = (REPO_ROOT / "scripts" / "launch-app.ps1").read_text(encoding="utf-8")
+
+    assert "Wait-HttpOk $appUrl 180" in script
+    assert "Wait-HttpOk $appUrl 45" not in script
+
+
+def test_launch_app_timeout_reports_stack_diagnostics() -> None:
+    script = (REPO_ROOT / "scripts" / "launch-app.ps1").read_text(encoding="utf-8")
+
+    assert "function Get-LaunchDiagnostics" in script
+    assert "Timed out waiting for $Url.`n$(Get-LaunchDiagnostics)" in script
+    assert "frontendLauncherPid" in script
+    assert "frontendOutLog" in script
+    assert "frontendErrLog" in script
+
+
+def test_start_stack_launches_frontend_on_requested_port_without_duplicate_port_args() -> None:
+    script = (REPO_ROOT / "scripts" / "start-stack.ps1").read_text(encoding="utf-8")
+
+    assert "node scripts/serve-dist.mjs" in script
+    assert "--host 127.0.0.1 --port $FrontendPort" in script
+    assert "npm run dev -- --host 127.0.0.1 --port $FrontendPort" not in script
+    assert "--port 5173 --host 127.0.0.1 --port $FrontendPort" not in script
+
+
+def test_start_stack_captures_frontend_launcher_logs_for_launch_diagnostics() -> None:
+    script = (REPO_ROOT / "scripts" / "start-stack.ps1").read_text(encoding="utf-8")
+
+    assert "$frontendOutLog" in script
+    assert "$frontendErrLog" in script
+    assert "-RedirectStandardOutput $frontendOutLog" in script
+    assert "-RedirectStandardError $frontendErrLog" in script
+    assert "frontendOutLog = $frontendOutLog" in script
+    assert "frontendErrLog = $frontendErrLog" in script
 
 
 def test_diagnose_teleop_latency_script_is_read_only_and_reports_action_history_stats() -> None:

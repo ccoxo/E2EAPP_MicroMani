@@ -7,6 +7,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$logDir = Join-Path $repo "backend\runtime\logs"
+$frontendOutLog = Join-Path $logDir "frontend-launch.out.log"
+$frontendErrLog = Join-Path $logDir "frontend-launch.err.log"
 
 function Stop-ProcessTree {
   param([int]$RootPid)
@@ -101,6 +104,9 @@ try {
 
 Start-Sleep -Seconds 1
 
+New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+Remove-Item -LiteralPath $frontendOutLog, $frontendErrLog -Force -ErrorAction SilentlyContinue
+
 $env:APPSTATION_HAL_MODE = "real"
 $env:APPSTATION_HAL_BASE_URL = "http://127.0.0.1:$activeHalPort"
 $env:APPSTATION_SKIP_STARTUP_HOME = if ($SkipStartupHome) { "true" } else { "false" }
@@ -111,12 +117,14 @@ $backend = Start-Process `
   -WindowStyle Hidden `
   -PassThru
 
-$frontendCommand = "`$env:VITE_MOCK_MODE='false'; `$env:VITE_API_BASE='http://127.0.0.1:$BackendPort'; `$env:VITE_WS_URL='ws://127.0.0.1:$BackendPort/ws'; npm run dev -- --host 127.0.0.1 --port $FrontendPort"
+$frontendCommand = "`$env:VITE_MOCK_MODE='false'; `$env:VITE_API_BASE='http://127.0.0.1:$BackendPort'; `$env:VITE_WS_URL='ws://127.0.0.1:$BackendPort/ws'; npm run build; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; node scripts/serve-dist.mjs --host 127.0.0.1 --port $FrontendPort"
 $frontend = Start-Process `
   -FilePath "powershell.exe" `
   -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $frontendCommand) `
   -WorkingDirectory (Join-Path $repo "frontend") `
   -WindowStyle Hidden `
+  -RedirectStandardOutput $frontendOutLog `
+  -RedirectStandardError $frontendErrLog `
   -PassThru
 
 Start-Sleep -Seconds 3
@@ -127,5 +135,7 @@ Start-Sleep -Seconds 3
   backend = "http://127.0.0.1:$BackendPort"
   frontend = "http://127.0.0.1:$FrontendPort"
   hal = "http://127.0.0.1:$activeHalPort"
+  frontendOutLog = $frontendOutLog
+  frontendErrLog = $frontendErrLog
   skipStartupHome = [bool]$SkipStartupHome
 }

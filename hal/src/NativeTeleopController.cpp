@@ -14,10 +14,6 @@ constexpr const char* kVelocityAdmittanceMode = "velocity_admittance";
 constexpr const char* kIncrementalPositionMode = "incremental_position";
 constexpr int kGripperTeleopDeadbandFloorCounts = 1;
 constexpr double kGripperTeleopMinCommandIntervalFloorMs = 10.0;
-constexpr double kRotationInputEpsilonFloorDeg = 0.08;
-constexpr double kTranslationMicroConfirmUpperM = 0.00002;
-constexpr double kRotationMicroConfirmUpperDeg = 0.18;
-constexpr int kContinuousMicroConfirmTicksFloor = 2;
 constexpr double kIncrementalRotationSpikeGuardDeg = 5.0;
 constexpr auto kGripperPositionSampleInterval = std::chrono::microseconds(33333);
 
@@ -244,10 +240,10 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config) {
   normalized.translationDeadzoneM = std::max(0.0, normalized.translationDeadzoneM);
   normalized.rotationDeadzoneDeg = std::max(0.0, normalized.rotationDeadzoneDeg);
   normalized.translationInputEpsilonM = std::max(0.0, normalized.translationInputEpsilonM);
-  normalized.rotationInputEpsilonDeg = std::max(kRotationInputEpsilonFloorDeg, normalized.rotationInputEpsilonDeg);
+  normalized.rotationInputEpsilonDeg = std::max(0.0, normalized.rotationInputEpsilonDeg);
   normalized.translationMinActivePulse = std::max(0.0, normalized.translationMinActivePulse);
   normalized.rotationMinActivePulse = std::max(0.0, normalized.rotationMinActivePulse);
-  normalized.continuousMicroConfirmTicks = std::max(kContinuousMicroConfirmTicksFloor, normalized.continuousMicroConfirmTicks);
+  normalized.continuousMicroConfirmTicks = std::max(0, normalized.continuousMicroConfirmTicks);
   // kalmanBeta：遗忘因子 beta，限制在 [0,1] 内，保证 Q/R 的凸组合更新有效。
   normalized.kalmanBeta = std::clamp(normalized.kalmanBeta, 0.0, 1.0);
   // kalmanMinVariance：所有方差/协方差的保护下限，避免数值退化。
@@ -1290,14 +1286,11 @@ std::array<double, 6> NativeTeleopController::incrementalDeltasUi(
       auto& pulseCarry = continuousPulseCarry_[sourceIndex][axisIndex];
       if (std::abs(requestedPulseFloat) > 1e-12) {
         pulseCarry += requestedPulseFloat;
-        const bool requiresConfirmation =
-            std::abs(filteredDelta) < (rotation ? kRotationMicroConfirmUpperDeg : kTranslationMicroConfirmUpperM);
         requestedPulse = static_cast<double>(applyContinuousPulseGate(
             sourceIndex,
             axisIndex,
             static_cast<long>(std::llround(pulseCarry)),
-            pulseCarry,
-            requiresConfirmation));
+            pulseCarry));
         if (std::abs(requestedPulse) > 1e-12) {
           const int emittedSign = signOfValue(requestedPulse);
           pulseCarry -= requestedPulse;
@@ -1329,8 +1322,7 @@ long NativeTeleopController::applyContinuousPulseGate(
     int sourceIndex,
     int axisIndex,
     long requestedPulse,
-    double requestedPulseFloat,
-    bool requiresConfirmation) {
+    double requestedPulseFloat) {
   if (std::abs(requestedPulseFloat) <= 1e-12) {
     continuousDirection_[sourceIndex][axisIndex] = 0;
     continuousStreak_[sourceIndex][axisIndex] = 0;
@@ -1347,21 +1339,6 @@ long NativeTeleopController::applyContinuousPulseGate(
   });
   auto& direction = continuousDirection_[sourceIndex][axisIndex];
   auto& streak = continuousStreak_[sourceIndex][axisIndex];
-  if (requiresConfirmation) {
-    if (direction == sign) {
-      ++streak;
-    } else {
-      direction = sign;
-      streak = 1;
-    }
-    if (config_.continuousMicroConfirmTicks <= 0 || streak < config_.continuousMicroConfirmTicks) {
-      return 0;
-    }
-    if (std::abs(requestedPulse) >= minimum) {
-      return requestedPulse;
-    }
-    return sign * minimum;
-  }
   if (std::abs(requestedPulse) >= minimum) {
     direction = sign;
     streak = config_.continuousMicroConfirmTicks;

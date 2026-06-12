@@ -290,6 +290,41 @@ long clampPulseStep(long deltaPulse, double stepLimitPulse) {
   return deltaPulse > 0 ? limit : -limit;
 }
 
+int signOfPulseDelta(double value) {
+  if (value > 0.5) {
+    return 1;
+  }
+  if (value < -0.5) {
+    return -1;
+  }
+  return 0;
+}
+
+long maxTeleopTargetLeadPulse(
+    long deltaPulse,
+    double maxVelocityPulse,
+    double accTimeSec,
+    double decTimeSec,
+    double stepLimitPulse) {
+  const auto requested = static_cast<long>(std::abs(deltaPulse));
+  const double leadTimeSec = (std::max)(0.01, (std::max)(accTimeSec, decTimeSec));
+  const auto velocityLead = (std::max)(
+      1L,
+      static_cast<long>(std::llround((std::max)(1.0, maxVelocityPulse) * leadTimeSec)));
+  const auto stepLimit = static_cast<long>(std::llround(stepLimitPulse));
+  const auto boundedVelocityLead = stepLimit > 0 ? (std::min)(velocityLead, stepLimit) : velocityLead;
+  return (std::max)(1L, (std::max)(requested, boundedVelocityLead));
+}
+
+double clampTeleopTargetLead(double actualPulse, double targetPulse, long targetLeadPulse) {
+  const auto lead = static_cast<double>((std::max)(1L, targetLeadPulse));
+  return std::clamp(targetPulse, actualPulse - lead, actualPulse + lead);
+}
+
+bool teleopTargetUpdateMissedWindow(int updateReturn) {
+  return updateReturn == 3011 || updateReturn == 3019;
+}
+
 #ifdef _WIN32
 void applyMotionProfile(
     unsigned short card,
@@ -1237,16 +1272,39 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
     const auto basePulse = actualPulse;
     const auto baseUi = pulseToUi(basePulse, side, axis);
     const auto limit = limits[axisIndex];
-    const auto unclippedTargetPulse = basePulse + static_cast<double>(deltaPulse);
+    const auto activeTargetLead = teleopTargetActive_[index] ? teleopTargetPulse_[index] - actualPulse : 0.0;
+    const bool reversingTargetLead =
+        signOfPulseDelta(activeTargetLead) != 0
+        && signOfPulseDelta(deltaPulse) != 0
+        && signOfPulseDelta(activeTargetLead) != signOfPulseDelta(deltaPulse);
+    const auto targetBasePulse = teleopTargetActive_[index] && !reversingTargetLead
+        ? teleopTargetPulse_[index] : actualPulse;
+    const auto targetLeadPulse = maxTeleopTargetLeadPulse(
+        deltaPulse,
+        maxVelocityPulse,
+        tacc,
+        tdec,
+        stepLimitPulse);
+    const auto unclippedTargetPulse = targetBasePulse + static_cast<double>(deltaPulse);
     const auto unclippedTargetUi = pulseToUi(unclippedTargetPulse, side, axis);
     const auto targetUi = clipTeleopTargetToLimit(baseUi, unclippedTargetUi, limit);
     const auto targetPulse = uiToPulse(targetUi, side, axis);
-    const auto updateTargetPulse = static_cast<long>(std::llround(targetPulse));
+    const auto leadLimitedTargetPulse = clampTeleopTargetLead(actualPulse, targetPulse, targetLeadPulse);
+    const auto updateTargetPulse = static_cast<long>(std::llround(leadLimitedTargetPulse));
     const auto appliedTargetPulse = static_cast<double>(updateTargetPulse);
     const auto appliedTargetUi = pulseToUi(appliedTargetPulse, side, axis);
     const bool targetHeldAtBase = std::abs(appliedTargetPulse - basePulse) <= 0.5;
     if (std::abs(targetUi - unclippedTargetUi) > 1e-9) {
       result.clipped[axisIndex] = true;
+    }
+    if (targetHeldAtBase && !moving) {
+      result.appliedDeltaPulse[axisIndex] = 0.0;
+      result.appliedDeltaUi[axisIndex] = 0.0;
+      result.targetPulse[axisIndex] = actualPulse;
+      result.targetUi[axisIndex] = pulseToUi(actualPulse, side, axis);
+      teleopTargetPulse_[index] = actualPulse;
+      teleopTargetActive_[index] = true;
+      continue;
     }
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
     if (targetHeldAtBase && moving) {
@@ -1264,15 +1322,32 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
       teleopTargetActive_[index] = true;
       continue;
     }
+#endif
     const bool shouldLaunchMove = !moving;
-    const auto launchDeltaPulse = deltaPulse;
+    const auto launchDeltaPulse = static_cast<long>(std::llround(appliedTargetPulse - actualPulse));
+#if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
     result.moveStarted[axisIndex] = shouldLaunchMove;
     result.launchDeltaPulse[axisIndex] = shouldLaunchMove ? static_cast<double>(launchDeltaPulse) : 0.0;
     if (shouldLaunchMove) {
       applyMotionProfile(card, axisNo, startVelocityPulse, maxVelocityPulse, tacc, tdec, launchDeltaPulse);
     }
-    result.updateReturn[axisIndex] =
-        static_cast<double>(updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse));
+    const auto updateReturn = updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse);
+    result.updateReturn[axisIndex] = static_cast<double>(updateReturn);
+    if (moving && teleopTargetUpdateMissedWindow(updateReturn)) {
+      const auto relaunchCurrentPulse = static_cast<double>(dmcGetPosition(card, axisNo));
+      const auto relaunchDeltaPulse =
+          static_cast<long>(std::llround(appliedTargetPulse - relaunchCurrentPulse));
+      if (relaunchDeltaPulse != 0) {
+        applyMotionProfile(card, axisNo, startVelocityPulse, maxVelocityPulse, tacc, tdec, relaunchDeltaPulse);
+        result.moveStarted[axisIndex] = true;
+        result.launchDeltaPulse[axisIndex] = static_cast<double>(relaunchDeltaPulse);
+        result.updateReturn[axisIndex] =
+            static_cast<double>(updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse));
+      }
+      actualPulse = relaunchCurrentPulse;
+      pulse_[index] = actualPulse;
+      result.currentPulse[axisIndex] = actualPulse;
+    }
 #else
     (void)card;
     (void)axisNo;
@@ -1282,7 +1357,8 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
     (void)tacc;
     (void)tdec;
     result.moveStarted[axisIndex] = !moving || !teleopTargetActive_[index];
-    result.launchDeltaPulse[axisIndex] = result.moveStarted[axisIndex] ? static_cast<double>(deltaPulse) : 0.0;
+    result.launchDeltaPulse[axisIndex] =
+        result.moveStarted[axisIndex] ? static_cast<double>(launchDeltaPulse) : 0.0;
 #endif
     result.appliedDeltaPulse[axisIndex] = appliedTargetPulse - basePulse;
     result.appliedDeltaUi[axisIndex] = appliedTargetUi - baseUi;

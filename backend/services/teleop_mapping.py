@@ -34,8 +34,6 @@ DEFAULT_ENABLED_AXES = [True] * 6
 NATIVE_STATUS_SUMMARY_LOG_INTERVAL_MS = 5000
 DEFAULT_NATIVE_STATUS_SAMPLE_HZ = 30.0
 PRE_HOME_ROTATION_LIMIT_TOLERANCE_DEG = 1e-6
-TRANSLATION_MICRO_CONFIRM_UPPER_M = 0.00002
-ROTATION_MICRO_CONFIRM_UPPER_DEG = 0.18
 
 
 class TeleopMappingService:
@@ -1486,7 +1484,6 @@ class TeleopMappingService:
                     deadband_pulse,
                     min_active_pulse,
                     config,
-                    requires_confirmation=self._requires_continuous_micro_confirmation(idx, filtered),
                 )
             requested_pulse_deltas[idx] = float(requested_pulse)
             deltas[idx] = self._pulse_delta_to_ui_delta(
@@ -1519,10 +1516,6 @@ class TeleopMappingService:
         threshold = self._rotation_input_epsilon_deg(config) if continuous_increment else deadzone_deg
         return raw_delta if abs(raw_delta) >= threshold else 0.0
 
-    def _requires_continuous_micro_confirmation(self, axis_index: int, filtered_delta: float) -> bool:
-        upper = ROTATION_MICRO_CONFIRM_UPPER_DEG if axis_index >= 3 else TRANSLATION_MICRO_CONFIRM_UPPER_M
-        return abs(filtered_delta) < upper
-
     def _apply_continuous_pulse_gate(
         self,
         side: SideName,
@@ -1532,8 +1525,6 @@ class TeleopMappingService:
         pulse_deadband: float,
         min_active_pulse: float,
         config: dict[str, Any],
-        *,
-        requires_confirmation: bool = False,
     ) -> int:
         if requested_pulse_float == 0.0:
             self._reset_continuous_axis(side, axis_index)
@@ -1543,18 +1534,6 @@ class TeleopMappingService:
         directions = self._continuous_direction.setdefault(side, [0, 0, 0, 0, 0, 0])
         streaks = self._continuous_streak.setdefault(side, [0, 0, 0, 0, 0, 0])
         confirm_ticks = self._continuous_micro_confirm_ticks(config)
-
-        if requires_confirmation:
-            if directions[axis_index] == sign:
-                streaks[axis_index] += 1
-            else:
-                directions[axis_index] = sign
-                streaks[axis_index] = 1
-            if confirm_ticks <= 0 or streaks[axis_index] < confirm_ticks:
-                return 0
-            if abs(requested_pulse) >= minimum:
-                return requested_pulse
-            return sign * minimum
 
         if abs(requested_pulse) >= minimum:
             directions[axis_index] = sign
@@ -1920,7 +1899,7 @@ class TeleopMappingService:
 
     def _continuous_micro_confirm_ticks(self, config: dict[str, Any]) -> int:
         return max(
-            int(ICF_TELEOP_DEFAULTS["continuousMicroConfirmTicks"]),
+            0,
             int(
                 math.ceil(
                     float(
@@ -1946,7 +1925,7 @@ class TeleopMappingService:
 
     def _rotation_input_epsilon_deg(self, config: dict[str, Any]) -> float:
         return max(
-            float(ICF_TELEOP_DEFAULTS["rotationInputEpsilon"]),
+            0.0,
             float(
                 config.get("teleop", {}).get(
                     "rotationInputEpsilon",
