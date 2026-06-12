@@ -41,8 +41,8 @@ CAMERA_DESCRIPTOR_KEYS = {
 }
 CAMERA_INDEX_FALLBACKS = {
     "global": -1,
-    "wrist_left": 2,
-    "wrist_right": 0,
+    "wrist_left": 0,
+    "wrist_right": 2,
 }
 IDENTITY_CACHE_TTL_S = 30.0
 IDENTITY_TOKEN_PATTERN = re.compile(r"[^a-z0-9]+")

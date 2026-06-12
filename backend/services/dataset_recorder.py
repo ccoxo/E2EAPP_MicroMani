@@ -113,6 +113,7 @@ WRITE_QUEUE_PUT_TIMEOUT_S = 1.0
 ASSEMBLY_QUEUE_MAX_FRAMES = 120
 ASSEMBLY_QUEUE_PUT_TIMEOUT_S = 1.0
 NATIVE_WRITER_COMMAND_TIMEOUT_S = 5.0
+NATIVE_SAVE_EPISODE_TIMEOUT_S = 60.0
 RECORDING_QUEUE_DRAIN_TIMEOUT_S = 30.0
 SAMPLER_START_LEAD_S = 0.05
 RECORDER_HARDWARE_WARMUP_S = 0.5
@@ -611,6 +612,7 @@ class DatasetRecorderService:
             self._accepting_frame_jobs = False
             self.telemetry.recording = False
         try:
+            await self.teleop.stop("recording")
             await self._drain_recording_queues()
             if self._native_writer_active():
                 await self._save_native_episode()
@@ -632,9 +634,9 @@ class DatasetRecorderService:
             if self._native_writer_active():
                 with contextlib.suppress(Exception):
                     await self._clear_native_episode_buffer()
-            await self.teleop.stop("recording")
+            with contextlib.suppress(Exception):
+                await self.teleop.stop("recording")
             raise
-        await self.teleop.stop("recording")
         self.logs.info("[LEROBOT]", f"record episode saved: {episode['id']}")
         return {"episode": episode, "status": await asyncio.to_thread(self.status)}
 
@@ -1431,11 +1433,16 @@ class DatasetRecorderService:
         if not writer.is_alive():
             raise RuntimeError("native LeRobot writer is not running")
         future = writer.submit(kind)
-        timeout_s = float(getattr(self, "_native_writer_command_timeout_s", NATIVE_WRITER_COMMAND_TIMEOUT_S))
+        timeout_s = self._native_writer_command_timeout_seconds(kind)
         try:
             return await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(future)), timeout=timeout_s)
         except TimeoutError as exc:
             raise RuntimeError(f"native LeRobot writer command timed out: {kind}") from exc
+
+    def _native_writer_command_timeout_seconds(self, kind: str) -> float:
+        if kind == "save_episode":
+            return float(getattr(self, "_native_save_episode_timeout_s", NATIVE_SAVE_EPISODE_TIMEOUT_S))
+        return float(getattr(self, "_native_writer_command_timeout_s", NATIVE_WRITER_COMMAND_TIMEOUT_S))
 
     async def _try_begin_native_dataset(self, config: dict[str, Any]) -> bool:
         """在写线程中打开或恢复 native 数据集，失败时记录错误原因。"""

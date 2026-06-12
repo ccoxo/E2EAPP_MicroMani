@@ -2717,11 +2717,11 @@ def test_settings_migration_updates_legacy_reversed_wrist_cameras(tmp_path: Any)
     config = SettingsService(runtime_dir, LogService()).get_config()
 
     assert config["cameras"]["global"] == "IMX335 / index 1"
-    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&124CCBA8&0&0000"
-    assert config["cameras"]["wristLeft"] == "IMX335 / index 2"
-    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&7861A93&0&0000"
-    assert config["cameras"]["wristRight"] == "IMX335 / index 0"
-    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
+    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 0"
+    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
+    assert config["cameras"]["wristRight"] == "IMX335 / index 2"
+    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000"
 
 
 def test_settings_migration_updates_previous_imx258_camera_defaults(tmp_path: Any) -> None:
@@ -2736,8 +2736,29 @@ def test_settings_migration_updates_previous_imx258_camera_defaults(tmp_path: An
     config = SettingsService(runtime_dir, LogService()).get_config()
 
     assert config["cameras"]["global"] == "IMX335 / index 1"
-    assert config["cameras"]["wristLeft"] == "IMX335 / index 2"
-    assert config["cameras"]["wristRight"] == "IMX335 / index 0"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 0"
+    assert config["cameras"]["wristRight"] == "IMX335 / index 2"
+
+
+def test_settings_migration_updates_previous_imx335_camera_defaults(tmp_path: Any) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    old_config = default_config()
+    old_config["cameras"]["global"] = "IMX335 / index 1"
+    old_config["cameras"]["globalIdentity"] = "USB\\VID_0ABD&PID_8050&MI_00\\7&124CCBA8&0&0000"
+    old_config["cameras"]["wristLeft"] = "IMX335 / index 2"
+    old_config["cameras"]["wristLeftIdentity"] = "USB\\VID_0ABD&PID_8050&MI_00\\7&7861A93&0&0000"
+    old_config["cameras"]["wristRight"] = "IMX335 / index 0"
+    old_config["cameras"]["wristRightIdentity"] = "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
+    (runtime_dir / "config.json").write_text(json.dumps(old_config), encoding="utf-8")
+
+    config = SettingsService(runtime_dir, LogService()).get_config()
+
+    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 0"
+    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
+    assert config["cameras"]["wristRight"] == "IMX335 / index 2"
+    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000"
 
 
 def test_settings_migration_updates_cyclic_camera_roles(tmp_path: Any) -> None:
@@ -2752,5 +2773,5 @@ def test_settings_migration_updates_cyclic_camera_roles(tmp_path: Any) -> None:
     config = SettingsService(runtime_dir, LogService()).get_config()
 
     assert config["cameras"]["global"] == "IMX335 / index 1"
-    assert config["cameras"]["wristLeft"] == "IMX335 / index 2"
-    assert config["cameras"]["wristRight"] == "IMX335 / index 0"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 0"
+    assert config["cameras"]["wristRight"] == "IMX335 / index 2"

@@ -926,6 +926,10 @@ export function normalizeConfig(config: AppConfig): AppConfig {
     config.cameras.global === 'AR0234 / index 1'
     && config.cameras.wristLeft === 'IMX258 / index 2'
     && config.cameras.wristRight === 'IMX258 / index 0'
+  const hasPreviousImx335CameraDefaults =
+    config.cameras.global === 'IMX335 / index 1'
+    && config.cameras.wristLeft === 'IMX335 / index 2'
+    && config.cameras.wristRight === 'IMX335 / index 0'
   const hasLegacyReversedWristCameras =
     config.cameras.global === 'AR0234 / index 2'
     && config.cameras.wristLeft === 'IMX258 / index 1'
@@ -935,11 +939,22 @@ export function normalizeConfig(config: AppConfig): AppConfig {
     && config.cameras.wristLeft === 'IMX258 / index 0'
     && config.cameras.wristRight === 'IMX258 / index 1'
   const hasStalePicoIp = config.picoVision.ip === '10.90.132.51'
-  if (!hasPreviousImx258CameraDefaults && !hasLegacyReversedWristCameras && !hasLegacyCyclicCameraRoles && !hasStalePicoIp) {
+  if (
+    !hasPreviousImx258CameraDefaults
+    && !hasPreviousImx335CameraDefaults
+    && !hasLegacyReversedWristCameras
+    && !hasLegacyCyclicCameraRoles
+    && !hasStalePicoIp
+  ) {
     return config
   }
   const next = cloneConfig(config)
-  if (hasPreviousImx258CameraDefaults || hasLegacyReversedWristCameras || hasLegacyCyclicCameraRoles) {
+  if (
+    hasPreviousImx258CameraDefaults
+    || hasPreviousImx335CameraDefaults
+    || hasLegacyReversedWristCameras
+    || hasLegacyCyclicCameraRoles
+  ) {
     next.cameras = {
       ...next.cameras,
       global: defaultConfig.cameras.global,

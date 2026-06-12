@@ -941,6 +941,29 @@ describe('AppStation M0 frontend', () => {
     expect(Date.now() - (session.phaseStartedAt ?? 0)).toBeGreaterThanOrEqual(550)
   })
 
+  it('keeps the recording progress bar visible when backend status omits the total duration', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-05-22T00:00:05.000Z'))
+    window.history.pushState({}, '', '/record')
+    useTelemetryStore.setState((state) => ({
+      recording: true,
+      recordSession: {
+        ...state.recordSession,
+        phase: 'recording',
+        phaseStartedAt: Date.now() - 5000,
+        episodeTimeS: 20,
+        recorderElapsedS: 5,
+        recorderTotalS: -1,
+      },
+    }))
+
+    render(<App />)
+
+    expect(
+      screen.getAllByRole('progressbar').some((bar) => bar.getAttribute('aria-valuenow') === '25'),
+    ).toBe(true)
+  })
+
   it('blocks record precheck until Omega.7 and gripper diagnostics are recognized', async () => {
     window.history.pushState({}, '', '/record')
     useTelemetryStore.setState((state) => ({
@@ -1318,8 +1341,8 @@ describe('AppStation M0 frontend', () => {
       expect(card?.querySelector('.camera-status-strip')).toBeTruthy()
     }
     expect(defaultConfig.cameras.global).toBe('IMX335 / index 1')
-    expect(defaultConfig.cameras.wristLeft).toBe('IMX335 / index 2')
-    expect(defaultConfig.cameras.wristRight).toBe('IMX335 / index 0')
+    expect(defaultConfig.cameras.wristLeft).toBe('IMX335 / index 0')
+    expect(defaultConfig.cameras.wristRight).toBe('IMX335 / index 2')
   })
 
   it('syncs PICO connection results into the global status bar', async () => {

@@ -48,6 +48,8 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
   const phase = useTelemetryStore((s) => s.recordSession.phase)
   const elapsedS = useTelemetryStore((s) => s.recordSession.recorderElapsedS)
   const totalS = useTelemetryStore((s) => s.recordSession.recorderTotalS)
+  const episodeTimeS = useTelemetryStore((s) => s.recordSession.episodeTimeS)
+  const resetTimeS = useTelemetryStore((s) => s.recordSession.resetTimeS)
   const task = useTelemetryStore((s) => s.recordSession.task)
   const setTask = useTelemetryStore((s) => s.setRecordTask)
   const datasetName = useTelemetryStore((s) => s.recordSession.datasetName)
@@ -71,6 +73,9 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
 
   const cfg = phaseConfig[phase]
   const busy = phase === 'starting' || phase === 'saving' || phase === 'finishing'
+  const progressTotalS =
+    totalS >= 0 ? totalS : phase === 'recording' ? episodeTimeS : phase === 'resetting' ? resetTimeS : -1
+  const phasePercent = progressTotalS > 0 ? Math.min(100, Math.round((elapsedS / progressTotalS) * 100)) : 0
   const leftReturnReady = motionSideReturnOriginReady('left', motionEnabled, motionAxisEnabled)
   const rightReturnReady = motionSideReturnOriginReady('right', motionEnabled, motionAxisEnabled)
   const handleReturnOrigin = async (side: 'left' | 'right') => {
@@ -131,12 +136,12 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
         <div style={{ textAlign: 'right' }}>
           <div style={{ fontSize: 10, color: '#8c8c8c' }}>剩余</div>
           <div className="record-phase-remaining">
-            {totalS >= 0 ? formatTime(Math.max(0, totalS - elapsedS)) : '--:--.-'}
+            {progressTotalS >= 0 ? formatTime(Math.max(0, progressTotalS - elapsedS)) : '--:--.-'}
           </div>
         </div>
       </div>
       <Progress
-        percent={totalS >= 0 && totalS > 0 ? Math.round((elapsedS / totalS) * 100) : 0}
+        percent={phasePercent}
         showInfo={false}
         strokeColor={cfg.barColor}
         size="small"

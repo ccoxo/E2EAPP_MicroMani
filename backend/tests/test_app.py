@@ -5392,6 +5392,8 @@ def test_camera_identity_overrides_stale_index(monkeypatch: MonkeyPatch) -> None
     config["cameras"]["globalIdentity"] = "USB\\VID_1D6B&PID_0102&MI_00\\7&235CBC02&0&0000"
     config["cameras"]["wristLeft"] = "IMX258 / index 1"
     config["cameras"]["wristLeftIdentity"] = ""
+    config["cameras"]["wristRight"] = "IMX258 / index -1"
+    config["cameras"]["wristRightIdentity"] = ""
     driver = OpenCVCameraDriver()
 
     monkeypatch.setattr(
@@ -5416,6 +5418,37 @@ def test_camera_identity_overrides_stale_index(monkeypatch: MonkeyPatch) -> None
     assert resolved["global"] == 2
 
 
+def test_current_camera_identity_mapping_binds_reenumerated_wrist_roles(monkeypatch: MonkeyPatch) -> None:
+    config = default_config()
+    driver = OpenCVCameraDriver()
+
+    monkeypatch.setattr(
+        driver,
+        "_camera_identities_by_index",
+        lambda: {
+            0: {
+                "name": "USB Camera",
+                "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&398f0a3&0&0000#{guid}\\global",
+                "displayName": "@device:pnp:left",
+            },
+            1: {
+                "name": "USB Camera",
+                "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&1396f44d&0&0000#{guid}\\global",
+                "displayName": "@device:pnp:global",
+            },
+            2: {
+                "name": "USB Camera",
+                "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#8&3724732e&0&0000#{guid}\\global",
+                "displayName": "@device:pnp:right",
+            },
+        },
+    )
+
+    resolved = driver._resolved_indices(object(), config, 30)  # noqa: SLF001
+
+    assert resolved == {"global": 1, "wrist_left": 0, "wrist_right": 2}
+
+
 def test_camera_identities_lock_all_role_indices(monkeypatch: MonkeyPatch) -> None:
     config = default_config()
     config["cameras"]["global"] = "AR0234 / index 2"
@@ -5434,31 +5467,31 @@ def test_camera_identities_lock_all_role_indices(monkeypatch: MonkeyPatch) -> No
             },
             1: {
                 "name": "USB Camera",
-                "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&124ccba8&0&0000#{guid}\\global",
+                "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&1396f44d&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:global",
             },
             2: {
                 "name": "USB Camera",
-                "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&7861a93&0&0000#{guid}\\global",
-                "displayName": "@device:pnp:left",
+                "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#8&3724732e&0&0000#{guid}\\global",
+                "displayName": "@device:pnp:right",
             },
         },
     )
 
     resolved = driver._resolved_indices(object(), config, 30)
 
-    assert resolved == {"global": 1, "wrist_left": 2, "wrist_right": 0}
+    assert resolved == {"global": 1, "wrist_left": 0, "wrist_right": 2}
 
 
 def test_default_camera_mapping_matches_deployment_hardware() -> None:
     config = default_config()
 
     assert config["cameras"]["global"] == "IMX335 / index 1"
-    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&124CCBA8&0&0000"
-    assert config["cameras"]["wristLeft"] == "IMX335 / index 2"
-    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&7861A93&0&0000"
-    assert config["cameras"]["wristRight"] == "IMX335 / index 0"
-    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
+    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 0"
+    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
+    assert config["cameras"]["wristRight"] == "IMX335 / index 2"
+    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000"
     assert config["cameras"]["previewResolution"] == "640x480"
     assert config["cameras"]["globalResolution"] == "640x480"
     assert config["cameras"]["wristLeftResolution"] == "640x480"

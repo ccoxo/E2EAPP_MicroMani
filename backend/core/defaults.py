@@ -24,11 +24,11 @@ ICF_HOME_REFERENCE_VERSION = "icf_home_reference_20260602_v1"
 
 ICF_CAMERA_DEFAULTS: dict[str, Any] = {
     "global": "IMX335 / index 1",
-    "globalIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&124CCBA8&0&0000",
-    "wristLeft": "IMX335 / index 2",
-    "wristLeftIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&7861A93&0&0000",
-    "wristRight": "IMX335 / index 0",
-    "wristRightIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000",
+    "globalIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000",
+    "wristLeft": "IMX335 / index 0",
+    "wristLeftIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000",
+    "wristRight": "IMX335 / index 2",
+    "wristRightIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000",
     "previewResolution": "640x480",
     "globalResolution": "640x480",
     "wristLeftResolution": "640x480",

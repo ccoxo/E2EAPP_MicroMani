@@ -919,10 +919,16 @@ class SettingsService:
                 and cameras.get("wristLeft") == "IMX258 / index 2"
                 and cameras.get("wristRight") == "IMX258 / index 0"
             )
+            has_previous_imx335_camera_defaults = (
+                cameras.get("global") == "IMX335 / index 1"
+                and cameras.get("wristLeft") == "IMX335 / index 2"
+                and cameras.get("wristRight") == "IMX335 / index 0"
+            )
             if (
                 has_legacy_reversed_wrist_cameras
                 or has_legacy_cyclic_camera_roles
                 or has_previous_imx258_camera_defaults
+                or has_previous_imx335_camera_defaults
             ):
                 for key, value in ICF_CAMERA_DEFAULTS.items():
                     if key == "tuning":

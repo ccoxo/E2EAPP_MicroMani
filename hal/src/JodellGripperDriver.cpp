@@ -19,13 +19,16 @@ namespace appstation::hal {
 
 namespace {
 
+// 现场默认接线：左夹爪 COM8、右夹爪 COM9。配置可覆盖，常量只作为兜底。
 constexpr const char* kDefaultLeftPort = "COM8";
 constexpr const char* kDefaultRightPort = "COM9";
+// Jodell DLL 在关闭一个串口后马上打开另一个串口时偶发失败，短暂等待让驱动释放端口。
 constexpr auto kPortSwitchSettleMs = std::chrono::milliseconds(50);
 
 template <typename Fn>
 Fn loadSymbol(void* module, const char* plain, const char* decorated) {
 #ifdef _WIN32
+  // vendor DLL 可能导出 C 名称，也可能导出 MSVC C++ 装饰名；两种都尝试以兼容不同版本。
   auto* handle = static_cast<HMODULE>(module);
   auto* proc = GetProcAddress(handle, plain);
   if (!proc && decorated) {
@@ -41,12 +44,14 @@ Fn loadSymbol(void* module, const char* plain, const char* decorated) {
 }
 
 std::string portLabel(int port) {
+  // 诊断字符串统一使用 COMx，便于和设备管理器/现场文档对应。
   std::ostringstream out;
   out << "COM" << port;
   return out.str();
 }
 
 #ifdef _WIN32
+// 父子进程协议按 tab 切分，消息字段里的控制字符必须被替换，避免破坏协议边界。
 std::string sanitizeProtocolField(std::string value) {
   for (char& ch : value) {
     if (ch == '\t' || ch == '\r' || ch == '\n') {
@@ -71,6 +76,7 @@ std::vector<std::string> splitTabs(const std::string& value) {
   return parts;
 }
 
+// CreateProcessA 需要一整条可修改命令行；参数单独加引号并转义反斜杠/双引号。
 std::string quoteWindowsArg(const std::string& value) {
   std::string out = "\"";
   for (char ch : value) {
@@ -84,6 +90,7 @@ std::string quoteWindowsArg(const std::string& value) {
 }
 
 std::string defaultWorkerExePath() {
+  // 环境变量用于调试或部署到非默认目录；否则默认 worker 与 HalServer 同目录。
   const char* workerOverride = std::getenv("APPSTATION_JODELL_WORKER_EXE");
   if (workerOverride != nullptr && workerOverride[0] != '\0') {
     return workerOverride;
@@ -102,6 +109,7 @@ std::string defaultWorkerExePath() {
 }
 
 bool writeAll(HANDLE handle, const std::string& value) {
+  // 管道写入不保证一次写完，循环直到整条命令都写入。
   size_t offset = 0;
   while (offset < value.size()) {
     DWORD written = 0;
@@ -116,6 +124,7 @@ bool writeAll(HANDLE handle, const std::string& value) {
 
 bool readLineWithTimeout(HANDLE handle, double timeoutMs, std::string* line) {
   line->clear();
+  // 使用 PeekNamedPipe 轮询，避免 ReadFile 在 worker 卡死时永久阻塞 HalServer 线程。
   const auto deadline = std::chrono::steady_clock::now()
       + std::chrono::milliseconds(static_cast<int>(std::max(1.0, timeoutMs)));
   while (std::chrono::steady_clock::now() < deadline) {
@@ -149,6 +158,7 @@ JodellGripperDriver::JodellGripperDriver() = default;
 
 JodellGripperDriver::~JodellGripperDriver() {
 #ifdef _WIN32
+  // 析构时先停 worker，再卸载 DLL，确保子进程不会继续持有同一串口资源。
   std::scoped_lock lock(mutex_);
   closeProcessWorkersUnlocked();
   closeUnlocked();
@@ -158,6 +168,7 @@ JodellGripperDriver::~JodellGripperDriver() {
 void JodellGripperDriver::configure(const JodellGripperConfig& config) {
   std::scoped_lock lock(mutex_);
 #ifdef _WIN32
+  // 配置可能改变端口、DLL 或 worker 路径；旧资源必须全部关闭后按新配置懒加载。
   closeProcessWorkersUnlocked();
   closeUnlocked();
 #endif
@@ -184,10 +195,12 @@ bool JodellGripperDriver::commandTarget(
   const int slave = config_.slaveIds[index];
   const double stroke = std::max(0.001, config_.strokeMm);
   const double bounded = std::clamp(targetMm, 0.0, stroke);
+  // vendor API 的速度/力矩范围是 1-255，这里在 HAL 边界做一次夹紧。
   const int safeSpeed = std::clamp(speed, 1, 255);
   const int safeTorque = std::clamp(torque, 1, 255);
   if (config_.processWorkersEnabled) {
 #ifdef _WIN32
+    // 推荐路径：每侧一个 worker 独占 DLL/串口状态，主进程只通过管道发命令。
     if (!ensureProcessWorkerUnlocked(index, message)) {
       return false;
     }
@@ -235,6 +248,7 @@ bool JodellGripperDriver::commandTarget(
     }
     return false;
   }
+  // Jodell 原始位置 0 表示最大开口、255 表示闭合；HAL 对外使用毫米开口。
   const int raw = static_cast<int>(std::lround((stroke - bounded) / stroke * 255.0));
   const int retRun = runWithParam_(slave, raw, safeSpeed, safeTorque);
   targetMm_[index] = bounded;
@@ -251,6 +265,7 @@ bool JodellGripperDriver::commandTarget(
   if (readPosition) {
     const int currentRaw = getClawCurrentLocation_(slave);
     if (currentRaw >= 0) {
+      // 读取值同样是反向 raw，需要换算回毫米开口并缓存。
       positionMm_[index] = stroke * (1.0 - std::clamp(currentRaw, 0, 255) / 255.0);
       out << ", current=" << currentRaw << ", positionMm=" << positionMm_[index];
     }
@@ -282,6 +297,7 @@ bool JodellGripperDriver::readPositionMm(Side side, std::string* message) {
   const int slave = config_.slaveIds[index];
   if (config_.processWorkersEnabled) {
 #ifdef _WIN32
+    // worker READ 不移动夹爪，只读取当前位置并更新主进程缓存。
     if (!ensureProcessWorkerUnlocked(index, message)) {
       return false;
     }
@@ -360,6 +376,7 @@ std::array<double, 2> JodellGripperDriver::positionMm() const {
 }
 
 std::array<double, 2> JodellGripperDriver::positionMmSnapshot(std::array<double, 2> fallback) const {
+  // 状态 JSON 路径不能被夹爪串口阻塞；抢不到锁时返回调用方提供的上一次快照。
   std::unique_lock lock(mutex_, std::try_to_lock);
   if (!lock.owns_lock()) {
     return fallback;
@@ -377,6 +394,7 @@ bool JodellGripperDriver::ensureLoadedUnlocked(std::string* message) {
   if (module_) {
     return true;
   }
+  // 优先使用配置中的绝对路径；失败后再尝试 PATH/当前目录下的 jodellTool.dll。
   HMODULE module = nullptr;
   if (!config_.dllPath.empty()) {
     module = LoadLibraryA(config_.dllPath.c_str());
@@ -391,6 +409,7 @@ bool JodellGripperDriver::ensureLoadedUnlocked(std::string* message) {
     return false;
   }
   module_ = module;
+  // 这里显式绑定需要的最小导出集；缺任意一个都无法安全执行命令。
   serialOperation_ = loadSymbol<decltype(serialOperation_)>(
       module_, "serialOperation", "?serialOperation@@YAHHH_N@Z");
   clawEnable_ = loadSymbol<decltype(clawEnable_)>(module_, "clawEnable", "?clawEnable@@YAHH_N@Z");
@@ -430,6 +449,7 @@ bool JodellGripperDriver::ensurePortOpenUnlocked(int index, int port, std::strin
   bool closedOtherPort = false;
   for (int& activePort : activePorts_) {
     if (activePort > 0 && activePort != port) {
+      // 这个 DLL 更像全局串口状态机，同时打开两个端口不稳定，因此切换前先关闭其他端口。
       (void)serialOperation_(activePort, config_.baudrate, 0);
       activePort = -1;
       closedOtherPort = true;
@@ -443,6 +463,7 @@ bool JodellGripperDriver::ensurePortOpenUnlocked(int index, int port, std::strin
   }
   int ret = -999;
   for (int attempt = 0; attempt < 5; ++attempt) {
+    // 串口打开偶发失败，重试前先发关闭命令复位 DLL 内部状态。
     ret = serialOperation_(port, config_.baudrate, 1);
     if (ret == 0 || ret == 1) {
       activePorts_[index] = port;
@@ -472,6 +493,7 @@ bool JodellGripperDriver::ensurePortOpenUnlocked(int index, int port, std::strin
 }
 
 int JodellGripperDriver::portNumber(const std::string& value) const {
+  // 接受 "COM8" 或 "8" 这样的配置形式，只提取数字部分传给 vendor API。
   std::string digits;
   for (const char ch : value) {
     if (ch >= '0' && ch <= '9') {
@@ -492,6 +514,7 @@ int JodellGripperDriver::sideIndex(Side side) const {
 bool JodellGripperDriver::ensureProcessWorkerUnlocked(int index, std::string* message) {
   auto& worker = workerProcesses_[index];
   if (worker.process != nullptr) {
+    // 复用仍然存活的 worker；如果已经退出，就关闭句柄后重新创建。
     DWORD exitCode = 0;
     if (GetExitCodeProcess(static_cast<HANDLE>(worker.process), &exitCode) && exitCode == STILL_ACTIVE) {
       return true;
@@ -503,6 +526,7 @@ bool JodellGripperDriver::ensureProcessWorkerUnlocked(int index, std::string* me
   security.nLength = sizeof(SECURITY_ATTRIBUTES);
   security.bInheritHandle = TRUE;
 
+  // 两条匿名管道分别承载父进程写命令和读响应。
   HANDLE childStdInRead = nullptr;
   HANDLE parentStdInWrite = nullptr;
   HANDLE parentStdOutRead = nullptr;
@@ -519,6 +543,7 @@ bool JodellGripperDriver::ensureProcessWorkerUnlocked(int index, std::string* me
 
   const std::string side = index == 0 ? "left" : "right";
   const std::string workerExe = config_.workerExePath.empty() ? defaultWorkerExePath() : config_.workerExePath;
+  // 把该侧端口、从站号和 DLL 路径固定传给 worker，worker 生命周期内不再切换侧。
   std::ostringstream command;
   command << quoteWindowsArg(workerExe)
       << " --side " << side
@@ -547,6 +572,7 @@ bool JodellGripperDriver::ensureProcessWorkerUnlocked(int index, std::string* me
       nullptr,
       &startup,
       &processInfo);
+  // 创建后父进程不再需要子进程那一端管道句柄。
   CloseHandle(childStdInRead);
   CloseHandle(childStdOutWrite);
   if (!created) {
@@ -578,6 +604,7 @@ bool JodellGripperDriver::commandProcessWorkerUnlocked(
     }
     return false;
   }
+  // 一条命令对应一行响应；超时会让上层看到失败，而不是卡住遥操作线程。
   if (!writeAll(static_cast<HANDLE>(worker.stdinWrite), command + "\n")) {
     if (message) {
       *message = "failed to write Jodell worker command";
@@ -598,6 +625,7 @@ bool JodellGripperDriver::commandProcessWorkerUnlocked(
     }
     return false;
   }
+  // parts[0] 是 OK/ERR，parts[1] 是位置毫米值，parts[2] 是可读诊断消息。
   if (positionMm) {
     char* end = nullptr;
     const double value = std::strtod(parts[1].c_str(), &end);
@@ -612,11 +640,13 @@ bool JodellGripperDriver::commandProcessWorkerUnlocked(
 void JodellGripperDriver::closeProcessWorkersUnlocked() {
   for (auto& worker : workerProcesses_) {
     if (worker.stdinWrite) {
+      // 正常路径先请求 worker 自行退出，避免直接终止时 DLL/串口状态未释放。
       (void)writeAll(static_cast<HANDLE>(worker.stdinWrite), "EXIT\n");
     }
     if (worker.process) {
       const DWORD waitResult = WaitForSingleObject(static_cast<HANDLE>(worker.process), 500);
       if (waitResult == WAIT_TIMEOUT) {
+        // 进程不响应时才强制终止，防止 HalServer 关闭流程无限等待。
         TerminateProcess(static_cast<HANDLE>(worker.process), 1);
         WaitForSingleObject(static_cast<HANDLE>(worker.process), 500);
       }
@@ -636,6 +666,7 @@ void JodellGripperDriver::closeProcessWorkersUnlocked() {
 
 void JodellGripperDriver::closeUnlocked() {
   if (serialOperation_) {
+    // 对每个实际打开过的串口只关闭一次，处理左右配置误设为同一 COM 的情况。
     for (size_t i = 0; i < activePorts_.size(); ++i) {
       const int port = activePorts_[i];
       if (port <= 0) {
@@ -652,6 +683,7 @@ void JodellGripperDriver::closeUnlocked() {
   }
   activePorts_ = {{-1, -1}};
   if (module_) {
+    // DLL 卸载后必须清空函数指针，避免下次配置失败时误用悬空指针。
     FreeLibrary(static_cast<HMODULE>(module_));
   }
   module_ = nullptr;

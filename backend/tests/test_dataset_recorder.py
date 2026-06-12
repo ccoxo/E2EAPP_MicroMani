@@ -371,6 +371,7 @@ def test_native_writer_command_times_out_when_writer_does_not_complete() -> None
         recorder = object.__new__(DatasetRecorderService)
         recorder._writer_thread = writer
         recorder._native_writer_command_timeout_s = 0.05
+        recorder._native_save_episode_timeout_s = 0.05
         task = asyncio.create_task(recorder._native_writer_command("save_episode"))
         try:
             with pytest.raises(RuntimeError, match="native LeRobot writer command timed out"):
@@ -380,6 +381,29 @@ def test_native_writer_command_times_out_when_writer_does_not_complete() -> None
                 writer.future.set_result(None)
             with contextlib.suppress(BaseException):
                 await task
+
+    asyncio.run(run_case())
+
+
+def test_native_writer_save_episode_uses_save_timeout() -> None:
+    class DelayedWriter:
+        def is_alive(self) -> bool:
+            return True
+
+        def submit(self, _kind: str) -> Future[object]:
+            future: Future[object] = Future()
+            asyncio.get_running_loop().call_later(0.05, future.set_result, 123)
+            return future
+
+    async def run_case() -> None:
+        recorder = object.__new__(DatasetRecorderService)
+        recorder._writer_thread = DelayedWriter()
+        recorder._native_writer_command_timeout_s = 0.01
+        recorder._native_save_episode_timeout_s = 0.2
+
+        result = await recorder._native_writer_command("save_episode")
+
+        assert result == 123
 
     asyncio.run(run_case())
 
@@ -750,7 +774,7 @@ def test_dataset_recorder_save_drains_queued_assembly_before_closing_episode() -
         assert recorder._reset_pending is True
         assert recorder._samplers_paused is True
         assert recorder.telemetry.recording is False
-        assert calls == ["drain", "finalize:review:False", "stop:recording", "log"]
+        assert calls == ["stop:recording", "drain", "finalize:review:False", "log"]
 
     asyncio.run(run_case())
 
@@ -800,6 +824,46 @@ def test_dataset_recorder_save_persists_episode_metadata_off_event_loop(
 
         assert result["episode"]["id"] == "episode_000000"
         assert to_thread_calls == ["finalize_episode", "record_status"]
+
+    asyncio.run(run_case())
+
+
+def test_dataset_recorder_save_stops_recording_teleop_before_drain() -> None:
+    async def run_case() -> None:
+        recorder = object.__new__(DatasetRecorderService)
+        calls: list[str] = []
+        recorder._session_active = True
+        recorder._recording = True
+        recorder._accepting_frame_jobs = True
+        recorder._episode_index = 0
+        recorder._reset_pending = False
+        recorder._samplers_paused = False
+        recorder._lock = asyncio.Lock()
+        recorder.telemetry = SimpleNamespace(recording=True, episode_count=0)
+        recorder._native_writer_active = lambda: False
+        recorder.logs = SimpleNamespace(info=lambda *_args: calls.append("log"))
+
+        async def drain() -> None:
+            calls.append("drain")
+
+        def finalize_episode(*, status: str, deleted: bool) -> dict[str, object]:
+            calls.append(f"finalize:{status}:{deleted}")
+            return {"id": "episode_000000", "episodeIndex": 0}
+
+        async def stop(source: str) -> None:
+            calls.append(f"stop:{source}")
+
+        def record_status() -> dict[str, object]:
+            return {"recording": recorder._recording}
+
+        recorder._drain_recording_queues = drain
+        recorder._finalize_episode_locked = finalize_episode
+        recorder.teleop = SimpleNamespace(stop=stop)
+        recorder.status = record_status
+
+        await recorder.save_episode()
+
+        assert calls[:2] == ["stop:recording", "drain"]
 
     asyncio.run(run_case())
 
@@ -888,7 +952,7 @@ def test_dataset_recorder_save_failure_stops_recording_source() -> None:
         assert recorder._reset_pending is True
         assert recorder._samplers_paused is True
         assert recorder.telemetry.recording is False
-        assert calls == ["drain", "save_native", "clear_native", "stop:recording"]
+        assert calls == ["stop:recording", "drain", "save_native", "clear_native", "stop:recording"]
 
     asyncio.run(run_case())
 

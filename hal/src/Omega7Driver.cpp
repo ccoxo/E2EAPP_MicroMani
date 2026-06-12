@@ -16,6 +16,7 @@ namespace appstation::hal {
 
 namespace {
 std::int64_t unixTimeMs() {
+  // 状态时间戳使用墙钟毫秒，方便前端和后端日志直接对齐。
   const auto now = std::chrono::system_clock::now().time_since_epoch();
   return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
 }
@@ -63,6 +64,7 @@ DhdErrorGetLastStr dhdErrorGetLastStr = nullptr;
 
 constexpr double kOmega7GripperOpenDeg = 30.0;
 constexpr double kOmega7GripperOpenMm = 25.0;
+// 有些 SDK/设备在开口读取失败时会返回接近 0 的噪声值，低于该阈值不作为可信开口。
 constexpr double kOmega7GripperGapMinReliableMm = 0.001;
 
 // SDK 调用失败时统一取最近错误。dhdErrorGetLastStr 本身也是可选导出，
@@ -180,11 +182,13 @@ bool Omega7Driver::initialize(int leftOpenId, int rightOpenId, bool swapHands) {
   };
 
   openDevice(leftOpenId, "left");
+  // 如果只枚举到一台设备，避免用同一个 openId 重复打开右手。
   if (deviceCount > 1 && rightOpenId != leftOpenId) {
     openDevice(rightOpenId, "right");
   }
 
   auto takeDeviceByHandedness = [&](bool wantLeftHanded) {
+    // 优先按 SDK 上报的左右手属性分配逻辑左右，比 openId 更贴近主手物理属性。
     for (auto it = openedDevices.begin(); it != openedDevices.end(); ++it) {
       if (it->handednessKnown && it->leftHanded == wantLeftHanded) {
         const auto item = *it;
@@ -196,6 +200,7 @@ bool Omega7Driver::initialize(int leftOpenId, int rightOpenId, bool swapHands) {
   };
 
   auto takeDeviceByOpenId = [&](int openId) {
+    // 部分 SDK 不支持左右手属性时，退回到配置中的 openId 顺序。
     for (auto it = openedDevices.begin(); it != openedDevices.end(); ++it) {
       if (it->openId == openId) {
         const auto item = *it;
@@ -223,6 +228,7 @@ bool Omega7Driver::initialize(int leftOpenId, int rightOpenId, bool swapHands) {
     openedDevices.erase(openedDevices.begin());
   }
   if (swapHands) {
+    // 最后再交换逻辑左右，保留前面的自动识别和 openId 兜底结果。
     std::swap(state_[0], state_[1]);
   }
   applyForceOutputUnlocked(0, forceOutputEnabled_[0]);
@@ -310,6 +316,7 @@ std::array<Omega7State, 2> Omega7Driver::readState() {
     double selectedGapMm = 0.0;
     bool haveGap = false;
     if (dhdGetGripperGap) {
+      // 首选 SDK 直接给出的开口距离，单位米。
       double gapM = 0.0;
       if (dhdGetGripperGap(&gapM, static_cast<char>(item.deviceId)) >= 0 && std::isfinite(gapM)) {
         const double directGapMm = (std::max)(0.0, gapM * 1000.0);
@@ -320,6 +327,7 @@ std::array<Omega7State, 2> Omega7Driver::readState() {
       }
     }
     if (!haveGap && dhdGetGripperEncoder && dhdGripperEncoderToGap) {
+      // 直接开口不可用时，用编码器读数经 SDK 换算成开口距离。
       int encoder = 0;
       double encoderGapM = 0.0;
       if (dhdGetGripperEncoder(&encoder, static_cast<char>(item.deviceId)) >= 0
@@ -333,6 +341,7 @@ std::array<Omega7State, 2> Omega7Driver::readState() {
       }
     }
     if (!haveGap && dhdGetGripperAngleDeg) {
+      // 最后才用夹爪角度线性估算开口，精度较低但可作为 teleop 兜底输入。
       double angleDeg = 0.0;
       if (dhdGetGripperAngleDeg(&angleDeg, static_cast<char>(item.deviceId)) >= 0 && std::isfinite(angleDeg)) {
         selectedGapMm = std::clamp(std::abs(angleDeg) / kOmega7GripperOpenDeg, 0.0, 1.0)
@@ -357,6 +366,7 @@ std::array<Omega7State, 2> Omega7Driver::readState() {
 
 void Omega7Driver::setGravityCompensation(bool leftEnabled, bool rightEnabled) {
   std::scoped_lock lock(mutex_);
+  // 两侧独立控制，允许只给已连接或需要的主手开启力输出。
   applyForceOutputUnlocked(0, leftEnabled);
   applyForceOutputUnlocked(1, rightEnabled);
 }
@@ -368,6 +378,7 @@ std::array<bool, 2> Omega7Driver::forceOutputEnabled() const {
 
 void Omega7Driver::zeroForceFeedback(int openId) {
   std::scoped_lock lock(mutex_);
+  // openId < 0 表示对所有已连接设备写零力；否则只处理指定启动编号的设备。
   for (const auto& item : state_) {
     if (item.connected && item.deviceId >= 0 && (openId < 0 || item.openId == openId)) {
       writeZeroForceUnlocked(item);
@@ -387,6 +398,7 @@ void Omega7Driver::applyForceOutputUnlocked(std::size_t index, bool enabled) {
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   const auto deviceId = static_cast<char>(item.deviceId);
   if (dhdEnableExpertMode) {
+    // Force Dimension SDK 的力输出通常要求先进入 expert mode；失败不阻断后续尝试。
     (void)dhdEnableExpertMode();
   }
   if (dhdSetGravityCompensation) {
@@ -411,6 +423,7 @@ int Omega7Driver::writeZeroForceUnlocked(const Omega7State& item) {
   if (!dhdSetForceAndTorqueAndGripperForce || !item.connected || item.deviceId < 0) {
     return -1;
   }
+  // 即使启用重力补偿，也周期性写 0 力/0 力矩，避免残留主动力反馈。
   return dhdSetForceAndTorqueAndGripperForce(
       0.0,
       0.0,
