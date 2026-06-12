@@ -70,6 +70,11 @@ class TeleopMappingService:
         self._last_native_payload: dict[str, Any] | None = None
         self._native_transition_lock = asyncio.Lock()
 
+    async def _get_config_async(self) -> dict[str, Any]:
+        if self.settings is None:
+            return {}
+        return await asyncio.to_thread(self.settings.get_config)
+
     async def start(
         self,
         source: str = "recording",
@@ -77,7 +82,7 @@ class TeleopMappingService:
         *,
         pre_home: bool = True,
     ) -> dict[str, Any]:
-        config = self.settings.get_config()
+        config = await self._get_config_async()
         op_id = self.logs.new_op_id("teleop") if self.logs is not None else None
         mode = self._hal_mode(config)
         if mode == "real" and self._native_engine(config):
@@ -85,7 +90,7 @@ class TeleopMappingService:
                 return await self._start_native_locked(config, op_id, source, home_side, pre_home)
         if self._task is not None and not self._task.done():
             self._arm_sources.add(source)
-            return self.status()
+            return self.status(config)
         if mode == "real" and pre_home:
             await self._return_to_work_origin_before_start(config, home_side)
         self._arm_sources.add(source)
@@ -102,7 +107,7 @@ class TeleopMappingService:
             self._last_action = None
             self._action_history.clear()
             self.logs.info("[HAL]", "teleop mapper armed in test mode; no hardware motion will be sent")
-            return self.status()
+            return self.status(config)
         self._stop_event = asyncio.Event()
         self._task = asyncio.create_task(self._run_loop(), name="teleop-mapping")
         translation_step = self._translation_step_um(config)
@@ -114,7 +119,7 @@ class TeleopMappingService:
                 f"max step {translation_step:g}um / {rotation_step:g}deg"
             ),
         )
-        return self.status()
+        return self.status(config)
 
     async def _start_native_locked(
         self,
@@ -142,7 +147,7 @@ class TeleopMappingService:
                 payload = self._native_payload(config)
                 changed_origin_sides = self._native_payload_changed_work_origin_sides(payload)
                 if payload == self._last_native_payload:
-                    return self.status()
+                    return self.status(config)
                 if changed_origin_sides:
                     await self._stop_and_return_changed_work_origins(config, changed_origin_sides, payload)
                 if source == "teleop-connect":
@@ -153,7 +158,7 @@ class TeleopMappingService:
                 if not source_was_present:
                     self._arm_sources.discard(source)
                 raise
-            return self.status()
+            return self.status(config)
         if pre_home:
             await self._return_to_work_origin_before_start(config, home_side)
         self._arm_sources.add(source)
@@ -198,7 +203,7 @@ class TeleopMappingService:
         self._log_teleop_mode(config, op_id, source, "start", native=True)
         self._log_teleop_profiles(config, op_id)
         self.logs.warning("[HAL]", "HAL-native teleop controller armed")
-        return self.status()
+        return self.status(config)
 
     async def _return_to_work_origin_before_start(
         self,
@@ -408,14 +413,14 @@ class TeleopMappingService:
         )
 
     async def stop(self, source: str = "recording", *, restart_remaining: bool = True) -> dict[str, Any]:
-        config = self.settings.get_config() if self.settings is not None else {}
+        config = await self._get_config_async()
         if self._native_engine(config):
             async with self._native_transition_lock:
                 return await self._stop_native_locked(config, source, restart_remaining)
         self._arm_sources.discard(source)
         if self._arm_sources:
             self._reset_all_tracking()
-            return self.status()
+            return self.status(config)
         self._armed_at_ms = None
         self._reset_all_tracking()
         stop_event = self._stop_event
@@ -433,7 +438,7 @@ class TeleopMappingService:
         self._stop_event = None
         if self.logs is not None:
             self.logs.info("[HAL]", "teleop mapper stopped")
-        return self.status()
+        return self.status(config)
 
     async def _stop_native_locked(
         self,
@@ -445,7 +450,7 @@ class TeleopMappingService:
         self._arm_sources.discard(source)
         task_running = self._task is not None and not self._task.done()
         if not source_was_present and not self._arm_sources and self._armed_at_ms is None and not task_running:
-            return self.status()
+            return self.status(config)
         if self._arm_sources:
             if restart_remaining:
                 try:
@@ -457,7 +462,7 @@ class TeleopMappingService:
                     await self._stop_native_after_start_gate_failure(config)
                     raise
                 await self._configure_and_start_native(config)
-            return self.status()
+            return self.status(config)
         self._armed_at_ms = None
         self._reset_all_tracking()
         stop_event = self._stop_event
@@ -487,7 +492,7 @@ class TeleopMappingService:
         if self.logs is not None:
             self._log_teleop_mode(config, None, source, "stop", native=True)
             self.logs.info("[HAL]", "HAL-native teleop controller stopped")
-        return self.status()
+        return self.status(config)
 
     async def _stop_native_after_start_gate_failure(self, config: dict[str, Any]) -> None:
         self._arm_sources.clear()
@@ -520,9 +525,9 @@ class TeleopMappingService:
         if self.logs is not None:
             self.logs.warning("[HAL]", "HAL-native teleop controller stopped after native start gate failure")
 
-    def status(self) -> dict[str, Any]:
+    def status(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
         running = self._task is not None and not self._task.done()
-        config = self.settings.get_config() if self.settings is not None else {}
+        config = config if config is not None else (self.settings.get_config() if self.settings is not None else {})
         native_engine = self._native_engine(config)
         if native_engine and self._native_status_cache:
             running = bool(self._native_status_cache.get("running", running))
@@ -569,7 +574,7 @@ class TeleopMappingService:
                     self.logs.error("[HAL]", f"HAL-native teleop status recovered: {message}")
                     self._last_error = message
                     self._last_error_at = now
-            config = self.settings.get_config()
+            config = await self._get_config_async()
             await asyncio.sleep(max(self._native_status_interval_s(config), self._command_interval_s(config)))
 
     async def _configure_and_start_native(self, config: dict[str, Any]) -> None:
@@ -602,9 +607,9 @@ class TeleopMappingService:
                 self._last_error = error
             return
         last_action = payload.get("lastAction") if isinstance(payload, dict) else None
+        config = await self._get_config_async()
         if isinstance(last_action, dict):
             self._last_action = last_action
-            config = self.settings.get_config() if self.settings is not None else {}
             self._log_native_diag_action(config, last_action, payload)
         history = payload.get("actionHistory") if isinstance(payload, dict) else None
         if isinstance(history, list):
@@ -618,7 +623,6 @@ class TeleopMappingService:
         error = payload.get("lastError") if isinstance(payload, dict) else None
         if isinstance(error, str):
             self._last_error = error
-        config = self.settings.get_config() if self.settings is not None else {}
         self._log_native_status_summary(config, payload)
 
     async def _run_loop(self) -> None:
@@ -636,11 +640,11 @@ class TeleopMappingService:
                     self._last_error = message
                     self._last_error_at = now
             elapsed = time.monotonic() - started
-            period_s = self._command_interval_s(self.settings.get_config())
+            period_s = self._command_interval_s(await self._get_config_async())
             await asyncio.sleep(max(0.001, period_s - elapsed))
 
     async def _step(self) -> None:
-        config = self.settings.get_config()
+        config = await self._get_config_async()
         health = await self.hal.health()
         if not health.connected or not health.ltdmc_ok or not health.omega7_ok:
             reasons = []

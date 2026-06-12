@@ -205,11 +205,14 @@ class GripperTeleService:
             "rightTargetMm": self._right.target_mm,
         }
 
+    async def _get_config_async(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._settings.get_config)
+
     async def _loop(self) -> None:
         stop_event = self._stop_event
         assert stop_event is not None
         while not stop_event.is_set():
-            config = self._settings.get_config()
+            config = await self._get_config_async()
             gt_cfg: dict[str, Any] = config.get("teleop", {}).get("gripperTeleop", {})
             loop_hz = max(1.0, float(gt_cfg.get("loopHz", 100)))
             diag = bool(gt_cfg.get("diagLog", False))

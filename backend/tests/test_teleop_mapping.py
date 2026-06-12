@@ -28,7 +28,7 @@ class FakeHal:
     def __init__(self) -> None:
         self.commands: list[tuple[str, dict[str, Any]]] = []
         self.native_status: dict[str, Any] = {
-            "running": False,
+            "running": True,
             "lastAction": {
                 "side": "right",
                 "sourceSide": "left",
@@ -70,6 +70,24 @@ class FakeSettings:
 
     def get_config(self) -> dict[str, Any]:
         return self.config
+
+
+class GuardedSettings(FakeSettings):
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__(config)
+        self.calls = 0
+
+    def get_config(self) -> dict[str, Any]:
+        self.calls += 1
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self.config
+        raise AssertionError("teleop mapper read config on the event loop")
+
+
+def _non_status_commands(commands: list[tuple[str, dict[str, Any]]]) -> list[tuple[str, dict[str, Any]]]:
+    return [(name, payload) for name, payload in commands if name != "teleop.native.status"]
 
 
 class FailingTeleopHal(FakeHal):
@@ -334,6 +352,21 @@ def test_native_teleop_start_configures_and_starts_hal_controller(monkeypatch: p
     asyncio.run(run())
 
 
+def test_teleop_mapper_start_stop_read_config_off_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+
+    async def run() -> None:
+        settings = GuardedSettings(start_config(engine="python_mapper"))
+        mapper = TeleopMappingService(settings=settings, hal=FakeHal(), logs=LogService())
+
+        await mapper.start("recording")
+        await mapper.stop("recording")
+
+        assert settings.calls >= 2
+
+    asyncio.run(run())
+
+
 def test_native_teleop_connect_does_not_enable_hal_gripper_follow(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
 
@@ -423,7 +456,7 @@ def test_native_manual_gripper_start_does_not_restart_active_arm_payload(
         hal.commands.clear()
         await mapper.start("manual-gripper", pre_home=False)
 
-        assert hal.commands == []
+        assert _non_status_commands(hal.commands) == []
         assert mapper.status()["sources"] == ["manual-gripper", "teleop-connect"]
 
     asyncio.run(run())
@@ -447,17 +480,18 @@ def test_native_teleop_running_origin_change_forces_rehome_before_start(
 
         await mapper.start("teleop-connect", pre_home=False)
 
-        assert [name for name, _ in hal.commands] == [
+        commands = _non_status_commands(hal.commands)
+        assert [name for name, _ in commands] == [
             "teleop.native.stop",
             "motion.home_origin_side",
             "teleop.native.start",
         ]
-        assert hal.commands[1][1] == {
+        assert commands[1][1] == {
             "side": "left",
             "pulse": [101.0, 102.0, 103.0, 104.0, 105.0, 106.0],
             "enabledAxes": [True, True, True, True, True, True],
         }
-        assert hal.commands[-1][1]["leftWorkOriginPulse"] == [101.0, 102.0, 103.0, 104.0, 105.0, 106.0]
+        assert commands[-1][1]["leftWorkOriginPulse"] == [101.0, 102.0, 103.0, 104.0, 105.0, 106.0]
         origin_event = next(
             message for message in [entry.msg for entry in logs.list_entries()]
             if "event=teleop_origin_transition" in message
@@ -507,7 +541,7 @@ def test_native_teleop_running_refresh_enters_recovery_for_rotation_outside_work
 
         await mapper.start("teleop-connect", pre_home=False)
 
-        assert [name for name, _ in hal.commands] == ["teleop.native.start"]
+        assert [name for name, _ in _non_status_commands(hal.commands)] == ["teleop.native.start"]
         assert mapper.status()["armed"] is True
         assert mapper.status()["running"] is True
         assert mapper.status()["sources"] == ["teleop-connect"]
@@ -533,7 +567,7 @@ def test_native_teleop_running_refresh_from_manual_gripper_enters_arm_recovery(
 
         await mapper.start("teleop-connect", pre_home=True, home_side="left")
 
-        assert [name for name, _ in hal.commands] == ["teleop.native.start"]
+        assert [name for name, _ in _non_status_commands(hal.commands)] == ["teleop.native.start"]
         assert mapper.status()["armed"] is True
         assert mapper.status()["running"] is True
         assert mapper.status()["sources"] == ["manual-gripper", "teleop-connect"]
@@ -555,13 +589,13 @@ def test_native_teleop_stop_can_remove_aux_source_without_restarting(monkeypatch
 
         await mapper.stop("teleop-connect", restart_remaining=False)
 
-        assert hal.commands == []
+        assert _non_status_commands(hal.commands) == []
         assert mapper.status()["armed"] is True
         assert mapper.status()["sources"] == ["recording"]
 
         await mapper.stop("recording")
 
-        assert [name for name, _ in hal.commands] == ["teleop.native.stop"]
+        assert [name for name, _ in _non_status_commands(hal.commands)] == ["teleop.native.stop"]
 
     asyncio.run(run())
 
@@ -585,7 +619,10 @@ def test_native_teleop_stop_restart_enters_recovery_for_remaining_arm_source(
 
         await mapper.stop("recording")
 
-        assert [name for name, _ in hal.commands] == ["teleop.native.configure", "teleop.native.start"]
+        assert [name for name, _ in _non_status_commands(hal.commands)] == [
+            "teleop.native.configure",
+            "teleop.native.start",
+        ]
         assert mapper.status()["armed"] is True
         assert mapper.status()["running"] is True
         assert mapper.status()["sources"] == ["teleop-connect"]

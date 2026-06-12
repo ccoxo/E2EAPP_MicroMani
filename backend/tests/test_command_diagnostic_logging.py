@@ -36,8 +36,15 @@ class FakeSettings:
 
 
 class FakeTelemetry:
-    def apply_axis_move(self, side: str, axis: str, direction: int, step: float) -> float:
-        _ = (side, axis)
+    def apply_axis_move(
+        self,
+        side: str,
+        axis: str,
+        direction: int,
+        step: float,
+        config: dict[str, Any] | None = None,
+    ) -> float:
+        _ = (side, axis, config)
         return direction * step
 
     def home_all(self) -> None:

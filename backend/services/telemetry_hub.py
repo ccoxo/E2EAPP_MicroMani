@@ -160,11 +160,18 @@ class TelemetryHub:
             processStatus=self._process_status(elapsed, real_mode),
         )
 
-    def apply_axis_move(self, side: str, axis: str, direction: int, step: float) -> float:
+    def apply_axis_move(
+        self,
+        side: str,
+        axis: str,
+        direction: int,
+        step: float,
+        config: dict[str, Any] | None = None,
+    ) -> float:
         axis_order = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
         axis_idx = axis_order.index(axis)
         state_idx = (0 if side == "left" else 6) + axis_idx
-        config = self.settings.get_config()
+        config = config if config is not None else self.settings.get_config()
         limit_key = axis.lower()
         limits_key = "leftSoftLimits" if side == "left" else "rightSoftLimits"
         limits = config["motion"][limits_key][limit_key]
@@ -175,8 +182,14 @@ class TelemetryHub:
         self.axis_offsets[state_idx] = next_offset
         return applied
 
-    def apply_gripper(self, side: str, command: str, target_mm: float | None) -> float:
-        config = self.settings.get_config()
+    def apply_gripper(
+        self,
+        side: str,
+        command: str,
+        target_mm: float | None,
+        config: dict[str, Any] | None = None,
+    ) -> float:
+        config = config if config is not None else self.settings.get_config()
         idx = 0 if side == "left" else 1
         stroke = float(config["gripper"]["strokeMm"])
         if command == "open":

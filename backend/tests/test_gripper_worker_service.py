@@ -35,12 +35,25 @@ class FakeTelemetry:
         self.motion_axis_enabled: dict[str, list[bool | None]] = {}
         self.motion_enabled: dict[str, bool | None] = {}
 
-    def apply_gripper(self, side: str, command: str, target_mm: float | None) -> float:
-        _ = (side, command, target_mm)
+    def apply_gripper(
+        self,
+        side: str,
+        command: str,
+        target_mm: float | None,
+        config: dict[str, Any] | None = None,
+    ) -> float:
+        _ = (side, command, target_mm, config)
         return 0.0
 
-    def apply_axis_move(self, side: str, axis: str, direction: int, step: float) -> float:
-        _ = (side, axis, direction)
+    def apply_axis_move(
+        self,
+        side: str,
+        axis: str,
+        direction: int,
+        step: float,
+        config: dict[str, Any] | None = None,
+    ) -> float:
+        _ = (side, axis, direction, config)
         return step
 
     def set_motion_enabled(self, side: str, enabled: bool | None) -> None:

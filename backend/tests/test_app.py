@@ -637,6 +637,30 @@ def test_device_routes_read_config_on_worker_thread(tmp_path: Path, monkeypatch:
     assert calls[:2] == ["get_config", "status"]
 
 
+def test_teleop_mapping_status_reads_config_off_event_loop(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path / "runtime"), raise_server_exceptions=False)
+    app_state = _app_state(client)
+    original_get_config = app_state.settings.get_config
+    calls: list[str] = []
+
+    def guarded_get_config() -> dict[str, Any]:
+        calls.append("get_config")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return original_get_config()
+        raise AssertionError("teleop mapping status read config on the event loop")
+
+    monkeypatch.setattr(app_state.settings, "get_config", guarded_get_config)
+
+    response = client.get("/api/teleop/mapping/status")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert calls == ["get_config"]
+
+
 def test_startup_emits_session_and_axis_config_logs(tmp_path: Path) -> None:
     client = TestClient(create_app(tmp_path))
 
@@ -773,6 +797,102 @@ def test_teleop_gravity_compensation_saves_config_off_event_loop(
     assert response.status_code == 200
     assert response.json()["data"]["enabled"] is False
     assert calls == ["save_config"]
+
+
+def test_motion_and_gripper_command_routes_use_config_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path), raise_server_exceptions=False)
+    app_state = _app_state(client)
+    config = client.get("/api/settings").json()
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+    config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
+    _disable_rotation_work_limits(config)
+    assert client.put("/api/settings", json=config).status_code == 200
+    original_get_config = app_state.settings.get_config
+    original_save_config = app_state.settings.save_config
+    calls: list[str] = []
+
+    def guarded_get_config() -> dict[str, Any]:
+        calls.append("get_config")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return original_get_config()
+        raise AssertionError("command route read config on the event loop")
+
+    def guarded_save_config(config: dict[str, Any], emit_log: bool = True, **kwargs: Any) -> dict[str, Any]:
+        calls.append("save_config")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return original_save_config(config, emit_log=emit_log, **kwargs)
+        raise AssertionError("command route wrote config on the event loop")
+
+    monkeypatch.setattr(app_state.settings, "get_config", guarded_get_config)
+    monkeypatch.setattr(app_state.settings, "save_config", guarded_save_config)
+
+    move_response = client.post(
+        "/api/motion/manual_axis_move",
+        json={"side": "left", "axis": "X", "direction": 1, "step": 100, "speedMode": "fine"},
+    )
+    gripper_response = client.post(
+        "/api/gripper/left/command",
+        json={"side": "left", "command": "enable"},
+    )
+    tare_response = client.post("/api/sensors/tare")
+
+    assert move_response.status_code == 200
+    assert gripper_response.status_code == 200
+    assert tare_response.status_code == 200
+    assert "get_config" in calls
+    assert "save_config" in calls
+
+
+def test_motion_origin_routes_use_config_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path), raise_server_exceptions=False)
+    app_state = _app_state(client)
+    config = client.get("/api/settings").json()
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+    config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
+    _disable_rotation_work_limits(config)
+    assert client.put("/api/settings", json=config).status_code == 200
+    original_get_config = app_state.settings.get_config
+    original_save_config = app_state.settings.save_config
+    calls: list[str] = []
+
+    def guarded_get_config() -> dict[str, Any]:
+        calls.append("get_config")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return original_get_config()
+        raise AssertionError("motion origin route read config on the event loop")
+
+    def guarded_save_config(config: dict[str, Any], emit_log: bool = True, **kwargs: Any) -> dict[str, Any]:
+        calls.append("save_config")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return original_save_config(config, emit_log=emit_log, **kwargs)
+        raise AssertionError("motion origin route wrote config on the event loop")
+
+    monkeypatch.setattr(app_state.settings, "get_config", guarded_get_config)
+    monkeypatch.setattr(app_state.settings, "save_config", guarded_save_config)
+
+    status_response = client.get("/api/motion/origin")
+    clear_response = client.post("/api/motion/origin/clear")
+
+    assert status_response.status_code == 200
+    assert clear_response.status_code == 200
+    assert "get_config" in calls
+    assert "save_config" in calls
 
 
 def test_websocket_telemetry_compatibility_and_log_shape(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -1068,6 +1188,43 @@ def test_hardware_status_native_mode_does_not_probe_python_gripper_serial(
     assert body["gripper"]["ok"] is True
     assert body["gripper"]["message"] == "managed by HAL-native teleop"
     assert body["gripper"]["ports"][1]["port"] == "COM9"
+
+
+def test_native_gripper_status_reuses_supplied_config_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path), raise_server_exceptions=False)
+    app_state = _app_state(client)
+    config = client.get("/api/settings").json()
+    config["teleop"]["engine"] = "hal_native"
+    config["gripper"]["sampleMode"] = "direct"
+    assert client.put("/api/settings", json=config).status_code == 200
+
+    def fake_hardware_status(*, include_gripper: bool = True) -> dict[str, object]:
+        _ = include_gripper
+        return {"camera": {}, "force": {}, "gripper": {"ok": None}, "pico": {}}
+
+    original_get_config = app_state.settings.get_config
+    calls: list[str] = []
+
+    def guarded_get_config() -> dict[str, Any]:
+        calls.append("get_config")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return original_get_config()
+        raise AssertionError("native gripper status read config on the event loop")
+
+    monkeypatch.setattr(app_state.hardware, "status", fake_hardware_status)
+    monkeypatch.setattr(app_state.settings, "get_config", guarded_get_config)
+
+    response = client.get("/api/hardware/status")
+
+    assert response.status_code == 200
+    assert response.json()["gripper"]["nativeManaged"] is True
+    assert calls == ["get_config"]
 
 
 def test_health_native_mode_does_not_probe_python_gripper_serial(
@@ -2895,6 +3052,41 @@ def test_native_gripper_teleop_start_uses_python_gripper_service(tmp_path: Path,
     assert native_start_calls == []
 
 
+def test_gripper_teleop_loop_reads_config_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    with TestClient(create_app(tmp_path)) as client:
+        config = client.get("/api/settings").json()
+        config["teleop"]["gripperTeleop"]["enabled"] = False
+        config["teleop"]["gripperTeleop"]["loopHz"] = 50
+        assert client.put("/api/settings", json=config).status_code == 200
+        app_state = _app_state(client)
+        original_get_config = app_state.settings.get_config
+        calls: list[str] = []
+
+        def guarded_get_config() -> dict[str, Any]:
+            calls.append("get_config")
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return original_get_config()
+            raise AssertionError("gripper teleop loop read config on the event loop")
+
+        monkeypatch.setattr(app_state.settings, "get_config", guarded_get_config)
+
+        response = client.post("/api/teleop/gripper/start")
+        time.sleep(0.08)
+        status_response = client.get("/api/teleop/gripper/status")
+        client.post("/api/teleop/gripper/stop")
+
+        assert response.status_code == 200
+        assert status_response.status_code == 200
+        assert status_response.json()["data"]["running"] is True
+        assert calls
+
+
 def test_native_teleop_connect_starts_python_dual_worker_gripper_follow(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -3346,55 +3538,60 @@ def test_native_teleop_connect_does_not_require_gripper_probe_before_start(
 
     fake_hal = FakeHal()
     monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: fake_hal)
-    client = TestClient(create_app(tmp_path))
-    config = client.app.state.settings.get_config()
-    config["motion"]["homeReference"] = {
-        "valid": True,
-        "leftValid": True,
-        "rightValid": True,
-        "leftPulse": [0.0] * 6,
-        "rightPulse": [0.0] * 6,
-        "updatedAt": 0,
-    }
-    config["motion"]["origin"] = {
-        "valid": True,
-        "leftValid": True,
-        "rightValid": True,
-        "leftPulse": [0.0] * 6,
-        "rightPulse": [0.0] * 6,
-        "updatedAt": 0,
-        "previousValid": False,
-        "previousLeftPulse": [0.0] * 6,
-        "previousRightPulse": [0.0] * 6,
-        "previousUpdatedAt": 0,
-    }
-    config["motion"]["workOriginOffset"] = {
-        "valid": True,
-        "leftValid": True,
-        "rightValid": True,
-        "leftPulseDelta": [0.0] * 6,
-        "rightPulseDelta": [0.0] * 6,
-        "updatedAt": 0,
-    }
-    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
-    config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
-    client.app.state.settings.save_config(config, emit_log=False)
-    monkeypatch.setattr(
-        client.app.state.hardware,
-        "status",
-        lambda *, include_gripper=True: {
-            "camera": {"ok": True, "message": "cameras ready"},
-            "force": {"ok": True, "message": "force ready"},
-            "gripper": {"ok": False, "message": "right COM9: serialOperation open ret=-1", "ports": []},
-            "pico": {},
-        },
-    )
-    response = client.post("/api/teleop/left/connect")
+    with TestClient(create_app(tmp_path)) as client:
+        config = client.app.state.settings.get_config()
+        config["motion"]["homeReference"] = {
+            "valid": True,
+            "leftValid": True,
+            "rightValid": True,
+            "leftPulse": [0.0] * 6,
+            "rightPulse": [0.0] * 6,
+            "updatedAt": 0,
+        }
+        config["motion"]["origin"] = {
+            "valid": True,
+            "leftValid": True,
+            "rightValid": True,
+            "leftPulse": [0.0] * 6,
+            "rightPulse": [0.0] * 6,
+            "updatedAt": 0,
+            "previousValid": False,
+            "previousLeftPulse": [0.0] * 6,
+            "previousRightPulse": [0.0] * 6,
+            "previousUpdatedAt": 0,
+        }
+        config["motion"]["workOriginOffset"] = {
+            "valid": True,
+            "leftValid": True,
+            "rightValid": True,
+            "leftPulseDelta": [0.0] * 6,
+            "rightPulseDelta": [0.0] * 6,
+            "updatedAt": 0,
+        }
+        config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+        config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
+        client.app.state.settings.save_config(config, emit_log=False)
+        monkeypatch.setattr(
+            client.app.state.hardware,
+            "status",
+            lambda *, include_gripper=True: {
+                "camera": {"ok": True, "message": "cameras ready"},
+                "force": {"ok": True, "message": "force ready"},
+                "gripper": {"ok": False, "message": "right COM9: serialOperation open ret=-1", "ports": []},
+                "pico": {},
+            },
+        )
+        response = client.post("/api/teleop/left/connect")
 
-    assert response.status_code == 200
-    assert client.app.state.settings.get_config()["teleop"]["leftConnected"] is True
-    configure_payloads = [payload for name, payload in fake_hal.commands if name == "teleop.native.configure"]
-    assert configure_payloads
+        assert response.status_code == 200
+        assert client.app.state.settings.get_config()["teleop"]["leftConnected"] is True
+        configure_payloads = []
+        for _ in range(50):
+            configure_payloads = [payload for name, payload in fake_hal.commands if name == "teleop.native.configure"]
+            if configure_payloads:
+                break
+            time.sleep(0.01)
+        assert configure_payloads
     assert configure_payloads[-1]["gripperTeleopEnabled"] is False
 
 
@@ -4520,6 +4717,12 @@ def test_camera_drop_defers_release_while_reader_is_still_reading(monkeypatch: M
     assert release_observed.is_set() is False
 
     assert finished_read.wait(timeout=1.0)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        reader = driver._reader_threads.get(0)  # noqa: SLF001
+        if reader is None or not reader.is_alive():
+            break
+        time.sleep(0.01)
     assert driver._drop_capture(0) is True  # noqa: SLF001
 
     assert release_observed.is_set()
@@ -5592,22 +5795,63 @@ def test_runtime_shutdown_endpoint_schedules_stop_stack(tmp_path: Path, monkeypa
 
 def test_stability_monitor_runs_short_non_motion_check(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
-    client = TestClient(create_app(tmp_path))
+    with TestClient(create_app(tmp_path)) as client:
+        response = client.post(
+            "/api/stability/start",
+            json={"durationS": 0.08, "samplePeriodS": 0.02, "includeCameras": False, "includeForce": True},
+        )
+        assert response.status_code == 200
+        assert response.json()["data"]["active"] is True
+        status = {}
+        for _ in range(50):
+            status_response = client.get("/api/stability/status")
+            assert status_response.status_code == 200
+            status = status_response.json()["data"]
+            if not status["active"] and status["hal"]["connectedSamples"] > 0:
+                break
+            time.sleep(0.02)
 
-    response = client.post(
-        "/api/stability/start",
-        json={"durationS": 0.08, "samplePeriodS": 0.02, "includeCameras": False, "includeForce": True},
-    )
-    assert response.status_code == 200
-    assert response.json()["data"]["active"] is True
-    time.sleep(0.2)
-
-    status_response = client.get("/api/stability/status")
-    assert status_response.status_code == 200
-    status = status_response.json()["data"]
     assert status["active"] is False
     assert status["hal"]["connectedSamples"] > 0
     assert status["force"]["skippedTestMode"] > 0
+
+
+def test_stability_monitor_samples_read_config_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    with TestClient(create_app(tmp_path)) as client:
+        app_state = _app_state(client)
+        original_get_config = app_state.settings.get_config
+        calls: list[str] = []
+
+        def guarded_get_config() -> dict[str, Any]:
+            calls.append("get_config")
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return original_get_config()
+            raise AssertionError("stability monitor read config on the event loop")
+
+        monkeypatch.setattr(app_state.settings, "get_config", guarded_get_config)
+
+        response = client.post(
+            "/api/stability/start",
+            json={"durationS": 0.08, "samplePeriodS": 0.02, "includeCameras": False, "includeForce": True},
+        )
+        assert response.status_code == 200
+        status = {}
+        for _ in range(50):
+            status_response = client.get("/api/stability/status")
+            assert status_response.status_code == 200
+            status = status_response.json()["data"]
+            if not status["active"] and calls:
+                break
+            time.sleep(0.02)
+
+        assert status["errors"] == []
+        assert calls
 
 
 def test_policy_model_auto_and_fine_tune_endpoints_are_conservative(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -5650,6 +5894,41 @@ def test_policy_model_auto_and_fine_tune_endpoints_are_conservative(tmp_path: Pa
     fine_tune_response = client.post("/api/fine_tune/jobs", json={"datasetId": "unit", "baseModel": "act"})
     assert fine_tune_response.status_code == 200
     assert fine_tune_response.json()["data"]["job"]["status"] == "planned"
+
+
+def test_policy_auto_routes_read_config_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path), raise_server_exceptions=False)
+    app_state = _app_state(client)
+    original_get_config = app_state.settings.get_config
+    calls: list[str] = []
+
+    def guarded_get_config() -> dict[str, Any]:
+        calls.append("get_config")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return original_get_config()
+        raise AssertionError("policy route read config on the event loop")
+
+    monkeypatch.setattr(app_state.settings, "get_config", guarded_get_config)
+
+    status_response = client.get("/api/auto/status")
+    start_response = client.post("/api/auto/start", json={"modelId": "act"})
+    action_response = client.post(
+        "/api/auto/action",
+        json={"side": "left", "axis": "X", "direction": 1, "step": 50, "speedMode": "fine"},
+    )
+    dispatch_response = client.post("/api/auto/dispatch_next")
+
+    assert status_response.status_code == 200
+    assert start_response.status_code == 200
+    assert action_response.status_code == 200
+    assert dispatch_response.status_code == 200
+    assert calls
 
 
 def test_emergency_stop_clears_auto_policy_queue(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

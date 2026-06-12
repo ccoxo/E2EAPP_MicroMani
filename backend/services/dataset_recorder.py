@@ -1518,7 +1518,7 @@ class DatasetRecorderService:
         if assembly_queue is not None:
             await self._wait_recording_queue_drain(assembly_queue.join(), "frame assembly")
         await self._wait_recording_queue_drain(self._write_enqueue_idle.wait(), "writer enqueue")
-        await self._wait_recording_queue_drain(asyncio.to_thread(self._write_queue.join), "writer queue")
+        await self._wait_blocking_queue_drain(self._write_queue, "writer queue")
 
     def _recording_queue_drain_timeout_seconds(self) -> float:
         return float(getattr(self, "_recording_queue_drain_timeout_s", RECORDING_QUEUE_DRAIN_TIMEOUT_S))
@@ -1530,6 +1530,38 @@ class DatasetRecorderService:
             message = f"recording queue drain timed out: {label}"
             self._native_error = message
             raise RuntimeError(message) from exc
+
+    async def _wait_blocking_queue_drain(self, drain_queue: Any, label: str) -> None:
+        timeout_s = self._recording_queue_drain_timeout_seconds()
+        loop = asyncio.get_running_loop()
+        unfinished_tasks = getattr(drain_queue, "unfinished_tasks", None)
+        if isinstance(unfinished_tasks, int):
+            deadline = loop.time() + timeout_s
+            while int(getattr(drain_queue, "unfinished_tasks", 0)) > 0:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    message = f"recording queue drain timed out: {label}"
+                    self._native_error = message
+                    raise RuntimeError(message)
+                await asyncio.sleep(min(0.01, remaining))
+            return
+
+        done = asyncio.Event()
+        errors: list[BaseException] = []
+
+        def wait_for_join() -> None:
+            try:
+                drain_queue.join()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(done.set)
+
+        Thread(target=wait_for_join, name="dataset-recording-queue-drain", daemon=True).start()
+        await self._wait_recording_queue_drain(done.wait(), label)
+        if errors:
+            raise errors[0]
 
     async def _stop_assembler_task(self) -> None:
         """排空组帧队列后取消组帧任务并清理队列引用。"""
@@ -1550,7 +1582,7 @@ class DatasetRecorderService:
         # 停止 writer 前必须先排空队列，保证 metadata 的帧数和磁盘内容一致。
         """排空写入队列，发送停止哨兵并等待写线程退出。"""
         await self._wait_recording_queue_drain(self._write_enqueue_idle.wait(), "writer enqueue")
-        await self._wait_recording_queue_drain(asyncio.to_thread(self._write_queue.join), "writer queue")
+        await self._wait_blocking_queue_drain(self._write_queue, "writer queue")
         writer = self._writer_thread
         if writer is None:
             return

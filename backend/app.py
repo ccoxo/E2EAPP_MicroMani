@@ -375,7 +375,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         active = config if config is not None else settings.get_config()
         targets = active.get("gripper", {}) if isinstance(active.get("gripper"), dict) else {}
-        mapper_status = teleop_mapper.status()
+        mapper_status = teleop_mapper.status(active)
         native_status = mapper_status.get("nativeStatus", {})
         sources = mapper_status.get("sources", [])
         requested_running = bool(
@@ -894,7 +894,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 查询自动策略运行状态。
     @app.get("/api/auto/status")
     async def auto_status() -> ApiEnvelope:
-        return envelope(policy.auto_status())
+        return envelope(await asyncio.to_thread(policy.auto_status))
 
     # 启动自动策略执行。
     @app.post("/api/auto/start")
@@ -966,7 +966,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 查询运动工作原点状态。
     @app.get("/api/motion/origin")
     async def motion_origin_status() -> ApiEnvelope:
-        return envelope(commands.motion_origin_status())
+        return envelope(await asyncio.to_thread(commands.motion_origin_status))
 
     # 双侧记录当前工作原点。
     @app.post("/api/motion/origin/capture")
@@ -993,7 +993,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/motion/origin/clear")
     async def clear_motion_origin_all() -> ApiEnvelope:
         try:
-            return envelope(commands.clear_motion_origin())
+            return envelope(await asyncio.to_thread(commands.clear_motion_origin))
         except RuntimeError as exc:
             logs.error("[HAL]", f"clear_motion_origin failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1037,7 +1037,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         try:
-            return envelope(commands.clear_motion_origin(side))
+            return envelope(await asyncio.to_thread(commands.clear_motion_origin, side))
         except RuntimeError as exc:
             logs.error("[HAL]", f"clear_motion_origin failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1396,7 +1396,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 查询遥操作映射状态。
     @app.get("/api/teleop/mapping/status")
     async def teleop_mapping_status() -> ApiEnvelope:
-        return envelope(teleop_mapper.status())
+        config = await get_config_async()
+        return envelope(teleop_mapper.status(config))
 
     # 设置指定侧重力补偿状态。
     @app.post("/api/teleop/{side}/gravity_compensation")
