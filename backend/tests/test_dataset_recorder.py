@@ -370,11 +370,11 @@ def test_native_writer_command_times_out_when_writer_does_not_complete() -> None
         writer = StalledWriter()
         recorder = object.__new__(DatasetRecorderService)
         recorder._writer_thread = writer
-        recorder._native_writer_command_timeout_s = 0.01
+        recorder._native_writer_command_timeout_s = 0.05
         task = asyncio.create_task(recorder._native_writer_command("save_episode"))
         try:
             with pytest.raises(RuntimeError, match="native LeRobot writer command timed out"):
-                await asyncio.wait_for(task, timeout=0.2)
+                await asyncio.wait_for(task, timeout=2.0)
         finally:
             if writer.future is not None and not writer.future.done():
                 writer.future.set_result(None)

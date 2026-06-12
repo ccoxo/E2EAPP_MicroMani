@@ -83,6 +83,7 @@ class TelemetryHub:
         omega_hands: list[dict[str, Any]] | None = None,
         native_gripper_status: dict[str, Any] | None = None,
         hal_ok: bool = True,
+        config: dict[str, Any] | None = None,
     ) -> TelemetryFrame:
         # 每一帧都合并 HAL、硬件轮询和测试夹具数据，给前端提供单一遥测快照。
         self.tick += 1
@@ -93,7 +94,7 @@ class TelemetryHub:
             instant_hz = 1.0 / interval
             self._ws_hz = instant_hz if self._ws_hz <= 0 else self._ws_hz * 0.8 + instant_hz * 0.2
         self._last_frame_at = now
-        config = self.settings.get_config()
+        config = config if config is not None else self.settings.get_config()
         real_mode = self._real_hardware_mode(config)
         if real_mode:
             if motion_positions is not None and len(motion_positions) == 12:

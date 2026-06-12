@@ -719,7 +719,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         app.state.teleop_background_tasks.clear()
         gripper_tele.stop(force=True)
         await asyncio.to_thread(gripper_workers.stop_all)
-        telemetry.shutdown()
+        await asyncio.to_thread(telemetry.shutdown)
 
     # 查询后端、HAL 与硬件健康状态。
     @app.get("/api/health")
@@ -1912,18 +1912,21 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         omega_hands = cached_omega_hands
                     hal_ok = hal_health.connected and (hal_health.mode != "real" or hal_health.ltdmc_ok)
                     use_gripper_workers = gripper_workers.is_enabled(active_config)
-                    frame = telemetry.next_frame(
+                    active_native_gripper_status = (
+                        native_gripper_status(active_config)
+                        if native_teleop_config(active_config) and not use_gripper_workers
+                        else None
+                    )
+                    frame = await asyncio.to_thread(
+                        telemetry.next_frame,
                         motion_positions,
                         motion_estop_active=motion_estop_active,
                         motion_enabled=motion_enabled,
                         motion_axis_enabled=motion_axis_enabled,
                         omega_hands=omega_hands,
-                        native_gripper_status=(
-                            native_gripper_status(active_config)
-                            if native_teleop_config(active_config) and not use_gripper_workers
-                            else None
-                        ),
+                        native_gripper_status=active_native_gripper_status,
                         hal_ok=hal_ok,
+                        config=active_config,
                     )
                     frame.halOk = frame.halOk and hal_ok
                     frame.processStatus[0].label = "HalServer.exe" if hal_health.mode == "real" else "Test HAL boundary"

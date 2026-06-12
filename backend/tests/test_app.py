@@ -757,6 +757,31 @@ def test_command_envelope_and_telemetry_ws(tmp_path: Path, monkeypatch: MonkeyPa
     assert len(teleop_response.json()["data"]["hands"]) == 2
 
 
+def test_websocket_telemetry_frame_runs_off_event_loop(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path / "runtime"))
+    app_state = _app_state(client)
+    original_next_frame = app_state.telemetry.next_frame
+    contexts: list[str] = []
+
+    def guarded_next_frame(*args: Any, **kwargs: Any) -> Any:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            contexts.append("worker")
+        else:
+            contexts.append("event_loop")
+        return original_next_frame(*args, **kwargs)
+
+    monkeypatch.setattr(app_state.telemetry, "next_frame", guarded_next_frame)
+
+    with client.websocket_connect("/ws") as websocket:
+        message = websocket.receive_json()
+
+    assert message["type"] == "telemetry"
+    assert contexts[:1] == ["worker"]
+
+
 def test_teleop_force_controls_forward_to_hal(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     client = TestClient(create_app(tmp_path))
@@ -2658,7 +2683,15 @@ def test_app_shutdown_closes_telemetry_hardware_resources(tmp_path: Path, monkey
     shutdown_calls: list[str] = []
 
     with TestClient(create_app(tmp_path)) as client:
-        client.app.state.telemetry.shutdown = lambda: shutdown_calls.append("shutdown")
+        def fake_shutdown() -> None:
+            shutdown_calls.append("shutdown")
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            raise AssertionError("telemetry shutdown ran on the event loop")
+
+        client.app.state.telemetry.shutdown = fake_shutdown
 
     assert shutdown_calls == ["shutdown"]
 
