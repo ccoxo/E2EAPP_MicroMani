@@ -351,8 +351,24 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 await commands.enable_motion_side(mapped_side)
             except RuntimeError as exc:
                 logs.error("[HAL]", f"teleop connect enable mapped {mapped_side} failed: {exc}")
-            await teleop_mapper.start("teleop-connect", pre_home=False, home_side=mapped_side)
-            await start_gripper_teleop_source("teleop-connect", config)
+            native_started = False
+            try:
+                await teleop_mapper.start("teleop-connect", pre_home=False, home_side=mapped_side)
+                native_started = True
+                await start_gripper_teleop_source("teleop-connect", config)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    gripper_tele.stop("teleop-connect")
+                if native_started:
+                    try:
+                        await teleop_mapper.stop("teleop-connect")
+                    except RuntimeError as cleanup_exc:
+                        logs.error("[HAL]", f"teleop connect rollback native stop failed: {cleanup_exc}")
+                try:
+                    await commands.stop_motion_side(mapped_side)
+                except RuntimeError as cleanup_exc:
+                    logs.error("[HAL]", f"teleop connect rollback stop mapped {mapped_side} failed: {cleanup_exc}")
+                raise
             logs.info("[HAL]", f"{side} Omega.7 logical connect background sync completed")
             return
 
@@ -1571,7 +1587,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             if await native_teleop_enabled_async():
                 await stop_aux_native_teleop_sources("record session create")
             result = await recorder.start_session(str(dataset_name), str(task))
-            await start_gripper_teleop_source("recording")
+            try:
+                await start_gripper_teleop_source("recording")
+            except Exception:
+                with contextlib.suppress(Exception):
+                    gripper_tele.stop("recording")
+                try:
+                    await recorder.finish_session()
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    logs.error("[LEROBOT]", f"record session create rollback failed: {cleanup_exc}")
+                raise
             return envelope(result)
         except RuntimeError as exc:
             if "native LeRobot dataset is required" in str(exc):
@@ -1636,7 +1661,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     )
                 await stop_aux_native_teleop_sources("record reset skip")
             result = await recorder.skip_reset()
-            await start_gripper_teleop_source("recording")
+            try:
+                await start_gripper_teleop_source("recording")
+            except Exception:
+                with contextlib.suppress(Exception):
+                    gripper_tele.stop("recording")
+                try:
+                    await recorder.discard_episode()
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    logs.error("[LEROBOT]", f"record reset skip rollback failed: {cleanup_exc}")
+                raise
             return envelope(result)
         except RuntimeError as exc:
             message = str(exc)

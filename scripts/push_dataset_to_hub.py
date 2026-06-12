@@ -21,7 +21,7 @@ def push_dataset(repo_id: str, local_path: Path, *, private: bool) -> dict[str, 
         raise RuntimeError(f"local dataset path is invalid or missing meta/info.json: {local_path}")
 
     try:
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset  # type: ignore[import-not-found]
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"lerobot[dataset] is not installed in backend runtime: {exc}") from exc
 
