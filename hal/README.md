@@ -24,7 +24,7 @@ Real hardware build path:
 2. Add include/library paths in `CMakeLists.txt` or a local CMake preset.
 3. Configure with `-DAPPSTATION_ENABLE_VENDOR_SDKS=ON`.
 4. Implement the guarded SDK calls in `LTDMCDriver.cpp` and `Omega7Driver.cpp` where marked.
-5. Add the HTTP/WebSocket transport layer for `/health`, `/motion/state`, `/motion/home_all`, `/motion/emergency_stop`, and telemetry broadcast.
+5. Use the built-in Fast-DDS control plane for backend telemetry and commands; HTTP remains only as a local diagnostic surface.
 
 真实硬件构建路径说明：
 
@@ -34,7 +34,7 @@ Real hardware build path:
 4. `Omega7Driver.cpp` 负责 Omega.7 设备枚举、位姿读取和力输出开关。
 5. `NativeTeleopController.cpp` 负责主从映射、Kalman/意图权重、夹爪 teleop 和安全门控。
 
-The Python backend already has `RealHalClient`; start it with `APPSTATION_HAL_MODE=real` once this service is listening on `hal.baseUrl`.
+The Python backend real-HAL path uses `DdsHalClient`; start it with `APPSTATION_HAL_MODE=real` and `APPSTATION_HAL_TRANSPORT=dds`.
 
 Local workstation runtime:
 

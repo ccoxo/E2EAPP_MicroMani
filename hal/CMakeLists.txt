@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.24)
 project(AppStationHal LANGUAGES CXX)
 
+option(APPSTATION_ENABLE_DDS "编译 HAL Fast-DDS 传输边界" ON)
+set(APPSTATION_FASTDDS_ROOT "F:/opt/ros/jazzy" CACHE PATH "Fast-DDS 安装根目录")
+
 # Vendor SDK 默认打开，面向现场工作站；没有硬件 SDK 的机器可在配置时显式关闭。
 option(APPSTATION_ENABLE_VENDOR_SDKS "Compile LTDMC and Omega.7 vendor SDK calls" ON)
 
@@ -24,10 +27,45 @@ if(APPSTATION_ENABLE_VENDOR_SDKS)
   target_compile_definitions(appstation_hal_core PRIVATE APPSTATION_ENABLE_VENDOR_SDKS=1)
 endif()
 
-# HalServer 是本地 HTTP 边界，给 Python backend 提供 /health、motion、teleop 等接口。
-add_executable(HalServer src/HalServer.cpp)
+# HalServer 串起 HTTP 控制、主手 DDS 发布、HAL 映射和 follower 目标执行。
+add_executable(HalServer
+  include/HalCommandDispatcher.h
+  include/HalDdsControlServer.h
+  include/HalHttpServer.h
+  include/HalJson.h
+  include/TeleopDdsTypes.h
+  include/TeleopFollowerTargetSubscriber.h
+  include/TeleopHardwareTargetExecutor.h
+  include/TeleopLeaderPublisher.h
+  include/TeleopMappingNode.h
+  src/HalCommandDispatcher.cpp
+  src/HalDdsControlServer.cpp
+  src/HalHttpServer.cpp
+  src/HalJson.cpp
+  src/HalServer.cpp
+  src/TeleopFollowerTargetSubscriber.cpp
+  src/TeleopHardwareTargetExecutor.cpp
+  src/TeleopLeaderPublisher.cpp
+  src/TeleopMappingNode.cpp
+)
 target_link_libraries(HalServer PRIVATE appstation_hal_core)
+if(APPSTATION_ENABLE_DDS)
+  # EPROSIMA_ALL_DYN_LINK 让 Fast-DDS/Fast-CDR 符号从 ROS2 预编译 DLL 导入。
+  target_compile_definitions(HalServer PRIVATE APPSTATION_ENABLE_DDS=1 EPROSIMA_ALL_DYN_LINK)
+  target_include_directories(HalServer PRIVATE
+    "${APPSTATION_FASTDDS_ROOT}/include"
+    "${APPSTATION_FASTDDS_ROOT}/include/fastrtps"
+    "${APPSTATION_FASTDDS_ROOT}/include/fastcdr"
+  )
+  target_link_directories(HalServer PRIVATE "${APPSTATION_FASTDDS_ROOT}/Lib")
+  target_link_libraries(HalServer PRIVATE
+    "${APPSTATION_FASTDDS_ROOT}/Lib/fastrtps-2.14.lib"
+    "${APPSTATION_FASTDDS_ROOT}/Lib/fastcdr-2.2.lib"
+    "${APPSTATION_FASTDDS_ROOT}/Lib/foonathan_memory-0.7.3.lib"
+  )
+endif()
 if(MSVC)
+  set_property(TARGET HalServer PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
   target_compile_options(HalServer PRIVATE /utf-8)
 endif()
 if(WIN32)

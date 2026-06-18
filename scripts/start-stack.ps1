@@ -109,6 +109,9 @@ Remove-Item -LiteralPath $frontendOutLog, $frontendErrLog -Force -ErrorAction Si
 
 $env:APPSTATION_HAL_MODE = "real"
 $env:APPSTATION_HAL_BASE_URL = "http://127.0.0.1:$activeHalPort"
+$env:APPSTATION_HAL_TRANSPORT = "dds"
+if (-not $env:APPSTATION_DDS_DOMAIN_ID) { $env:APPSTATION_DDS_DOMAIN_ID = "42" }
+if (-not $env:APPSTATION_DDS_LAN_DISCOVERY) { $env:APPSTATION_DDS_LAN_DISCOVERY = "0" }
 $env:APPSTATION_SKIP_STARTUP_HOME = if ($SkipStartupHome) { "true" } else { "false" }
 $backend = Start-Process `
   -FilePath (Join-Path $repo "backend\.venv\Scripts\python.exe") `

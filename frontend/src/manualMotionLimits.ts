@@ -2,7 +2,8 @@ export const manualAxisStepLimitPulse = 100000
 const manualTranslationStepLimitUm = 5000
 const manualRotationStepLimitDeg = 2
 const manualCoarseRotationStepLimitDeg = 10
-/** 计算或执行手动控制的对应逻辑。 */
+
+/** Convert the shared pulse cap into the current axis UI unit. */
 export function manualAxisStepLimitFromPulse(
   pulsePerUiUnit: number,
   rotation: boolean,

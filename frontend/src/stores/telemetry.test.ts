@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { defaultConfig } from '../data'
-import { normalizeConfig } from './telemetry'
+import { defaultConfig, defaultDiagnostics } from '../data'
+import { diagnosticsFromHardwareStatus, normalizeConfig } from './telemetry'
 
 describe('telemetry config normalization', () => {
   it('migrates stale PICO and camera hardware defaults', () => {
@@ -34,5 +34,43 @@ describe('telemetry config normalization', () => {
     expect(normalized.cameras.wristLeftIdentity).toBe('USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000')
     expect(normalized.cameras.wristRight).toBe('IMX335 / index 2')
     expect(normalized.cameras.wristRightIdentity).toBe('USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000')
+  })
+})
+
+describe('hardware diagnostics', () => {
+  it('warns when a newer HAL runtime binary is waiting for restart', () => {
+    const diagnostics = diagnosticsFromHardwareStatus(defaultDiagnostics, {
+      runtime: {
+        halDeployment: {
+          restartRequired: true,
+          message: 'HalServer.next.exe differs from HalServer.exe',
+          components: {
+            HalServer: { pendingNext: true },
+          },
+        },
+      },
+    })
+
+    expect(diagnostics.find((item) => item.key === 'hal-health')).toMatchObject({
+      status: 'warn',
+      remediation: 'HalServer.next.exe differs from HalServer.exe',
+    })
+  })
+
+  it('warns when backend source changed after the process started', () => {
+    const diagnostics = diagnosticsFromHardwareStatus(defaultDiagnostics, {
+      runtime: {
+        backendDeployment: {
+          restartRequired: true,
+          message: 'Backend source changed after process start; restart backend',
+          latestPath: 'backend/app.py',
+        },
+      },
+    } as any)
+
+    expect(diagnostics.find((item) => item.key === 'hal-health')).toMatchObject({
+      status: 'warn',
+      remediation: 'Backend source changed after process start; restart backend',
+    })
   })
 })

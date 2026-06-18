@@ -29,19 +29,11 @@ void MotionControlThread::stop() {
   }
 }
 
-void MotionControlThread::setSoftLimits(std::array<AxisLimit, 12> limits) {
-  limits_ = limits;
-}
-
-MotionState MotionControlThread::latestState() const {
-  return latest_;
-}
-
 void MotionControlThread::loop() {
   while (running_) {
     const auto started = std::chrono::steady_clock::now();
-    // readState 内部负责真实硬件读取、缓存退回和异常隔离；线程这里只保存最新快照。
-    latest_ = driver_.readState();
+    // readState 内部负责真实硬件读取、缓存退回和异常隔离。
+    driver_.readState();
     const auto elapsed = std::chrono::steady_clock::now() - started;
     // 周期从本轮开始时间计算，读硬件耗时会自动从 sleep 中扣除。
     if (elapsed < period_) {

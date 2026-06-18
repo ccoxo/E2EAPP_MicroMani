@@ -7,7 +7,7 @@ import { ActionCompareModal } from './components/ActionCompareModal'
 import { LogPanel } from './components/LogPanel'
 import { defaultConfig, defaultDiagnostics } from './data'
 import { chartHistoryIntervalMs, uiFrameIntervalMs, useTelemetryStore } from './stores/telemetry'
-import { isManualAxisDisabled } from './manualAxisRules'
+import { isManualAxisDisabled, isManualAxisDisabledForCard } from './manualAxisRules'
 import type { TelemetryFrame } from './types'
 import { DatasetView } from './views/DatasetView'
 
@@ -21,6 +21,20 @@ afterEach(() => {
     config: structuredClone(defaultConfig),
     diagnostics: structuredClone(defaultDiagnostics),
     picoConnection: { state: 'pending', message: '尚未检查 PICO ADB', checkedAt: null },
+    manualControl: {
+      selectedSide: 'left',
+      selectedAxis: 'X',
+      axisStepUm: 100,
+      axisStepDeg: 1,
+      speedMode: 'fine',
+      axisBusyUntil: {},
+      recording: false,
+      recordingStartedAt: null,
+      draftActions: [],
+      memories: [],
+      replayingMemoryId: null,
+      axisOffsets: {},
+    },
     frame: {
       ...state.frame,
       teleopHands: state.frame.teleopHands.map((hand) => ({
@@ -215,12 +229,12 @@ describe('AppStation M0 frontend', () => {
   })
 
   it('returns left and right slave arms to recorded zero from the record controls', async () => {
-    let resolveLeftReturn: (value: { ok: boolean }) => void = () => undefined
-    const leftReturnPromise = new Promise<{ ok: boolean }>((resolve) => {
-      resolveLeftReturn = resolve
+    let resolveOperatorLeftReturn: (value: { ok: boolean }) => void = () => undefined
+    const operatorLeftReturnPromise = new Promise<{ ok: boolean }>((resolve) => {
+      resolveOperatorLeftReturn = resolve
     })
     const returnOriginSpy = vi.spyOn(api, 'returnMotionOriginSide').mockImplementation((side) => {
-      if (side === 'left') return leftReturnPromise
+      if (side === 'right') return operatorLeftReturnPromise
       return Promise.resolve({ ok: true })
     })
 
@@ -252,10 +266,10 @@ describe('AppStation M0 frontend', () => {
     const rightButton = () => screen.getByText('右从臂回工作原点').closest('button')!
 
     fireEvent.click(leftButton())
-    await waitFor(() => expect(returnOriginSpy).toHaveBeenCalledWith('left'), { timeout: 1000 })
+    await waitFor(() => expect(returnOriginSpy).toHaveBeenCalledWith('right'), { timeout: 1000 })
     expect(rightButton()).toBeDisabled()
 
-    resolveLeftReturn({ ok: true })
+    resolveOperatorLeftReturn({ ok: true })
     useTelemetryStore.setState((state) => ({
       frame: {
         ...state.frame,
@@ -279,7 +293,7 @@ describe('AppStation M0 frontend', () => {
     }))
     await waitFor(() => expect(rightButton()).toBeEnabled(), { timeout: 1000 })
     fireEvent.click(rightButton())
-    expect(returnOriginSpy).toHaveBeenCalledWith('right')
+    expect(returnOriginSpy.mock.calls).toEqual([['right'], ['left']])
   })
 
   it('disables record return-to-origin buttons when the motion side is not enabled', () => {
@@ -308,8 +322,8 @@ describe('AppStation M0 frontend', () => {
       },
     }))
 
-    expect(screen.getByText('左从臂回工作原点').closest('button')).toBeDisabled()
-    expect(screen.getByText('右从臂回工作原点').closest('button')).toBeEnabled()
+    expect(screen.getByText('左从臂回工作原点').closest('button')).toBeEnabled()
+    expect(screen.getByText('右从臂回工作原点').closest('button')).toBeDisabled()
   })
 
   it('shows teleop connection, gripper teleop ports, and camera tuning controls in compact status rows', () => {
@@ -323,8 +337,8 @@ describe('AppStation M0 frontend', () => {
 
     const gripperTeleopStrips = document.querySelectorAll('.gripper-teleop-strip')
     expect(gripperTeleopStrips.length).toBeGreaterThanOrEqual(2)
-    expect(gripperTeleopStrips[0].textContent).toContain('COM8')
-    expect(gripperTeleopStrips[0].textContent).toContain('slave 10')
+    expect(gripperTeleopStrips[0].textContent).toContain('COM9')
+    expect(gripperTeleopStrips[0].textContent).toContain('slave 9')
 
     const cameraRows = document.querySelectorAll('.camera-tuning-control-row')
     expect(cameraRows.length).toBeGreaterThanOrEqual(6)
@@ -416,7 +430,7 @@ describe('AppStation M0 frontend', () => {
     expect(teleopCard).not.toHaveTextContent('OpenID 0 / device 1')
   })
 
-  it('shows the crossed target arm for each Omega teleop source hand', () => {
+  it('shows the operator-view target arm for each Omega teleop source hand', () => {
     window.history.pushState({}, '', '/settings')
 
     render(<App />)
@@ -430,22 +444,67 @@ describe('AppStation M0 frontend', () => {
     const leftMetrics = leftTeleopCard!.querySelector<HTMLElement>('.hardware-metric-grid')
     const rightMetrics = rightTeleopCard!.querySelector<HTMLElement>('.hardware-metric-grid')
     expect(leftActions).toHaveTextContent('目标臂')
-    expect(leftActions).toHaveTextContent('右臂')
+    expect(leftActions).toHaveTextContent('左臂')
+    expect(leftActions).toHaveTextContent('操作视角')
+    expect(leftActions).toHaveTextContent('硬件右臂')
     expect(leftActions!.textContent!.indexOf('目标臂')).toBeLessThan(leftActions!.textContent!.indexOf('连接主手'))
     expect(rightActions).toHaveTextContent('目标臂')
-    expect(rightActions).toHaveTextContent('左臂')
+    expect(rightActions).toHaveTextContent('右臂')
+    expect(rightActions).toHaveTextContent('操作视角')
+    expect(rightActions).toHaveTextContent('硬件左臂')
     expect(rightActions!.textContent!.indexOf('目标臂')).toBeLessThan(rightActions!.textContent!.indexOf('连接主手'))
     expect(leftMetrics).not.toHaveTextContent('目标臂')
     expect(rightMetrics).not.toHaveTextContent('目标臂')
   })
 
+  it('blocks Omega teleop connect when the mapped work origin is missing', () => {
+    const connectSpy = vi.spyOn(api, 'connectTeleopHand')
+    window.history.pushState({}, '', '/settings#teleop-left')
+    useTelemetryStore.setState((state) => ({
+      config: {
+        ...state.config,
+        motion: {
+          ...state.config.motion,
+          origin: {
+            ...state.config.motion.origin,
+            valid: false,
+            rightValid: false,
+          },
+        },
+      },
+      frame: {
+        ...state.frame,
+        teleopHands: state.frame.teleopHands.map((hand) =>
+          hand.side === 'left'
+            ? { ...hand, connected: true, lastReadOk: true, message: '' }
+            : hand,
+        ),
+      },
+    }))
+
+    render(<App />)
+
+    const teleopCard = document.querySelector<HTMLElement>('#teleop-left')
+    expect(teleopCard).toBeTruthy()
+    expect(teleopCard).toHaveTextContent('目标硬件右臂工作原点未设置')
+    const connectButton = [...teleopCard!.querySelectorAll<HTMLButtonElement>('button')].find((item) =>
+      item.textContent?.includes('连接主手'),
+    )
+    expect(connectButton).toBeTruthy()
+    expect(connectButton).toBeDisabled()
+
+    fireEvent.click(connectButton!)
+
+    expect(connectSpy).not.toHaveBeenCalled()
+  })
+
   it('returns only the selected slave arm to the work origin from Omega cards', async () => {
-    let resolveLeftReturn: (value: { ok: boolean }) => void = () => undefined
-    const leftReturnPromise = new Promise<{ ok: boolean }>((resolve) => {
-      resolveLeftReturn = resolve
+    let resolveOperatorLeftReturn: (value: { ok: boolean }) => void = () => undefined
+    const operatorLeftReturnPromise = new Promise<{ ok: boolean }>((resolve) => {
+      resolveOperatorLeftReturn = resolve
     })
     const returnOriginSpy = vi.spyOn(api, 'returnMotionOriginSide').mockImplementation((side) => {
-      if (side === 'left') return leftReturnPromise
+      if (side === 'right') return operatorLeftReturnPromise
       return Promise.resolve({ ok: true })
     })
     const homeAllSpy = vi.spyOn(api, 'homeAll').mockResolvedValue({ ok: true })
@@ -487,10 +546,10 @@ describe('AppStation M0 frontend', () => {
     }
 
     fireEvent.click(getReturnButton('left'))
-    await waitFor(() => expect(returnOriginSpy).toHaveBeenCalledWith('left'), { timeout: 1000 })
+    await waitFor(() => expect(returnOriginSpy).toHaveBeenCalledWith('right'), { timeout: 1000 })
     expect(getReturnButton('right')).toBeDisabled()
 
-    resolveLeftReturn({ ok: true })
+    resolveOperatorLeftReturn({ ok: true })
     useTelemetryStore.setState((state) => ({
       frame: {
         ...state.frame,
@@ -514,10 +573,54 @@ describe('AppStation M0 frontend', () => {
     }))
     await waitFor(() => expect(getReturnButton('right')).toBeEnabled(), { timeout: 1000 })
     fireEvent.click(getReturnButton('right'))
-    expect(returnOriginSpy.mock.calls).toEqual([['left'], ['right']])
-    expect(returnOriginSpy).toHaveBeenCalledWith('right')
+    expect(returnOriginSpy.mock.calls).toEqual([['right'], ['left']])
     expect(homeAllSpy).not.toHaveBeenCalled()
     expect(captureOriginSpy).not.toHaveBeenCalled()
+  })
+
+  it('returns the same-side work origin from Omega cards when teleop channel swap is disabled', async () => {
+    const returnOriginSpy = vi.spyOn(api, 'returnMotionOriginSide').mockResolvedValue({ ok: true })
+
+    window.history.pushState({}, '', '/settings')
+    useTelemetryStore.setState((state) => ({
+      config: {
+        ...state.config,
+        teleop: {
+          ...state.config.teleop,
+          swapTeleopChannels: false,
+        },
+      },
+      frame: {
+        ...state.frame,
+        motionEnabled: { left: true, right: true },
+        motionAxisEnabled: {
+          left: [true, true, true, true, true, true],
+          right: [true, true, true, true, true, false],
+        },
+      },
+    }))
+    render(<App />)
+    useTelemetryStore.getState().stopMock()
+    useTelemetryStore.setState((state) => ({
+      frame: {
+        ...state.frame,
+        motionEnabled: { left: true, right: true },
+        motionAxisEnabled: {
+          left: [true, true, true, true, true, true],
+          right: [true, true, true, true, true, false],
+        },
+      },
+    }))
+
+    const teleopLeft = document.querySelector<HTMLElement>('#teleop-left')
+    expect(teleopLeft).toBeTruthy()
+    const returnButton = [...teleopLeft!.querySelectorAll<HTMLButtonElement>('button')].find((item) => item.textContent?.includes('回工作原点'))
+    expect(returnButton).toBeTruthy()
+
+    fireEvent.click(returnButton!)
+
+    await waitFor(() => expect(returnOriginSpy).toHaveBeenCalledWith('left'), { timeout: 1000 })
+    expect(returnOriginSpy).not.toHaveBeenCalledWith('right')
   })
 
   it('disables Omega return-to-origin buttons when the motion side is not enabled', () => {
@@ -557,8 +660,8 @@ describe('AppStation M0 frontend', () => {
       return button!
     }
 
-    expect(getReturnButton('left')).toBeDisabled()
-    expect(getReturnButton('right')).toBeEnabled()
+    expect(getReturnButton('left')).toBeEnabled()
+    expect(getReturnButton('right')).toBeDisabled()
   })
 
   it('does not show stale Omega pose values after the latest read failed', () => {
@@ -622,9 +725,9 @@ describe('AppStation M0 frontend', () => {
       data: {
         running: false,
         requestedRunning: false,
-        message: 'left gripper serial open failed',
+        message: 'right gripper serial open failed',
         ports: [
-          { side: 'left', port: 'COM8', slaveId: 10, baudrate: 115200, ok: false, message: 'serial open failed' },
+          { side: 'right', port: 'COM9', slaveId: 9, baudrate: 115200, ok: false, message: 'serial open failed' },
         ],
       },
     })
@@ -1299,7 +1402,8 @@ describe('AppStation M0 frontend', () => {
     fireEvent.click(motionButton!)
     expect(window.location.pathname).toBe('/settings')
     expect(window.location.hash).toBe('#motion-left')
-    expect(screen.getByText('左臂运动控制卡 · Card 1')).toBeInTheDocument()
+    expect(screen.getByText('左臂运动控制卡 · Card 0')).toBeInTheDocument()
+    expect(screen.getByText('硬件右侧通道')).toBeInTheDocument()
   })
 
   it('maps manual motion stop to the backend command route', async () => {
@@ -1309,6 +1413,9 @@ describe('AppStation M0 frontend', () => {
   it('formats backend command errors with detail codes and messages', () => {
     expect(formatApiErrorMessage(409, { detail: { code: 'RECORDING_BUSY', message: 'record session already active' } })).toBe(
       '录制会话已在运行，请先结束当前会话后再开始新的录制。（409 RECORDING_BUSY）',
+    )
+    expect(formatApiErrorMessage(409, { detail: { code: 'WORK_ORIGIN_MISSING', message: 'right motion work origin is not captured' } })).toBe(
+      '目标硬件臂工作原点未设置，请先在设置页记录工作原点后再连接遥操作。（409 WORK_ORIGIN_MISSING）',
     )
   })
 
@@ -1371,14 +1478,20 @@ describe('AppStation M0 frontend', () => {
       },
     }))
     render(<App />)
-    expect(screen.getByText('左臂运动控制卡 · Card 1')).toBeInTheDocument()
-    expect(screen.getByText('右臂运动控制卡 · Card 0')).toBeInTheDocument()
+    expect(screen.getByText('左臂运动控制卡 · Card 0')).toBeInTheDocument()
+    expect(screen.getByText('右臂运动控制卡 · Card 1')).toBeInTheDocument()
     expect(screen.getByText('0,1,3,5,4,2')).toBeInTheDocument()
     expect(screen.getByText('2,0,5,8,1,7')).toBeInTheDocument()
     expect(screen.getAllByText(/640x480/).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/mN·m/).length).toBeGreaterThan(0)
     expect(screen.getByDisplayValue('COM8')).toBeInTheDocument()
     expect(screen.getByDisplayValue('COM9')).toBeInTheDocument()
+    const leftGripperCard = document.querySelector<HTMLElement>('#gripper-left')
+    const rightGripperCard = document.querySelector<HTMLElement>('#gripper-right')
+    expect(leftGripperCard).toHaveTextContent('COM9')
+    expect(leftGripperCard).toHaveTextContent('从站 9')
+    expect(rightGripperCard).toHaveTextContent('COM8')
+    expect(rightGripperCard).toHaveTextContent('从站 10')
     expect(screen.getAllByText('0-26 mm').length).toBeGreaterThan(0)
     expect(screen.getAllByText('初始速度').length).toBeGreaterThan(0)
     expect(screen.queryByText('最大加速度')).not.toBeInTheDocument()
@@ -1439,6 +1552,12 @@ describe('AppStation M0 frontend', () => {
     expect(defaultConfig.teleop.rightSoftLimitMax).toEqual([25000, 37500, 37500, 5, 30, 7])
     expect(defaultConfig.motion.rotationWorkLimits.left.roll).toEqual({ min: -5, max: 95 })
     expect(defaultConfig.motion.rotationWorkLimits.left.pitch).toEqual({ min: -30, max: 30 })
+    expect(defaultConfig.cameras.tuning.global.autoExposure).toBe(true)
+    expect(defaultConfig.cameras.tuning.global.autoWhiteBalance).toBe(true)
+    expect(defaultConfig.cameras.tuning.wrist_left.autoExposure).toBe(true)
+    expect(defaultConfig.cameras.tuning.wrist_left.autoWhiteBalance).toBe(true)
+    expect(defaultConfig.cameras.tuning.wrist_right.autoExposure).toBe(true)
+    expect(defaultConfig.cameras.tuning.wrist_right.autoWhiteBalance).toBe(true)
     expect(defaultConfig.motion.rotationWorkLimits.right.roll).toEqual({ min: -95, max: 5 })
     expect(defaultConfig.motion.rotationWorkLimits.right.pitch).toEqual({ min: -30, max: 30 })
     expect(defaultConfig.teleop.leftTranslationScale).toBe(1)
@@ -1462,6 +1581,8 @@ describe('AppStation M0 frontend', () => {
     expect(defaultConfig.teleop.continuousMicroConfirmTicks).toBe(0)
     expect(defaultConfig.teleop.leftImpulseCoeff).toEqual([-5000000, -5000000, -10000000, 1667, 2500, -333.3333])
     expect(defaultConfig.teleop.rightImpulseCoeff).toEqual([-5000000, 10000000, -5000000, 1667, -2500, 3333.333])
+    expect(defaultConfig.teleop.gripperTeleop.leftSourceHand).toBe('PhysicalLeft')
+    expect(defaultConfig.teleop.gripperTeleop.rightSourceHand).toBe('PhysicalRight')
     expect(defaultConfig.teleop.gripperTeleop.rightGapInvert).toBe(false)
     expect(defaultConfig.teleop.gripperTeleop.gripTorque).toBe(1)
     expect(defaultConfig.teleop.gripperTeleop.releaseTorque).toBe(1)
@@ -1603,51 +1724,109 @@ describe('AppStation M0 frontend', () => {
     const dialog = (await screen.findByText('左臂回硬件零点')).closest('[role="dialog"]') as HTMLElement
     fireEvent.click(within(dialog).getByText('确认回硬件零点').closest('button')!)
 
-    await waitFor(() => expect(homeSpy).toHaveBeenCalledWith('left'))
+    await waitFor(() => expect(homeSpy).toHaveBeenCalledWith('right'))
     expect(captureSpy).not.toHaveBeenCalled()
   }, 10000)
 
-  it('shows before and after values before executing a gripper target', async () => {
+  it('executes settings gripper targets through operator-view side mapping', async () => {
     window.history.pushState({}, '', '/settings#gripper-left')
     useTelemetryStore.setState((state) => ({
       config: {
         ...state.config,
-        gripper: { ...state.config.gripper, leftEnabled: true },
+        gripper: {
+          ...state.config.gripper,
+          leftEnabled: true,
+          rightEnabled: true,
+          targetLeftMm: 7,
+          targetRightMm: 17,
+        },
       },
     }))
     render(<App />)
     const leftGripperCard = document.querySelector<HTMLElement>('#gripper-left')
+    const rightGripperCard = document.querySelector<HTMLElement>('#gripper-right')
     expect(leftGripperCard).toBeTruthy()
+    expect(rightGripperCard).toBeTruthy()
 
     fireEvent.click(within(leftGripperCard!).getByText('执行目标').closest('button')!)
 
-    const dialog = (await screen.findByText('左臂夹爪执行目标')).closest('[role="dialog"]') as HTMLElement
-    expect(dialog).toBeTruthy()
-    expect(within(dialog).getByText('当前')).toBeInTheDocument()
-    expect(within(dialog).getByText('将应用')).toBeInTheDocument()
-    expect(within(dialog).getByText('目标开合')).toBeInTheDocument()
-    expect(within(dialog).getByText('确认执行')).toBeInTheDocument()
+    const leftDialog = (await screen.findByText('左臂夹爪执行目标')).closest('[role="dialog"]') as HTMLElement
+    expect(leftDialog).toBeTruthy()
+    expect(within(leftDialog).getByText('当前')).toBeInTheDocument()
+    expect(within(leftDialog).getByText('将应用')).toBeInTheDocument()
+    expect(within(leftDialog).getByText('目标开合')).toBeInTheDocument()
+    expect(within(within(leftDialog).getByText('目标开合').closest('.action-compare-row') as HTMLElement).getByText('17.0 mm')).toBeInTheDocument()
+    fireEvent.click(within(leftDialog).getByText('确认执行').closest('button')!)
+    await waitFor(() => expect(useTelemetryStore.getState().logs.some((log) => log.msg.includes('左夹爪 目标 17.0mm'))).toBe(true))
+
+    fireEvent.click(within(rightGripperCard!).getByText('执行目标').closest('button')!)
+
+    const rightDialog = (await screen.findByText('右臂夹爪执行目标')).closest('[role="dialog"]') as HTMLElement
+    expect(rightDialog).toBeTruthy()
+    expect(within(rightDialog).getByText('当前')).toBeInTheDocument()
+    expect(within(rightDialog).getByText('将应用')).toBeInTheDocument()
+    expect(within(rightDialog).getByText('目标开合')).toBeInTheDocument()
+    expect(within(within(rightDialog).getByText('目标开合').closest('.action-compare-row') as HTMLElement).getByText('7.0 mm')).toBeInTheDocument()
+    fireEvent.click(within(rightDialog).getByText('确认执行').closest('button')!)
+    await waitFor(() => expect(useTelemetryStore.getState().logs.some((log) => log.msg.includes('右夹爪 目标 7.0mm'))).toBe(true))
+    expect(useTelemetryStore.getState().config.gripper.targetLeftMm).toBe(7)
+    expect(useTelemetryStore.getState().config.gripper.targetRightMm).toBe(17)
   }, 10000)
 
-  it('shows before and after values before executing a manual gripper target', async () => {
+  it('records manual gripper targets with hardware sides mapped from operator controls', async () => {
     window.history.pushState({}, '', '/settings#manual')
     useTelemetryStore.setState((state) => ({
       config: {
         ...state.config,
-        gripper: { ...state.config.gripper, leftEnabled: true },
+        gripper: {
+          ...state.config.gripper,
+          leftEnabled: true,
+          rightEnabled: true,
+          targetLeftMm: 7,
+          targetRightMm: 17,
+        },
       },
     }))
     render(<App />)
+    fireEvent.click(screen.getByText('开始记录').closest('button')!)
     const leftGripperCard = screen.getByText('左臂夹爪手动控制').closest('article')
+    const rightGripperCard = screen.getByText('右臂夹爪手动控制').closest('article')
     expect(leftGripperCard).toBeTruthy()
+    expect(rightGripperCard).toBeTruthy()
 
     fireEvent.click(within(leftGripperCard as HTMLElement).getByRole('button', { name: '执行目标' }))
 
-    const dialog = (await screen.findByText('左臂夹爪执行目标')).closest('[role="dialog"]') as HTMLElement
-    expect(dialog).toBeTruthy()
-    expect(within(dialog).getByText('当前')).toBeInTheDocument()
-    expect(within(dialog).getByText('将应用')).toBeInTheDocument()
-    expect(within(dialog).getByText('确认执行')).toBeInTheDocument()
+    const leftDialog = (await screen.findByText('左臂夹爪执行目标')).closest('[role="dialog"]') as HTMLElement
+    expect(leftDialog).toBeTruthy()
+    expect(within(leftDialog).getByText('当前')).toBeInTheDocument()
+    expect(within(leftDialog).getByText('将应用')).toBeInTheDocument()
+    expect(within(within(leftDialog).getByText('目标开合').closest('.action-compare-row') as HTMLElement).getByText('17.0 mm')).toBeInTheDocument()
+    fireEvent.click(within(leftDialog).getByText('确认执行').closest('button')!)
+    await waitFor(() => expect(useTelemetryStore.getState().manualControl.draftActions).toHaveLength(1))
+    expect(useTelemetryStore.getState().manualControl.draftActions[0]).toMatchObject({
+      type: 'gripper',
+      side: 'right',
+      command: 'target',
+      targetMm: 17,
+    })
+    expect(useTelemetryStore.getState().logs.some((log) => log.msg.includes('左夹爪 目标 17.0mm'))).toBe(true)
+
+    fireEvent.click(within(rightGripperCard as HTMLElement).getByRole('button', { name: '执行目标' }))
+
+    const rightDialog = (await screen.findByText('右臂夹爪执行目标')).closest('[role="dialog"]') as HTMLElement
+    expect(rightDialog).toBeTruthy()
+    expect(within(rightDialog).getByText('当前')).toBeInTheDocument()
+    expect(within(rightDialog).getByText('将应用')).toBeInTheDocument()
+    expect(within(within(rightDialog).getByText('目标开合').closest('.action-compare-row') as HTMLElement).getByText('7.0 mm')).toBeInTheDocument()
+    fireEvent.click(within(rightDialog).getByText('确认执行').closest('button')!)
+    await waitFor(() => expect(useTelemetryStore.getState().manualControl.draftActions).toHaveLength(2))
+    expect(useTelemetryStore.getState().manualControl.draftActions[1]).toMatchObject({
+      type: 'gripper',
+      side: 'left',
+      command: 'target',
+      targetMm: 7,
+    })
+    expect(useTelemetryStore.getState().logs.some((log) => log.msg.includes('右夹爪 目标 7.0mm'))).toBe(true)
   }, 10000)
 
   it('renders manual control instead of old jog/developer pages', () => {
@@ -1669,6 +1848,8 @@ describe('AppStation M0 frontend', () => {
     expect(isManualAxisDisabled('left', 'Yaw')).toBe(false)
     expect(isManualAxisDisabled('right', 'Roll')).toBe(false)
     expect(isManualAxisDisabled('right', 'Yaw')).toBe(true)
+    expect(isManualAxisDisabledForCard(0, 'Yaw')).toBe(true)
+    expect(isManualAxisDisabledForCard(1, 'Yaw')).toBe(false)
   })
 
   it('records arm and gripper manual actions into replay memory', () => {
@@ -1687,6 +1868,11 @@ describe('AppStation M0 frontend', () => {
     expect(leftGripperCard).toBeTruthy()
     fireEvent.click(within(leftArmCard as HTMLElement).getByText('+100um').closest('button')!)
     fireEvent.click(within(leftGripperCard as HTMLElement).getByText(/打\s*开/).closest('button')!)
+    const actions = useTelemetryStore.getState().manualControl.draftActions
+    expect(actions[0]).toMatchObject({ type: 'arm-axis', side: 'right', axis: 'X' })
+    expect(actions[1]).toMatchObject({ type: 'gripper', side: 'right', command: 'open' })
+    expect(screen.getAllByText(/左臂 X \+100\.0um/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText('左夹爪 打开').length).toBeGreaterThan(0)
     fireEvent.click(screen.getByText('保存动作记忆').closest('button')!)
     expect(screen.getByText('动作记忆 1')).toBeInTheDocument()
     expect(screen.getByText(/2 steps/)).toBeInTheDocument()
@@ -1792,6 +1978,38 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getAllByText('Roll -95~5° / Pitch ±30° · Yaw disabled').length).toBeGreaterThan(0)
   })
 
+  it('disables restoring the previous work origin when the backup is outside effective limits', async () => {
+    window.history.pushState({}, '', '/settings#motion-left')
+    vi.spyOn(api, 'fetchMotionOrigin').mockResolvedValue({
+      ok: true,
+      data: {
+        origin: {
+          ...defaultConfig.motion.origin,
+          previousValid: true,
+        },
+        previousRestore: {
+          available: true,
+          restorable: false,
+          message: 'left Yaw work origin exceeds soft limit: 300.000 not in [-7.000, 7.000]',
+        },
+      },
+    })
+    const restoreSpy = vi.spyOn(api, 'restorePreviousMotionOrigin')
+
+    render(<App />)
+
+    const hardwareLeftCard = document.querySelector<HTMLElement>('#motion-right')
+    expect(hardwareLeftCard).toBeTruthy()
+    await waitFor(() => expect(within(hardwareLeftCard!).getByText('备份不可恢复')).toBeInTheDocument())
+    expect(within(hardwareLeftCard!).getByText(/left Yaw work origin exceeds soft limit/)).toBeInTheDocument()
+    const restoreButton = within(hardwareLeftCard!).getByText('恢复上个工作原点').closest('button')
+    expect(restoreButton).toBeDisabled()
+
+    fireEvent.click(restoreButton!)
+
+    expect(restoreSpy).not.toHaveBeenCalled()
+  }, 10000)
+
   it('updates the work origin state when the side controls are used', async () => {
     window.history.pushState({}, '', '/settings#motion-left')
     render(<App />)
@@ -1802,7 +2020,7 @@ describe('AppStation M0 frontend', () => {
     fireEvent.click((await screen.findByText('确认记录工作原点')).closest('button')!)
     await waitFor(() => expect(within(leftCard!).getByText('已记录')).toBeInTheDocument())
     await waitFor(() => expect(within(leftCard!).getByText(/工作原点位置：左\[/)).toBeInTheDocument())
-    await waitFor(() => expect(useTelemetryStore.getState().logs.at(-1)?.msg).toContain('工作原点位置：左['))
+    await waitFor(() => expect(useTelemetryStore.getState().logs.some((log) => log.msg.includes('工作原点位置：左['))).toBe(true))
   }, 10000)
 
   it('requires a second confirmation before overwriting a drifted motion origin', async () => {
@@ -1812,7 +2030,7 @@ describe('AppStation M0 frontend', () => {
       thresholds: { translationUm: 5000, rotationDeg: 1 },
       sides: [
         {
-          side: 'left',
+          side: 'right',
           baseline: 'current',
           axes: [
             {
@@ -1829,8 +2047,8 @@ describe('AppStation M0 frontend', () => {
     }
     const nextOrigin = {
       ...defaultConfig.motion.origin,
-      leftValid: true,
-      leftPulse: [100000, 0, 0, 0, 0, 0],
+      rightValid: true,
+      rightPulse: [100000, 0, 0, 0, 0, 0],
     }
     const savedConfig = structuredClone(defaultConfig)
     savedConfig.motion = {
@@ -1861,12 +2079,12 @@ describe('AppStation M0 frontend', () => {
     const driftDialog = (await screen.findByText('左臂工作原点漂移过大')).closest('[role="dialog"]') as HTMLElement
     expect(within(driftDialog).getByText('确认覆盖零点')).toBeInTheDocument()
     expect(within(driftDialog).getByText('左.X 20000 um')).toBeInTheDocument()
-    expect(captureSpy).toHaveBeenNthCalledWith(1, 'left', undefined)
+    expect(captureSpy).toHaveBeenNthCalledWith(1, 'right', undefined)
 
     fireEvent.click(within(driftDialog).getByText('确认覆盖零点').closest('button')!)
 
-    await waitFor(() => expect(captureSpy).toHaveBeenNthCalledWith(2, 'left', { confirmLargeDrift: true }))
-    await waitFor(() => expect(useTelemetryStore.getState().config.motion.origin.leftPulse[0]).toBe(100000))
-    expect(useTelemetryStore.getState().config.motion.homeReference.leftPulse).toEqual(defaultConfig.motion.homeReference.leftPulse)
+    await waitFor(() => expect(captureSpy).toHaveBeenNthCalledWith(2, 'right', { confirmLargeDrift: true }))
+    await waitFor(() => expect(useTelemetryStore.getState().config.motion.origin.rightPulse[0]).toBe(100000))
+    expect(useTelemetryStore.getState().config.motion.homeReference.rightPulse).toEqual(defaultConfig.motion.homeReference.rightPulse)
   }, 10000)
 })

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <sstream>
+#include <utility>
 
 namespace appstation::hal {
 
@@ -352,7 +353,11 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config) {
   if (!normalized.gripperTeleopEnabled) {
     stopGripperWorker();
   }
-  omega_.setGravityCompensation(normalized.leftGravityCompensation, normalized.rightGravityCompensation);
+  omega_.setGravityCompensation(
+      normalized.leftGravityCompensation,
+      normalized.rightGravityCompensation,
+      normalized.leftGravityScale,
+      normalized.rightGravityScale);
 }
 
 void NativeTeleopController::configureGripper(const JodellGripperConfig& config) {
@@ -471,6 +476,35 @@ void NativeTeleopController::stop() {
     lastOutputDeltaUi_ = {};
 }
 
+void NativeTeleopController::requestEmergencyStop() {
+  running_.store(false);
+  gripperWorkerRunning_.store(false);
+  gripperCv_.notify_all();
+  {
+    std::scoped_lock gripperLock(gripperMutex_);
+    pendingGripperCommands_ = {};
+  }
+  std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return;
+  }
+  logicalConnected_ = {false, false};
+  referenceValid_ = {false, false};
+  targetActive_ = {false, false};
+  velocityUiPerSec_ = {};
+  incrementalCarry_ = {};
+  incrementalDirection_ = {};
+  incrementalInputActive_ = {false, false};
+  continuousPulseCarry_ = {};
+  continuousDirection_ = {};
+  continuousStreak_ = {};
+  lastRawDelta_ = {};
+  lastFilteredDelta_ = {};
+  lastRequestedPulse_ = {};
+  lastEmittedPulse_ = {};
+  lastOutputDeltaUi_ = {};
+}
+
 void NativeTeleopController::startGripperWorker() {
   bool expected = false;
   if (!gripperWorkerRunning_.compare_exchange_strong(expected, true)) {
@@ -562,6 +596,16 @@ void NativeTeleopController::sampleGripperPosition(Side side) {
 
 bool NativeTeleopController::running() const {
   return running_.load();
+}
+
+void NativeTeleopController::setLeaderStatePublisher(LeaderStatePublisher publisher) {
+  std::scoped_lock lock(mutex_);
+  leaderStatePublisher_ = std::move(publisher);
+}
+
+void NativeTeleopController::setHardwareTargetPublisher(HardwareTargetPublisher publisher) {
+  std::scoped_lock lock(mutex_);
+  hardwareTargetPublisher_ = std::move(publisher);
 }
 
 bool NativeTeleopController::commandGripperTarget(
@@ -700,6 +744,7 @@ std::string NativeTeleopController::statusJson() const {
   out << ",\"gravityCompensation\":["
       << (config_.leftGravityCompensation ? "true" : "false") << ","
       << (config_.rightGravityCompensation ? "true" : "false") << "]"
+      << ",\"gravityScale\":[" << config_.leftGravityScale << "," << config_.rightGravityScale << "]"
       << ",\"forceOutputEnabled\":["
       << (forceOutput[0] ? "true" : "false") << ","
       << (forceOutput[1] ? "true" : "false") << "]"
@@ -744,8 +789,20 @@ void NativeTeleopController::loop() {
 }
 
 void NativeTeleopController::tick(double dtSec) {
-  // 每帧先读取两只主手状态，再分别处理左右通道，最后处理夹爪映射。
   const auto hands = omega_.readState();
+  LeaderStatePublisher publisher;
+  {
+    std::scoped_lock lock(mutex_);
+    publisher = leaderStatePublisher_;
+  }
+  if (publisher) {
+    publisher(hands);
+    return;
+  }
+  processLeaderState(hands, dtSec);
+}
+
+void NativeTeleopController::processLeaderState(const std::array<Omega7State, 2>& hands, double dtSec) {
   tickSideBestEffort(0, hands[0], dtSec);
   tickSideBestEffort(1, hands[1], dtSec);
   try {
@@ -875,6 +932,38 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
   }
 
   const auto limits = effectiveSoftLimits(targetSide, targetIndex);
+  if (hardwareTargetPublisher_) {
+    TeleopHardwareTarget target;
+    target.sequence = ++hardwareTargetSequence_;
+    target.stampUnixMs = static_cast<std::uint64_t>(unixTimeMs());
+    target.stampMonotonicMs = static_cast<std::uint64_t>(monotonicSeconds() * 1000.0);
+    target.side = targetSide == Side::Left ? 0 : 1;
+    target.deltas = deltas;
+    target.translationStepLimitPulse = config_.translationStepLimitPulse;
+    target.rotationStepLimitPulse = config_.rotationStepLimitPulse;
+    target.translationPulseDeadband = config_.translationPulseDeadband;
+    target.rotationPulseDeadband = config_.rotationPulseDeadband;
+    target.enabledAxes = config_.enabledAxes[targetIndex];
+    target.syncZeroDeltaTarget = true;
+    for (size_t i = 0; i < limits.size(); ++i) {
+      target.softLimitMin[i] = limits[i].min;
+      target.softLimitMax[i] = limits[i].max;
+    }
+    target.translationVelocityUiPerSec = config_.translationMaxVelocityUmS;
+    target.rotationVelocityUiPerSec = config_.rotationMaxVelocityDegS;
+    target.translationStartVelocityUiPerSec = config_.translationStartVelocityUmS;
+    target.rotationStartVelocityUiPerSec = config_.rotationStartVelocityDegS;
+    target.accTimeSec = config_.accTimeSec;
+    target.decTimeSec = config_.decTimeSec;
+    hardwareTargetPublisher_(target);
+    targetActive_[targetIndex] = true;
+    setBlockerUnlocked(sourceIndex, "active", "");
+    if (config_.controlMode == kIncrementalPositionMode) {
+      referencePose_[sourceIndex] = semanticPose;
+    }
+    return;
+  }
+
   const auto result = motion_.updateTeleopTargetUi(
       targetSide,
       deltas,
@@ -1196,15 +1285,6 @@ bool NativeTeleopController::suppressIncrementalRotationSpikeUnlocked(
 
 std::array<AxisLimit, 6> NativeTeleopController::effectiveSoftLimits(Side targetSide, int targetIndex) const {
   auto limits = config_.softLimits[targetIndex];
-  if (config_.homeReferenceValid[targetIndex]) {
-    // 平移软限位以 home reference 为零点平移到当前硬件坐标系。
-    for (int axisIndex = 0; axisIndex < 3; ++axisIndex) {
-      const auto axis = static_cast<SemanticAxis>(axisIndex);
-      const double originUi = pulseToUi(config_.homeReferencePulse[targetIndex][axisIndex], targetSide, axis);
-      limits[axisIndex].min += originUi;
-      limits[axisIndex].max += originUi;
-    }
-  }
   if (!config_.rotationWorkLimitEnabled) {
     return limits;
   }

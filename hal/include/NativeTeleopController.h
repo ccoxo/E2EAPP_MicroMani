@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -13,6 +14,7 @@
 #include "JodellGripperDriver.h"
 #include "LTDMCDriver.h"
 #include "Omega7Driver.h"
+#include "TeleopDdsTypes.h"
 
 namespace appstation::hal {
 
@@ -30,6 +32,8 @@ struct NativeTeleopConfig {
   // Force Dimension 侧的力输出/重力补偿开关，和从端 LTDMC 伺服使能无关。
   bool leftGravityCompensation{true};
   bool rightGravityCompensation{true};
+  double leftGravityScale{0.45};
+  double rightGravityScale{1.0};
 
   // 位移/旋转整体比例先按侧应用，axisOutputScale 再按单轴微调。
   std::array<double, 2> translationScale{{1.0, 1.0}};
@@ -169,6 +173,9 @@ struct NativeTeleopAction {
 // 它只负责实时映射和安全门控，不拥有底层驱动生命周期。
 class NativeTeleopController {
  public:
+  using LeaderStatePublisher = std::function<void(const std::array<Omega7State, 2>&)>;
+  using HardwareTargetPublisher = std::function<void(const TeleopHardwareTarget&)>;
+
   NativeTeleopController(LTDMCDriver& motion, Omega7Driver& omega, JodellGripperDriver& gripper);
   ~NativeTeleopController();
 
@@ -179,9 +186,13 @@ class NativeTeleopController {
   // leftConnected/rightConnected 是逻辑主手连接状态，用于在部分连接时只启动可用通道。
   void start(bool leftConnected, bool rightConnected);
   void stop();
+  void requestEmergencyStop();
   // statusJson 直接面向 HalServer 响应，包含 blocker、最后动作、夹爪和滤波诊断。
   std::string statusJson() const;
   bool running() const;
+  void setLeaderStatePublisher(LeaderStatePublisher publisher);
+  void setHardwareTargetPublisher(HardwareTargetPublisher publisher);
+  void processLeaderState(const std::array<Omega7State, 2>& hands, double dtSec);
   // 手动夹爪命令会进入同一条 gripper worker 队列，避免和 teleop 自动命令交叉写串口。
   bool commandGripperTarget(Side side, double targetMm, int speed, int torque, std::string* message = nullptr);
 
@@ -284,6 +295,9 @@ class NativeTeleopController {
   // mutex_ 保护 teleop 配置、引用位姿、诊断状态和动作历史；夹爪队列使用单独 mutex。
   mutable std::mutex mutex_;
   NativeTeleopConfig config_{};
+  LeaderStatePublisher leaderStatePublisher_;
+  HardwareTargetPublisher hardwareTargetPublisher_;
+  std::uint64_t hardwareTargetSequence_{0};
   std::atomic<bool> running_{false};
   std::thread worker_;
   // logicalConnected_ 是启动时认定可用的主手通道，targetActive_ 表示该通道当前正在输出运动。

@@ -5,6 +5,7 @@ import argparse
 import configparser
 import json
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -17,9 +18,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from backend.core.defaults import (  # noqa: E402
     ICF_KINEMATICS_DEFAULTS,
+    ICF_LEFT_MOTION_MECHANICAL_LIMITS,
+    ICF_RIGHT_MOTION_MECHANICAL_LIMITS,
     ICF_TELEOP_STRATEGY_VERSION,
     default_config,
+    rotation_work_limits_from_soft_limits,
 )
+from backend.core.config import _ensure_home_reference_model, _normalize_card0_yaw_disabled  # noqa: E402
 from backend.core.schemas import AppConfig  # noqa: E402
 
 
@@ -186,6 +191,8 @@ def apply_icf_config(config: dict[str, Any], ini: configparser.ConfigParser, sou
     normalize_teleop_limits(teleop, "right")
     apply_gripper_config(config, ini)
     apply_motion_profiles_and_limits(config)
+    _ensure_home_reference_model(config, has_current_home_reference_strategy=False)
+    _normalize_card0_yaw_disabled(config)
 
 
 def apply_gripper_config(config: dict[str, Any], ini: configparser.ConfigParser) -> None:
@@ -208,6 +215,12 @@ def apply_gripper_config(config: dict[str, Any], ini: configparser.ConfigParser)
         gripper_teleop["rightSourceHand"] = value(right, "SourceHand", "PhysicalLeft")
         gripper_teleop["rightGapMinMm"] = float(value(right, "OmegaGapClosedMm", "0"))
         gripper_teleop["rightGapMaxMm"] = float(value(right, "OmegaGapOpenMm", "25"))
+    if (
+        gripper_teleop.get("leftSourceHand") == "PhysicalRight"
+        and gripper_teleop.get("rightSourceHand") == "PhysicalLeft"
+    ):
+        gripper_teleop["leftSourceHand"] = "PhysicalLeft"
+        gripper_teleop["rightSourceHand"] = "PhysicalRight"
     reference = right or left
     if reference is None:
         return
@@ -245,7 +258,11 @@ def apply_motion_profiles_and_limits(config: dict[str, Any]) -> None:
             "translation": dict(translation_profile),
             "rotation": dict(rotation_profile),
         }
-        motion[f"{side}SoftLimits"] = motion_soft_limits(config["teleop"], side)
+    left_work_limits = motion_soft_limits(config["teleop"], "left")
+    right_work_limits = motion_soft_limits(config["teleop"], "right")
+    motion["rotationWorkLimits"] = rotation_work_limits_from_soft_limits(left_work_limits, right_work_limits)
+    motion["leftSoftLimits"] = deepcopy(ICF_LEFT_MOTION_MECHANICAL_LIMITS)
+    motion["rightSoftLimits"] = deepcopy(ICF_RIGHT_MOTION_MECHANICAL_LIMITS)
     yaw_limit = max(
         abs(float(config["teleop"]["leftSoftLimitMin"][5])),
         abs(float(config["teleop"]["leftSoftLimitMax"][5])),

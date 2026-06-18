@@ -1,3 +1,10 @@
+"""Coordinate Omega.7 teleop modes and guard live motion handoffs.
+
+This service owns both the backend fallback loop and the HAL-native start/stop
+path, so comments here focus on work-origin safety gates and state transitions
+that can move real hardware.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -84,6 +91,8 @@ class TeleopMappingService:
         op_id = self.logs.new_op_id("teleop") if self.logs is not None else None
         mode = self._hal_mode(config)
         if mode == "real" and self._native_engine(config):
+            # Native teleop reconfiguration can stop/re-home/start hardware, so
+            # serialize it even when UI connect and recording start race.
             async with self._native_transition_lock:
                 return await self._start_native_locked(config, op_id, source, home_side, pre_home)
         if self._task is not None and not self._task.done():
@@ -128,6 +137,9 @@ class TeleopMappingService:
         pre_home: bool,
     ) -> dict[str, Any]:
         if self._task is not None and not self._task.done():
+            # A running native controller may be shared by manual teleop-connect
+            # and recording. Track sources separately so stopping one source does
+            # not surprise the other unless the payload must be restarted.
             source_was_present = source in self._arm_sources
             self._arm_sources.add(source)
             try:
@@ -258,6 +270,9 @@ class TeleopMappingService:
     ) -> None:
         if not rotation_work_limit_enabled(config):
             return
+        # Native rotation limits are relative to the captured hardware home
+        # reference. Validate before arming so an old work origin cannot launch
+        # teleop from outside its allowed recovery envelope.
         state = await self.hal.motion_state()
         pulses = self._motion_state_pulses(state)
         for side in sides:
@@ -326,6 +341,57 @@ class TeleopMappingService:
             isinstance(startup_config, dict)
             and str(startup_config.get("mode", "work_origin")) != "work_origin"
         )
+
+    def _native_startup_blockers(self, config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        if not self._native_prehome_enabled(config):
+            return {}
+        origin = self._normalized_motion_origin(config)
+        blockers: dict[str, dict[str, Any]] = {}
+        ts = now_ms()
+        for source_side in ("left", "right"):
+            target_side = self._target_side_for_source(source_side, config)
+            valid_key = "leftValid" if target_side == "left" else "rightValid"
+            if bool(origin[valid_key]):
+                continue
+            reasons = [f"{target_side} motion work origin is not captured"]
+            previous_detail = self._previous_origin_restore_blocker_detail(config, target_side)
+            if previous_detail:
+                reasons.append(previous_detail)
+            blockers[source_side] = {
+                "sourceSide": source_side,
+                "targetSide": target_side,
+                "active": False,
+                "state": "blocked",
+                "reasons": reasons,
+                "ts": ts,
+            }
+        return blockers
+
+    def _previous_origin_restore_blocker_detail(self, config: dict[str, Any], side: SideName) -> str | None:
+        motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+        origin = motion.get("origin", {}) if isinstance(motion, dict) else {}
+        if not isinstance(origin, dict) or not bool(origin.get("previousValid", False)):
+            return None
+        pulse_key = "previousLeftPulse" if side == "left" else "previousRightPulse"
+        pulses = self._six_pulses(origin.get(pulse_key))
+        try:
+            positions = side_positions_ui(config, side, pulses)
+            soft_limit_min, soft_limit_max = effective_limit_arrays(config, side)
+        except (TypeError, ValueError, RuntimeError, WorkOriginMissing) as exc:
+            return f"previous {side} work origin cannot be validated: {exc}"
+        enabled_axes = self._enabled_axes(side, config)
+        for axis_index, axis_name in enumerate(AXES):
+            if not enabled_axes[axis_index]:
+                continue
+            position = positions[axis_index]
+            limit_min = soft_limit_min[axis_index]
+            limit_max = soft_limit_max[axis_index]
+            if position < limit_min - 1e-6 or position > limit_max + 1e-6:
+                return (
+                    f"previous {side} work origin exceeds effective soft limit: "
+                    f"{axis_name} {position:.3f} not in [{limit_min:.3f}, {limit_max:.3f}]"
+                )
+        return None
 
     def _mark_native_rotation_recovery(
         self,
@@ -529,6 +595,9 @@ class TeleopMappingService:
         native_engine = self._native_engine(config)
         if native_engine and self._native_status_cache:
             running = bool(self._native_status_cache.get("running", running))
+        blockers = dict(self._last_blockers)
+        if native_engine and self._armed_at_ms is None:
+            blockers = {**self._native_startup_blockers(config), **blockers}
         return {
             "armed": self._armed_at_ms is not None,
             "running": running,
@@ -538,7 +607,7 @@ class TeleopMappingService:
             "lastAction": self._last_action,
             "actionHistory": list(self._action_history),
             "lastError": self._last_error,
-            "blockers": dict(self._last_blockers),
+            "blockers": blockers,
             "nativeStatus": dict(self._native_status_cache) if native_engine else {},
             "limits": {
                 "translationStepUm": self._translation_step_um(config),
@@ -709,6 +778,8 @@ class TeleopMappingService:
         self._set_active(side, target_side)
         reference = self._references.get(side)
         if reference is None:
+            # First valid clutch frame establishes a pose reference; movement
+            # starts on the next frame so a reconnect cannot create a jump.
             self._references[side] = pose
             self._last_blockers[side]["state"] = "reference"
             return
@@ -724,6 +795,8 @@ class TeleopMappingService:
         sync_zero_delta_target = True
         soft_limit_min, soft_limit_max = self._effective_limit_arrays(target_side, config)
         payload = {
+            # HAL receives both UI-space deltas and pulse/limit metadata so the
+            # final clipping decision happens next to the motion controller.
             "side": target_side,
             "deltas": {axis: deltas[idx] for idx, axis in enumerate(AXES)},
             "translationStepUm": self._translation_step_um(config),
@@ -1715,6 +1788,8 @@ class TeleopMappingService:
             "requireClutch": bool(teleop.get("requireClutch", False)),
             "leftGravityCompensation": bool(teleop.get("leftGravityCompensation", True)),
             "rightGravityCompensation": bool(teleop.get("rightGravityCompensation", True)),
+            "leftGravityScale": float(teleop.get("leftGravityScale", ICF_TELEOP_DEFAULTS["leftGravityScale"])),
+            "rightGravityScale": float(teleop.get("rightGravityScale", ICF_TELEOP_DEFAULTS["rightGravityScale"])),
             "leftTranslationScale": float(
                 teleop.get("leftTranslationScale", ICF_TELEOP_DEFAULTS["leftTranslationScale"])
             ),
@@ -1779,8 +1854,8 @@ class TeleopMappingService:
             "rightGapMaxMm": float(gripper_teleop.get("rightGapMaxMm", 25.0)),
             "leftGapInvert": bool(gripper_teleop.get("leftGapInvert", False)),
             "rightGapInvert": bool(gripper_teleop.get("rightGapInvert", False)),
-            "leftSourceHand": str(gripper_teleop.get("leftSourceHand", "PhysicalRight")),
-            "rightSourceHand": str(gripper_teleop.get("rightSourceHand", "PhysicalLeft")),
+            "leftSourceHand": str(gripper_teleop.get("leftSourceHand", "PhysicalLeft")),
+            "rightSourceHand": str(gripper_teleop.get("rightSourceHand", "PhysicalRight")),
             "gripSpeed": int(gripper_teleop.get("gripSpeed", 255)),
             "gripTorque": int(gripper_teleop.get("gripTorque", 1)),
             "positionDeadbandCounts": int(gripper_teleop.get("positionDeadbandCounts", 1)),
@@ -2041,13 +2116,23 @@ class TeleopMappingService:
     def _llround(self, value: float) -> int:
         return int(math.floor(value + 0.5)) if value >= 0 else int(math.ceil(value - 0.5))
 
+    def _motion_card_no(self, side: SideName, config: dict[str, Any]) -> int:
+        motion = config.get("motion", {})
+        fallback = 1 if side == "left" else 0
+        if not isinstance(motion, dict):
+            return fallback
+        try:
+            return int(motion.get(f"{side}CardNo", fallback))
+        except (TypeError, ValueError):
+            return fallback
+
     def _enabled_axes(self, side: SideName, config: dict[str, Any]) -> list[bool]:
         key = f"{side}EnabledAxes"
         raw = config.get("teleop", {}).get(key, DEFAULT_ENABLED_AXES)
         if not isinstance(raw, list) or len(raw) != 6:
             raw = DEFAULT_ENABLED_AXES
         axes = [bool(value) for value in raw]
-        if side == "right":
+        if self._motion_card_no(side, config) == 0:
             axes[5] = False
         return axes
 

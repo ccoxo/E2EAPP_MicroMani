@@ -424,6 +424,7 @@ export interface AppConfig {
     wristLeftResolution?: string
     wristRightResolution?: string
     fps: number
+    tuningDefaultsVersion?: string
     tuning: Record<CameraTelemetry['key'], CameraTuningProfile>
   }
   force: {
@@ -567,6 +568,8 @@ export interface AppConfig {
     rightGravityCompensation: boolean
     leftForceFeedback: boolean
     rightForceFeedback: boolean
+    leftGravityScale: number
+    rightGravityScale: number
     strategyVersion: string
     mappingMode: 'direct' | 'legacy'
     swapHands: boolean

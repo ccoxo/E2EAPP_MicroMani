@@ -29,8 +29,20 @@ def test_start_hal_passes_configured_port_to_hal_process_and_health_check() -> N
 
     assert "[int]$Port = 8091" in script
     assert '$env:APPSTATION_HAL_PORT = "$Port"' in script
+    assert '$env:APPSTATION_HAL_DDS_ENABLED = "1"' in script
+    assert '$env:APPSTATION_DDS_DOMAIN_ID = "42"' in script
     assert '"http://127.0.0.1:$Port/health"' in script
     assert 'url = "http://127.0.0.1:$Port"' in script
+
+
+def test_start_hal_redirects_hal_stdout_to_runtime_logs() -> None:
+    script = (REPO_ROOT / "scripts" / "start-hal.ps1").read_text(encoding="utf-8")
+
+    assert '$logDir = Join-Path $repo "backend\\runtime\\logs"' in script
+    assert '$halOutLog = Join-Path $logDir "hal-server.out.log"' in script
+    assert '$halErrLog = Join-Path $logDir "hal-server.err.log"' in script
+    assert "-RedirectStandardOutput $halOutLog" in script
+    assert "-RedirectStandardError $halErrLog" in script
 
 
 def test_start_hal_skips_locked_runtime_promotion_without_failing_launch() -> None:
@@ -44,6 +56,15 @@ def test_start_hal_skips_locked_runtime_promotion_without_failing_launch() -> No
     assert "HAL runtime promotion skipped for $TargetExe:" not in promote_body
     assert "HAL runtime promotion skipped" in promote_body
     assert "return" in promote_body.split("catch", 1)[1]
+
+
+def test_start_hal_promotes_candidate_by_hash_not_timestamp() -> None:
+    script = (REPO_ROOT / "scripts" / "start-hal.ps1").read_text(encoding="utf-8")
+    promote_body = script.split("function Promote-HalCandidate", 1)[1].split("function Copy-RuntimeDllIfNewer", 1)[0]
+
+    assert "Get-FileHash" in promote_body
+    assert "$candidateHash.Hash -ne $targetHash.Hash" in promote_body
+    assert "LastWriteTimeUtc" not in promote_body
 
 
 def test_start_hal_restart_cleans_repo_hal_workers_before_runtime_promotion() -> None:
@@ -72,6 +93,20 @@ def test_start_hal_uses_runtime_worker_copy_when_worker_target_is_locked() -> No
     assert '$env:APPSTATION_JODELL_WORKER_EXE = "$workerRuntimeExe"' in script
 
 
+def test_start_hal_copies_fastdds_runtime_dlls_beside_hal_exe() -> None:
+    script = (REPO_ROOT / "scripts" / "start-hal.ps1").read_text(encoding="utf-8")
+
+    assert "F:\\opt\\ros\\jazzy\\bin" in script
+    assert "F:\\opt\\ros\\jazzy\\.pixi\\envs\\default\\Library\\bin" in script
+    assert "function Copy-RuntimeDllIfNewer" in script
+    assert "fastrtps-2.14.dll" in script
+    assert "fastcdr-2.2.dll" in script
+    assert "tinyxml2.dll" in script
+    assert "libssl-3-x64.dll" in script
+    assert "libcrypto-3-x64.dll" in script
+    assert "F:\\opt\\ros\\jazzy\\bin;F:\\opt\\ros\\jazzy\\.pixi\\envs\\default\\Library\\bin;$env:PATH" in script
+
+
 def test_start_stack_retries_hal_on_fallback_port_and_propagates_active_url() -> None:
     script = (REPO_ROOT / "scripts" / "start-stack.ps1").read_text(encoding="utf-8")
 
@@ -79,8 +114,35 @@ def test_start_stack_retries_hal_on_fallback_port_and_propagates_active_url() ->
     assert "$activeHalPort = $HalPort" in script
     assert 'start-hal.ps1") -Restart -Port $activeHalPort' in script
     assert "$activeHalPort = 8092" in script
+    assert 'APPSTATION_HAL_TRANSPORT = "dds"' in script
+    assert 'APPSTATION_DDS_DOMAIN_ID = "42"' in script
     assert 'APPSTATION_HAL_BASE_URL = "http://127.0.0.1:$activeHalPort"' in script
     assert 'hal = "http://127.0.0.1:$activeHalPort"' in script
+
+
+def test_start_stack_preserves_existing_dds_domain_for_backend_after_hal_start() -> None:
+    script = (REPO_ROOT / "scripts" / "start-stack.ps1").read_text(encoding="utf-8")
+    after_hal_start = script.split('start-hal.ps1") -Restart', 1)[1]
+
+    assert 'if (-not $env:APPSTATION_DDS_DOMAIN_ID) { $env:APPSTATION_DDS_DOMAIN_ID = "42" }' in after_hal_start
+    assert '$env:APPSTATION_DDS_DOMAIN_ID = "42"' not in after_hal_start.replace(
+        'if (-not $env:APPSTATION_DDS_DOMAIN_ID) { $env:APPSTATION_DDS_DOMAIN_ID = "42" }',
+        "",
+    )
+
+
+def test_start_stack_preserves_existing_dds_lan_discovery_for_backend_after_hal_start() -> None:
+    script = (REPO_ROOT / "scripts" / "start-stack.ps1").read_text(encoding="utf-8")
+    after_hal_start = script.split('start-hal.ps1") -Restart', 1)[1]
+
+    assert (
+        'if (-not $env:APPSTATION_DDS_LAN_DISCOVERY) { $env:APPSTATION_DDS_LAN_DISCOVERY = "0" }'
+        in after_hal_start
+    )
+    assert '$env:APPSTATION_DDS_LAN_DISCOVERY = "0"' not in after_hal_start.replace(
+        'if (-not $env:APPSTATION_DDS_LAN_DISCOVERY) { $env:APPSTATION_DDS_LAN_DISCOVERY = "0" }',
+        "",
+    )
 
 
 def test_launch_app_forwards_hal_port_to_initial_start_and_restart() -> None:
@@ -167,6 +229,19 @@ def test_start_stack_launches_frontend_on_requested_port_without_duplicate_port_
     assert "--port 5173 --host 127.0.0.1 --port $FrontendPort" not in script
 
 
+def test_start_dds_stack_enables_hal_direct_dds_without_python_sidecar() -> None:
+    script = (REPO_ROOT / "scripts" / "start-stack-dds.ps1").read_text(encoding="utf-8")
+
+    assert "[int]$DomainId = 42" in script
+    assert 'APPSTATION_HAL_DDS_ENABLED = "1"' in script
+    assert 'APPSTATION_HAL_TRANSPORT = "dds"' in script
+    assert 'APPSTATION_DDS_DOMAIN_ID = "$DomainId"' in script
+    assert 'APPSTATION_DDS_LAN_DISCOVERY = if ($LanDiscovery) { "1" } else { "0" }' in script
+    assert "backend.hal_client." + "dds_" + "bridge_runner" not in script
+    assert "ddsBridgePid" not in script
+    assert "backend.app:create_app" in script
+
+
 def test_start_stack_captures_frontend_launcher_logs_for_launch_diagnostics() -> None:
     script = (REPO_ROOT / "scripts" / "start-stack.ps1").read_text(encoding="utf-8")
 
@@ -178,22 +253,14 @@ def test_start_stack_captures_frontend_launcher_logs_for_launch_diagnostics() ->
     assert "frontendErrLog = $frontendErrLog" in script
 
 
-def test_diagnose_teleop_latency_script_is_read_only_and_reports_action_history_stats() -> None:
+def test_diagnose_teleop_latency_script_no_longer_uses_direct_hal_http_diagnostics() -> None:
     script = (REPO_ROOT / "scripts" / "diagnose-teleop-latency.ps1").read_text(encoding="utf-8")
 
     assert "param(" in script
     assert "[int]$BackendPort = 18082" in script
     assert "[int]$HalPort = 8091" in script
-    assert "Invoke-RestMethod -Uri" in script
-    assert "http://127.0.0.1:$BackendPort/api/settings" in script
-    assert "http://127.0.0.1:$HalPort/motion/axis_diagnostics" in script
-    assert "http://127.0.0.1:$HalPort/teleop/native/status" in script
-    assert "Get-GapStats" in script
-    assert "Get-UpdateReturnStats" in script
-    assert "axisCounts" in script
-    assert "sideCounts" in script
-    assert "updateReturnByCode" in script
-    assert "positive hard limit blocks positive PMOVE start" in script
-    assert "negative hard limit blocks negative PMOVE start" in script
-    assert "moveStartedAxisCounts" in script
-    assert "Invoke-RestMethod -Method Post" not in script
+    assert "HAL HTTP only supports /health" in script
+    assert "backend DDS telemetry" in script
+    assert "Invoke-RestMethod" not in script
+    assert "/motion/axis_diagnostics" not in script
+    assert "/teleop/native/status" not in script

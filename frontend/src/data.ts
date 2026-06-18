@@ -21,6 +21,22 @@ export const semanticAxes = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'] as const
 
 export type RobotSide = 'left' | 'right'
 
+export function hardwareSideForOperatorSide(side: RobotSide): RobotSide {
+  return side === 'left' ? 'right' : 'left'
+}
+
+export function operatorSideForHardwareSide(side: RobotSide): RobotSide {
+  return side === 'left' ? 'right' : 'left'
+}
+
+export function operatorSideLabel(side: RobotSide) {
+  return side === 'left' ? '左臂' : '右臂'
+}
+
+export function hardwareChannelLabel(side: RobotSide) {
+  return side === 'left' ? '硬件左侧通道' : '硬件右侧通道'
+}
+
 export const motionCardModelByNo: Record<number, string> = {
   0: 'DMC5C10',
   1: 'DMC3C00',
@@ -69,7 +85,7 @@ export const axisHardwareSpecs = [
     unit: 'µm',
     travel: '75 mm',
     model: 'KXL06075-C1-G4',
-    leftPulsePerUnit: 10000,
+    leftPulsePerUnit: 5000,
     rightPulsePerUnit: 10000,
     softLimit: '机械行程 75 mm',
     warning: false,
@@ -80,7 +96,7 @@ export const axisHardwareSpecs = [
     travel: '75 mm',
     model: 'KXL06075-C1-G4',
     leftPulsePerUnit: 10000,
-    rightPulsePerUnit: 10000,
+    rightPulsePerUnit: 5000,
     softLimit: '机械行程 75 mm',
     warning: false,
   },
@@ -89,8 +105,8 @@ export const axisHardwareSpecs = [
     unit: '°',
     travel: '360°',
     model: 'KRW04360M-LC',
-    leftPulsePerUnit: 1666.6667,
-    rightPulsePerUnit: 1666.6667,
+    leftPulsePerUnit: 1666.666667,
+    rightPulsePerUnit: 1666.666667,
     softLimit: '硬件零点 ±100°',
     warning: false,
   },
@@ -259,12 +275,12 @@ export const defaultKinematics = {
   leftPhysicalAxis: [0, 1, 3, 5, 4, 2],
   rightPhysicalAxis: [2, 0, 5, 8, 1, 7],
   axisUnitSpec: ['mm', 'mm', 'mm', 'deg', 'deg', 'deg'],
-  leftPulsePerUnit: [5000, 10000, 10000, 1666.666667, 2500, 3333.333],
-  rightPulsePerUnit: [5000, 10000, 10000, 1666.666667, 2500, 333.3333],
+  leftPulsePerUnit: [5000, 5000, 10000, 1666.666667, 2500, 3333.333],
+  rightPulsePerUnit: [5000, 10000, 5000, 1666.666667, 2500, 333.3333],
   leftDirectionSign: [-1, 1, -1, 1, -1, -1],
   rightDirectionSign: [-1, -1, -1, 1, 1, 1],
-  leftSignedPulsePerUnit: [-5000, 10000, -10000, 1666.666667, -2500, -3333.333],
-  rightSignedPulsePerUnit: [-5000, -10000, -10000, 1666.666667, 2500, 333.3333],
+  leftSignedPulsePerUnit: [-5000, 5000, -10000, 1666.666667, -2500, -3333.333],
+  rightSignedPulsePerUnit: [-5000, -10000, -5000, 1666.666667, 2500, 333.3333],
   syncActionPulseCoeff: true,
   updatedAt: '2026-04-17T00:00:00',
 }
@@ -385,24 +401,25 @@ export const defaultConfig: AppConfig = {
     wristLeftResolution: '640x480',
     wristRightResolution: '640x480',
     fps: 30,
+    tuningDefaultsVersion: 'auto_awb_exposure_20260616',
     tuning: {
       global: {
-        autoExposure: false,
+        autoExposure: true,
         exposure: -5.5,
         gain: 0,
-        autoWhiteBalance: false,
+        autoWhiteBalance: true,
       },
       wrist_left: {
-        autoExposure: false,
+        autoExposure: true,
         exposure: -6,
         gain: 0,
-        autoWhiteBalance: false,
+        autoWhiteBalance: true,
       },
       wrist_right: {
-        autoExposure: false,
+        autoExposure: true,
         exposure: -6,
         gain: 0,
-        autoWhiteBalance: false,
+        autoWhiteBalance: true,
       },
     },
   },
@@ -575,7 +592,9 @@ export const defaultConfig: AppConfig = {
     rightGravityCompensation: true,
     leftForceFeedback: true,
     rightForceFeedback: true,
-    strategyVersion: 'e2e_omega7_native_v29_stable_feel_lead_20260612',
+    leftGravityScale: 0.45,
+    rightGravityScale: 1.0,
+    strategyVersion: 'e2e_omega7_native_v31_gravity_scale_20260617',
     mappingMode: 'direct',
     swapHands: false,
     swapTeleopChannels: true,
@@ -644,8 +663,8 @@ export const defaultConfig: AppConfig = {
       autoGapMarginMm: 1.0,
       releaseSpeed: 255,
       releaseTorque: 1,
-      leftSourceHand: 'PhysicalRight',
-      rightSourceHand: 'PhysicalLeft',
+      leftSourceHand: 'PhysicalLeft',
+      rightSourceHand: 'PhysicalRight',
       objectDetectMargin: 10,
       buttonFallback: true,
       diagLog: false,

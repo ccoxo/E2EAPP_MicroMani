@@ -1,3 +1,10 @@
+"""OpenCV camera access with process isolation for fragile capture backends.
+
+Several Windows camera drivers can block or crash inside OpenCV. The driver
+keeps the public snapshot API synchronous while optionally moving capture into
+a child process and caching recent frames for the recorder.
+"""
+
 from __future__ import annotations
 
 import base64
@@ -54,22 +61,22 @@ CAMERA_RELEASE_JOIN_SEC = 2.0
 CAMERA_CAPTURE_FOURCC = "YUYV"
 CAMERA_TUNING_DEFAULTS: dict[str, dict[str, float | bool]] = {
     "global": {
-        "autoExposure": False,
+        "autoExposure": True,
         "exposure": -5.5,
         "gain": 0.0,
-        "autoWhiteBalance": False,
+        "autoWhiteBalance": True,
     },
     "wrist_left": {
-        "autoExposure": False,
+        "autoExposure": True,
         "exposure": -6.0,
         "gain": 0.0,
-        "autoWhiteBalance": False,
+        "autoWhiteBalance": True,
     },
     "wrist_right": {
-        "autoExposure": False,
+        "autoExposure": True,
         "exposure": -6.0,
         "gain": 0.0,
-        "autoWhiteBalance": False,
+        "autoWhiteBalance": True,
     },
 }
 
@@ -342,6 +349,8 @@ def _co_uninitialize_for_capture_thread(token: object | None) -> None:
 
 
 class OpenCVCameraDriver:
+    """Probe, configure, and sample the configured camera set."""
+
     def __init__(self, logs: Any | None = None) -> None:
         self._logs = logs
         self._last_probe = 0.0
@@ -685,6 +694,7 @@ class OpenCVCameraDriver:
 
     def _store(self, ok: bool, message: str, cameras: list[CameraTelemetry]) -> CameraProbeResult:
         self._cached = CameraProbeResult(ok=ok, message=message, cameras=cameras)
+        self._last_probe = time.monotonic()
         return self._cached
 
     def _clear_probe_cache(self) -> None:
@@ -1093,7 +1103,7 @@ class OpenCVCameraDriver:
         if mode in {"process", "worker", "isolated", "1", "true", "on"}:
             requested = True
         else:
-            requested = os.name == "nt"
+            requested = False
         if not requested:
             return False
         if getattr(cv2, "__name__", "cv2") != "cv2":

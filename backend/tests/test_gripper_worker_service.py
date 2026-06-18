@@ -507,6 +507,49 @@ def test_manual_axis_move_rejects_right_yaw_disabled_by_policy() -> None:
     assert hal.commands == []
 
 
+def test_manual_axis_move_rejects_card0_yaw_when_card0_is_configured_as_left() -> None:
+    config = default_config()
+    config["motion"]["leftCardNo"] = 0
+    config["motion"]["rightCardNo"] = 1
+    settings = FakeSettings(config)
+    hal = FakeHal(enabled=True)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    try:
+        asyncio.run(
+            service.manual_axis_move(
+                ManualAxisMoveRequest(side="left", axis="Yaw", direction=1, step=0.1, speedMode="fine")
+            )
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected card0 yaw motion to fail")
+
+    assert "left Yaw motion axis is disabled" in message
+    assert hal.commands == []
+
+
+def test_manual_axis_move_allows_non_card0_yaw_when_card0_is_configured_as_left() -> None:
+    config = default_config()
+    config["motion"]["leftCardNo"] = 0
+    config["motion"]["rightCardNo"] = 1
+    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -360000, "max": 360000}
+    config["motion"]["rotationWorkLimits"]["enabled"] = False
+    settings = FakeSettings(config)
+    hal = FakeHal(enabled=True)
+    service = CommandService(settings, FakeTelemetry(), hal, FakeLogs(), FakeHardware(), FakeWorkers())
+
+    result = asyncio.run(
+        service.manual_axis_move(
+            ManualAxisMoveRequest(side="right", axis="Yaw", direction=1, step=0.1, speedMode="fine")
+        )
+    )
+
+    assert result["hal"]["command"] == "motion.manual_axis_move"
+    assert hal.commands[-1][1]["axis"] == "Yaw"
+
+
 def test_manual_axis_move_uses_faster_coarse_rotation_profile() -> None:
     config = default_config()
     config["motion"]["origin"]["rightValid"] = False

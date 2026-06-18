@@ -18,9 +18,10 @@ DEFAULT_MOTION_PROFILE: dict[str, Any] = {
     },
 }
 
-ICF_TELEOP_STRATEGY_VERSION = "e2e_omega7_native_v29_stable_feel_lead_20260612"
+ICF_TELEOP_STRATEGY_VERSION = "e2e_omega7_native_v31_gravity_scale_20260617"
 ICF_WORK_ORIGIN_VERSION = "icf_work_origin_20260521_rotation_limit_v2"
 ICF_HOME_REFERENCE_VERSION = "icf_home_reference_20260602_v1"
+ICF_CAMERA_TUNING_DEFAULTS_VERSION = "auto_awb_exposure_20260616"
 
 ICF_CAMERA_DEFAULTS: dict[str, Any] = {
     "global": "IMX335 / index 1",
@@ -34,24 +35,25 @@ ICF_CAMERA_DEFAULTS: dict[str, Any] = {
     "wristLeftResolution": "640x480",
     "wristRightResolution": "640x480",
     "fps": 30,
+    "tuningDefaultsVersion": ICF_CAMERA_TUNING_DEFAULTS_VERSION,
     "tuning": {
         "global": {
-            "autoExposure": False,
+            "autoExposure": True,
             "exposure": -5.5,
             "gain": 0.0,
-            "autoWhiteBalance": False,
+            "autoWhiteBalance": True,
         },
         "wrist_left": {
-            "autoExposure": False,
+            "autoExposure": True,
             "exposure": -6.0,
             "gain": 0.0,
-            "autoWhiteBalance": False,
+            "autoWhiteBalance": True,
         },
         "wrist_right": {
-            "autoExposure": False,
+            "autoExposure": True,
             "exposure": -6.0,
             "gain": 0.0,
-            "autoWhiteBalance": False,
+            "autoWhiteBalance": True,
         },
     },
 }
@@ -135,6 +137,8 @@ ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "kalmanTranslationIntentVelocityThreshold": 0.0005,
     "kalmanRotationIntentVelocityThreshold": 0.5,
     "strategyVersion": ICF_TELEOP_STRATEGY_VERSION,
+    "leftGravityScale": 0.45,
+    "rightGravityScale": 1.0,
     "mappingMode": "direct",
     "swapHands": False,
     "swapTeleopChannels": True,
@@ -274,17 +278,34 @@ def rotation_work_limits_from_soft_limits(left_limits: dict[str, Any], right_lim
     }
 
 
-ICF_LEFT_MOTION_MECHANICAL_LIMITS: dict[str, Any] = anchored_mechanical_soft_limits(
+ICF_LEFT_MOTION_LEGACY_ANCHORED_LIMITS: dict[str, Any] = anchored_mechanical_soft_limits(
     ICF_LEFT_MOTION_SOFT_LIMITS,
     ICF_WORK_ORIGIN_DEFAULTS["leftPulse"],
     ICF_KINEMATICS_DEFAULTS["leftSignedPulsePerUnit"],
 )
 
-ICF_RIGHT_MOTION_MECHANICAL_LIMITS: dict[str, Any] = anchored_mechanical_soft_limits(
+ICF_RIGHT_MOTION_LEGACY_ANCHORED_LIMITS: dict[str, Any] = anchored_mechanical_soft_limits(
     ICF_RIGHT_MOTION_SOFT_LIMITS,
     ICF_WORK_ORIGIN_DEFAULTS["rightPulse"],
     ICF_KINEMATICS_DEFAULTS["rightSignedPulsePerUnit"],
 )
+
+ICF_ROTATION_MECHANICAL_LIMIT_CONFIG = 1_000_000_000.0
+
+
+def stable_mechanical_soft_limits(relative_limits: dict[str, Any]) -> dict[str, Any]:
+    limits = deepcopy(relative_limits)
+    for axis_key in ("roll", "pitch", "yaw"):
+        limits[axis_key] = {
+            "min": -ICF_ROTATION_MECHANICAL_LIMIT_CONFIG,
+            "max": ICF_ROTATION_MECHANICAL_LIMIT_CONFIG,
+        }
+    return limits
+
+
+ICF_LEFT_MOTION_MECHANICAL_LIMITS: dict[str, Any] = stable_mechanical_soft_limits(ICF_LEFT_MOTION_SOFT_LIMITS)
+
+ICF_RIGHT_MOTION_MECHANICAL_LIMITS: dict[str, Any] = stable_mechanical_soft_limits(ICF_RIGHT_MOTION_SOFT_LIMITS)
 
 ICF_ROTATION_WORK_LIMIT_DEFAULTS: dict[str, Any] = rotation_work_limits_from_soft_limits(
     ICF_LEFT_MOTION_SOFT_LIMITS,
@@ -429,6 +450,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "rightGravityCompensation": True,
         "leftForceFeedback": True,
         "rightForceFeedback": True,
+        "leftGravityScale": 0.45,
+        "rightGravityScale": 1.0,
         **deepcopy(ICF_TELEOP_DEFAULTS),
         "requireClutch": False,
         "stabilityMode": "off",
@@ -453,8 +476,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "autoGapMarginMm": 1.0,
             "releaseSpeed": 255,
             "releaseTorque": 1,
-            "leftSourceHand": "PhysicalRight",
-            "rightSourceHand": "PhysicalLeft",
+            "leftSourceHand": "PhysicalLeft",
+            "rightSourceHand": "PhysicalRight",
             "objectDetectMargin": 10,
             "buttonFallback": True,
             "diagLog": False,

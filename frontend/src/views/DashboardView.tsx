@@ -5,7 +5,7 @@ import { useNavigate } from 'react-router-dom'
 import { CameraPreview } from '../components/CameraPreview'
 import { AxisGroupChart, ForceChart } from '../components/Charts'
 import { MetricPill } from '../components/MetricPill'
-import { armHardwareSpecs } from '../data'
+import { armHardwareSpecs, hardwareSideForOperatorSide } from '../data'
 import { useTelemetryStore } from '../stores/telemetry'
 import { teleopHandState, teleopHandValue, teleopPairState, teleopPairValue } from '../teleopStatus'
 import type { CameraTelemetry, ConnectionState, DiagnosticItem, TelemetryFrame, TelemetrySample } from '../types'
@@ -191,21 +191,22 @@ function ArmHardwarePanel({
   diagnostics: DiagnosticItem[]
 }) {
   const navigate = useNavigate()
-  const isLeft = side === 'left'
-  const sideSpec = armHardwareSpecs[side]
-  const label = isLeft ? '左机械臂' : '右机械臂'
+  const hardwareSide = hardwareSideForOperatorSide(side)
+  const isHardwareLeft = hardwareSide === 'left'
+  const sideSpec = armHardwareSpecs[hardwareSide]
+  const label = side === 'left' ? '左机械臂' : '右机械臂'
   const cardNo = `Card ${sideSpec.cardNo}`
   const axisOrder = sideSpec.axisOrder.join(' / ')
   const axisOffset = sideSpec.stateOffset
-  const wristCamera = cameraByKey(frame.cameras, isLeft ? 'wrist_left' : 'wrist_right')
-  const forceValues = isLeft ? frame.forceLeft : frame.forceRight
-  const forceState = diagnosticState(diagnostics, isLeft ? 'ati-left' : 'ati-right')
+  const wristCamera = cameraByKey(frame.cameras, isHardwareLeft ? 'wrist_left' : 'wrist_right')
+  const forceValues = isHardwareLeft ? frame.forceLeft : frame.forceRight
+  const forceState = diagnosticState(diagnostics, isHardwareLeft ? 'ati-left' : 'ati-right')
   const gripperState = diagnosticState(diagnostics, 'gripper')
   const teleopState = teleopHandState(frame, diagnostics, side)
   const motionState: ConnectionState = frame.halOk ? 'ok' : 'error'
   const forceNorm = forceMagnitude(forceValues)
   const safetyState: ConnectionState = forceNorm > 2.5 || frame.dangerIndex > 0.65 ? 'warn' : 'ok'
-  const gripperValue = formatGripperValue(frame.gripperPositions[isLeft ? 0 : 1])
+  const gripperValue = formatGripperValue(frame.gripperPositions[isHardwareLeft ? 0 : 1])
  /** 描述当前方法的功能边界。 */
  const go = (hash: string) => navigate(`/settings#${hash}`)
 
@@ -221,16 +222,16 @@ function ArmHardwarePanel({
       </div>
 
       <div className="device-chip-row">
-        <DeviceChip label="运动控制卡" state={motionState} value={cardNo} icon={<Cpu size={14} />} onClick={() => go(isLeft ? 'motion-left' : 'motion-right')} />
-        <DeviceChip label="物理轴号" state={motionState} value={axisOrder} icon={<MapPinned size={14} />} onClick={() => go(isLeft ? 'motion-left' : 'motion-right')} />
-        <DeviceChip label="Nano-17" state={forceState} value="mN" icon={<Waves size={14} />} onClick={() => go(isLeft ? 'force-left' : 'force-right')} />
-        <DeviceChip label="夹爪" state={gripperState} value={gripperValue} icon={<Hand size={14} />} onClick={() => go(isLeft ? 'gripper-left' : 'gripper-right')} />
-        <DeviceChip label="主手" state={teleopState} value={teleopHandValue(frame, side)} icon={<Gamepad2 size={14} />} onClick={() => go(isLeft ? 'teleop-left' : 'teleop-right')} />
+        <DeviceChip label="运动控制卡" state={motionState} value={cardNo} icon={<Cpu size={14} />} onClick={() => go(side === 'left' ? 'motion-left' : 'motion-right')} />
+        <DeviceChip label="物理轴号" state={motionState} value={axisOrder} icon={<MapPinned size={14} />} onClick={() => go(side === 'left' ? 'motion-left' : 'motion-right')} />
+        <DeviceChip label="Nano-17" state={forceState} value="mN" icon={<Waves size={14} />} onClick={() => go(side === 'left' ? 'force-left' : 'force-right')} />
+        <DeviceChip label="夹爪" state={gripperState} value={gripperValue} icon={<Hand size={14} />} onClick={() => go(side === 'left' ? 'gripper-left' : 'gripper-right')} />
+        <DeviceChip label="主手" state={teleopState} value={teleopHandValue(frame, side)} icon={<Gamepad2 size={14} />} onClick={() => go(side === 'left' ? 'teleop-left' : 'teleop-right')} />
       </div>
 
       <div className="arm-hardware-layout">
         <div className="arm-camera-block">
-          {wristCamera && <CameraPreview camera={wristCamera} compact onClick={() => go(isLeft ? 'camera-left' : 'camera-right')} />}
+          {wristCamera && <CameraPreview camera={wristCamera} compact onClick={() => go(side === 'left' ? 'camera-left' : 'camera-right')} />}
         </div>
         <div className="arm-axis-monitor">
           <div className="axis-readout-compact">
@@ -250,22 +251,22 @@ function ArmHardwarePanel({
             ))}
           </div>
           <div className="axis-chart-pair">
-            <button className="axis-chart-card" type="button" onClick={() => go(isLeft ? 'motion-left' : 'motion-right')}>
+            <button className="axis-chart-card" type="button" onClick={() => go(side === 'left' ? 'motion-left' : 'motion-right')}>
               <Typography.Text strong>平移轴位置 · µm</Typography.Text>
-              <AxisGroupChart history={history} side={side} group="translation" />
+              <AxisGroupChart history={history} side={hardwareSide} group="translation" />
             </button>
-            <button className="axis-chart-card" type="button" onClick={() => go(isLeft ? 'motion-left' : 'motion-right')}>
+            <button className="axis-chart-card" type="button" onClick={() => go(side === 'left' ? 'motion-left' : 'motion-right')}>
               <Typography.Text strong>旋转轴角度 · °</Typography.Text>
-              <AxisGroupChart history={history} side={side} group="rotation" />
+              <AxisGroupChart history={history} side={hardwareSide} group="rotation" />
             </button>
           </div>
         </div>
       </div>
 
       <div className="arm-force-layout">
-        <button className="force-chart-card" type="button" onClick={() => go(isLeft ? 'force-left' : 'force-right')}>
+        <button className="force-chart-card" type="button" onClick={() => go(side === 'left' ? 'force-left' : 'force-right')}>
           <Typography.Text strong>Nano-17 六维力觉 · mN</Typography.Text>
-          <ForceChart history={history} side={side} height={116} />
+          <ForceChart history={history} side={hardwareSide} height={116} />
         </button>
         <div className="force-summary-card">
           <b>|F| {(forceNorm * 1000).toFixed(0)} mN</b>

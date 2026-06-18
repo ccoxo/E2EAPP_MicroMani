@@ -1,11 +1,9 @@
 #pragma once
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <thread>
 
-#include "HalTypes.h"
 #include "LTDMCDriver.h"
 
 namespace appstation::hal {
@@ -21,11 +19,6 @@ class MotionControlThread {
   void start(int hz);
   // 停止线程并 join，析构时也会调用。
   void stop();
-  // 预留的软限位缓存，保持与上层接口一致；当前 loop 只读取状态，不主动下发限位。
-  void setSoftLimits(std::array<AxisLimit, 12> limits);
-  // 返回最近一次轮询结果；调用方应把它视为快照而非实时硬件读。
-  MotionState latestState() const;
-
  private:
   void loop();
 
@@ -34,8 +27,6 @@ class MotionControlThread {
   std::atomic<bool> running_{false};
   std::chrono::microseconds period_{1000};
   std::thread worker_;
-  std::array<AxisLimit, 12> limits_{};
-  MotionState latest_{};
 };
 
 }  // namespace appstation::hal

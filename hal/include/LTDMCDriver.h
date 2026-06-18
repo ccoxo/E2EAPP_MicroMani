@@ -19,31 +19,25 @@ class LTDMCDriver {
   HalHealth health(double uptimeS) const;
   // 读取 12 个语义轴的运动快照。读锁竞争时返回最近缓存，避免周期线程阻塞。
   MotionState readState();
-  // 输出每个轴的 IO、伺服、限位和停止原因诊断 JSON，供硬件联调使用。
-  std::string axisDiagnosticsJson();
   // 立即急停所有轴并尽力关闭伺服，随后需要由回零/使能流程清除急停状态。
   void emergencyStop();
+  bool estopActive() const;
   // 回工作原点前的安全检查，急停未清除时直接拒绝运动。
   void ensureMotionReturnAllowed() const;
   // 按侧打开/关闭伺服；enabledAxes 允许只作用于部分语义轴。
   std::string enableSide(Side side, bool enabled = true);
   std::string enableSide(Side side, bool enabled, const std::array<bool, 6>& enabledAxes);
   // 使用控制卡原点回零模式回单侧机械原点。
-  void homeSide(Side side);
   void homeSide(Side side, const std::array<bool, 6>& enabledAxes);
   // 两侧回工作原点。workOriginPulse 是 12 轴目标脉冲，顺序与 MotionState::axes 一致。
-  void homeAll(const std::array<double, 12>& workOriginPulse);
   void homeAll(
       const std::array<double, 12>& workOriginPulse,
       const std::array<std::array<bool, 6>, 2>& enabledAxes);
   // 单侧回工作原点。入参只包含该侧 6 个语义轴的目标脉冲。
-  void homeOriginSide(Side side, const std::array<double, 6>& workOriginPulse);
   void homeOriginSide(
       Side side,
       const std::array<double, 6>& workOriginPulse,
       const std::array<bool, 6>& enabledAxes);
-  // 直接设置 12 轴 UI 目标位置；当前主要用于 skeleton/仿真路径和限位验证。
-  void moveAllUi(const std::array<double, 12>& targetUi, const std::array<AxisLimit, 12>& limits);
   // maxVelocityUiPerSec/startVelocityUiPerSec 使用语义 UI 单位：
   // 平移轴是 um/s，旋转轴是 deg/s；传入 <=0 时使用内置保守默认值。
   void moveRelativeUi(
@@ -77,9 +71,9 @@ class LTDMCDriver {
 
  private:
   void ensureInitialized() const;
+  void throwIfEstopActive() const;
   // 配置某侧控制卡轴的脉冲模式、限位模式等基础参数。
   void configureStageAxes(Side side);
-  void checkLimits(const std::array<double, 12>& targetUi, const std::array<AxisLimit, 12>& limits) const;
   // 根据 commandedEnabled_ 与 enabledAxes 判断某个语义轴是否允许运动。
   bool axisMotionEnabled(Side side, SemanticAxis axis) const;
   // snapshotMutex_ 保护的缓存读写，用于高频读取失败时退回上一帧。

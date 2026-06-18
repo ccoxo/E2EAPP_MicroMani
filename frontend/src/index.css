@@ -3112,6 +3112,11 @@ select {
   width: 108px;
 }
 
+.teleop-gravity-scale-slider {
+  width: 160px;
+  padding-inline: 8px;
+}
+
 .teleop-route-label {
   display: inline-grid;
   grid-template-columns: auto auto;

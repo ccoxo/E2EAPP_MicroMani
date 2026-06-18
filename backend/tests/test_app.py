@@ -13,7 +13,8 @@ import pytest
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
-from backend.app import create_app, relative_motion_positions
+from backend.app import create_app, backend_deployment_status, hal_deployment_status, relative_motion_positions
+from backend.core.config import SettingsService
 from backend.core.defaults import default_config
 from backend.core.logging import LogService
 from backend.core.motion_limits import effective_limits_ui, side_home_reference_ui
@@ -118,6 +119,27 @@ def test_backend_app_import_does_not_create_runtime_services(tmp_path: Path) -> 
     assert not list((tmp_path / "runtime" / "logs").glob("*.log"))
 
 
+def test_create_app_exposes_gripper_router(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path))
+
+    assert client.app.state.gripper_router is not None
+    assert client.app.state.gripper_router.backend_name(client.app.state.settings.get_config()) in {
+        "dual_worker",
+        "hal_native",
+        "python_rs485",
+    }
+
+
+def test_create_app_exposes_app_services_and_legacy_state_attrs(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path))
+    services = client.app.state.services
+
+    assert client.app.state.logs is services.logs
+    assert client.app.state.settings is services.settings
+    assert client.app.state.commands is services.commands
+    assert client.app.state.gripper_router is services.gripper_router
+
+
 def _wide_motion_soft_limits() -> dict[str, dict[str, float]]:
     return {
         "x": {"min": -1_000_000.0, "max": 1_000_000.0},
@@ -208,6 +230,22 @@ def test_settings_round_trip(tmp_path: Path) -> None:
     assert put_response.json()["hal"]["apiConfirmed"] is True
 
     assert client.get("/api/settings").json()["hal"]["apiConfirmed"] is True
+
+
+def test_settings_normalizes_yaw_disable_to_card0_side(tmp_path: Path) -> None:
+    logs = LogService(log_file_path=tmp_path / "logs" / "test.log", emit_startup=False)
+    settings = SettingsService(tmp_path, logs)
+    config = default_config()
+    config["motion"]["leftCardNo"] = 0
+    config["motion"]["rightCardNo"] = 1
+    config["teleop"]["leftEnabledAxes"] = [True, True, True, True, True, True]
+    config["teleop"]["rightEnabledAxes"] = [True, True, True, True, True, False]
+    settings.save_config(config, emit_log=False)
+
+    normalized = settings.get_config()
+
+    assert normalized["teleop"]["leftEnabledAxes"] == [True, True, True, True, True, False]
+    assert normalized["teleop"]["rightEnabledAxes"] == [True, True, True, True, True, True]
 
 
 def test_settings_save_and_apply_run_config_methods_off_event_loop(
@@ -786,12 +824,46 @@ def test_teleop_force_controls_forward_to_hal(tmp_path: Path, monkeypatch: Monke
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     client = TestClient(create_app(tmp_path))
 
-    gravity_response = client.post("/api/teleop/right/gravity_compensation", json={"enabled": False})
+    hal_commands: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_hal_command(name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        hal_commands.append((name, payload or {}))
+        return {"ok": True}
+
+    monkeypatch.setattr(client.app.state.hal, "command", fake_hal_command)
+
+    gravity_response = client.post("/api/teleop/right/gravity_compensation", json={"enabled": False, "scale": 0.8})
     assert gravity_response.status_code == 200
     assert gravity_response.json()["data"]["enabled"] is False
+    assert gravity_response.json()["data"]["scale"] == 0.8
     config = client.get("/api/settings").json()
     assert config["teleop"]["rightGravityCompensation"] is False
     assert config["teleop"]["rightForceFeedback"] is False
+    assert config["teleop"]["rightGravityScale"] == 0.8
+
+    config_without_right_force = json.loads(json.dumps(config))
+    config_without_right_force["teleop"].pop("rightGravityCompensation", None)
+    config_without_right_force["teleop"].pop("rightForceFeedback", None)
+    config_without_right_force["teleop"].pop("rightGravityScale", None)
+
+    def fake_get_config() -> dict[str, Any]:
+        return json.loads(json.dumps(config_without_right_force))
+
+    def fake_save_config(config: dict[str, Any], emit_log: bool = True) -> dict[str, Any]:
+        _ = emit_log
+        return config
+
+    monkeypatch.setattr(client.app.state.settings, "get_config", fake_get_config)
+    monkeypatch.setattr(client.app.state.settings, "save_config", fake_save_config)
+
+    left_response = client.post("/api/teleop/left/gravity_compensation", json={"enabled": True, "scale": 0.55})
+    assert left_response.status_code == 200
+    assert left_response.json()["data"]["enabled"] is True
+    assert left_response.json()["data"]["scale"] == 0.55
+    assert hal_commands[-1] == (
+        "omega7.gravity_compensation",
+        {"leftEnabled": True, "rightEnabled": True, "leftScale": 0.55, "rightScale": 1.0},
+    )
 
     zero_response = client.post("/api/teleop/right/zero_force_feedback")
     assert zero_response.status_code == 200
@@ -955,6 +1027,9 @@ def test_websocket_reports_card0_dmc5c10_enabled_feedback_as_unknown(
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
 
     class FakeHal:
+        def __init__(self) -> None:
+            self.commands: list[tuple[str, dict[str, Any]]] = []
+
         async def health(self) -> HalHealth:
             return HalHealth(
                 ltdmc_ok=True,
@@ -1127,6 +1202,139 @@ def test_health_reads_gripper_worker_status_off_event_loop(tmp_path: Path, monke
 
     assert response.status_code == 200
     assert response.json()["hardware"]["gripper"]["message"] == "dual gripper workers"
+
+
+def test_hal_deployment_status_reports_pending_next_binary(tmp_path: Path) -> None:
+    build_dir = tmp_path / "hal" / "build"
+    build_dir.mkdir(parents=True)
+    (build_dir / "HalServer.exe").write_bytes(b"old-hal")
+    (build_dir / "HalServer.next.exe").write_bytes(b"new-hal")
+    (build_dir / "JodellGripperWorker.exe").write_bytes(b"old-worker")
+    (build_dir / "JodellGripperWorker.next.exe").write_bytes(b"old-worker")
+
+    status = hal_deployment_status(tmp_path)
+
+    assert status["restartRequired"] is True
+    assert status["components"]["HalServer"]["pendingNext"] is True
+    assert status["components"]["JodellGripperWorker"]["pendingNext"] is False
+    assert "HalServer.next.exe differs from HalServer.exe" in status["message"]
+
+
+def test_backend_deployment_status_reports_source_newer_than_process(tmp_path: Path) -> None:
+    backend_dir = tmp_path / "backend"
+    backend_dir.mkdir()
+    app_source = backend_dir / "app.py"
+    app_source.write_text("print('new backend')\n", encoding="utf-8")
+
+    status = backend_deployment_status(tmp_path, started_at=0.0)
+
+    assert status["restartRequired"] is True
+    assert status["latestPath"] == str(app_source)
+    assert "Backend source changed after process start" in status["message"]
+
+
+def test_backend_deployment_status_reports_stale_fastdds_binding(tmp_path: Path) -> None:
+    native_dir = tmp_path / "backend" / "native"
+    build_dir = native_dir / "build"
+    build_dir.mkdir(parents=True)
+    source = native_dir / "appstation_fastdds_transport.cpp"
+    dll = build_dir / "appstation_fastdds_transport.dll"
+    dll.write_bytes(b"old-fastdds")
+    source.write_text("// new fastdds source\n", encoding="utf-8")
+    old_time = 1_000.0
+    new_time = 2_000.0
+    os.utime(dll, (old_time, old_time))
+    os.utime(source, (new_time, new_time))
+
+    status = backend_deployment_status(tmp_path, started_at=3_000.0)
+
+    assert status["restartRequired"] is True
+    assert status["native"]["fastddsBinding"]["rebuildRequired"] is True
+    assert status["native"]["fastddsBinding"]["sourcePath"] == str(source)
+    assert "Fast-DDS binding source changed after DLL build" in status["message"]
+
+
+def test_backend_deployment_status_reports_pending_fastdds_next_dll(tmp_path: Path) -> None:
+    native_dir = tmp_path / "backend" / "native"
+    build_dir = native_dir / "build"
+    build_dir.mkdir(parents=True)
+    source = native_dir / "appstation_fastdds_transport.cpp"
+    dll = build_dir / "appstation_fastdds_transport.dll"
+    next_dll = build_dir / "appstation_fastdds_transport.next.dll"
+    dll.write_bytes(b"old-fastdds")
+    next_dll.write_bytes(b"new-fastdds")
+    source.write_text("// source already built into next dll\n", encoding="utf-8")
+    deployed_time = 1_000.0
+    source_time = 2_000.0
+    next_time = 3_000.0
+    os.utime(dll, (deployed_time, deployed_time))
+    os.utime(source, (source_time, source_time))
+    os.utime(next_dll, (next_time, next_time))
+
+    status = backend_deployment_status(tmp_path, started_at=4_000.0)
+    fastdds = status["native"]["fastddsBinding"]
+
+    assert status["restartRequired"] is True
+    assert fastdds["pendingNext"] is True
+    assert fastdds["rebuildRequired"] is False
+    assert fastdds["nextDllPath"] == str(next_dll)
+    assert "Fast-DDS binding next DLL differs from deployed DLL" in status["message"]
+
+
+def test_health_includes_hal_deployment_status(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+
+    def fake_hal_deployment_status() -> dict[str, object]:
+        return {
+            "restartRequired": True,
+            "components": {"HalServer": {"pendingNext": True}},
+            "message": "HalServer.next.exe differs from HalServer.exe",
+        }
+
+    def fake_backend_deployment_status() -> dict[str, object]:
+        return {
+            "restartRequired": True,
+            "latestPath": "backend/app.py",
+            "message": "Backend source changed after process start; restart backend",
+        }
+
+    monkeypatch.setattr("backend.app.hal_deployment_status", fake_hal_deployment_status)
+    monkeypatch.setattr("backend.app.backend_deployment_status", fake_backend_deployment_status)
+
+    response = client.get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json()["runtime"]["halDeployment"]["restartRequired"] is True
+    assert response.json()["runtime"]["backendDeployment"]["restartRequired"] is True
+
+
+def test_hardware_status_includes_hal_deployment_status(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+
+    def fake_hal_deployment_status() -> dict[str, object]:
+        return {
+            "restartRequired": True,
+            "components": {"HalServer": {"pendingNext": True}},
+            "message": "HalServer.next.exe differs from HalServer.exe",
+        }
+
+    def fake_backend_deployment_status() -> dict[str, object]:
+        return {
+            "restartRequired": True,
+            "latestPath": "backend/app.py",
+            "message": "Backend source changed after process start; restart backend",
+        }
+
+    monkeypatch.setattr("backend.app.hal_deployment_status", fake_hal_deployment_status)
+    monkeypatch.setattr("backend.app.backend_deployment_status", fake_backend_deployment_status)
+
+    response = client.get("/api/hardware/status")
+
+    assert response.status_code == 200
+    assert response.json()["runtime"]["halDeployment"]["restartRequired"] is True
+    assert response.json()["runtime"]["backendDeployment"]["restartRequired"] is True
 
 
 def test_hardware_status_uses_gripper_workers_in_native_mode_when_configured(
@@ -1339,6 +1547,19 @@ def test_hardware_status_reports_omega7_and_gripper_serial_identity(
         lambda *, include_gripper=True: {"camera": {}, "force": {}, "gripper": {"ok": None}, "pico": {}},
     )
 
+    async def fake_gripper_status(config: dict[str, Any]) -> dict[str, Any]:
+        _ = config
+        return {
+            "ok": True,
+            "message": "gripper status fixture",
+            "ports": [
+                {"side": "left", "port": "COM8", "slaveId": 10, "baudrate": 115200},
+                {"side": "right", "port": "COM9", "slaveId": 9, "baudrate": 115200},
+            ],
+        }
+
+    monkeypatch.setattr(client.app.state.gripper_router, "status", fake_gripper_status)
+
     response = client.get("/api/hardware/status")
 
     assert response.status_code == 200
@@ -1355,6 +1576,10 @@ def test_hardware_status_reports_omega7_and_gripper_serial_identity(
 def test_motion_side_enable_and_home_routes(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     client = TestClient(create_app(tmp_path))
+    config = client.app.state.settings.get_config()
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+    config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
+    client.app.state.settings.save_config(config, emit_log=False)
 
     enable_response = client.post("/api/motion/left/enable_all")
     assert enable_response.status_code == 200
@@ -2028,6 +2253,7 @@ def test_home_motion_side_refreshes_home_reference_and_shifts_work_origin(
         "rightPulseDelta": [0.0] * 6,
         "updatedAt": 123,
     }
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
     config["motion"]["origin"]["leftPulse"] = old_origin
     config["motion"]["origin"]["leftValid"] = True
     config["motion"]["origin"]["valid"] = False
@@ -2047,7 +2273,7 @@ def test_home_motion_side_refreshes_home_reference_and_shifts_work_origin(
     assert saved["motion"]["origin"]["leftPulse"] == [
         new_left_ref[index] + left_offset[index] for index in range(6)
     ]
-    assert saved["motion"]["leftSoftLimits"] != left_soft_limits_before
+    assert saved["motion"]["leftSoftLimits"] == left_soft_limits_before
     _assert_rotation_window_from_home_reference(saved, "left")
 
 
@@ -2181,6 +2407,8 @@ def test_motion_origin_capture_records_work_origin_without_changing_home_referen
         "rightPulse": home_right,
         "updatedAt": 123,
     }
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+    config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
     settings.save_config(config, emit_log=False)
 
     response = client.post("/api/motion/origin/capture", json={"confirmLargeDrift": True})
@@ -2248,6 +2476,8 @@ def test_motion_origin_capture_preserves_previous_work_origin(tmp_path: Path, mo
         "rightPulse": [0.0] * 6,
         "updatedAt": 0,
     }
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+    config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
     settings.save_config(config, emit_log=False)
 
     response = client.post("/api/motion/origin/capture")
@@ -2306,8 +2536,10 @@ def test_motion_origin_capture_keeps_rotation_limits_anchored_to_home_reference(
         "rightPulse": work_origin_pulses[6:12],
         "updatedAt": 123,
     }
-    config["motion"]["leftSoftLimits"]["yaw"] = {"min": -8000.0, "max": 8000.0}
-    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -40000.0, "max": -26000.0}
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+    config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
+    left_soft_limits_before = json.loads(json.dumps(config["motion"]["leftSoftLimits"]))
+    right_soft_limits_before = json.loads(json.dumps(config["motion"]["rightSoftLimits"]))
     settings.save_config(config, emit_log=False)
 
     response = client.post("/api/motion/origin/capture", json={"confirmLargeDrift": True})
@@ -2316,10 +2548,8 @@ def test_motion_origin_capture_keeps_rotation_limits_anchored_to_home_reference(
     saved = response.json()["data"]["config"]
     _assert_rotation_window_from_home_reference(saved, "left")
     _assert_rotation_window_from_home_reference(saved, "right")
-    left_yaw = saved["motion"]["leftSoftLimits"]["yaw"]
-    right_yaw = saved["motion"]["rightSoftLimits"]["yaw"]
-    assert left_yaw["max"] - left_yaw["min"] == pytest.approx(14_000.0)
-    assert right_yaw["max"] - right_yaw["min"] == pytest.approx(14_000.0)
+    assert saved["motion"]["leftSoftLimits"] == left_soft_limits_before
+    assert saved["motion"]["rightSoftLimits"] == right_soft_limits_before
 
 
 def test_motion_origin_capture_does_not_issue_hardware_home(
@@ -2371,6 +2601,8 @@ def test_motion_origin_capture_does_not_issue_hardware_home(
         "rightPulse": [0.0] * 6,
         "updatedAt": 0,
     }
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+    config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
     settings.save_config(config, emit_log=False)
 
     response = client.post("/api/motion/origin/capture")
@@ -2510,6 +2742,8 @@ def test_restore_previous_motion_origin_swaps_current_and_previous(
     }
     _set_home_reference_to_origin(config)
     _set_zero_work_origin_offset(config)
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+    config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
     settings.save_config(config, emit_log=False)
 
     response = client.post("/api/motion/origin/restore_previous")
@@ -2523,6 +2757,92 @@ def test_restore_previous_motion_origin_swaps_current_and_previous(
     assert origin["previousLeftPulse"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
     assert origin["previousRightPulse"] == [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
     assert origin["previousUpdatedAt"] == 100
+    work_origin_offset = response.json()["data"]["config"]["motion"]["workOriginOffset"]
+    assert work_origin_offset["leftPulseDelta"] == [100.0, 100.0, 100.0, 5.0, 5.0, 5.0]
+    assert work_origin_offset["rightPulseDelta"] == [100.0, 100.0, 100.0, 3.0, 3.0, 3.0]
+    assert work_origin_offset["leftValid"] is True
+    assert work_origin_offset["rightValid"] is True
+
+
+def test_restore_previous_motion_origin_rejects_previous_origin_outside_effective_limits(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    settings = client.app.state.settings
+    config = settings.get_config()
+    config["motion"]["origin"] = {
+        "valid": True,
+        "leftValid": True,
+        "rightValid": True,
+        "leftPulse": [0.0] * 6,
+        "rightPulse": [0.0] * 6,
+        "updatedAt": 100,
+        "previousValid": True,
+        "previousLeftPulse": [0.0, 0.0, 0.0, 0.0, 0.0, -1_000_000.0],
+        "previousRightPulse": [0.0] * 6,
+        "previousUpdatedAt": 50,
+    }
+    config["motion"]["homeReference"] = {
+        "valid": True,
+        "leftValid": True,
+        "rightValid": True,
+        "leftPulse": [0.0] * 6,
+        "rightPulse": [0.0] * 6,
+        "updatedAt": 100,
+    }
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+    config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
+    settings.save_config(config, emit_log=False)
+    original_origin = settings.get_config()["motion"]["origin"]
+
+    response = client.post("/api/motion/origin/restore_previous")
+
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert detail["code"] == "MOTION_UNAVAILABLE"
+    assert "left Yaw work origin exceeds soft limit" in detail["message"]
+    assert settings.get_config()["motion"]["origin"] == original_origin
+
+
+def test_motion_origin_status_reports_previous_origin_not_restorable(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    settings = client.app.state.settings
+    config = settings.get_config()
+    config["motion"]["origin"] = {
+        "valid": False,
+        "leftValid": False,
+        "rightValid": False,
+        "leftPulse": [0.0] * 6,
+        "rightPulse": [0.0] * 6,
+        "updatedAt": 0,
+        "previousValid": True,
+        "previousLeftPulse": [0.0, 0.0, 0.0, 0.0, 0.0, -1_000_000.0],
+        "previousRightPulse": [0.0] * 6,
+        "previousUpdatedAt": 50,
+    }
+    config["motion"]["homeReference"] = {
+        "valid": True,
+        "leftValid": True,
+        "rightValid": True,
+        "leftPulse": [0.0] * 6,
+        "rightPulse": [0.0] * 6,
+        "updatedAt": 100,
+    }
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+    config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
+    settings.save_config(config, emit_log=False)
+
+    response = client.get("/api/motion/origin")
+
+    assert response.status_code == 200
+    previous_restore = response.json()["data"]["previousRestore"]
+    assert previous_restore["available"] is True
+    assert previous_restore["restorable"] is False
+    assert previous_restore["message"] == "left Yaw work origin exceeds soft limit: 300.000 not in [-7.000, 7.000]"
 
 
 def test_restore_previous_motion_origin_keeps_rotation_limits_anchored_to_home_reference(
@@ -2540,12 +2860,14 @@ def test_restore_previous_motion_origin_keeps_rotation_limits_anchored_to_home_r
         "rightPulse": [7.0, 8.0, 9.0, 10000.0, 11000.0, 12000.0],
         "updatedAt": 100,
         "previousValid": True,
-        "previousLeftPulse": [53026.0, 277839.0, -323796.0, 10142.0, 84625.0, -12820.0],
-        "previousRightPulse": [46474.0, 49416.0, 366208.0, -159813.0, -680804.0, -694.0],
+        "previousLeftPulse": [53026.0, 277839.0, -323796.0, 4000.0, 5000.0, 6000.0],
+        "previousRightPulse": [46474.0, 49416.0, 366208.0, 10000.0, 11000.0, 12000.0],
         "previousUpdatedAt": 50,
     }
-    config["motion"]["leftSoftLimits"]["yaw"] = {"min": -8000.0, "max": 8000.0}
-    config["motion"]["rightSoftLimits"]["yaw"] = {"min": -40000.0, "max": -26000.0}
+    _set_home_reference_to_origin(config)
+    _set_zero_work_origin_offset(config)
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+    config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
     settings.save_config(config, emit_log=False)
 
     response = client.post("/api/motion/origin/restore_previous")
@@ -2681,6 +3003,7 @@ def test_runtime_release_handles_stops_gripper_workers_off_event_loop(
 def test_app_shutdown_closes_telemetry_hardware_resources(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     shutdown_calls: list[str] = []
+    camera_close_calls: list[str] = []
 
     with TestClient(create_app(tmp_path)) as client:
         def fake_shutdown() -> None:
@@ -2692,8 +3015,10 @@ def test_app_shutdown_closes_telemetry_hardware_resources(tmp_path: Path, monkey
             raise AssertionError("telemetry shutdown ran on the event loop")
 
         client.app.state.telemetry.shutdown = fake_shutdown
+        client.app.state.hardware.cameras.close_all = lambda: camera_close_calls.append("close_all")
 
     assert shutdown_calls == ["shutdown"]
+    assert camera_close_calls == ["close_all"]
 
 
 def test_app_shutdown_stops_gripper_workers_off_event_loop(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -2784,7 +3109,7 @@ def test_teleop_logical_connection_saves_config_off_event_loop(
 def test_teleop_logical_connect_starts_native_without_return_to_work_origin() -> None:
     source = (REPO_ROOT / "backend" / "app.py").read_text(encoding="utf-8")
 
-    assert 'await teleop_mapper.start("teleop-connect", pre_home=False, home_side=mapped_side)' in source
+    assert 'await teleop_mapper.start("teleop-connect", pre_home=False, home_side=hardware_side)' in source
 
 
 def test_record_session_controls_gripper_teleop_recording_source(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -3192,35 +3517,35 @@ def test_native_teleop_connect_starts_python_dual_worker_gripper_follow(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
-    client = TestClient(create_app(tmp_path))
-    config = client.get("/api/settings").json()
-    config["teleop"]["engine"] = "hal_native"
-    config["teleop"]["gripperTeleop"]["enabled"] = True
-    config["gripper"]["sampleMode"] = "dual_worker"
-    assert client.put("/api/settings", json=config).status_code == 200
-    gripper_start_calls: list[str] = []
-    worker_stop_calls: list[str] = []
-    native_start_calls: list[str] = []
+    with TestClient(create_app(tmp_path)) as client:
+        config = client.get("/api/settings").json()
+        config["teleop"]["engine"] = "hal_native"
+        config["teleop"]["gripperTeleop"]["enabled"] = True
+        config["gripper"]["sampleMode"] = "dual_worker"
+        assert client.put("/api/settings", json=config).status_code == 200
+        gripper_start_calls: list[str] = []
+        worker_stop_calls: list[str] = []
+        native_start_calls: list[str] = []
 
-    async def fake_native_start(source: str = "recording", home_side: str | None = None, *, pre_home: bool = True):
-        native_start_calls.append(source)
-        return {"running": True}
+        async def fake_native_start(source: str = "recording", home_side: str | None = None, *, pre_home: bool = True):
+            native_start_calls.append(source)
+            return {"running": True}
 
-    monkeypatch.setattr(client.app.state.teleop_mapper, "start", fake_native_start)
-    monkeypatch.setattr(
-        client.app.state.gripper_tele,
-        "start",
-        lambda source="manual": gripper_start_calls.append(source),
-    )
-    monkeypatch.setattr(client.app.state.gripper_workers, "stop_all", lambda: worker_stop_calls.append("stop_all"))
+        monkeypatch.setattr(client.app.state.teleop_mapper, "start", fake_native_start)
+        monkeypatch.setattr(
+            client.app.state.gripper_tele,
+            "start",
+            lambda source="manual": gripper_start_calls.append(source),
+        )
+        monkeypatch.setattr(client.app.state.gripper_workers, "stop_all", lambda: worker_stop_calls.append("stop_all"))
 
-    response = client.post("/api/teleop/left/connect")
+        response = client.post("/api/teleop/left/connect")
 
-    assert response.status_code == 200
-    time.sleep(0.1)
-    assert native_start_calls == ["teleop-connect"]
-    assert gripper_start_calls == ["teleop-connect"]
-    assert worker_stop_calls == []
+        assert response.status_code == 200
+        time.sleep(0.1)
+        assert native_start_calls == ["teleop-connect"]
+        assert gripper_start_calls == ["teleop-connect"]
+        assert worker_stop_calls == []
 
 
 def test_native_teleop_connect_rolls_back_when_gripper_follow_start_fails(
@@ -3228,39 +3553,39 @@ def test_native_teleop_connect_rolls_back_when_gripper_follow_start_fails(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
-    client = TestClient(create_app(tmp_path))
-    config = client.get("/api/settings").json()
-    config["teleop"]["engine"] = "hal_native"
-    config["teleop"]["gripperTeleop"]["enabled"] = True
-    config["gripper"]["sampleMode"] = "dual_worker"
-    assert client.put("/api/settings", json=config).status_code == 200
-    native_start_calls: list[str] = []
-    native_stop_calls: list[str] = []
+    with TestClient(create_app(tmp_path)) as client:
+        config = client.get("/api/settings").json()
+        config["teleop"]["engine"] = "hal_native"
+        config["teleop"]["gripperTeleop"]["enabled"] = True
+        config["gripper"]["sampleMode"] = "dual_worker"
+        assert client.put("/api/settings", json=config).status_code == 200
+        native_start_calls: list[str] = []
+        native_stop_calls: list[str] = []
 
-    async def fake_native_start(source: str = "recording", home_side: str | None = None, *, pre_home: bool = True):
-        native_start_calls.append(source)
-        return {"running": True}
+        async def fake_native_start(source: str = "recording", home_side: str | None = None, *, pre_home: bool = True):
+            native_start_calls.append(source)
+            return {"running": True}
 
-    async def fake_native_stop(source: str = "recording", *, restart_remaining: bool = True) -> dict[str, Any]:
-        native_stop_calls.append(source)
-        return {"running": False}
+        async def fake_native_stop(source: str = "recording", *, restart_remaining: bool = True) -> dict[str, Any]:
+            native_stop_calls.append(source)
+            return {"running": False}
 
-    def fail_gripper_start(source: str = "manual") -> None:
-        raise RuntimeError(f"{source} gripper follow failed")
+        def fail_gripper_start(source: str = "manual") -> None:
+            raise RuntimeError(f"{source} gripper follow failed")
 
-    monkeypatch.setattr(client.app.state.teleop_mapper, "start", fake_native_start)
-    monkeypatch.setattr(client.app.state.teleop_mapper, "stop", fake_native_stop)
-    monkeypatch.setattr(client.app.state.gripper_tele, "start", fail_gripper_start)
+        monkeypatch.setattr(client.app.state.teleop_mapper, "start", fake_native_start)
+        monkeypatch.setattr(client.app.state.teleop_mapper, "stop", fake_native_stop)
+        monkeypatch.setattr(client.app.state.gripper_tele, "start", fail_gripper_start)
 
-    response = client.post("/api/teleop/left/connect")
+        response = client.post("/api/teleop/left/connect")
 
-    deadline = time.monotonic() + 1.0
-    while not native_stop_calls and time.monotonic() < deadline:
-        time.sleep(0.01)
+        deadline = time.monotonic() + 1.0
+        while not native_stop_calls and time.monotonic() < deadline:
+            time.sleep(0.01)
 
-    assert response.status_code == 200
-    assert native_start_calls == ["teleop-connect"]
-    assert native_stop_calls == ["teleop-connect"]
+        assert response.status_code == 200
+        assert native_start_calls == ["teleop-connect"]
+        assert native_stop_calls == ["teleop-connect"]
 
 
 def test_native_gripper_teleop_stop_uses_python_gripper_service(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -3494,6 +3819,9 @@ def test_native_record_session_ignores_stale_native_gripper_status_when_python_w
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
 
     class FakeHal:
+        def __init__(self) -> None:
+            self.commands: list[tuple[str, dict[str, Any]]] = []
+
         async def health(self) -> HalHealth:
             return HalHealth(
                 ltdmc_ok=True,
@@ -3513,9 +3841,11 @@ def test_native_record_session_ignores_stale_native_gripper_status_when_python_w
             }
 
         async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
+            self.commands.append((name, payload or {}))
             return {"command": name, "payload": payload or {}}
 
-    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: FakeHal())
+    fake_hal = FakeHal()
+    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: fake_hal)
     client = TestClient(create_app(tmp_path))
     config = client.get("/api/settings").json()
     config["teleop"]["engine"] = "hal_native"
@@ -3837,6 +4167,45 @@ def test_teleop_connect_accepts_logical_connection_without_waiting_for_hal(
     assert client.app.state.settings.get_config()["teleop"]["leftConnected"] is True
 
 
+def test_native_teleop_connect_rejects_missing_mapped_work_origin_before_logical_connect(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    class BlockingHal:
+        async def health(self) -> HalHealth:
+            raise RuntimeError("HAL health should not run")
+
+        async def omega_state(self) -> dict[str, Any]:
+            raise RuntimeError("omega state should not run")
+
+        async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
+            raise RuntimeError(f"{name} should not run")
+
+        async def motion_state(self) -> dict[str, Any]:
+            raise RuntimeError("motion state should not run")
+
+    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: BlockingHal())
+    client = TestClient(create_app(tmp_path))
+    config = client.app.state.settings.get_config()
+    config["teleop"]["engine"] = "hal_native"
+    config["teleop"]["swapTeleopChannels"] = True
+    config["motion"]["origin"]["rightValid"] = False
+    config["motion"]["origin"]["valid"] = False
+    client.app.state.settings.save_config(config, emit_log=False)
+
+    response = client.post("/api/teleop/left/connect")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "WORK_ORIGIN_MISSING",
+        "message": "right motion work origin is not captured",
+    }
+    assert client.app.state.settings.get_config()["teleop"]["leftConnected"] is False
+    assert client.app.state.teleop_background_tasks == set()
+
+
 def test_teleop_disconnect_schedules_native_refresh_and_reports_mapped_stop(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -3844,6 +4213,9 @@ def test_teleop_disconnect_schedules_native_refresh_and_reports_mapped_stop(
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
 
     class FakeHal:
+        def __init__(self) -> None:
+            self.commands: list[tuple[str, dict[str, Any]]] = []
+
         async def health(self) -> HalHealth:
             return HalHealth(
                 ltdmc_ok=True,
@@ -3858,12 +4230,14 @@ def test_teleop_disconnect_schedules_native_refresh_and_reports_mapped_stop(
             return {"hands": []}
 
         async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
+            self.commands.append((name, payload or {}))
             return {"command": name, "payload": payload or {}}
 
         async def motion_state(self) -> dict[str, Any]:
             return {"enabled": [True] * 12, "pulses": [0.0] * 12}
 
-    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: FakeHal())
+    fake_hal = FakeHal()
+    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: fake_hal)
     client = TestClient(create_app(tmp_path))
     config = client.app.state.settings.get_config()
     config["teleop"]["engine"] = "hal_native"
@@ -3876,9 +4250,10 @@ def test_teleop_disconnect_schedules_native_refresh_and_reports_mapped_stop(
 
     assert response.status_code == 200
     assert response.json()["data"]["connected"] is False
-    assert response.json()["data"]["stoppedSide"] == "right"
+    assert response.json()["data"]["stoppedSide"] == "left"
     assert response.json()["data"]["backgroundSync"] is True
     assert client.app.state.settings.get_config()["teleop"]["leftConnected"] is False
+    assert ("motion.teleop_stop_side", {"side": "right"}) in fake_hal.commands
 
 
 def test_teleop_logical_connect_does_not_return_to_work_origin(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -3930,25 +4305,29 @@ def test_teleop_logical_connect_does_not_return_to_work_origin(tmp_path: Path, m
 
     fake_hal = FakeHal()
     monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: fake_hal)
-    client = TestClient(create_app(tmp_path))
-    monkeypatch.setattr(
-        client.app.state.hardware,
-        "status",
-        lambda *, include_gripper=True: {
-            "camera": {"ok": True, "message": "cameras ready"},
-            "force": {"ok": True, "message": "force ready"},
-            "gripper": {"ok": True, "message": "grippers ready", "ports": []},
-            "pico": {},
-        },
-    )
+    with TestClient(create_app(tmp_path)) as client:
+        monkeypatch.setattr(
+            client.app.state.hardware,
+            "status",
+            lambda *, include_gripper=True: {
+                "camera": {"ok": True, "message": "cameras ready"},
+                "force": {"ok": True, "message": "force ready"},
+                "gripper": {"ok": True, "message": "grippers ready", "ports": []},
+                "pico": {},
+            },
+        )
 
-    connect_response = client.post("/api/teleop/left/connect")
-    assert connect_response.status_code == 200
-    assert connect_response.json()["data"]["connected"] is True
+        connect_response = client.post("/api/teleop/left/connect")
+        assert connect_response.status_code == 200
+        assert connect_response.json()["data"]["connected"] is True
 
-    client.post("/api/teleop/left/disconnect")
+        deadline = time.monotonic() + 1.0
+        while "motion.enable_side" not in [name for name, _payload in fake_hal.commands] and time.monotonic() < deadline:
+            time.sleep(0.01)
 
-    command_names = [name for name, _payload in fake_hal.commands]
+        client.post("/api/teleop/left/disconnect")
+
+        command_names = [name for name, _payload in fake_hal.commands]
     assert "motion.enable_side" in command_names
     assert "motion.home_origin_side" not in command_names
     assert "motion.home_all" not in command_names
@@ -4570,17 +4949,17 @@ def test_camera_snapshot_endpoint_returns_jpeg(tmp_path: Path, monkeypatch: Monk
             return True, b"\xff\xd8fake-jpeg\xff\xd9"
 
     monkeypatch.setattr("backend.drivers.camera_opencv.import_module", lambda name: FakeCv2)
-    client = TestClient(create_app(tmp_path))
-    config = client.get("/api/settings").json()
-    _clear_camera_identities(config)
-    _avoid_camera_index_conflicts(config)
-    config["cameras"]["global"] = "Global UVC / index 0"
-    assert client.put("/api/settings", json=config).status_code == 200
+    with TestClient(create_app(tmp_path)) as client:
+        config = client.get("/api/settings").json()
+        _clear_camera_identities(config)
+        _avoid_camera_index_conflicts(config)
+        config["cameras"]["global"] = "Global UVC / index 0"
+        assert client.put("/api/settings", json=config).status_code == 200
 
-    response = client.get("/api/cameras/global/snapshot")
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "image/jpeg"
-    assert response.content.startswith(b"\xff\xd8")
+        response = client.get("/api/cameras/global/snapshot")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/jpeg"
+        assert response.content.startswith(b"\xff\xd8")
 
 
 def test_camera_driver_falls_back_when_first_windows_backend_fails(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -4635,17 +5014,17 @@ def test_camera_driver_falls_back_when_first_windows_backend_fails(tmp_path: Pat
 
     monkeypatch.setenv("APPSTATION_CAMERA_BACKEND", "msmf")
     monkeypatch.setattr("backend.drivers.camera_opencv.import_module", lambda name: FakeCv2)
-    client = TestClient(create_app(tmp_path))
-    config = client.get("/api/settings").json()
-    _clear_camera_identities(config)
-    _avoid_camera_index_conflicts(config)
-    config["cameras"]["global"] = "Global UVC / index 0"
-    assert client.put("/api/settings", json=config).status_code == 200
+    with TestClient(create_app(tmp_path)) as client:
+        config = client.get("/api/settings").json()
+        _clear_camera_identities(config)
+        _avoid_camera_index_conflicts(config)
+        config["cameras"]["global"] = "Global UVC / index 0"
+        assert client.put("/api/settings", json=config).status_code == 200
 
-    response = client.get("/api/cameras/global/snapshot")
+        response = client.get("/api/cameras/global/snapshot")
 
-    assert response.status_code == 200
-    assert calls[:2] == [(0, 1400), (0, 700)]
+        assert response.status_code == 200
+        assert calls[:2] == [(0, 1400), (0, 700)]
 
 
 def test_camera_open_attempt_logs_backend_fallback(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -4700,24 +5079,24 @@ def test_camera_open_attempt_logs_backend_fallback(tmp_path: Path, monkeypatch: 
 
     monkeypatch.setenv("APPSTATION_CAMERA_BACKEND", "msmf")
     monkeypatch.setattr("backend.drivers.camera_opencv.import_module", lambda name: FakeCv2)
-    client = TestClient(create_app(tmp_path))
-    config = client.get("/api/settings").json()
-    _clear_camera_identities(config)
-    _avoid_camera_index_conflicts(config)
-    config["cameras"]["global"] = "Global UVC / index 0"
-    assert client.put("/api/settings", json=config).status_code == 200
+    with TestClient(create_app(tmp_path)) as client:
+        config = client.get("/api/settings").json()
+        _clear_camera_identities(config)
+        _avoid_camera_index_conflicts(config)
+        config["cameras"]["global"] = "Global UVC / index 0"
+        assert client.put("/api/settings", json=config).status_code == 200
 
-    response = client.get("/api/cameras/global/snapshot")
+        response = client.get("/api/cameras/global/snapshot")
 
-    assert response.status_code == 200
-    messages = [entry.msg for entry in client.app.state.logs.list_entries()]
-    assert any("event=camera_mapping" in message and "role=global" in message for message in messages)
-    assert any(
-        "event=camera_open_attempt" in message
-        and "backend=CAP_MSMF" in message
-        and "openRet=false" in message
-        for message in messages
-    )
+        assert response.status_code == 200
+        messages = [entry.msg for entry in client.app.state.logs.list_entries()]
+        assert any("event=camera_mapping" in message and "role=global" in message for message in messages)
+        assert any(
+            "event=camera_open_attempt" in message
+            and "backend=CAP_MSMF" in message
+            and "openRet=false" in message
+            for message in messages
+        )
     assert any(
         "event=camera_open_attempt" in message
         and "backend=CAP_DSHOW" in message
@@ -5001,6 +5380,21 @@ def test_camera_process_capture_falls_back_when_worker_unavailable(monkeypatch: 
     assert attempts[0] == (0, FakeCv2.CAP_DSHOW)
     assert driver._capture_backend_labels[0] == "CAP_DSHOW fallback"  # noqa: SLF001
     driver._drop_capture(0)  # noqa: SLF001
+
+
+def test_camera_process_capture_is_opt_in(monkeypatch: MonkeyPatch) -> None:
+    fake_cv2 = type("cv2", (), {})
+    candidates = [(700, "CAP_DSHOW")]
+    driver = OpenCVCameraDriver()
+
+    monkeypatch.delenv("APPSTATION_CAMERA_CAPTURE_MODE", raising=False)
+    assert driver._process_capture_enabled(fake_cv2, candidates) is False  # noqa: SLF001
+
+    monkeypatch.setenv("APPSTATION_CAMERA_CAPTURE_MODE", "process")
+    assert driver._process_capture_enabled(fake_cv2, candidates) is True  # noqa: SLF001
+
+    monkeypatch.setenv("APPSTATION_CAMERA_CAPTURE_MODE", "direct")
+    assert driver._process_capture_enabled(fake_cv2, candidates) is False  # noqa: SLF001
 
 
 def test_camera_process_capture_starts_module_subprocess(monkeypatch: MonkeyPatch) -> None:
@@ -5496,9 +5890,36 @@ def test_default_camera_mapping_matches_deployment_hardware() -> None:
     assert config["cameras"]["globalResolution"] == "640x480"
     assert config["cameras"]["wristLeftResolution"] == "640x480"
     assert config["cameras"]["wristRightResolution"] == "640x480"
+    assert config["cameras"]["tuning"]["global"]["autoExposure"] is True
+    assert config["cameras"]["tuning"]["global"]["autoWhiteBalance"] is True
     assert config["cameras"]["tuning"]["global"]["exposure"] == -5.5
+    assert config["cameras"]["tuning"]["wrist_left"]["autoExposure"] is True
+    assert config["cameras"]["tuning"]["wrist_left"]["autoWhiteBalance"] is True
     assert config["cameras"]["tuning"]["wrist_left"]["exposure"] == -6.0
+    assert config["cameras"]["tuning"]["wrist_right"]["autoExposure"] is True
+    assert config["cameras"]["tuning"]["wrist_right"]["autoWhiteBalance"] is True
     assert config["cameras"]["tuning"]["wrist_right"]["exposure"] == -6.0
+
+
+def test_startup_migrates_legacy_default_camera_tuning_to_auto(tmp_path: Path) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    config = default_config()
+    config["cameras"].pop("tuningDefaultsVersion", None)
+    for profile in config["cameras"]["tuning"].values():
+        profile["autoExposure"] = False
+        profile["autoWhiteBalance"] = False
+    (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    client = TestClient(create_app(runtime_dir))
+
+    tuning = client.get("/api/settings").json()["cameras"]["tuning"]
+    assert tuning["global"]["autoExposure"] is True
+    assert tuning["global"]["autoWhiteBalance"] is True
+    assert tuning["wrist_left"]["autoExposure"] is True
+    assert tuning["wrist_left"]["autoWhiteBalance"] is True
+    assert tuning["wrist_right"]["autoExposure"] is True
+    assert tuning["wrist_right"]["autoWhiteBalance"] is True
 
 
 def test_camera_tuning_allows_manual_wrist_exposure() -> None:
@@ -5638,6 +6059,35 @@ def test_camera_driver_fps_uses_windowed_samples_to_ignore_single_interval_jitte
     assert driver._latest_fps[0] < 35.0  # noqa: SLF001
 
 
+def test_camera_probe_cache_starts_after_slow_probe_completion(monkeypatch: MonkeyPatch) -> None:
+    driver = OpenCVCameraDriver()
+    config = default_config()
+    _clear_camera_identities(config)
+    current_time = 100.0
+    open_attempts = 0
+
+    def fake_monotonic() -> float:
+        return current_time
+
+    def fake_get_capture(*_args: object, **_kwargs: object) -> None:
+        nonlocal current_time, open_attempts
+        open_attempts += 1
+        current_time = 108.0
+        return None
+
+    monkeypatch.setattr("backend.drivers.camera_opencv.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("backend.drivers.camera_opencv.import_module", lambda name: object())
+    monkeypatch.setattr(driver, "_resolved_indices", lambda cv2, cfg, fps: {"global": 0, "wrist_left": 1, "wrist_right": 2})
+    monkeypatch.setattr(driver, "_get_capture", fake_get_capture)
+
+    first = driver.probe(config)
+    current_time = 109.0
+    second = driver.probe(config)
+
+    assert second is first
+    assert open_attempts == 3
+
+
 def test_camera_reconnect_releases_selected_capture(monkeypatch: MonkeyPatch) -> None:
     class FakeCapture:
         released = False
@@ -5668,14 +6118,41 @@ def test_camera_reconnect_releases_selected_capture(monkeypatch: MonkeyPatch) ->
 
 def test_real_hal_mode_reports_unavailable_without_service(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
-    monkeypatch.setenv("APPSTATION_HAL_BASE_URL", "http://127.0.0.1:65530")
+
+    class UnavailableHal:
+        async def health(self) -> HalHealth:
+            return HalHealth(
+                ltdmc_ok=False,
+                omega7_ok=False,
+                version="fake-hal",
+                uptime_s=0.0,
+                connected=False,
+                mode="real",
+                message="HAL unavailable",
+            )
+
+        async def omega_state(self) -> dict[str, Any]:
+            return {"hands": []}
+
+        async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
+            raise RuntimeError(f"{name} should not run")
+
+        async def motion_state(self) -> dict[str, Any]:
+            raise RuntimeError("motion_state should not run")
 
     def fake_hardware_status(self: object, *, include_gripper: bool = True) -> dict[str, object]:
         _ = (self, include_gripper)
         return {}
 
+    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: UnavailableHal())
     monkeypatch.setattr("backend.services.hardware_service.HardwareService.status", fake_hardware_status)
     client = TestClient(create_app(tmp_path))
+
+    async def fake_gripper_status(config: dict[str, Any]) -> dict[str, Any]:
+        _ = config
+        return {"ok": True, "message": "gripper status fixture", "sides": {}, "ports": []}
+
+    monkeypatch.setattr(client.app.state.gripper_router, "status", fake_gripper_status)
 
     response = client.get("/api/health")
     assert response.status_code == 200
@@ -6133,6 +6610,53 @@ def test_emergency_stop_clears_auto_policy_queue(tmp_path: Path, monkeypatch: Mo
     status = status_response.json()["data"]
     assert status["running"] is False
     assert status["queueDepth"] == 0
+
+
+def test_emergency_stop_returns_before_slow_auto_policy_cleanup(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    with TestClient(create_app(tmp_path)) as client:
+        started = Event()
+        finished = Event()
+        release = Event()
+        result: dict[str, Any] = {}
+
+        async def slow_auto_stop() -> dict[str, Any]:
+            started.set()
+            await asyncio.to_thread(release.wait)
+            finished.set()
+            return {"running": False, "queueDepth": 0}
+
+        async def fast_emergency_stop() -> dict[str, object]:
+            return {"mode": "test", "command": "motion.emergency_stop", "payload": {}}
+
+        monkeypatch.setattr(client.app.state.policy, "auto_stop", slow_auto_stop)
+        monkeypatch.setattr(client.app.state.commands, "emergency_stop", fast_emergency_stop)
+
+        def post_emergency_stop() -> None:
+            try:
+                result["response"] = client.post("/api/motion/emergency_stop")
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        request_thread = Thread(target=post_emergency_stop)
+        request_thread.start()
+
+        try:
+            assert started.wait(timeout=1.0)
+            request_thread.join(timeout=0.5)
+            returned_before_release = not request_thread.is_alive()
+            finished_before_release = finished.is_set()
+        finally:
+            release.set()
+            request_thread.join(timeout=1.0)
+
+        if "error" in result:
+            raise result["error"]
+        assert returned_before_release
+        assert not finished_before_release
+        assert result["response"].status_code == 200
 
 
 def test_acknowledge_safety_restores_enable_snapshot_without_origin_move(

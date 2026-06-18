@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
@@ -306,17 +307,19 @@ def test_return_motion_origin_side_logs_planned_axis_delta_before_hal_command(
     )
 
 
-def test_capture_motion_origin_reanchors_rotation_limits_to_hardware_zero(
+def test_capture_motion_origin_keeps_mechanical_soft_limits_stable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     config = default_config()
-    config["motion"]["leftSoftLimits"]["yaw"] = {"min": -9000.0, "max": 9000.0}
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+    soft_limits_before = json.loads(json.dumps(config["motion"]["leftSoftLimits"]))
     pulses = list(config["motion"]["origin"]["leftPulse"] + config["motion"]["origin"]["rightPulse"])
     service = _service_with_hal(config, LogService(emit_startup=False), FakeMotionStateHal(pulses))
 
     asyncio.run(service.capture_motion_origin("left", confirm_large_drift=True))
 
+    assert config["motion"]["leftSoftLimits"] == soft_limits_before
     home_reference = side_home_reference_ui(config, "left")
     assert home_reference is not None
     limits = effective_limits_ui(config, "left")

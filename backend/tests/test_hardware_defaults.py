@@ -66,7 +66,7 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["kalmanRotationProcessVelocityVariance"] == 1e-3
     assert teleop["kalmanTranslationIntentVelocityThreshold"] == 0.0005
     assert teleop["kalmanRotationIntentVelocityThreshold"] == 0.5
-    assert teleop["strategyVersion"] == "e2e_omega7_native_v29_stable_feel_lead_20260612"
+    assert teleop["strategyVersion"] == "e2e_omega7_native_v31_gravity_scale_20260617"
     assert teleop["mappingMode"] == "direct"
     assert teleop["swapHands"] is False
     assert teleop["swapTeleopChannels"] is True
@@ -75,8 +75,12 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["rightTranslationScale"] == 1.0
     assert teleop["leftRotationScale"] == 1.0
     assert teleop["rightRotationScale"] == 1.0
+    assert teleop["leftGravityCompensation"] is True
+    assert teleop["rightGravityCompensation"] is True
     assert teleop["leftForceFeedback"] is True
     assert teleop["rightForceFeedback"] is True
+    assert teleop["leftGravityScale"] == 0.45
+    assert teleop["rightGravityScale"] == 1.0
     assert teleop["leftAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.10]
     assert teleop["rightAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.001]
     assert teleop["translationStepLimitPulse"] == 4000
@@ -105,8 +109,8 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["rightImpulseCoeff"] == [-5000000, 10000000, -5000000, 1667, -2500, 3333.333]
     assert teleop["leftDirectionSign"] == [1, -1, -1, 1, -1, -1]
     assert teleop["rightDirectionSign"] == [1, 1, -1, 1, 1, 1]
-    assert teleop["gripperTeleop"]["leftSourceHand"] == "PhysicalRight"
-    assert teleop["gripperTeleop"]["rightSourceHand"] == "PhysicalLeft"
+    assert teleop["gripperTeleop"]["leftSourceHand"] == "PhysicalLeft"
+    assert teleop["gripperTeleop"]["rightSourceHand"] == "PhysicalRight"
     assert teleop["gripperTeleop"]["leftGapInvert"] is False
     assert teleop["gripperTeleop"]["rightGapInvert"] is False
 
@@ -200,8 +204,8 @@ def test_gripper_teleop_defaults_match_omega7_gap_range() -> None:
     assert gripper_teleop["minCommandIntervalMs"] == 20
     assert gripper_teleop["gripTorque"] == 1
     assert gripper_teleop["releaseTorque"] == 1
-    assert gripper_teleop["leftSourceHand"] == "PhysicalRight"
-    assert gripper_teleop["rightSourceHand"] == "PhysicalLeft"
+    assert gripper_teleop["leftSourceHand"] == "PhysicalLeft"
+    assert gripper_teleop["rightSourceHand"] == "PhysicalRight"
     assert gripper_teleop["leftGapInvert"] is False
     assert gripper_teleop["rightGapInvert"] is False
     assert gripper_teleop["autoGapCalibration"] is True

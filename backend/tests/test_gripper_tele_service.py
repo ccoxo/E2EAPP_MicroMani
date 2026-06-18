@@ -267,7 +267,10 @@ def test_gripper_teleop_left_command_does_not_block_right_follow() -> None:
             await asyncio.wait_for(asyncio.to_thread(hardware.gripper.left_entered.wait), timeout=1.0)
             await asyncio.sleep(0.05)
 
-            assert any(side == "right" and command == "target" for _cfg, side, command, _target in hardware.gripper.calls)
+            assert any(
+                side == "right" and command == "target"
+                for _cfg, side, command, _target in hardware.gripper.calls
+            )
         finally:
             hardware.gripper.left_release.set()
             service.stop("manual")
@@ -278,7 +281,7 @@ def test_gripper_teleop_left_command_does_not_block_right_follow() -> None:
 
 def test_gripper_teleop_target_bypasses_manual_enable_flag() -> None:
     settings = FakeSettings()
-    settings.config["gripper"]["leftEnabled"] = False
+    settings.config["gripper"]["rightEnabled"] = False
     hardware = FakeHardware()
     service = GripperTeleService(settings, None, hardware, LogService())  # type: ignore[arg-type]
 
@@ -286,7 +289,7 @@ def test_gripper_teleop_target_bypasses_manual_enable_flag() -> None:
 
     assert result.ok is True
     sent_config, side, command, target = hardware.gripper.calls[-1]
-    assert side == "left"
+    assert side == "right"
     assert command == "target"
     assert target == 12.0
-    assert sent_config["gripper"]["leftEnabled"] is True
+    assert sent_config["gripper"]["rightEnabled"] is True

@@ -159,6 +159,7 @@ export interface FineTuneJobApi {
 
 const localizedApiErrorMessages: Record<string, string> = {
   RECORDING_BUSY: '录制会话已在运行，请先结束当前会话后再开始新的录制。',
+  WORK_ORIGIN_MISSING: '目标硬件臂工作原点未设置，请先在设置页记录工作原点后再连接遥操作。',
 }
 /** 格式化对应数值用于界面展示。 */
 export function formatApiErrorMessage(status: number, payload?: unknown, fallback = 'command failed') {
@@ -170,7 +171,7 @@ export function formatApiErrorMessage(status: number, payload?: unknown, fallbac
   const suffix = [code, message].filter(Boolean).join(': ')
   return suffix ? `${fallback}: ${status} ${suffix}` : `${fallback}: ${status}`
 }
-/** 描述当前方法的功能边界。 */
+/** Build a typed command error while preserving backend detail payloads. */
 async function commandErrorFromResponse(response: Response, fallback = 'command failed') {
   let payload: unknown
   try {
@@ -186,7 +187,7 @@ async function commandErrorFromResponse(response: Response, fallback = 'command 
   if (isMotionOriginCaptureDrift(detail?.drift)) error.drift = detail.drift
   return error
 }
-/** 描述当前方法的功能边界。 */
+/** Narrow backend drift metadata before attaching it to command errors. */
 function isMotionOriginCaptureDrift(value: unknown): value is MotionOriginCaptureDrift {
   if (!value || typeof value !== 'object') return false
   const drift = value as MotionOriginCaptureDrift
@@ -198,7 +199,7 @@ function isMotionOriginCaptureDrift(value: unknown): value is MotionOriginCaptur
     Array.isArray(drift.sides)
   )
 }
-/** 从后端读取对应数据。 */
+/** Load persisted runtime settings; mock mode returns an isolated copy. */
 export async function fetchConfig(): Promise<AppConfig> {
   if (mockMode) return structuredClone(defaultConfig)
   const response = await fetch(`${apiBase}/api/settings`)
@@ -227,8 +228,20 @@ export interface HardwareProbeStatus {
     }>
   }
   pico?: { ok: boolean; message: string }
+  runtime?: {
+    backendDeployment?: {
+      restartRequired?: boolean
+      message?: string
+      latestPath?: string | null
+    }
+    halDeployment?: {
+      restartRequired?: boolean
+      message?: string
+      components?: Record<string, { pendingNext?: boolean }>
+    }
+  }
 }
-/** 从后端读取对应数据。 */
+/** Probe hardware status without changing device state. */
 export async function fetchHardwareStatus(): Promise<HardwareProbeStatus> {
   if (mockMode) return {}
   const response = await fetch(`${apiBase}/api/hardware/status`)
@@ -250,7 +263,7 @@ export async function postCommand(path: string, body?: unknown) {
   return response.json() as Promise<unknown>
 }
 
-/** 描述当前方法的功能边界。 */
+/** Persist the full settings tree through the backend validator. */
 export async function putConfig(config: AppConfig): Promise<AppConfig> {
   if (mockMode) return structuredClone(config)
   const response = await fetch(`${apiBase}/api/settings`, {
@@ -364,6 +377,12 @@ export const homeMotionSide = (side: ManualControlSide) =>
 export const returnMotionOriginSide = (side: ManualControlSide) =>
   postCommand(`/motion/${side}/return_origin`)
 
+export interface MotionPreviousRestoreStatus {
+  available: boolean
+  restorable: boolean
+  message: string
+}
+
 export interface MotionOriginResponse {
   ok: boolean
   data?: {
@@ -372,6 +391,7 @@ export interface MotionOriginResponse {
     workOriginOffset?: MotionWorkOriginOffsetConfig
     config?: AppConfig
     originCaptureDrift?: MotionOriginCaptureDrift
+    previousRestore?: MotionPreviousRestoreStatus
   }
 }
 
@@ -384,6 +404,11 @@ export async function fetchMotionOrigin(): Promise<MotionOriginResponse> {
         origin: structuredClone(defaultConfig.motion.origin),
         homeReference: structuredClone(defaultConfig.motion.homeReference),
         workOriginOffset: structuredClone(defaultConfig.motion.workOriginOffset),
+        previousRestore: {
+          available: false,
+          restorable: false,
+          message: 'previous motion work origin is not available',
+        },
       },
     }
   }
@@ -657,8 +682,10 @@ export const disconnectTeleopHand = (side: ManualControlSide) =>
 /** 从后端读取对应数据。 */
 export const fetchTeleopMappingStatus = () => fetch(`${apiBase}/api/teleop/mapping/status`).then((r) => r.json())
 /** 设置当前流程的对应状态。 */
-export const setTeleopGravityCompensation = (side: ManualControlSide, enabled: boolean) =>
-  postCommand(`/teleop/${side}/gravity_compensation`, { enabled })
+export const setTeleopGravityCompensation = (
+  side: ManualControlSide,
+  value: boolean | { enabled: boolean; scale?: number },
+) => postCommand(`/teleop/${side}/gravity_compensation`, typeof value === 'boolean' ? { enabled: value } : value)
 
 /** 发送或封装对应的后端命令。 */
 export const zeroTeleopForceFeedback = (side: ManualControlSide) =>

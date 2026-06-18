@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -17,7 +18,7 @@ namespace appstation::hal {
 namespace {
 // 这些默认掩码只表示“本次请求覆盖全部 6 个语义轴”，不代表硬件实际都已使能。
 constexpr std::array<bool, 6> kAllAxesEnabled{true, true, true, true, true, true};
-constexpr std::array<std::array<bool, 6>, 2> kAllSidesAxesEnabled{{kAllAxesEnabled, kAllAxesEnabled}};
+constexpr unsigned short kHomeDirection = 0;
 
 std::int64_t unixTimeMs() {
   // 对外状态使用墙钟毫秒，便于和后端、前端日志时间线对齐。
@@ -46,12 +47,7 @@ using DmcHomeMove = short(__stdcall*)(unsigned short, unsigned short);
 using DmcWriteSevonPin = short(__stdcall*)(unsigned short, unsigned short, unsigned short);
 using DmcReadSevonPin = short(__stdcall*)(unsigned short, unsigned short);
 using DmcAxisIoStatus = unsigned long(__stdcall*)(unsigned short, unsigned short);
-using DmcReadRdyPin = short(__stdcall*)(unsigned short, unsigned short);
-using DmcReadErcPin = short(__stdcall*)(unsigned short, unsigned short);
-using DmcReadSevrstPin = short(__stdcall*)(unsigned short, unsigned short);
 using DmcGetStopReason = short(__stdcall*)(unsigned short, unsigned short, long*);
-using DmcGetElMode =
-    short(__stdcall*)(unsigned short, unsigned short, unsigned short*, unsigned short*, unsigned short*);
 
 HMODULE ltdmcModule = nullptr;
 DmcBoardInit dmcBoardInit = nullptr;
@@ -71,11 +67,7 @@ DmcHomeMove dmcHomeMove = nullptr;
 DmcWriteSevonPin dmcWriteSevonPin = nullptr;
 DmcReadSevonPin dmcReadSevonPin = nullptr;
 DmcAxisIoStatus dmcAxisIoStatus = nullptr;
-DmcReadRdyPin dmcReadRdyPin = nullptr;
-DmcReadErcPin dmcReadErcPin = nullptr;
-DmcReadSevrstPin dmcReadSevrstPin = nullptr;
 DmcGetStopReason dmcGetStopReason = nullptr;
-DmcGetElMode dmcGetElMode = nullptr;
 #endif
 
 // 以下错误消息保留 card、axis、pulse 等现场排障信息，避免只看到 vendor 返回码。
@@ -192,6 +184,10 @@ unsigned short cardForSide(appstation::hal::Side side) {
   return side == appstation::hal::Side::Left ? static_cast<unsigned short>(1) : static_cast<unsigned short>(0);
 }
 
+bool axisMotionPermanentlyDisabled(appstation::hal::Side side, appstation::hal::SemanticAxis axis) {
+  return cardForSide(side) == 0 && axis == appstation::hal::SemanticAxis::Yaw;
+}
+
 const char* sideName(appstation::hal::Side side) {
   return side == appstation::hal::Side::Left ? "left" : "right";
 }
@@ -214,41 +210,49 @@ const char* axisName(appstation::hal::SemanticAxis axis) {
   return "Unknown";
 }
 
-void appendNullableShort(std::ostringstream& out, const char* key, bool available, short value) {
-  // 诊断 JSON 中用 null 表示该 SDK 导出不可用或本次读取失败，而不是伪造 0。
-  out << ",\"" << key << "\":";
-  if (available) {
-    out << value;
-  } else {
-    out << "null";
+std::string boolArray6LogValue(const std::array<bool, 6>& values) {
+  std::ostringstream out;
+  out << "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) {
+      out << ",";
+    }
+    out << (values[i] ? "true" : "false");
   }
+  out << "]";
+  return out.str();
 }
 
-void appendNullableUnsignedLong(std::ostringstream& out, const char* key, bool available, unsigned long value) {
-  out << ",\"" << key << "\":";
-  if (available) {
-    out << value;
-  } else {
-    out << "null";
-  }
-}
-
-void appendNullableLong(std::ostringstream& out, const char* key, bool available, long value) {
-  out << ",\"" << key << "\":";
-  if (available) {
-    out << value;
-  } else {
-    out << "null";
-  }
-}
-
-void appendNullableHex(std::ostringstream& out, const char* key, bool available, unsigned long value) {
-  out << ",\"" << key << "\":";
-  if (available) {
-    out << "\"0x" << std::uppercase << std::hex << value << std::dec << std::nouppercase << "\"";
-  } else {
-    out << "null";
-  }
+void logHardwareHomeDiagnostic(
+    const char* event,
+    appstation::hal::Side side,
+    appstation::hal::SemanticAxis axis,
+    unsigned short card,
+    unsigned short physicalAxisNo,
+    unsigned short homeDir,
+    long beforePulse,
+    double beforeUi,
+    const std::array<bool, 6>& enabledAxes,
+    long afterPulse,
+    double afterUi,
+    short ret) {
+  std::cout << "[HAL] INFO component=MOTION"
+            << " event=" << event
+            << " side=" << sideName(side)
+            << " card=" << card
+            << " semanticAxis=" << axisName(axis)
+            << " physicalAxis=" << physicalAxisNo
+            << " homeDir=" << homeDir
+            << " beforePulse=" << beforePulse
+            << " beforeUi=" << beforeUi
+            << " enabledAxes=" << boolArray6LogValue(enabledAxes)
+            << " afterPulse=" << afterPulse
+            << " afterUi=" << afterUi
+            << " deltaPulse=" << (afterPulse - beforePulse)
+            << " deltaUi=" << (afterUi - beforeUi)
+            << " ret=" << ret
+            << " sample=command_returned"
+            << std::endl;
 }
 
 int stageAxisCount(appstation::hal::Side side) {
@@ -445,11 +449,7 @@ bool LTDMCDriver::initialize() {
   dmcWriteSevonPin = reinterpret_cast<DmcWriteSevonPin>(GetProcAddress(ltdmcModule, "dmc_write_sevon_pin"));
   dmcReadSevonPin = reinterpret_cast<DmcReadSevonPin>(GetProcAddress(ltdmcModule, "dmc_read_sevon_pin"));
   dmcAxisIoStatus = reinterpret_cast<DmcAxisIoStatus>(GetProcAddress(ltdmcModule, "dmc_axis_io_status"));
-  dmcReadRdyPin = reinterpret_cast<DmcReadRdyPin>(GetProcAddress(ltdmcModule, "dmc_read_rdy_pin"));
-  dmcReadErcPin = reinterpret_cast<DmcReadErcPin>(GetProcAddress(ltdmcModule, "dmc_read_erc_pin"));
-  dmcReadSevrstPin = reinterpret_cast<DmcReadSevrstPin>(GetProcAddress(ltdmcModule, "dmc_read_sevrst_pin"));
   dmcGetStopReason = reinterpret_cast<DmcGetStopReason>(GetProcAddress(ltdmcModule, "dmc_get_stop_reason"));
-  dmcGetElMode = reinterpret_cast<DmcGetElMode>(GetProcAddress(ltdmcModule, "dmc_get_el_mode"));
   // 初始化只要求核心运动读写导出存在；诊断 IO 导出允许缺失并在 JSON 中返回 null。
   if (!dmcBoardInit || !dmcGetPosition || !dmcSetProfile || !dmcPMove || !dmcCheckDone) {
     lastError_ = "required LTDMC exports missing: board_init/get_position/set_profile/pmove/check_done";
@@ -504,9 +504,13 @@ HalHealth LTDMCDriver::health(double uptimeS) const {
 }
 
 void LTDMCDriver::ensureMotionReturnAllowed() const {
-  if (estopActive_.load(std::memory_order_acquire)) {
+  if (estopActive()) {
     throw std::runtime_error("emergency stop active; acknowledge safety before returning to work origin");
   }
+}
+
+bool LTDMCDriver::estopActive() const {
+  return estopActive_.load(std::memory_order_acquire);
 }
 
 MotionState LTDMCDriver::readState() {
@@ -588,110 +592,6 @@ void LTDMCDriver::publishStateSnapshotLocked(const MotionState& state) {
   cachedState_ = state;
   cachedInitialized_ = initialized_;
   cachedLastError_ = lastError_;
-}
-
-std::string LTDMCDriver::axisDiagnosticsJson() {
-  std::scoped_lock lock(mutex_);
-  ensureInitialized();
-  // 该接口面向现场联调，直接输出 vendor IO/限位/停止原因，不做业务抽象。
-  std::ostringstream out;
-  out << "{\"timestamp_ms\":" << unixTimeMs() << ",\"axes\":[";
-  bool first = true;
-  for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
-    const auto side = sideIndex == 0 ? Side::Left : Side::Right;
-    const auto card = cardForSide(side);
-    for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-      const auto axis = static_cast<SemanticAxis>(axisIndex);
-      const auto index = stateIndex(side, axis);
-      const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
-      auto pulse = static_cast<long>(std::llround(pulse_[index]));
-      short done = -1;
-      short sevon = -1;
-      short rdy = -1;
-      short erc = -1;
-      short sevrst = -1;
-      short stopReasonRet = -1;
-      short elModeRet = -1;
-      long stopReason = 0;
-      unsigned short elEnable = 0;
-      unsigned short elLogic = 0;
-      unsigned short elMode = 0;
-      unsigned long axisIo = 0;
-      bool axisIoAvailable = false;
-      bool sevonAvailable = false;
-      bool rdyAvailable = false;
-      bool ercAvailable = false;
-      bool sevrstAvailable = false;
-      bool stopReasonFunctionAvailable = false;
-      bool stopReasonAvailable = false;
-      bool elModeFunctionAvailable = false;
-      bool elModeAvailable = false;
-#if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
-      pulse = dmcGetPosition(card, axisNo);
-      done = dmcCheckDone(card, axisNo);
-      if (dmcAxisIoStatus) {
-        axisIo = dmcAxisIoStatus(card, axisNo);
-        axisIoAvailable = true;
-      }
-      if (dmcReadSevonPin && usesSevonPin(side, axis)) {
-        sevon = dmcReadSevonPin(card, axisNo);
-        sevonAvailable = true;
-      }
-      if (dmcReadRdyPin) {
-        rdy = dmcReadRdyPin(card, axisNo);
-        rdyAvailable = true;
-      }
-      if (dmcReadErcPin) {
-        erc = dmcReadErcPin(card, axisNo);
-        ercAvailable = true;
-      }
-      if (dmcReadSevrstPin) {
-        sevrst = dmcReadSevrstPin(card, axisNo);
-        sevrstAvailable = true;
-      }
-      if (dmcGetStopReason) {
-        stopReasonFunctionAvailable = true;
-        stopReasonRet = dmcGetStopReason(card, axisNo, &stopReason);
-        stopReasonAvailable = stopReasonRet == 0;
-      }
-      if (dmcGetElMode) {
-        elModeFunctionAvailable = true;
-        elModeRet = dmcGetElMode(card, axisNo, &elEnable, &elLogic, &elMode);
-        elModeAvailable = elModeRet == 0;
-      }
-#endif
-      pulse_[index] = static_cast<double>(pulse);
-      if (!first) {
-        out << ",";
-      }
-      first = false;
-      out << "{\"side\":\"" << sideName(side) << "\""
-          << ",\"axis\":\"" << axisName(axis) << "\""
-          << ",\"semanticIndex\":" << axisIndex
-          << ",\"card\":" << card
-          << ",\"physicalAxis\":" << axisNo
-          << ",\"pulse\":" << pulse
-          << ",\"uiPosition\":" << pulseToUi(pulse, side, axis)
-          << ",\"enabled\":" << (enabled_[index] ? "true" : "false")
-          << ",\"commandedEnabled\":" << (commandedEnabled_[index] ? "true" : "false");
-      appendNullableShort(out, "checkDone", true, done);
-      appendNullableUnsignedLong(out, "axisIoStatus", axisIoAvailable, axisIo);
-      appendNullableHex(out, "axisIoStatusHex", axisIoAvailable, axisIo);
-      appendNullableShort(out, "sevon", sevonAvailable, sevon);
-      appendNullableShort(out, "rdy", rdyAvailable, rdy);
-      appendNullableShort(out, "erc", ercAvailable, erc);
-      appendNullableShort(out, "sevrst", sevrstAvailable, sevrst);
-      appendNullableShort(out, "getStopReasonRet", stopReasonFunctionAvailable, stopReasonRet);
-      appendNullableLong(out, "stopReason", stopReasonAvailable, stopReason);
-      appendNullableShort(out, "getElModeRet", elModeFunctionAvailable, elModeRet);
-      appendNullableShort(out, "elEnable", elModeAvailable, static_cast<short>(elEnable));
-      appendNullableShort(out, "elLogic", elModeAvailable, static_cast<short>(elLogic));
-      appendNullableShort(out, "elMode", elModeAvailable, static_cast<short>(elMode));
-      out << "}";
-    }
-  }
-  out << "]}";
-  return out.str();
 }
 
 void LTDMCDriver::emergencyStop() {
@@ -777,7 +677,7 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bo
   const auto card = cardForSide(side);
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     const auto axis = static_cast<SemanticAxis>(axisIndex);
-    const auto axisEnabled = enabled && enabledAxes[axisIndex];
+    const auto axisEnabled = enabled && enabledAxes[axisIndex] && !axisMotionPermanentlyDisabled(side, axis);
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
     if (!axisEnabled && dmcCheckDone(card, axisNo) == 0) {
       // 轴运动中禁止关闭伺服，否则可能让机构失控或丢步。
@@ -827,7 +727,7 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bo
 #else
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     const auto axis = static_cast<SemanticAxis>(axisIndex);
-    const auto axisEnabled = enabled && enabledAxes[axisIndex];
+    const auto axisEnabled = enabled && enabledAxes[axisIndex] && !axisMotionPermanentlyDisabled(side, axis);
     const auto index = stateIndex(side, axis);
     enabled_[index] = axisEnabled;
     commandedEnabled_[index] = axisEnabled;
@@ -853,13 +753,10 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bo
   return message.str();
 }
 
-void LTDMCDriver::homeSide(Side side) {
-  homeSide(side, kAllAxesEnabled);
-}
-
 void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes) {
   std::scoped_lock lock(mutex_);
   ensureInitialized();
+  throwIfEstopActive();
   const auto estopSequenceAtStart = estopSequence_.load(std::memory_order_acquire);
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   if (!dmcHomeMove || !dmcSetPulseOutmode || !dmcSetElMode || !dmcSetHomeMode || !dmcSetHomePinLogic) {
@@ -869,10 +766,10 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes) {
   configureStageAxes(side);
   const auto card = cardForSide(side);
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-    if (!enabledAxes[axisIndex]) {
+    const auto axis = static_cast<SemanticAxis>(axisIndex);
+    if (!enabledAxes[axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
       continue;
     }
-    const auto axis = static_cast<SemanticAxis>(axisIndex);
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
     if (dmcCheckDone(card, axisNo) == 0) {
       // homing 不与现有运动叠加，必须等轴空闲。
@@ -880,12 +777,42 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes) {
     }
   }
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-    if (!enabledAxes[axisIndex]) {
+    const auto axis = static_cast<SemanticAxis>(axisIndex);
+    if (!enabledAxes[axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
       continue;
     }
-    const auto axis = static_cast<SemanticAxis>(axisIndex);
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
+    const auto beforePulse = dmcGetPosition ? dmcGetPosition(card, axisNo) : static_cast<long>(pulse_[stateIndex(side, axis)]);
+    const auto beforeUi = pulseToUi(static_cast<double>(beforePulse), side, axis);
+    logHardwareHomeDiagnostic(
+        "home_start",
+        side,
+        axis,
+        card,
+        axisNo,
+        kHomeDirection,
+        beforePulse,
+        beforeUi,
+        enabledAxes,
+        beforePulse,
+        beforeUi,
+        0);
     const auto ret = dmcHomeMove(card, axisNo);
+    const auto afterPulse = dmcGetPosition ? dmcGetPosition(card, axisNo) : static_cast<long>(pulse_[stateIndex(side, axis)]);
+    const auto afterUi = pulseToUi(static_cast<double>(afterPulse), side, axis);
+    logHardwareHomeDiagnostic(
+        "home_done",
+        side,
+        axis,
+        card,
+        axisNo,
+        kHomeDirection,
+        beforePulse,
+        beforeUi,
+        enabledAxes,
+        afterPulse,
+        afterUi,
+        ret);
     if (ret != 0) {
       throw std::runtime_error(dmcAxisFailureMessage("dmc_home_move", ret, card, axisNo));
     }
@@ -899,16 +826,13 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes) {
   publishStateSnapshotLocked();
 }
 
-void LTDMCDriver::homeAll(const std::array<double, 12>& workOriginPulse) {
-  homeAll(workOriginPulse, kAllSidesAxesEnabled);
-}
-
 void LTDMCDriver::homeAll(
     const std::array<double, 12>& workOriginPulse,
     const std::array<std::array<bool, 6>, 2>& enabledAxes) {
   std::scoped_lock lock(mutex_);
   ensureInitialized();
   ensureMotionReturnAllowed();
+  throwIfEstopActive();
   const auto estopSequenceAtStart = estopSequence_.load(std::memory_order_acquire);
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   if (!dmcSetProfile || !dmcPMove || !dmcCheckDone || !dmcGetPosition) {
@@ -926,10 +850,10 @@ void LTDMCDriver::homeAll(
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
     const auto card = cardForSide(side);
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-      if (!enabledAxes[sideIndex][axisIndex]) {
+      const auto axis = static_cast<SemanticAxis>(axisIndex);
+      if (!enabledAxes[sideIndex][axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
         continue;
       }
-      const auto axis = static_cast<SemanticAxis>(axisIndex);
       if (!axisMotionEnabled(side, axis)) {
         throw std::runtime_error("motion axis is not servo-enabled; enable required axes before returning to work origin");
       }
@@ -943,10 +867,10 @@ void LTDMCDriver::homeAll(
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
     const auto card = cardForSide(side);
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-      if (!enabledAxes[sideIndex][axisIndex]) {
+      const auto axis = static_cast<SemanticAxis>(axisIndex);
+      if (!enabledAxes[sideIndex][axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
         continue;
       }
-      const auto axis = static_cast<SemanticAxis>(axisIndex);
       const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
       const auto index = stateIndex(side, axis);
       const auto targetPulse = static_cast<long>(std::llround(workOriginPulse[index]));
@@ -993,10 +917,10 @@ void LTDMCDriver::homeAll(
   for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-      if (!enabledAxes[sideIndex][axisIndex]) {
+      const auto axis = static_cast<SemanticAxis>(axisIndex);
+      if (!enabledAxes[sideIndex][axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
         continue;
       }
-      const auto axis = static_cast<SemanticAxis>(axisIndex);
       if (!axisMotionEnabled(side, axis)) {
         throw std::runtime_error("motion axis is not servo-enabled; enable required axes before returning to work origin");
       }
@@ -1009,10 +933,6 @@ void LTDMCDriver::homeAll(
   publishStateSnapshotLocked();
 }
 
-void LTDMCDriver::homeOriginSide(Side side, const std::array<double, 6>& workOriginPulse) {
-  homeOriginSide(side, workOriginPulse, kAllAxesEnabled);
-}
-
 void LTDMCDriver::homeOriginSide(
     Side side,
     const std::array<double, 6>& workOriginPulse,
@@ -1020,6 +940,7 @@ void LTDMCDriver::homeOriginSide(
   std::scoped_lock lock(mutex_);
   ensureInitialized();
   ensureMotionReturnAllowed();
+  throwIfEstopActive();
   const auto estopSequenceAtStart = estopSequence_.load(std::memory_order_acquire);
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   if (!dmcSetProfile || !dmcPMove || !dmcCheckDone || !dmcGetPosition) {
@@ -1035,10 +956,10 @@ void LTDMCDriver::homeOriginSide(
   size_t homeAxisCount = 0;
   // 单侧回工作原点与 homeAll 逻辑一致，但只处理调用方指定侧。
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-    if (!enabledAxes[axisIndex]) {
+    const auto axis = static_cast<SemanticAxis>(axisIndex);
+    if (!enabledAxes[axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
       continue;
     }
-    const auto axis = static_cast<SemanticAxis>(axisIndex);
     if (!axisMotionEnabled(side, axis)) {
       throw std::runtime_error("motion axis is not servo-enabled; enable required axes before returning to work origin");
     }
@@ -1047,10 +968,10 @@ void LTDMCDriver::homeOriginSide(
   }
   waitForAxesDone(homeAxes, homeAxisCount, "home_origin_side pre-move", 3000);
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-    if (!enabledAxes[axisIndex]) {
+    const auto axis = static_cast<SemanticAxis>(axisIndex);
+    if (!enabledAxes[axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
       continue;
     }
-    const auto axis = static_cast<SemanticAxis>(axisIndex);
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
     const auto index = stateIndex(side, axis);
     const auto targetPulse = static_cast<long>(std::llround(workOriginPulse[axisIndex]));
@@ -1087,10 +1008,10 @@ void LTDMCDriver::homeOriginSide(
   }
 #else
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-    if (!enabledAxes[axisIndex]) {
+    const auto axis = static_cast<SemanticAxis>(axisIndex);
+    if (!enabledAxes[axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
       continue;
     }
-    const auto axis = static_cast<SemanticAxis>(axisIndex);
     if (!axisMotionEnabled(side, axis)) {
       throw std::runtime_error("motion axis is not servo-enabled; enable required axes before returning to work origin");
     }
@@ -1103,25 +1024,6 @@ void LTDMCDriver::homeOriginSide(
   publishStateSnapshotLocked();
 }
 
-void LTDMCDriver::moveAllUi(const std::array<double, 12>& targetUi, const std::array<AxisLimit, 12>& limits) {
-  std::scoped_lock lock(mutex_);
-  ensureInitialized();
-  checkLimits(targetUi, limits);
-  // 当前该接口主要服务 skeleton/仿真路径，只更新内部脉冲缓存。
-  for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
-    const auto side = sideIndex == 0 ? Side::Left : Side::Right;
-    for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-      const auto axis = static_cast<SemanticAxis>(axisIndex);
-      const auto index = stateIndex(side, axis);
-      pulse_[index] = uiToPulse(targetUi[index], side, axis);
-      teleopTargetActive_[index] = false;
-    }
-  }
-#ifdef APPSTATION_ENABLE_VENDOR_SDKS
-  // TODO: 将语义轴映射到 physicalAxis(side, axis)，应用运动参数并提交运动命令。
-#endif
-}
-
 void LTDMCDriver::moveRelativeUi(
     Side side,
     SemanticAxis axis,
@@ -1132,6 +1034,7 @@ void LTDMCDriver::moveRelativeUi(
     double decTimeSec) {
   std::scoped_lock lock(mutex_);
   ensureInitialized();
+  throwIfEstopActive();
   const auto estopSequenceAtStart = estopSequence_.load(std::memory_order_acquire);
   const auto rotation = isRotation(axis);
   // 硬件测试安全边界：避免相对 jog 误把轴带出工作台范围。
@@ -1142,6 +1045,9 @@ void LTDMCDriver::moveRelativeUi(
   }
   if (maxVelocityUiPerSec <= 0) {
     throw std::runtime_error("max velocity must be positive");
+  }
+  if (axisMotionPermanentlyDisabled(side, axis)) {
+    throw std::runtime_error("Card 0 Yaw motion axis is disabled by safety policy");
   }
   const auto index = stateIndex(side, axis);
   const auto deltaPulse = static_cast<long>(std::llround(uiToPulse(deltaUi, side, axis)));
@@ -1220,6 +1126,7 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
     double decTimeSec) {
   std::scoped_lock lock(mutex_);
   ensureInitialized();
+  throwIfEstopActive();
   const auto estopSequenceAtStart = estopSequence_.load(std::memory_order_acquire);
   if (translationVelocityUiPerSec <= 0 || rotationVelocityUiPerSec <= 0) {
     throw std::runtime_error("teleop velocity must be positive");
@@ -1248,7 +1155,7 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
     result.requestedDeltaUi[axisIndex] = delta;
     result.targetPulse[axisIndex] = actualPulse;
     result.targetUi[axisIndex] = pulseToUi(actualPulse, side, axis);
-    if (!enabledAxes[axisIndex]) {
+    if (!enabledAxes[axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
       // 被软件掩码禁用的轴不更新目标，防止重新使能后继续沿旧目标运动。
       teleopTargetActive_[index] = false;
       continue;
@@ -1444,6 +1351,11 @@ void LTDMCDriver::stopTeleopSide(Side side) {
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     const auto axis = static_cast<SemanticAxis>(axisIndex);
     const auto index = stateIndex(side, axis);
+    if (axisMotionPermanentlyDisabled(side, axis)) {
+      teleopTargetActive_[index] = false;
+      teleopTargetPulse_[index] = pulse_[index];
+      continue;
+    }
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
     if (dmcStop) {
       // stopTeleopSide 是“停止遥操作保持当前位置”，不是急停；停止后仍同步目标到当前位置。
@@ -1485,7 +1397,7 @@ void LTDMCDriver::configureStageAxes(Side side) {
     if (retEl != 0) {
       throw std::runtime_error(dmcAxisFailureMessage("dmc_set_el_mode", retEl, card, axisNo));
     }
-    const auto retHome = dmcSetHomeMode(card, axisNo, 0, 1.0, 0, 1);
+    const auto retHome = dmcSetHomeMode(card, axisNo, kHomeDirection, 1.0, 0, 1);
     if (retHome != 0) {
       throw std::runtime_error(dmcAxisFailureMessage("dmc_set_homemode", retHome, card, axisNo));
     }
@@ -1505,20 +1417,15 @@ void LTDMCDriver::ensureInitialized() const {
   }
 }
 
-void LTDMCDriver::checkLimits(
-    const std::array<double, 12>& targetUi,
-    const std::array<AxisLimit, 12>& limits) const {
-  // moveAllUi 的一次性目标必须全部在软限位内；teleop 使用更细粒度的逐轴裁剪。
-  for (int i = 0; i < 12; ++i) {
-    if (targetUi[i] < limits[i].min || targetUi[i] > limits[i].max) {
-      throw std::runtime_error("motion target exceeds soft limit");
-    }
+void LTDMCDriver::throwIfEstopActive() const {
+  if (estopActive()) {
+    throw std::runtime_error("emergency stop active; acknowledge safety before motion commands");
   }
 }
 
 bool LTDMCDriver::axisMotionEnabled(Side side, SemanticAxis axis) const {
   // 运动许可读软件缓存，兼容没有可靠 sevon 反馈的轴。
-  return enabled_[stateIndex(side, axis)];
+  return !axisMotionPermanentlyDisabled(side, axis) && enabled_[stateIndex(side, axis)];
 }
 
 }  // namespace appstation::hal

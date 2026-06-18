@@ -1615,6 +1615,8 @@ class DatasetRecorderService:
 
     def _sample_source_loop(self, source: str) -> None:
         """按源采样频率循环采样硬件数据并写入时间缓存。"""
+        # Source samplers run in ordinary threads so slow hardware calls cannot
+        # block the asyncio event loop that drives UI commands and status.
         epoch_s = 0.0
         sample_index = 0
         while self._session_active and not self._sampler_stop_event.is_set():
@@ -1936,6 +1938,8 @@ class DatasetRecorderService:
 
     async def _frame_assembler_loop(self) -> None:
         """按队列顺序等待对齐时刻、组装帧并移交写线程。"""
+        # Assembly is intentionally decoupled from writing: if disk/video work
+        # stalls, backpressure is detected here before frames cross episodes.
         while self._session_active:
             assembly_queue = self._assembly_queue
             if assembly_queue is None:

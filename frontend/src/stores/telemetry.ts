@@ -29,7 +29,7 @@ import {
   type RecordStatusApi,
   wsUrl,
 } from '../api/index'
-import { defaultConfig, defaultDiagnostics, logChannels } from '../data'
+import { defaultConfig, defaultDiagnostics, logChannels, operatorSideForHardwareSide, operatorSideLabel } from '../data'
 import { manualAxisStepLimitFromPulse } from '../manualMotionLimits'
 import { manualMaxVelocity } from '../manualSpeed'
 import { motionSideReturnOriginReady } from '../motionReturnReady'
@@ -60,8 +60,7 @@ const maxLogEntries = 5000
 export const uiFrameIntervalMs = 66
 export const chartHistoryIntervalMs = 100
 export const mockTelemetryIntervalMs = 33
-// 说明当前代码块的功能用途。
-// 说明当前代码块的功能用途。
+// Keep mock history short enough for smooth chart rendering during long demos.
 const maxHistorySamples = 120
 const parameterSnapshotStorageKey = 'appstation.parameterSnapshots.v1'
 const cameraLabels = {
@@ -92,7 +91,7 @@ const manualAxisDirectionSign = {
   left: [1, 1, 1, 1, 1, 1],
   right: [1, 1, 1, 1, 1, 1],
 } as const
-/** 计算或执行手动控制的对应逻辑。 */
+/** Key used to lock one manual jog button until the estimated HAL move settles. */
 function manualAxisBusyKey(side: ManualControlState['selectedSide'], axis: ManualControlAxis) {
   return `${side}-${axis}`
 }
@@ -103,7 +102,7 @@ function queueConfigSave(config: AppConfig) {
   configSaveQueue = nextSave.catch(() => undefined)
   return nextSave
 }
-/** 计算或执行手动控制的对应逻辑。 */
+/** Convert UI units to pulse units for per-axis jog safety limits. */
 function manualAxisPulsePerUiUnit(
   config: AppConfig,
   side: ManualControlState['selectedSide'],
@@ -116,7 +115,7 @@ function manualAxisPulsePerUiUnit(
   if (!Number.isFinite(pulsePerUnit) || pulsePerUnit <= 0) return 0
   return axisIndex < 3 ? pulsePerUnit / 1000 : pulsePerUnit
 }
-/** 计算或执行手动控制的对应逻辑。 */
+/** Clamp frontend jog steps to the same pulse-derived limits as the backend. */
 function manualAxisStepLimit(
   config: AppConfig,
   side: ManualControlState['selectedSide'],
@@ -139,7 +138,7 @@ function clampManualAxisStep(
   return Math.min(Math.max(0, step), manualAxisStepLimit(config, side, axis, speedMode))
 }
 
-/** 计算或执行手动控制的对应逻辑。 */
+/** Apply side-specific sign conventions before sending a manual jog command. */
 function manualAxisEffectiveDirection(
   side: ManualControlState['selectedSide'],
   axisIndex: number,
@@ -279,8 +278,7 @@ function applyMotionCardSnapshotConfig(config: AppConfig, scope: Exclude<Paramet
 /** 描述当前方法的功能边界。 */
 function parameterSnapshotScopeLabel(scope: ParameterSnapshotScope) {
   if (scope === 'all') return '全局硬件'
-  if (scope === 'motion-left') return '左臂运动控制卡'
-  return '右臂运动控制卡'
+  return `${operatorSideLabel(operatorSideForHardwareSide(scope === 'motion-left' ? 'left' : 'right'))}运动控制卡`
 }
 
 /** 读取对应的本地状态或存储数据。 */
@@ -450,7 +448,7 @@ const emptyFrame: TelemetryFrame = {
     },
   ],
 }
-/** 构建当前流程需要的数据结构。 */
+/** Build deterministic process rows for mock telemetry mode. */
 function nextProcessStatus(t: number, autoRunning: boolean): ProcessStatus[] {
   return [
     {
@@ -498,9 +496,9 @@ function nextProcessStatus(t: number, autoRunning: boolean): ProcessStatus[] {
     },
   ]
 }
-/** 构建当前流程需要的数据结构。 */
+/** Synthesize one mock telemetry frame that exercises dashboard edge states. */
 function buildFrame(state: TelemetryStore): TelemetryFrame {
-  // 说明当前代码块的功能用途。
+  // The mock signal is deterministic so tests and visual checks stay stable.
   const tick = state.tick + 1
   const t = tick / 50
   const jointPositions = Array.from({ length: 12 }, (_, index) => {
@@ -672,7 +670,7 @@ function buildFrame(state: TelemetryStore): TelemetryFrame {
 let _logIdSeq = 0
 let _manualActionIdSeq = 0
 let _manualMemoryIdSeq = 0
-/** 构建当前流程需要的数据结构。 */
+/** Create a bounded in-memory log entry for UI-only events. */
 function makeLog(level: LogLevel, msg: string, channel?: LogEntry['channel']): LogEntry {
   const id = ++_logIdSeq
   return {
@@ -683,7 +681,7 @@ function makeLog(level: LogLevel, msg: string, channel?: LogEntry['channel']): L
     msg,
   }
 }
-/** 构建当前流程需要的数据结构。 */
+/** Append one log while enforcing the UI retention limit. */
 function appendLog(logs: LogEntry[], entry: LogEntry) {
   return [...logs, entry].slice(-maxLogEntries)
 }
@@ -692,7 +690,7 @@ type BackendWsMessage =
   | { type: 'telemetry'; data: TelemetryFrame }
   | { type: 'log'; data: LogEntry }
   | { type: 'config'; data: AppConfig }
-/** 描述当前方法的功能边界。 */
+/** Strip a backend telemetry frame down to the fields rendered in charts. */
 function telemetrySampleFromFrame(frame: TelemetryFrame): TelemetrySample {
   // 图表只保留绘制需要的字段，避免历史缓冲持有整帧对象造成渲染压力。
   return {
@@ -705,7 +703,7 @@ function telemetrySampleFromFrame(frame: TelemetryFrame): TelemetrySample {
     queueRight: frame.queueDepth.right,
   }
 }
-/** 构建当前流程需要的数据结构。 */
+/** Append chart history without retaining old full telemetry frames. */
 function appendTelemetryHistory(history: TelemetrySample[], sample: TelemetrySample) {
   const nextHistory = history.length >= maxHistorySamples
     ? history.slice(history.length - maxHistorySamples + 1)
@@ -727,7 +725,7 @@ let backendFrameDelayTimer: number | null = null
 let backendFrameRaf: number | null = null
 let lastBackendFrameCommitAt = 0
 let lastBackendHistoryCommitAt = 0
-/** 描述当前方法的功能边界。 */
+/** Finalize the backend session after the quality-report review flow closes. */
 function finishRecordSessionNow(set: TelemetryStoreSet) {
   void finishRecordSessionApi().finally(() => {
     finishRecordSessionAfterReview = false
@@ -976,11 +974,25 @@ export function normalizeConfig(config: AppConfig): AppConfig {
   return next
 }
 /** 计算对应的业务值或展示值。 */
-function diagnosticsFromHardwareStatus(
+export function diagnosticsFromHardwareStatus(
   diagnostics: DiagnosticItem[],
   status: Awaited<ReturnType<typeof fetchHardwareStatus>>,
 ): DiagnosticItem[] {
   return diagnostics.map((item) => {
+    if (item.key === 'hal-health' && (status.runtime?.backendDeployment || status.runtime?.halDeployment)) {
+      const backendDeployment = status.runtime?.backendDeployment
+      const halDeployment = status.runtime?.halDeployment
+      const restartMessages = [backendDeployment, halDeployment]
+        .filter((deployment) => deployment?.restartRequired)
+        .map((deployment) => deployment?.message)
+        .filter((message): message is string => Boolean(message))
+      const restartRequired = Boolean(backendDeployment?.restartRequired || halDeployment?.restartRequired)
+      return {
+        ...item,
+        status: restartRequired ? 'warn' : 'ok',
+        remediation: restartMessages.join('; ') || halDeployment?.message || backendDeployment?.message || item.remediation,
+      }
+    }
     if (item.key.startsWith('cam-') && status.camera) {
       return { ...item, status: status.camera.ok ? 'ok' : 'error', remediation: status.camera.message }
     }
@@ -1899,16 +1911,17 @@ homeRecordArms: () => {
 
 /** 描述当前方法的功能边界。 */
 returnRecordMotionOrigin: async (side) => {
+    const operatorLabel = operatorSideLabel(operatorSideForHardwareSide(side))
     if (recordMotionOriginInFlight) {
       set((state) => ({
-        logs: appendLog(state.logs, makeLog('WARNING', `${side} slave arm return-to-work-origin ignored: request is already pending`, '[HAL]')),
+        logs: appendLog(state.logs, makeLog('WARNING', `${operatorLabel} slave arm return-to-work-origin ignored: request is already pending`, '[HAL]')),
       }))
       return
     }
     const frame = get().frame
     if (!motionSideReturnOriginReady(side, frame.motionEnabled, frame.motionAxisEnabled)) {
       set((state) => ({
-        logs: appendLog(state.logs, makeLog('WARNING', `${side} slave arm return-to-work-origin ignored: motion side is disabled`, '[HAL]')),
+        logs: appendLog(state.logs, makeLog('WARNING', `${operatorLabel} slave arm return-to-work-origin ignored: motion side is disabled`, '[HAL]')),
       }))
       return
     }
@@ -1926,11 +1939,11 @@ returnRecordMotionOrigin: async (side) => {
           ...state.recordSession,
           ...returnedRecordResetState(state.recordSession, side),
         },
-        logs: appendLog(state.logs, makeLog('INFO', `${side} slave arm returned to work origin`, '[HAL]')),
+        logs: appendLog(state.logs, makeLog('INFO', `${operatorLabel} slave arm returned to work origin`, '[HAL]')),
       }))
     } catch (error) {
       set((state) => ({
-        logs: appendLog(state.logs, makeLog('ERROR', `${side} slave arm return-to-work-origin failed: ${String(error)}`, '[HAL]')),
+        logs: appendLog(state.logs, makeLog('ERROR', `${operatorLabel} slave arm return-to-work-origin failed: ${String(error)}`, '[HAL]')),
       }))
     } finally {
       recordMotionOriginInFlight = false
@@ -2231,12 +2244,13 @@ setManualSpeedMode: (mode) =>
 
 /** 计算或执行手动控制的对应逻辑。 */
 issueManualAxisMove: (side, axis, direction) => {
+    const operatorLabel = operatorSideLabel(operatorSideForHardwareSide(side))
     if (!mockMode) {
       const state = get()
       const axisIndex = manualAxisOrder.indexOf(axis)
       if (state.frame.motionAxisEnabled?.[side]?.[axisIndex] === false) {
         set((current) => ({
-          logs: appendLog(current.logs, makeLog('WARNING', `${side} ${axis} jog skipped: motion axis is disabled`, '[HAL]')),
+          logs: appendLog(current.logs, makeLog('WARNING', `${operatorLabel} ${axis} jog skipped: motion axis is disabled`, '[HAL]')),
         }))
         return
       }
@@ -2252,7 +2266,7 @@ issueManualAxisMove: (side, axis, direction) => {
         set((current) => ({
           logs: appendLog(
             current.logs,
-            makeLog('WARNING', `${side} ${axis} jog skipped: axis is still moving (${remainingS}s)`, '[HAL]'),
+            makeLog('WARNING', `${operatorLabel} ${axis} jog skipped: axis is still moving (${remainingS}s)`, '[HAL]'),
           ),
         }))
         return
@@ -2274,7 +2288,7 @@ issueManualAxisMove: (side, axis, direction) => {
       void manualAxisMoveApi(side, axis, effectiveDirection, step, speedMode)
         .then(() => {
           set((current) => ({
-            logs: appendLog(current.logs, makeLog('INFO', `${side} ${axis} jog command accepted by HAL`, '[HAL]')),
+            logs: appendLog(current.logs, makeLog('INFO', `${operatorLabel} ${axis} jog command accepted by HAL`, '[HAL]')),
           }))
         })
         .catch((error) => {
@@ -2332,11 +2346,11 @@ issueManualAxisMove: (side, axis, direction) => {
         frame: { ...state.frame, jointPositions },
         logs: appendLog(
           state.logs,
-          makeLog(
-            'INFO',
-            `${side === 'left' ? '左臂' : '右臂'} ${axis} ${appliedDelta >= 0 ? '+' : ''}${appliedDelta.toFixed(unit === 'um' ? 1 : 3)}${unit} · ${speedModeText(state.manualControl.speedMode)} · test fixture`,
-            '[HAL]',
-          ),
+            makeLog(
+              'INFO',
+              `${operatorLabel} ${axis} ${appliedDelta >= 0 ? '+' : ''}${appliedDelta.toFixed(unit === 'um' ? 1 : 3)}${unit} · ${speedModeText(state.manualControl.speedMode)} · test fixture`,
+              '[HAL]',
+            ),
         ),
       }
     })
@@ -2344,6 +2358,9 @@ issueManualAxisMove: (side, axis, direction) => {
 
 /** 计算或执行手动控制的对应逻辑。 */
 issueManualGripperMove: (side, command, targetMm) => {
+    const operatorSide = operatorSideForHardwareSide(side)
+    const operatorLabel = operatorSideLabel(operatorSide)
+    const operatorGripperLabel = operatorSide === 'left' ? '左夹爪' : '右夹爪'
     if (!mockMode) {
       const enabledKey = side === 'left' ? 'leftEnabled' : 'rightEnabled'
       const config = get().config
@@ -2353,7 +2370,7 @@ issueManualGripperMove: (side, command, targetMm) => {
         && !config.gripper[enabledKey]
       ) {
         set((current) => ({
-          logs: appendLog(current.logs, makeLog('WARNING', `${side} gripper ${command} skipped: gripper is disabled`, '[GRIPPER]')),
+          logs: appendLog(current.logs, makeLog('WARNING', `${operatorLabel} gripper ${command} skipped: gripper is disabled`, '[GRIPPER]')),
         }))
         return
       }
@@ -2377,7 +2394,7 @@ issueManualGripperMove: (side, command, targetMm) => {
       void gripperCommandApi(side, command, targetMm, get().config.gripper.commandForceLimitN)
         .then(() => {
           set((current) => ({
-            logs: appendLog(current.logs, makeLog('INFO', `${side} gripper ${command} accepted by backend`, '[GRIPPER]')),
+            logs: appendLog(current.logs, makeLog('INFO', `${operatorLabel} gripper ${command} accepted by backend`, '[GRIPPER]')),
           }))
           // 说明当前代码块的功能用途。
           // 说明当前代码块的功能用途。
@@ -2436,7 +2453,6 @@ issueManualGripperMove: (side, command, targetMm) => {
         enabled: nextEnabled,
       }
       const nextManual = appendManualAction(state.manualControl, action)
-      const label = side === 'left' ? '左夹爪' : '右夹爪'
       const commandText: Record<ManualGripperCommand, string> = {
         enable: '使能',
         disable: '断使能',
@@ -2449,7 +2465,7 @@ issueManualGripperMove: (side, command, targetMm) => {
       return {
         config: nextConfig,
         manualControl: nextManual,
-        logs: appendLog(state.logs, makeLog('INFO', `${label} ${commandText[command]} · gripper test fixture`, '[GRIPPER]')),
+        logs: appendLog(state.logs, makeLog('INFO', `${operatorGripperLabel} ${commandText[command]} · gripper test fixture`, '[GRIPPER]')),
       }
     })
   },

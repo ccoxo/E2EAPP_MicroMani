@@ -141,7 +141,7 @@ def test_hal_native_acceptance_report_verifier_explains_missing_observation(tmp_
 
     assert result.returncode == 2
     assert "Observation mode was not run" in result.stderr
-    assert "-Strict" in result.stderr
+    assert "backend/UI DDS native teleop report" in result.stderr
     assert "ObserveSeconds" in result.stderr
 
 
@@ -335,37 +335,12 @@ def test_hal_native_acceptance_report_verifier_rejects_zero_only_cross_mapping(t
     assert "non-zero left->right" in result.stderr
 
 
-def test_acceptance_report_axis_diagnostics_use_native_inputs_not_action_vector() -> None:
+def test_acceptance_script_no_longer_reads_direct_hal_native_status() -> None:
     source = ACCEPT_SCRIPT.read_text(encoding="utf-8")
 
-    assert "status.inputs" in source
-    assert "-OutputDelta $delta" not in source
-
-
-def test_acceptance_report_axis_diagnostics_include_duty_metrics() -> None:
-    source = ACCEPT_SCRIPT.read_text(encoding="utf-8")
-
-    assert "rawActiveSamples" in source
-    assert "outputDuty" in source
-    assert "pulseEfficiency" in source
-    assert "directionMismatchSamples" in source
-    assert "expectedOutputSign" in source
-    assert DIRECTION_POLICY in source
-
-
-def test_acceptance_report_observation_mode_auto_runs_verifier_before_gate_exit() -> None:
-    source = ACCEPT_SCRIPT.read_text(encoding="utf-8")
-
-    assert "$autoVerifyReport" in source
-    assert "$ObserveSeconds -gt 0" in source
-    assert "if ($autoVerifyReport)" in source
-    assert source.index("if ($VerifyReport)") < source.index("if (!$gatesPass)")
-
-
-def test_acceptance_report_no_motion_probe_accepts_auto_idle_controller() -> None:
-    source = ACCEPT_SCRIPT.read_text(encoding="utf-8")
-
-    no_motion_block = source.split("$noMotionPass = (", 1)[1].split("$noMotion = [pscustomobject]", 1)[0]
-    assert "[bool]$start.ok" in no_motion_block
-    assert "!( [bool]$after.running )" in no_motion_block
-    assert "[bool]$during.running" not in no_motion_block
+    assert "HAL HTTP only supports /health" in source
+    assert "backend/UI DDS path" in source
+    assert "Invoke-RestMethod" not in source
+    assert "/teleop/native/status" not in source
+    assert "/teleop/native/start" not in source
+    assert "/teleop/native/stop" not in source

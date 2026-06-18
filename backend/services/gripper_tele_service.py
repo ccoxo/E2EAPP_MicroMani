@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio
 import copy
 import time
-from typing import Any
+from typing import Any, cast
 
 from backend.core.config import SettingsService
 from backend.core.gripper_protection import protected_gripper_target_mm_from_values
 from backend.core.logging import LogService
+from backend.core.operator_view import SideName, hardware_side_for_operator_side
 from backend.hal_client.client import HalClient
 from backend.services.hardware_service import HardwareService
-
 
 CommandRequest = tuple[dict[str, Any], str, str, int, int, float | None, int]
 
@@ -344,18 +344,19 @@ class GripperTeleService:
         torque: int,
         target_mm: float | None,
     ) -> Any:
+        hardware_side = hardware_side_for_operator_side(cast(SideName, side)) if side in {"left", "right"} else side
         cfg = copy.deepcopy(config)
-        cfg.setdefault("gripper", {})[f"{side}Enabled"] = True
+        cfg.setdefault("gripper", {})[f"{hardware_side}Enabled"] = True
         cfg["gripper"]["commandSpeed"] = speed
         cfg["gripper"]["commandTorque"] = torque
         if self._gripper_workers is not None and self._gripper_workers.is_enabled(cfg):
-            if side not in self._teleop_enabled_sides:
-                enable_result = self._gripper_workers.command(cfg, side, "enable", None)
+            if hardware_side not in self._teleop_enabled_sides:
+                enable_result = self._gripper_workers.command(cfg, hardware_side, "enable", None)
                 if not enable_result.ok:
                     return enable_result
-                self._teleop_enabled_sides.add(side)
-            return self._gripper_workers.command(cfg, side, cmd, target_mm)
-        return self._hardware.gripper.command(cfg, side, cmd, target_mm)
+                self._teleop_enabled_sides.add(hardware_side)
+            return self._gripper_workers.command(cfg, hardware_side, cmd, target_mm)
+        return self._hardware.gripper.command(cfg, hardware_side, cmd, target_mm)
 
     @staticmethod
     def _select_source_hand(
