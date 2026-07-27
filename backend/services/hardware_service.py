@@ -40,7 +40,7 @@ class HardwareService:
                     "ports": gripper.details.get("ports", []),
                 }
                 if gripper is not None
-                else {"ok": None, "message": "managed by gripper workers"}
+                else {"ok": None, "message": "managed by HAL-native gripper"}
             ),
             "pico": {"ok": pico.ok, "message": pico.message, "stdout": pico.stdout, "stderr": pico.stderr},
         }

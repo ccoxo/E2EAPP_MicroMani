@@ -71,11 +71,17 @@ def test_policy_observation_endpoint_returns_lerobot_state(tmp_path, monkeypatch
     client = TestClient(create_app(tmp_path))
     client.app.state.telemetry.motion_positions = [1, 2, 3, 0.1, -0.2, 0.3, 4, 5, 6, -0.4, 0.5, -0.6]
     client.app.state.telemetry.gripper_positions = [7, 8]
+    client.app.state.telemetry.force_left = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    client.app.state.telemetry.force_right = [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6]
 
     response = client.get("/api/policy/observation")
 
     assert response.status_code == 200
-    assert response.json()["data"]["state"] == [1, 2, 3, 100, -200, 300, 7, 4, 5, 6, -400, 500, -600, 8]
+    payload = response.json()["data"]
+    assert payload["state"] == [1, 2, 3, 100, -200, 300, 7, 4, 5, 6, -400, 500, -600, 8]
+    assert payload["pulses"] == [0.0] * 12
+    assert payload["force_left"] == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    assert payload["force_right"] == [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6]
 
 
 def test_policy_action_endpoint_is_dry_run_by_default(tmp_path, monkeypatch) -> None:
@@ -111,3 +117,41 @@ def test_policy_action_endpoint_can_send_through_test_hal(tmp_path, monkeypatch)
     assert payload["sent"] is True
     assert set(payload["results"]["motion"]) == {"left", "right"}
     assert set(payload["results"]["grippers"]) == {"left", "right"}
+
+
+def test_policy_action_endpoint_skips_disabled_grippers_when_sending_motion(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    client.app.state.telemetry.motion_positions = [0.0] * 12
+    client.app.state.telemetry.gripper_positions = [13.0, 13.0]
+
+    response = client.post("/api/policy/action", json={"action": [10.0] * 14, "dryRun": False})
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["dryRun"] is False
+    assert payload["sent"] is True
+    assert set(payload["results"]["motion"]) == {"left", "right"}
+    assert payload["results"]["grippers"] == {}
+
+
+def test_policy_action_endpoint_can_limit_control_to_left_side(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    client.app.state.telemetry.motion_positions = [0.0] * 12
+    client.app.state.telemetry.gripper_positions = [13.0, 13.0]
+    config = client.get("/api/settings").json()
+    config["gripper"]["leftEnabled"] = True
+    config["gripper"]["rightEnabled"] = True
+    assert client.put("/api/settings", json=config).status_code == 200
+
+    response = client.post(
+        "/api/policy/action",
+        json={"action": [10.0] * 14, "dryRun": False, "controlledSides": ["left"]},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["sent"] is True
+    assert set(payload["results"]["motion"]) == {"left"}
+    assert set(payload["results"]["grippers"]) == {"left"}

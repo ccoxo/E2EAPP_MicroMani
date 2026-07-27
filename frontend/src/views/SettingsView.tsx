@@ -1,4 +1,4 @@
-import { Button, Dropdown, Form, Input, InputNumber, Modal, Segmented, Select, Slider, Space, Switch, Tabs, Tag, Typography, type MenuProps } from 'antd'
+import { Button, Dropdown, Form, Input, InputNumber, Modal, Select, Slider, Space, Switch, Tabs, Tag, Typography, type MenuProps } from 'antd'
 import {
   Activity,
   AlertTriangle,
@@ -42,11 +42,8 @@ import {
   setTeleopGravityCompensation,
   tareForceSensor,
   zeroTeleopForceFeedback,
-  startGripperTeleop,
-  stopGripperTeleop,
   stopMotionSide,
   fetchMotionOrigin,
-  fetchGripperTeleopStatus,
   mockMode,
   type ApiCommandError,
   type MotionOriginCaptureDrift,
@@ -103,15 +100,6 @@ interface GripperPortHint {
   baudrate?: number
   ok?: boolean | null
   message?: string
-}
-
-interface GripperTeleopStatusHint {
-  running?: boolean
-  requestedRunning?: boolean
-  message?: string
-  ports?: GripperPortHint[]
-  leftObjectDetected?: boolean
-  rightObjectDetected?: boolean
 }
 
 type InlineStatusTone = 'ok' | 'warn' | 'error' | 'pending'
@@ -1628,8 +1616,8 @@ function GripperCard({
   const slaveKey = hardwareSide === 'left' ? 'leftSlaveId' : 'rightSlaveId'
   const enabledKey = hardwareSide === 'left' ? 'leftEnabled' : 'rightEnabled'
   const gripperEnabled = Boolean(config.gripper[enabledKey])
-  const halNativeGripperTeleop = config.teleop.engine === 'hal_native'
-  const canCommandGripper = gripperEnabled || halNativeGripperTeleop
+  const halNativeGripperTeleop = true
+  const canCommandGripper = true
   const gapMinKey = side === 'left' ? 'leftGapMinMm' : 'rightGapMinMm'
   const gapMaxKey = side === 'left' ? 'leftGapMaxMm' : 'rightGapMaxMm'
   const protectedMinGapMm = config.gripper.icfTargetProtectionEnabled
@@ -1651,88 +1639,31 @@ function GripperCard({
   /** 设置当前流程的对应状态。 */
   const setGt = (patch: Partial<typeof gt>) =>
     updateConfig({ teleop: { ...config.teleop, gripperTeleop: { ...gt, ...patch } } })
-  const [teleopRunning, setTeleopRunning] = useState(false)
-  const [objectDetected, setObjectDetected] = useState(false)
-  const [gripperTeleopStatus, setGripperTeleopStatus] = useState<GripperTeleopStatusHint | null>(null)
-  const applyGripperTeleopStatus = useCallback((status: GripperTeleopStatusHint | null) => {
-    const d = status ?? {}
-    setGripperTeleopStatus(status)
-    setTeleopRunning(Boolean(d.running))
-    setObjectDetected(Boolean(side === 'left' ? d.leftObjectDetected : d.rightObjectDetected))
-  }, [side])
-  useEffect(() => {
-    fetchGripperTeleopStatus()
-      .then((r: { data?: GripperTeleopStatusHint }) => {
-        applyGripperTeleopStatus(r?.data ?? null)
-      })
-      .catch(() => {})
-    const timer = setInterval(() => {
-      fetchGripperTeleopStatus()
-        .then((r: { data?: GripperTeleopStatusHint }) => {
-          applyGripperTeleopStatus(r?.data ?? null)
-        })
-        .catch(() => {})
-    }, 1000)
-    return () => clearInterval(timer)
-  }, [applyGripperTeleopStatus])
- /** 处理对应的用户交互。 */
- const handleTeleopToggle = async () => {
-    try {
-      if (teleopRunning) {
-        const result = await stopGripperTeleop()
-        applyGripperTeleopStatus((result as { data?: GripperTeleopStatusHint })?.data ?? null)
-        commandLog(injectLog, '[GRIPPER]', `${operatorLabel}夹爪遥操作停止请求已发送`)
-      } else {
-        const result = await startGripperTeleop()
-        applyGripperTeleopStatus((result as { data?: GripperTeleopStatusHint })?.data ?? null)
-        commandLog(injectLog, '[GRIPPER]', `${operatorLabel}夹爪遥操作启动请求已发送`)
-      }
-      void fetchGripperTeleopStatus()
-        .then((r: { data?: GripperTeleopStatusHint }) => applyGripperTeleopStatus(r?.data ?? null))
-        .catch(() => {})
-    } catch (error) {
-      injectLog('ERROR', `${operatorLabel}夹爪遥操作切换失败：${commandErrorMessage(error)}`, '[GRIPPER]')
-    }
-  }
+  const teleopRunning = halNativeGripperTeleop && Boolean(config.teleop.leftConnected || config.teleop.rightConnected)
   const fallbackTeleopPort: GripperPortHint = {
     side: hardwareSide,
     port: config.gripper[portKey],
     slaveId: config.gripper[slaveKey],
     baudrate: config.gripper.baudrate,
   }
-  const teleopPort = gripperTeleopStatus?.ports?.find((port) => port.side === hardwareSide) ?? fallbackTeleopPort
+  const teleopPort = fallbackTeleopPort
   const teleopPortSummary = `${teleopPort.port ?? '-'} / slave ${teleopPort.slaveId ?? '-'}`
-  const teleopPortDetail = `${teleopPort.baudrate ?? config.gripper.baudrate} baud · ${teleopPort.message || (config.teleop.engine === 'hal_native' ? 'HAL-native 夹爪遥操作串口' : 'Python 夹爪 worker 串口')}`
+  const teleopPortDetail = `${teleopPort.baudrate ?? config.gripper.baudrate} baud · HAL-native 夹爪遥操作串口`
   const teleopRunSummary = halNativeGripperTeleop
     ? teleopRunning
       ? '随 Omega.7 自动遥操作'
-      : gripperTeleopStatus?.requestedRunning
-        ? '等待 HAL 接管夹爪'
-        : '等待主手连接'
-    : teleopRunning
-      ? '遥操作运行中'
-      : gripperTeleopStatus?.requestedRunning
-        ? '遥操作等待 HAL 回报'
-        : '遥操作未启动'
-  const teleopRunDetail = gripperTeleopStatus?.message || (
-    halNativeGripperTeleop
-      ? objectDetected ? '检测到夹持物体' : '主手连接后 HAL-native 会自动接管夹爪'
-      : objectDetected ? '检测到夹持物体' : '等待 Omega.7 夹爪输入'
-  )
-  const gripperPortTone: InlineStatusTone =
-    teleopPort.ok === false ? 'error' : teleopPort.ok === true ? 'ok' : 'pending'
-  const gripperRunTone: InlineStatusTone =
-    teleopRunning ? 'ok' : gripperTeleopStatus?.requestedRunning ? 'warn' : gripperTeleopStatus?.message ? 'error' : 'pending'
-  const gripperHasTeleopError = gripperPortTone === 'error' || gripperRunTone === 'error'
-  const gripperErrorDetail = [
-    gripperPortTone === 'error' ? teleopPort.message || teleopPortDetail : '',
-    gripperRunTone === 'error' ? teleopRunDetail : '',
-  ].filter(Boolean).join(' · ')
-  const gripperCardState: ConnectionState = gripperHasTeleopError
-    ? 'error'
-    : halNativeGripperTeleop
-      ? teleopRunning || gripperTeleopStatus?.requestedRunning ? 'ok' : 'pending'
-      : config.gripper[enabledKey] ? 'ok' : 'pending'
+      : '等待主手连接'
+    : gripperEnabled
+      ? '已使能'
+      : '未使能'
+  const teleopRunDetail = halNativeGripperTeleop ? '主手连接后 HAL-native 会自动接管夹爪' : '等待 Omega.7 夹爪输入'
+  const gripperPortTone: InlineStatusTone = 'pending'
+  const gripperRunTone: InlineStatusTone = teleopRunning ? 'ok' : 'pending'
+  const gripperHasTeleopError = false
+  const gripperErrorDetail = ''
+  const gripperCardState: ConnectionState = halNativeGripperTeleop
+    ? teleopRunning ? 'ok' : 'pending'
+    : config.gripper[enabledKey] ? 'ok' : 'pending'
   const gripperControlLabel = halNativeGripperTeleop ? '控制状态' : '使能状态'
   const gripperControlValue = halNativeGripperTeleop ? teleopRunSummary : gripperEnabled ? '已使能' : '未使能'
   const gripperControlTone = halNativeGripperTeleop ? teleopRunning ? 'ok' : 'warn' : gripperEnabled ? 'ok' : 'warn'
@@ -1784,16 +1715,6 @@ function GripperCard({
             <Form.Item label="从站地址"><InputNumber value={config.gripper[slaveKey]} onChange={(value) => updateConfig({ gripper: { ...config.gripper, [slaveKey]: Number(value ?? sideSpec.gripperSlaveId) } })} /></Form.Item>
             <Form.Item label="行程 mm"><InputNumber value={config.gripper.strokeMm} onChange={(value) => updateConfig({ gripper: { ...config.gripper, strokeMm: Number(value ?? 26) } })} /></Form.Item>
             <Form.Item label="命令力限制 N"><InputNumber min={0} max={8} value={config.gripper.commandForceLimitN} onChange={(value) => updateConfig({ gripper: { ...config.gripper, commandForceLimitN: Number(value ?? 8) } })} /></Form.Item>
-            <Form.Item label="采样模式">
-              <Segmented<AppConfig['gripper']['sampleMode']>
-                value={config.gripper.sampleMode}
-                onChange={(value) => updateConfig({ gripper: { ...config.gripper, sampleMode: value } })}
-                options={[
-                  { value: 'direct', label: '直连' },
-                  { value: 'dual_worker', label: '双 worker' },
-                ]}
-              />
-            </Form.Item>
             <Form.Item label="采样 Hz">
               <InputNumber min={1} max={60} value={config.gripper.sampleHz} onChange={(value) => updateConfig({ gripper: { ...config.gripper, sampleHz: Number(value ?? 30) } })} />
             </Form.Item>
@@ -1860,16 +1781,7 @@ function GripperCard({
           <div className="hardware-subtitle-row">
             <b>Omega7 夹爪遥操作</b>
             <Space size={6}>
-              {objectDetected && <Tag color="success">已夹持物体</Tag>}
-              <Button
-                type={teleopRunning || halNativeGripperTeleop ? 'default' : 'primary'}
-                danger={teleopRunning}
-                size="small"
-                className={teleopRunning ? 'gripper-teleop-stop-button' : undefined}
-                onClick={handleTeleopToggle}
-              >
-                {teleopRunning ? '停止遥操' : halNativeGripperTeleop ? '手动启动遥操' : '启动遥操'}
-              </Button>
+              <Tag color={teleopRunning ? 'success' : 'processing'}>{teleopRunSummary}</Tag>
             </Space>
           </div>
           {gripperHasTeleopError && (
@@ -2221,7 +2133,16 @@ function TeleopHandCard({
   const targetWorkOriginLabel = hardwareSide === 'left' ? '目标硬件左臂' : '目标硬件右臂'
   const readState: ConnectionState = !physicalConnected ? 'error' : targetWorkOriginBlocked ? 'warn' : !logicalConnected ? 'pending' : handState?.lastReadOk ? 'ok' : 'warn'
   const [connectionPending, setConnectionPending] = useState(false)
+  const [connectSyncPending, setConnectSyncPending] = useState(false)
   const [connectionHint, setConnectionHint] = useState('')
+  const teleopConnectPending = connectionPending || connectSyncPending
+  useEffect(() => {
+    if (!connectSyncPending) return
+    if (!logicalConnected || physicalConnected) {
+      setConnectSyncPending(false)
+      setConnectionPending(false)
+    }
+  }, [connectSyncPending, logicalConnected, physicalConnected])
   const liveOpenId = handState?.openId ?? openId
   const omegaSummary = `OpenID ${liveOpenId} / device ${handState?.deviceId ?? '-'}`
   const handedText = handState?.leftHanded == null ? 'handedness -' : handState.leftHanded ? 'left-handed' : 'right-handed'
@@ -2254,6 +2175,7 @@ function TeleopHandCard({
   }
   /** 发送或封装对应的后端命令。 */
   const toggleConnection = () => {
+    if (teleopConnectPending) return
     if (!logicalConnected && targetWorkOriginBlocked) {
       setConnectionHint(workOriginBlockMessage)
       injectLog('WARNING', `${sideSpec.shortLabel} Omega.7 connect blocked: ${workOriginBlockMessage}`, '[HAL]')
@@ -2261,6 +2183,7 @@ function TeleopHandCard({
     }
     setConnectionPending(true)
     if (logicalConnected) {
+      setConnectSyncPending(false)
       setConnectionHint('断开请求已发送')
       commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel} Omega.7 logical disconnect`)
       void disconnectTeleopHand(side)
@@ -2278,12 +2201,17 @@ function TeleopHandCard({
     }
     setConnectionHint('逻辑连接请求已发送，后台同步 HAL')
     commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel} Omega.7 connect dhdOpenID(${openId})`)
+    let waitForTelemetry = false
     void connectTeleopHand(side)
       .then((result) => {
         const payload = result as { data?: { connected?: boolean; backgroundSync?: boolean; physicalConnected?: boolean; lastReadOk?: boolean; message?: string } }
         const nextConnected = payload.data?.connected ?? true
         setConnected(nextConnected)
         if (payload.data?.backgroundSync) {
+          if (nextConnected) {
+            waitForTelemetry = true
+            setConnectSyncPending(true)
+          }
           setConnectionHint(`${nextConnected ? '逻辑已连接' : '连接被拒绝'} · 后台同步中，等待遥测刷新${payload.data?.message ? ` · ${payload.data.message}` : ''}`)
         } else {
           const physical = payload.data?.physicalConnected ? '物理在线' : '物理离线'
@@ -2299,7 +2227,9 @@ function TeleopHandCard({
         setConnectionHint(message)
         injectLog('ERROR', `${sideSpec.shortLabel} Omega.7 connect failed: ${message}`, '[HAL]')
       })
-      .finally(() => setConnectionPending(false))
+      .finally(() => {
+        if (!waitForTelemetry) setConnectionPending(false)
+      })
   }
   /** 设置当前流程的对应状态。 */
   const setGravityScaleValue = (value: number | null) => {
@@ -2359,8 +2289,8 @@ function TeleopHandCard({
             danger={logicalConnected}
             icon={<Usb size={15} />}
             onClick={toggleConnection}
-            loading={connectionPending}
-            disabled={!logicalConnected && targetWorkOriginBlocked}
+            loading={teleopConnectPending}
+            disabled={teleopConnectPending || (!logicalConnected && targetWorkOriginBlocked)}
           >
             {logicalConnected ? '断开主手' : '连接主手'}
           </Button>
@@ -2843,7 +2773,7 @@ function ManualGripperControl({
   const slaveKey = hardwareSide === 'left' ? 'leftSlaveId' : 'rightSlaveId'
   const enabledKey = hardwareSide === 'left' ? 'leftEnabled' : 'rightEnabled'
   const gripperEnabled = Boolean(config.gripper[enabledKey])
-  const canCommandGripper = gripperEnabled || config.teleop.engine === 'hal_native'
+  const canCommandGripper = true
   /** 设置当前流程的对应状态。 */
   const protectedMinGapMm = config.gripper.icfTargetProtectionEnabled
     ? Math.min(Math.max(config.gripper.icfTargetMinGapMm, 0), config.gripper.strokeMm)

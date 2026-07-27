@@ -220,7 +220,6 @@ export type ManualGripperCommand = 'enable' | 'disable' | 'open' | 'close' | 'ho
 export type PicoVisionCameraSource = CameraTelemetry['key']
 export type PicoVisionRotation = 'none' | 'cw90' | 'ccw90' | '180'
 export type Omega7StabilityMode = 'track' | 'hold' | 'off'
-export type TeleopEngine = 'hal_native' | 'python_mapper'
 export type TeleopControlMode = 'velocity_admittance' | 'incremental_position'
 
 export type RecorderPhase = 'idle' | 'starting' | 'recording' | 'reviewing' | 'resetting' | 'saving' | 'finishing'
@@ -483,7 +482,6 @@ export interface AppConfig {
     commandTorque: number
     icfTargetProtectionEnabled: boolean
     icfTargetMinGapMm: number
-    sampleMode: 'direct' | 'dual_worker'
     sampleHz: number
     sampleStaleMs: number
     sampleEnableOnNegative: boolean
@@ -529,7 +527,6 @@ export interface AppConfig {
     cameraSource: PicoVisionCameraSource
   }
   teleop: {
-    engine: TeleopEngine
     controlMode: TeleopControlMode
     nativeLoopHz: number
     nativeTranslationDeadzoneM: number

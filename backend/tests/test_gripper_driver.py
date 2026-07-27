@@ -54,7 +54,6 @@ def test_jodell_gripper_default_config_matches_reference_project() -> None:
     assert config["gripper"]["rightSlaveId"] == 9
     assert config["gripper"]["commandSpeed"] == 10
     assert config["gripper"]["commandTorque"] == 1
-    assert config["gripper"]["sampleMode"] == "dual_worker"
     assert config["gripper"]["sampleHz"] == 30
     assert config["gripper"]["jodellDllPath"].endswith("backend/vendor/jodell/jodellTool.dll")
 

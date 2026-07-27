@@ -49,14 +49,10 @@ def now_unix_ms() -> int:
     return int(time.time() * 1000)
 
 
-def now_monotonic_ms() -> int:
-    return int(time.monotonic() * 1000)
-
-
-def make_json_envelope(source: str, payload: dict[str, Any]) -> JsonEnvelope:
+def make_json_envelope(source: str, payload: dict[str, Any], *, stamp_monotonic_ms: int) -> JsonEnvelope:
     return JsonEnvelope(
         stamp_unix_ms=now_unix_ms(),
-        stamp_monotonic_ms=now_monotonic_ms(),
+        stamp_monotonic_ms=int(stamp_monotonic_ms),
         source=source,
         payload_json=json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str),
     )

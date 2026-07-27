@@ -33,9 +33,7 @@ from backend.core.schemas import GripperCommandRequest, ManualAxisMoveRequest, S
 from backend.core.units import motion_pulse_per_unit, pulse_to_ui
 from backend.hal_client.client import HalClient
 from backend.services.gripper_backend import (
-    DirectGripperAdapter,
     NativeGripperAdapter,
-    WorkerGripperAdapter,
     hal_response_message,
     native_teleop_enabled,
 )
@@ -91,7 +89,6 @@ class CommandService:
         hal: HalClient,
         logs: LogService,
         hardware: HardwareService | None = None,
-        gripper_workers: Any | None = None,
         origin_mutation_locked: Callable[[], bool] | None = None,
         teleop: Any | None = None,
         gripper_router: Any | None = None,
@@ -101,15 +98,10 @@ class CommandService:
         self.hal = hal
         self.logs = logs
         self.hardware = hardware
-        self.gripper_workers = gripper_workers
         self.teleop = teleop
         self.gripper_router = gripper_router
-        if self.gripper_router is None and hardware is not None and gripper_workers is not None:
-            self.gripper_router = GripperRouter(
-                native=NativeGripperAdapter(hal, teleop),
-                worker=WorkerGripperAdapter(gripper_workers),
-                direct=DirectGripperAdapter(hardware),
-            )
+        if self.gripper_router is None:
+            self.gripper_router = GripperRouter(native=NativeGripperAdapter(hal, teleop))
         self._origin_mutation_locked = origin_mutation_locked or (lambda: False)
         self._motion_enable_restore_snapshot: dict[str, list[bool]] | None = None
 
@@ -730,30 +722,25 @@ class CommandService:
             raise RuntimeError("gripper router is not available")
         gripper_backend = self.gripper_router.backend_name(config)
         target = self._gripper_command_target(config, request)
-        if gripper_backend == "hal_native":
-            if target is None and request.command == "enable":
-                target_key = "targetLeftMm" if request.side == "left" else "targetRightMm"
-                target = protected_gripper_target_mm(
-                    config,
-                    float(config.get("gripper", {}).get(target_key, 0.0)),
-                )
-            try:
-                result = await self.gripper_router.command(config, request.side, request.command, target)
-            except Exception as exc:
-                self._log_gripper_command(
-                    config,
-                    request,
-                    backend=gripper_backend,
-                    target=target,
-                    run_ret=False,
-                    ipc_ok=False,
-                    error=str(exc),
-                )
-                raise
-        else:
-            self._validate_gripper_command_enabled(config, request)
-            dispatch_command, dispatch_target = self._gripper_dispatch_command(config, request, target)
-            result = await self.gripper_router.command(config, request.side, dispatch_command, dispatch_target)
+        if target is None and request.command == "enable":
+            target_key = "targetLeftMm" if request.side == "left" else "targetRightMm"
+            target = protected_gripper_target_mm(
+                config,
+                float(config.get("gripper", {}).get(target_key, 0.0)),
+            )
+        try:
+            result = await self.gripper_router.command(config, request.side, request.command, target)
+        except Exception as exc:
+            self._log_gripper_command(
+                config,
+                request,
+                backend=gripper_backend,
+                target=target,
+                run_ret=False,
+                ipc_ok=False,
+                error=str(exc),
+            )
+            raise
         if not result.ok:
             self._log_gripper_command(
                 config,
@@ -766,7 +753,7 @@ class CommandService:
             )
             self.logs.error("[GRIPPER]", result.message)
             raise RuntimeError(result.message)
-        if gripper_backend == "hal_native" and request.command in {"open", "close", "home", "target"}:
+        if request.command in {"open", "close", "home", "target"}:
             config.setdefault("gripper", {})[f"{request.side}Enabled"] = True
         await self._save_gripper_command_state_async(config, request, target)
         self._log_gripper_command(
@@ -780,11 +767,10 @@ class CommandService:
         side_label = "left gripper" if request.side == "left" else "right gripper"
         self.logs.info("[GRIPPER]", f"{side_label} {request.command}: {result.message}")
         response: dict[str, object] = {"message": result.message}
-        if gripper_backend == "hal_native":
-            response["nativeManaged"] = True
-            hal_result = result.details.get("hal") if isinstance(result.details, dict) else None
-            if isinstance(hal_result, dict):
-                response["hal"] = hal_result
+        response["nativeManaged"] = True
+        hal_result = result.details.get("hal") if isinstance(result.details, dict) else None
+        if isinstance(hal_result, dict):
+            response["hal"] = hal_result
         if target is not None:
             response["targetMm"] = target
         return response

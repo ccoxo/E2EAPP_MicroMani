@@ -29,7 +29,8 @@ from backend.services.dataset_recorder import (
 def hal_motion_fixture(timestamp_ms: int = 1234) -> dict[str, object]:
     return {
         "timestamp_ms": timestamp_ms,
-        "received_monotonic_ms": timestamp_ms,
+        "dds_stamp_monotonic_ms": timestamp_ms,
+        "monotonicMs": timestamp_ms,
         "estop_active": False,
         "positions": [0.0] * 12,
         "pulses": [0.0] * 12,
@@ -40,7 +41,8 @@ def hal_motion_fixture(timestamp_ms: int = 1234) -> dict[str, object]:
 def omega_state_fixture(timestamp_ms: int = 1234) -> dict[str, object]:
     return {
         "timestamp_ms": timestamp_ms,
-        "received_monotonic_ms": timestamp_ms,
+        "dds_stamp_monotonic_ms": timestamp_ms,
+        "monotonicMs": timestamp_ms,
         "hands": [
             {"side": "left", "connected": True, "openId": 0, "lastReadOk": True},
             {"side": "right", "connected": False, "openId": 1, "lastReadOk": False},
@@ -655,7 +657,7 @@ def test_dataset_recorder_skip_reset_requires_required_work_origin_side() -> Non
         recorder.logs = SimpleNamespace(info=lambda *_args: calls.append("log"))
         recorder.status = lambda: {"recording": recorder._recording, "resetReady": recorder._reset_ready_locked()}
 
-        def begin_episode() -> None:
+        def begin_episode(**_kwargs: object) -> None:
             calls.append("begin")
             recorder._recording = True
 
@@ -1008,7 +1010,7 @@ def test_dataset_recorder_skip_reset_starts_after_discarded_episode_waiting() ->
         recorder.logs = SimpleNamespace(info=lambda *_args: calls.append("log"))
         recorder.status = lambda: {"recording": recorder._recording}
 
-        def begin_episode() -> None:
+        def begin_episode(**_kwargs: object) -> None:
             calls.append("begin")
             recorder._recording = True
 
@@ -1039,8 +1041,8 @@ def test_dataset_recorder_skip_reset_transition_uses_single_lock() -> None:
     before_teleop_start = body.split('await self.teleop.start("recording", pre_home=False)', 1)[0]
 
     assert before_teleop_start.count("async with self._lock:") == 1
-    assert body.index("if not self._reset_ready_locked():") < body.index("self._begin_episode_locked()")
-    assert body.index("self._begin_episode_locked()") < body.index(
+    assert body.index("if not self._reset_ready_locked():") < body.index("self._begin_episode_locked(")
+    assert body.index("self._begin_episode_locked(") < body.index(
         'await self.teleop.start("recording", pre_home=False)'
     )
 
@@ -1065,7 +1067,7 @@ def test_dataset_recorder_skip_reset_rolls_back_when_teleop_start_fails() -> Non
             warning=lambda *_args: calls.append("warn"),
         )
 
-        def begin_episode() -> None:
+        def begin_episode(**_kwargs: object) -> None:
             calls.append("begin")
             recorder._recording = True
             recorder._samplers_paused = False
@@ -1516,6 +1518,30 @@ def test_dataset_recorder_alignment_time_uses_warmup_plus_dataset_timestamp() ->
     assert recorder._record_target_timestamp_s(15) == pytest.approx(101.0)
 
 
+def test_dataset_recorder_begin_episode_uses_hal_clock_for_targets_and_python_clock_for_schedule() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    recorder.settings = SimpleNamespace(get_config=default_config)
+    recorder._recording_config_snapshot = default_config()
+    recorder._episode_generation = 0
+    recorder._record_fps_hz = 30
+    recorder._force_sample_hz = 200.0
+    recorder._native_total_frames_cached = 12
+    recorder._native_writer_active = lambda: True
+
+    recorder._begin_episode_locked(sample_clock_now_s=456.0, schedule_now_s=1000.0)
+
+    sample_start = 456.0 + dataset_recorder_module.SAMPLER_START_LEAD_S
+    schedule_start = 1000.0 + dataset_recorder_module.SAMPLER_START_LEAD_S
+    assert recorder._sampler_start_monotonic_s == pytest.approx(sample_start)
+    assert recorder._sampler_schedule_start_s == pytest.approx(schedule_start)
+    assert recorder._record_target_timestamp_s(0) == pytest.approx(
+        sample_start + dataset_recorder_module.RECORDER_HARDWARE_WARMUP_S
+    )
+    assert recorder._record_schedule_timestamp_s(0) == pytest.approx(
+        schedule_start + dataset_recorder_module.RECORDER_HARDWARE_WARMUP_S
+    )
+
+
 def test_dataset_recorder_frame_assembly_uses_default_alignment_delay() -> None:
     recorder = object.__new__(DatasetRecorderService)
 
@@ -1652,13 +1678,17 @@ def test_dataset_recorder_quality_warnings_include_camera_fps_and_worker_fallbac
 def test_dataset_recorder_source_timestamp_uses_assigned_sample_time() -> None:
     recorder = object.__new__(DatasetRecorderService)
 
-    assert recorder._source_sample_monotonic({"received_monotonic_ms": 1, "monotonic_s": 2.0}, 42.0) == 2.0
+    assert recorder._source_sample_monotonic({"dds_stamp_monotonic_ms": 1, "monotonic_s": 2.0}, 42.0) == 2.0
 
 
-def test_dataset_recorder_source_timestamp_uses_real_sample_time() -> None:
+def test_dataset_recorder_source_timestamp_prefers_dds_steady_clock_time() -> None:
     recorder = object.__new__(DatasetRecorderService)
 
-    assert recorder._source_sample_monotonic({"received_monotonic_ms": 100250}, 42.0) == pytest.approx(100.25)
+    assert recorder._source_sample_monotonic(
+        {"dds_stamp_monotonic_ms": 456000, "received_monotonic_ms": 100250},
+        42.0,
+    ) == pytest.approx(456.0)
+    assert recorder._source_sample_monotonic({"monotonicMs": 100250}, 42.0) == pytest.approx(100.25)
     assert recorder._source_sample_monotonic(SimpleNamespace(sample_monotonic_s=100.5), 42.0) == pytest.approx(100.5)
     assert recorder._source_sample_monotonic({"monotonic_s": 2.0}, 42.0) == pytest.approx(2.0)
 
@@ -1820,7 +1850,9 @@ def test_dataset_recorder_uses_native_gripper_targets_for_action() -> None:
     )[6::7] == [8.0, 9.0]
 
 
-def test_dataset_recorder_uses_config_gripper_targets_when_workers_own_gripper() -> None:
+def test_dataset_recorder_real_hal_native_action_ignores_config_targets_when_native_targets_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class FakeTeleop:
         def status(self) -> dict[str, object]:
             return {
@@ -1828,28 +1860,25 @@ def test_dataset_recorder_uses_config_gripper_targets_when_workers_own_gripper()
                     "ts": int(time.time() * 1000),
                     "deltaVector": [0.0] * 12,
                 },
-                "nativeStatus": {
-                    "gripperTargets": [8.0, 9.0],
-                },
+                "nativeStatus": {},
             }
-
-    class FakeWorkers:
-        def is_enabled(self, config: dict[str, object]) -> bool:
-            gripper = config.get("gripper", {})
-            return isinstance(gripper, dict) and gripper.get("sampleMode") == "dual_worker"
-
-    class FakeTelemetry:
-        def __init__(self) -> None:
-            self.gripper_workers = FakeWorkers()
 
     recorder = object.__new__(DatasetRecorderService)
     recorder.teleop = FakeTeleop()
-    recorder.telemetry = FakeTelemetry()
+    monkeypatch.delenv("APPSTATION_HAL_MODE", raising=False)
+
+    state = [0.0] * 14
+    state[6] = 12.3373
+    state[13] = 25.1843
 
     assert recorder._latest_action_vector(
-        [0.0] * 14,
-        {"gripper": {"sampleMode": "dual_worker", "targetLeftMm": 1.0, "targetRightMm": 2.0}},
-    )[6::7] == [1.0, 2.0]
+        state,
+        {
+            "hal": {"mode": "real"},
+            "teleop": {"engine": "hal_native"},
+            "gripper": {"targetLeftMm": 13.0, "targetRightMm": 13.0},
+        },
+    )[6::7] == pytest.approx([12.3373, 25.1843])
 
 
 def test_dataset_recorder_uses_native_gripper_positions_for_observation() -> None:
@@ -1882,11 +1911,12 @@ def test_dataset_recorder_uses_native_gripper_positions_for_observation() -> Non
     assert sample.value == [3.25, 4.5]
 
 
-def test_dataset_recorder_prefers_worker_gripper_positions_when_workers_own_gripper() -> None:
+def test_dataset_recorder_native_gripper_positions_use_native_status_steady_clock() -> None:
     class FakeTeleop:
         def status(self) -> dict[str, object]:
             return {
                 "nativeStatus": {
+                    "dds_stamp_monotonic_ms": 456000,
                     "grippers": {
                         "left": {"positionMm": 3.25, "targetMm": 8.0},
                         "right": {"positionMm": 4.5, "targetMm": 9.0},
@@ -1894,44 +1924,63 @@ def test_dataset_recorder_prefers_worker_gripper_positions_when_workers_own_grip
                 },
             }
 
-    class FakeWorkers:
-        def is_enabled(self, config: dict[str, object]) -> bool:
-            gripper = config.get("gripper", {})
-            return isinstance(gripper, dict) and gripper.get("sampleMode") == "dual_worker"
+    recorder = object.__new__(DatasetRecorderService)
+    recorder.teleop = FakeTeleop()
+
+    sample = recorder._gripper_source_sync(
+        {"hal": {"mode": "real"}, "teleop": {"engine": "hal_native"}},
+        456.0,
+        record_quality=False,
+    )
+
+    assert sample.ok is True
+    assert sample.monotonic_s == pytest.approx(456.0)
+    assert sample.value == [3.25, 4.5]
+
+
+def test_dataset_recorder_real_hal_native_gripper_observation_reuses_native_position_when_status_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTeleop:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def status(self) -> dict[str, object]:
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "nativeStatus": {
+                        "dds_stamp_monotonic_ms": 10000,
+                        "grippers": {
+                            "left": {"positionMm": 12.3373},
+                            "right": {"positionMm": 25.1843},
+                        },
+                    },
+                }
+            return {"nativeStatus": {}}
 
     class FakeTelemetry:
         def __init__(self) -> None:
-            self.gripper_workers = FakeWorkers()
-            self.gripper_positions = [-1.0, -1.0]
-            self.gripper_samples: dict[str, dict[str, object]] = {}
-            self._last_gripper_sample_at = 0.0
+            self.gripper_positions = [13.0, 13.0]
+            self._last_gripper_sample_at = time.monotonic()
 
         def refresh_gripper_positions(self, _config: dict[str, object], now: float) -> None:
-            self.gripper_positions = [6.0, 7.0]
+            self.gripper_positions = [13.0, 13.0]
             self._last_gripper_sample_at = now
-            sample_ms = int(now * 1000)
-            self.gripper_samples = {
-                "left": {"positionMm": 6.0, "monotonicMs": sample_ms},
-                "right": {"positionMm": 7.0, "monotonicMs": sample_ms},
-            }
 
     recorder = object.__new__(DatasetRecorderService)
     recorder.teleop = FakeTeleop()
     recorder.telemetry = FakeTelemetry()
-    recorder._drop_counts = {"gripper": 0}
-    recorder._late_source_frames = {}
-    recorder._source_skews_ms = {"gripper": []}
-    recorder._source_elapsed_ms = {"gripper": []}
-    recorder._source_fail_streaks = {"gripper": 0}
-    recorder._source_warnings = []
+    monkeypatch.delenv("APPSTATION_HAL_MODE", raising=False)
+    config = {"hal": {"mode": "real"}, "teleop": {"engine": "hal_native"}}
 
-    sample = recorder._gripper_source_sync(
-        {"hal": {"mode": "real"}, "teleop": {"engine": "hal_native"}, "gripper": {"sampleMode": "dual_worker"}},
-        10.0,
-    )
+    first = recorder._gripper_source_sync(config, 10.0, record_quality=False)
+    second = recorder._gripper_source_sync(config, 10.1, record_quality=False)
 
-    assert sample.ok is True
-    assert sample.value == [6.0, 7.0]
+    assert first.value == [12.3373, 25.1843]
+    assert second.value == [12.3373, 25.1843]
+    assert second.ok is False
+    assert second.stale is True
 
 
 def test_dataset_recorder_action_vector_uses_last_action_before_target() -> None:
@@ -1962,6 +2011,49 @@ def test_dataset_recorder_action_vector_uses_last_action_before_target() -> None
 
     assert recorder._latest_action_vector([0.0] * 14, {}, 10.0) == [
         1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
+
+
+def test_dataset_recorder_action_vector_uses_hal_steady_clock_over_host_monotonic() -> None:
+    class FakeTeleop:
+        def status(self) -> dict[str, object]:
+            return {
+                "lastAction": {
+                    "ts": int(time.time() * 1000),
+                    "host_monotonic_s": 456.0,
+                    "monotonicMs": 9900,
+                    "monotonic_s": 9.9,
+                    "deltaVector": [2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                },
+                "actionHistory": [
+                    {
+                        "ts": int(time.time() * 1000),
+                        "host_monotonic_s": 456.0,
+                        "monotonicMs": 9900,
+                        "monotonic_s": 9.9,
+                        "deltaVector": [2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    }
+                ],
+            }
+
+    recorder = object.__new__(DatasetRecorderService)
+    recorder.teleop = FakeTeleop()
+
+    assert recorder._latest_action_vector([0.0] * 14, {}, 10.0) == [
+        2.0,
         0.0,
         0.0,
         0.0,

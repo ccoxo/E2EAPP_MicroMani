@@ -1,4 +1,4 @@
-"""Select the active gripper backend for the current runtime mode."""
+"""Route gripper commands through the HAL-native backend."""
 
 from __future__ import annotations
 
@@ -6,33 +6,24 @@ from typing import Any
 
 from backend.drivers.gripper_rs485 import GripperResult
 from backend.services.gripper_backend import (
-    DirectGripperAdapter,
     GripperBackend,
     NativeGripperAdapter,
-    WorkerGripperAdapter,
 )
 
 
 class GripperRouter:
-    """Routes gripper reads and commands to native HAL, worker, or direct SDK."""
+    """Routes gripper reads and commands to HAL-native."""
 
     def __init__(
         self,
         *,
         native: NativeGripperAdapter,
-        worker: WorkerGripperAdapter,
-        direct: DirectGripperAdapter,
     ) -> None:
         self._native = native
-        self._worker = worker
-        self._direct = direct
 
     def select(self, config: dict[str, Any]) -> GripperBackend:
-        if self._worker.is_enabled(config):
-            return self._worker
-        if self._native.is_enabled(config):
-            return self._native
-        return self._direct
+        _ = config
+        return self._native
 
     def backend_name(self, config: dict[str, Any]) -> str:
         return self.select(config).name
@@ -59,4 +50,4 @@ class GripperRouter:
         return await self.select(config).command(config, side, command, target_mm)
 
     async def stop(self) -> None:
-        await self._worker.stop()
+        return None

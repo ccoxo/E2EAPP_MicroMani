@@ -17,11 +17,9 @@ class TelemetryHub:
         self,
         settings: SettingsService,
         hardware: HardwareService | None = None,
-        gripper_workers: Any | None = None,
     ) -> None:
         self.settings = settings
         self.hardware = hardware
-        self.gripper_workers = gripper_workers
         self.started = time.monotonic()
         self.tick = 0
         self.axis_offsets = [0.0] * 12
@@ -42,11 +40,6 @@ class TelemetryHub:
         self.episode_count = 0
         self.frame_count = 0
         self._last_gripper_sample_at = 0.0
-        # Both grippers share the Jodell DLL's single active COM port, so reading
-        # left then right back-to-back forces an open/close cycle (~140 ms each).
-        # Alternating sides per poll keeps each tick to one port-switch worth of
-        # work and stops user commands from contending with a 280ms sample.
-        self._next_gripper_side = "left"
         self._last_force_sample_at = 0.0
         self._last_camera_sample_at = 0.0
         self._last_frame_at = 0.0
@@ -54,19 +47,17 @@ class TelemetryHub:
         self._hardware_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="telemetry-hardware")
         # 硬件采样放在线程池中，避免慢速 IO 阻塞 WebSocket 发送节奏。
         self._force_future: Future[Any] | None = None
-        self._gripper_future: Future[Any] | None = None
         self._camera_future: Future[Any] | None = None
         self._cached_cameras: list[CameraTelemetry] = self._offline_cameras("checking")
         self._shutdown = False
 
     def shutdown(self) -> None:
         self._shutdown = True
-        for future in (self._force_future, self._gripper_future, self._camera_future):
+        for future in (self._force_future, self._camera_future):
             if future is not None and not future.done():
                 future.cancel()
         self._hardware_executor.shutdown(wait=True, cancel_futures=True)
         self._force_future = None
-        self._gripper_future = None
         self._camera_future = None
         cameras = getattr(self.hardware, "cameras", None)
         close_all = getattr(cameras, "close_all", None)
@@ -126,8 +117,6 @@ class TelemetryHub:
             self._refresh_force_values(config, now)
             if native_gripper_status is not None:
                 self.apply_native_gripper_status(native_gripper_status, now)
-            else:
-                self.refresh_gripper_positions(config, now)
             force_left = list(self.force_left)
             force_right = list(self.force_right)
         if real_mode:
@@ -579,58 +568,8 @@ class TelemetryHub:
             self._camera_future = self._hardware_executor.submit(self.hardware.cameras.probe, config)
 
     def refresh_gripper_positions(self, config: dict[str, Any], now: float | None = None) -> None:
-        """从当前采样后端刷新夹爪缓存位置。"""
-        now = time.monotonic() if now is None else now
-        if self.hardware is None or getattr(self, "_shutdown", False):
-            return
-        if self.gripper_workers is not None and self.gripper_workers.is_enabled(config):
-            samples = self.gripper_workers.samples(config)
-            self.gripper_samples = samples
-            self.gripper_positions = [-1.0, -1.0]
-            updated = False
-            latest_sample_at = 0.0
-            for side, idx in (("left", 0), ("right", 1)):
-                sample = samples.get(side, {})
-                value = sample.get("positionMm")
-                if value is not None:
-                    self.gripper_positions[idx] = float(value)
-                    updated = True
-                monotonic_ms = sample.get("monotonicMs")
-                if monotonic_ms is not None:
-                    latest_sample_at = max(latest_sample_at, float(monotonic_ms) / 1000.0)
-            if updated:
-                self._last_gripper_sample_at = latest_sample_at or now
-            else:
-                self._last_gripper_sample_at = 0.0
-            return
-        if not hasattr(self.hardware, "gripper") or not hasattr(self, "_hardware_executor"):
-            return
-        if self._gripper_future is not None and self._gripper_future.done():
-            try:
-                positions = self._gripper_future.result()
-                for idx, value in enumerate(positions):
-                    if value is not None:
-                        self.gripper_positions[idx] = float(value)
-                        side = "left" if idx == 0 else "right"
-                        # 直接读取路径也写入统一样本缓存，录制端才能判断夹爪数据是否过期。
-                        self.gripper_samples[side] = {
-                            "ok": True,
-                            "positionMm": float(value),
-                            "sampleHz": 1.0,
-                            "ageMs": 0.0,
-                            "tsMs": int(time.time() * 1000),
-                            "monotonicMs": int(now * 1000),
-                            "message": "direct gripper sample",
-                        }
-                        self._last_gripper_sample_at = now
-            except Exception:
-                pass
-            finally:
-                self._gripper_future = None
-        if self._gripper_future is None and now - self._last_gripper_sample_at >= 1.0:
-            # 夹爪位置变化较慢，低频采样足够支撑状态面板。
-            self._last_gripper_sample_at = now
-            self._gripper_future = self._hardware_executor.submit(self._sample_gripper_positions, config)
+        """HAL-native status is the only real gripper position source."""
+        _ = (config, now)
 
     def _refresh_gripper_positions(self, config: dict[str, Any], now: float) -> None:
         self.refresh_gripper_positions(config, now)
@@ -670,22 +609,11 @@ class TelemetryHub:
         if updated:
             self._last_gripper_sample_at = now
 
-    def _sample_gripper_positions(self, config: dict[str, Any]) -> list[float | None]:
-        if self.hardware is None or getattr(self, "_shutdown", False):
-            return [None, None]
         # Read only one side per cycle — the Jodell DLL keeps a single COM port
         # active and switching costs ~140ms, which would otherwise block user
         # gripper commands behind the periodic sampling.
-        side = self._next_gripper_side
-        result = self.hardware.gripper.position(config, side)
-        positions: list[float | None] = [None, None]
-        if result.ok:
-            positions[0 if side == "left" else 1] = result.position_mm
         # Toggle for the next cycle so each gripper still gets a fresh reading
         # roughly every 2× the gripper sample period (default 1s -> 2s/side).
-        self._next_gripper_side = "right" if side == "left" else "left"
-        return positions
-
     def _offline_cameras(self, health: Literal["ok", "warn", "error", "checking", "pending"]) -> list[CameraTelemetry]:
         return [
             CameraTelemetry(

@@ -40,7 +40,7 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     config = default_config()
     teleop = config["teleop"]
 
-    assert teleop["engine"] == "hal_native"
+    assert "engine" not in teleop
     assert teleop["controlMode"] == "incremental_position"
     assert teleop["nativeLoopHz"] == 100
     assert teleop["nativeTranslationDeadzoneM"] == 0.002

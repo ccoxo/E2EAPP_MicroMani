@@ -194,7 +194,7 @@ function ArmHardwarePanel({
   const hardwareSide = hardwareSideForOperatorSide(side)
   const isHardwareLeft = hardwareSide === 'left'
   const sideSpec = armHardwareSpecs[hardwareSide]
-  const label = side === 'left' ? '左机械臂' : '右机械臂'
+  const label = isHardwareLeft ? '左机械臂' : '右机械臂'
   const cardNo = `Card ${sideSpec.cardNo}`
   const axisOrder = sideSpec.axisOrder.join(' / ')
   const axisOffset = sideSpec.stateOffset
@@ -304,8 +304,8 @@ export function DashboardView() {
     <div className="view-stack hardware-dashboard-page">
       <GlobalHardwarePanel frame={frame} diagnostics={diagnostics} />
       <section className="arm-hardware-grid">
-        <ArmHardwarePanel side="left" frame={frame} history={history} diagnostics={diagnostics} />
         <ArmHardwarePanel side="right" frame={frame} history={history} diagnostics={diagnostics} />
+        <ArmHardwarePanel side="left" frame={frame} history={history} diagnostics={diagnostics} />
       </section>
     </div>
   )

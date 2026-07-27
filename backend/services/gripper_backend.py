@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from backend.core.gripper_protection import icf_target_min_gap_mm, icf_target_protection_enabled
 from backend.drivers.gripper_rs485 import GripperResult
@@ -37,8 +37,7 @@ class GripperBackend(Protocol):
 
 
 def native_teleop_enabled(config: dict[str, Any]) -> bool:
-    teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
-    return str(teleop.get("engine", "")).lower() == "hal_native"
+    return True
 
 
 def gripper_serial_ports(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -156,56 +155,6 @@ def native_status_to_gripper_status(config: dict[str, Any], mapper_status: dict[
     }
 
 
-def result_to_status(result: GripperResult) -> dict[str, Any]:
-    return {
-        "ok": result.ok,
-        "message": result.message,
-        "details": result.details,
-        "ports": result.details.get("ports", []),
-    }
-
-
-class WorkerGripperAdapter:
-    name = "dual_worker"
-
-    def __init__(self, gripper_workers: Any) -> None:
-        self._gripper_workers = gripper_workers
-
-    def is_enabled(self, config: dict[str, Any]) -> bool:
-        return bool(self._gripper_workers is not None and self._gripper_workers.is_enabled(config))
-
-    async def status(self, config: dict[str, Any]) -> dict[str, Any]:
-        status = cast(dict[str, Any], await asyncio.to_thread(self._gripper_workers.status, config))
-        status.setdefault("ports", gripper_serial_ports(config))
-        return status
-
-    async def position(self, config: dict[str, Any], side: str) -> GripperResult:
-        return await asyncio.to_thread(self._gripper_workers.position, config, side)
-
-    async def diagnose(self, config: dict[str, Any], side: str) -> GripperResult:
-        status = await self.status(config)
-        side_status = status.get("sides", {}).get(side, {}) if isinstance(status.get("sides"), dict) else {}
-        position_mm = side_status.get("positionMm") if isinstance(side_status, dict) else None
-        return GripperResult(
-            bool(side_status.get("ok")) if isinstance(side_status, dict) else False,
-            str(side_status.get("message", "worker status")) if isinstance(side_status, dict) else "worker status",
-            float(position_mm) if position_mm is not None else None,
-            dict(side_status) if isinstance(side_status, dict) else {},
-        )
-
-    async def command(
-        self,
-        config: dict[str, Any],
-        side: str,
-        command: str,
-        target_mm: float | None,
-    ) -> GripperResult:
-        return await asyncio.to_thread(self._gripper_workers.command, config, side, command, target_mm)
-
-    async def stop(self) -> None:
-        await asyncio.to_thread(self._gripper_workers.stop_all)
-
-
 class NativeGripperAdapter:
     name = "hal_native"
 
@@ -258,41 +207,6 @@ class NativeGripperAdapter:
             target_mm,
             {"nativeManaged": True, "hal": hal_result},
         )
-
-    async def stop(self) -> None:
-        return None
-
-
-class DirectGripperAdapter:
-    name = "python_rs485"
-
-    def __init__(self, hardware: Any) -> None:
-        self._hardware = hardware
-
-    def is_enabled(self, config: dict[str, Any]) -> bool:
-        _ = config
-        return True
-
-    async def status(self, config: dict[str, Any]) -> dict[str, Any]:
-        result = await asyncio.to_thread(self._hardware.gripper.probe, config)
-        status = result_to_status(result)
-        status.setdefault("ports", gripper_serial_ports(config))
-        return status
-
-    async def position(self, config: dict[str, Any], side: str) -> GripperResult:
-        return await asyncio.to_thread(self._hardware.gripper.position, config, side)
-
-    async def diagnose(self, config: dict[str, Any], side: str) -> GripperResult:
-        return await asyncio.to_thread(self._hardware.gripper.diagnose, config, side)
-
-    async def command(
-        self,
-        config: dict[str, Any],
-        side: str,
-        command: str,
-        target_mm: float | None,
-    ) -> GripperResult:
-        return await asyncio.to_thread(self._hardware.gripper.command, config, side, command, target_mm)
 
     async def stop(self) -> None:
         return None

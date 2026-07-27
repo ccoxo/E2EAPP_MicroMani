@@ -395,13 +395,11 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     logs = svc.logs
     settings = svc.settings
     hardware = svc.hardware
-    gripper_workers = svc.gripper_workers
     telemetry = svc.telemetry
     hal = svc.hal
     teleop_mapper = svc.teleop_mapper
     gripper_router = svc.gripper_router
     commands = svc.commands
-    gripper_tele = svc.gripper_tele
     recorder = svc.recorder
     stability = svc.stability
     policy = svc.policy
@@ -415,10 +413,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     app.state.commands = commands
     app.state.hal = hal
     app.state.hardware = hardware
-    app.state.gripper_workers = gripper_workers
     app.state.gripper_router = gripper_router
     app.state.teleop_mapper = teleop_mapper
-    app.state.gripper_tele = gripper_tele
     app.state.recorder = recorder
     app.state.stability = stability
     app.state.policy = policy
@@ -433,16 +429,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         config["teleop"][f"{side}Connected"] = connected
         return settings.save_config(config, emit_log=False)
 
-    def _gripper_teleop_enabled(config: dict[str, Any]) -> bool:
-        teleop = config.get("teleop", {})
-        gripper_teleop = teleop.get("gripperTeleop", {}) if isinstance(teleop, dict) else {}
-        return isinstance(gripper_teleop, dict) and bool(gripper_teleop.get("enabled", False))
-
     async def get_config_async() -> dict[str, Any]:
         return await asyncio.to_thread(settings.get_config)
-
-    async def gripper_teleop_enabled_async() -> bool:
-        return _gripper_teleop_enabled(await get_config_async())
 
     async def native_teleop_enabled_async() -> bool:
         return native_teleop_enabled(await get_config_async())
@@ -530,10 +518,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             try:
                 await teleop_mapper.start("teleop-connect", pre_home=False, home_side=hardware_side)
                 native_started = True
-                await start_gripper_teleop_source("teleop-connect", config)
             except Exception:
-                with contextlib.suppress(Exception):
-                    gripper_tele.stop("teleop-connect")
                 if native_started:
                     try:
                         await teleop_mapper.stop("teleop-connect")
@@ -553,7 +538,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             logs.error("[HAL]", f"teleop disconnect stop mapped {hardware_side} failed: {exc}")
         if not bool(teleop_config.get("leftConnected", False)) and not bool(teleop_config.get("rightConnected", False)):
             await teleop_mapper.stop("teleop-connect")
-            gripper_tele.stop("teleop-connect")
             logs.info("[HAL]", f"{side} Omega.7 logical disconnect background stop completed")
             return
         if native_teleop_enabled(config):
@@ -650,7 +634,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             failures.append(
                 str(camera_status.get("message") if isinstance(camera_status, dict) else "cameras not ready")
             )
-        if require_gripper and gripper_router.backend_name(config) != "dual_worker":
+        if require_gripper:
             gripper_status = await gripper_router.status(config)
             if not isinstance(gripper_status, dict) or not bool(gripper_status.get("ok", False)):
                 failures.append(
@@ -668,15 +652,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 detail={"code": "HARDWARE_PRECHECK_FAILED", "message": message},
             )
 
-    async def start_gripper_teleop_source(source: str, config: dict[str, Any] | None = None) -> None:
-        enabled = (
-            _gripper_teleop_enabled(config)
-            if config is not None
-            else await gripper_teleop_enabled_async()
-        )
-        if enabled:
-            gripper_tele.start(source)
-
     async def stop_aux_native_teleop_sources(reason: str) -> None:
         if not await native_teleop_enabled_async():
             return
@@ -688,7 +663,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 raise
 
     async def release_runtime_handles(reason: str) -> dict[str, Any]:
-        gripper_tele.stop(force=True)
         released_grippers: list[str] = []
         gripper_errors: dict[str, str] = {}
         teleop_errors: dict[str, str] = {}
@@ -704,7 +678,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         config["gripper"]["leftEnabled"] = False
         config["gripper"]["rightEnabled"] = False
         await asyncio.to_thread(settings.save_config, config, emit_log=False)
-        await asyncio.to_thread(gripper_workers.stop_all)
         for source in ("teleop-connect", "recording"):
             try:
                 await teleop_mapper.stop(source)
@@ -783,7 +756,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             logs.error("[HAL]", f"startup return-to-work-origin failed: {exc}")
 
     @app.on_event("shutdown")
-    async def stop_gripper_workers() -> None:
+    async def shutdown_runtime_services() -> None:
         try:
             record_status = await asyncio.to_thread(recorder.status)
             if record_status.get("active") or record_status.get("recording"):
@@ -798,8 +771,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         app.state.teleop_background_tasks.clear()
-        gripper_tele.stop(force=True)
-        await asyncio.to_thread(gripper_workers.stop_all)
         await asyncio.to_thread(hardware.cameras.close_all)
         await asyncio.to_thread(telemetry.shutdown)
 
@@ -847,7 +818,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.put("/api/settings")
     async def put_settings(config: AppConfig) -> dict[str, Any]:
         saved = await asyncio.to_thread(settings.save_config, config.model_dump(mode="json"))
-        await asyncio.to_thread(gripper_workers.sync_config, saved)
         return saved
 
     # 应用传入配置或重新应用当前配置。
@@ -860,7 +830,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": str(exc)}) from exc
-        await asyncio.to_thread(gripper_workers.sync_config, active)
         return envelope({"config": active})
 
     # 列出配置快照。
@@ -1194,6 +1163,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def policy_observation() -> ApiEnvelope:
         config = await get_config_async()
         joint_positions = list(telemetry.motion_positions)
+        pulses: list[float] | None = None
         if _real_hardware_mode(config):
             try:
                 motion_state = await hal.motion_state()
@@ -1212,7 +1182,20 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     detail={"code": "POLICY_OBSERVATION_UNAVAILABLE", "message": str(exc)},
                 ) from exc
         grippers = _policy_gripper_positions(config)
-        return envelope({"state": lerobot_state_from_ui(joint_positions, grippers)})
+        force_left = list(getattr(telemetry, "force_left", [0.0] * 6))[:6]
+        force_right = list(getattr(telemetry, "force_right", [0.0] * 6))[:6]
+        if len(force_left) < 6:
+            force_left.extend([0.0] * (6 - len(force_left)))
+        if len(force_right) < 6:
+            force_right.extend([0.0] * (6 - len(force_right)))
+        return envelope(
+            {
+                "state": lerobot_state_from_ui(joint_positions, grippers),
+                "pulses": pulses if pulses is not None else [0.0] * 12,
+                "force_left": [float(value) for value in force_left],
+                "force_right": [float(value) for value in force_right],
+            }
+        )
 
     @app.post("/api/policy/action")
     async def policy_action(payload: Annotated[dict[str, Any], Body()]) -> ApiEnvelope:
@@ -1238,9 +1221,20 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail={"code": "POLICY_ACTION_BLOCKED", "message": str(exc)}) from exc
         if dry_run:
             return envelope({"dryRun": True, "sent": False, "plan": plan})
+        raw_controlled_sides = payload.get("controlledSides")
+        controlled_sides = (
+            [side for side in raw_controlled_sides if side in {"left", "right"}]
+            if isinstance(raw_controlled_sides, list)
+            else ["left", "right"]
+        )
+        if not controlled_sides:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "BAD_POLICY_SIDES", "message": "controlledSides must include left or right"},
+            )
         results: dict[str, Any] = {"motion": {}, "grippers": {}}
         try:
-            for side in ("left", "right"):
+            for side in controlled_sides:
                 motion_plan = plan["motion"][side]
                 await commands.enable_motion_side(side)
                 results["motion"][side] = await hal.command(
@@ -1248,6 +1242,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     _policy_motion_payload(side, motion_plan, config),
                 )
             for side, target_key in (("left", "leftMm"), ("right", "rightMm")):
+                if side not in controlled_sides:
+                    continue
+                if not bool(config.get("gripper", {}).get(f"{side}Enabled", False)):
+                    continue
                 gripper_side = cast(SideName, side)
                 request = GripperCommandRequest(
                     side=gripper_side,
@@ -1329,7 +1327,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             )
         try:
             result = envelope(await commands.gripper_command(request))
-            gripper_tele.reset_side(side)
             return result
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail={"code": "GRIPPER_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1356,21 +1353,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         return envelope(gripper_result_payload(result))
 
     # 启动夹爪遥操作。
-    @app.post("/api/teleop/gripper/start")
-    async def gripper_tele_start() -> ApiEnvelope:
-        gripper_tele.start("manual")
-        return envelope(gripper_tele.get_status())
 
     # 停止夹爪遥操作。
-    @app.post("/api/teleop/gripper/stop")
-    async def gripper_tele_stop() -> ApiEnvelope:
-        gripper_tele.stop("manual")
-        return envelope(gripper_tele.get_status())
 
     # 查询夹爪遥操作状态。
-    @app.get("/api/teleop/gripper/status")
-    async def gripper_tele_status() -> ApiEnvelope:
-        return envelope(gripper_tele.get_status())
 
     # 切换遥操作离合状态。
     @app.post("/api/teleop/clutch_toggle")
@@ -1630,16 +1616,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             if await native_teleop_enabled_async():
                 await stop_aux_native_teleop_sources("record session create")
             result = await recorder.start_session(str(dataset_name), str(task))
-            try:
-                await start_gripper_teleop_source("recording")
-            except Exception:
-                with contextlib.suppress(Exception):
-                    gripper_tele.stop("recording")
-                try:
-                    await recorder.finish_session()
-                except Exception as cleanup_exc:  # noqa: BLE001
-                    logs.error("[LEROBOT]", f"record session create rollback failed: {cleanup_exc}")
-                raise
             return envelope(result)
         except RuntimeError as exc:
             if "native LeRobot dataset is required" in str(exc):
@@ -1654,10 +1630,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def save_episode() -> ApiEnvelope:
         try:
             await stop_aux_native_teleop_sources("record episode save")
-            try:
-                result = await recorder.save_episode()
-            finally:
-                gripper_tele.stop("recording")
+            result = await recorder.save_episode()
             return envelope(result)
         except DatasetSaveError as exc:
             raise HTTPException(status_code=500, detail={"code": "RECORDING_SAVE_FAILED", "message": str(exc)}) from exc
@@ -1670,10 +1643,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         try:
             if await native_teleop_enabled_async():
                 await stop_aux_native_teleop_sources("record episode discard")
-            try:
-                result = await recorder.discard_episode()
-            finally:
-                gripper_tele.stop("recording")
+            result = await recorder.discard_episode()
             return envelope(result)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail={"code": "RECORDING_NOT_ACTIVE", "message": str(exc)}) from exc
@@ -1682,10 +1652,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/record/session/finish")
     async def finish_session() -> ApiEnvelope:
         await stop_aux_native_teleop_sources("record session finish")
-        try:
-            result = await recorder.finish_session()
-        finally:
-            gripper_tele.stop("recording")
+        result = await recorder.finish_session()
         return envelope(result)
 
     # 跳过录制重置步骤。
@@ -1704,16 +1671,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     )
                 await stop_aux_native_teleop_sources("record reset skip")
             result = await recorder.skip_reset()
-            try:
-                await start_gripper_teleop_source("recording")
-            except Exception:
-                with contextlib.suppress(Exception):
-                    gripper_tele.stop("recording")
-                try:
-                    await recorder.discard_episode()
-                except Exception as cleanup_exc:  # noqa: BLE001
-                    logs.error("[LEROBOT]", f"record reset skip rollback failed: {cleanup_exc}")
-                raise
             return envelope(result)
         except RuntimeError as exc:
             message = str(exc)

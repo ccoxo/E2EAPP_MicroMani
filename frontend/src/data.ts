@@ -507,7 +507,6 @@ export const defaultConfig: AppConfig = {
     commandTorque: 1,
     icfTargetProtectionEnabled: true,
     icfTargetMinGapMm: 1.02,
-    sampleMode: 'dual_worker',
     sampleHz: 30,
     sampleStaleMs: 500,
     sampleEnableOnNegative: true,
@@ -553,7 +552,6 @@ export const defaultConfig: AppConfig = {
     cameraSource: 'global',
   },
   teleop: {
-    engine: 'hal_native',
     controlMode: 'incremental_position',
     nativeLoopHz: 100,
     nativeTranslationDeadzoneM: 0.002,

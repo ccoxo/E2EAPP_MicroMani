@@ -426,9 +426,9 @@ struct HalDdsControlServer::Impl {
       const bool handledCommand = pollCommands();
       const auto now = std::chrono::steady_clock::now();
       if (now >= nextTelemetryAt) {
-        // 遥测以 20 Hz 发布，控制命令有数据时优先被处理。
+        // 遥测以 100 Hz 发布，控制命令有数据时优先被处理。
         publishTelemetry();
-        nextTelemetryAt = now + std::chrono::milliseconds(50);
+        nextTelemetryAt = now + std::chrono::milliseconds(10);
       }
       if (!handledCommand) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));

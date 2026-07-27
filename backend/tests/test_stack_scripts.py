@@ -264,3 +264,49 @@ def test_diagnose_teleop_latency_script_no_longer_uses_direct_hal_http_diagnosti
     assert "Invoke-RestMethod" not in script
     assert "/motion/axis_diagnostics" not in script
     assert "/teleop/native/status" not in script
+
+
+def test_run_act_jepa_deploy_defaults_to_f_drive_checkpoint() -> None:
+    script = (REPO_ROOT / "scripts" / "run-act-jepa-deploy.ps1").read_text(encoding="utf-8")
+
+    assert r'F:\model\grab_screw\act_jepa_tarimg_same_v2\050000' in script
+    assert '[string]$Checkpoint = "pretrained_model"' in script
+    assert 'act_deploy.py not found in checkpoint directory' in script
+
+
+def test_run_act_jepa_deploy_stops_backend_by_port_without_wmi_scan() -> None:
+    script = (REPO_ROOT / "scripts" / "run-act-jepa-deploy.ps1").read_text(encoding="utf-8")
+
+    assert "Get-NetTCPConnection -LocalPort $BackendPort" in script
+    assert "Get-CimInstance Win32_Process | Where-Object" not in script
+
+
+def test_run_act_jepa_deploy_invokes_start_hal_directly() -> None:
+    script = (REPO_ROOT / "scripts" / "run-act-jepa-deploy.ps1").read_text(encoding="utf-8")
+
+    assert '& (Join-Path $repo "scripts\\start-hal.ps1") -Restart' in script
+    assert 'powershell -ExecutionPolicy Bypass -File (Join-Path $repo "scripts\\start-hal.ps1")' not in script
+
+
+def test_run_act_jepa_deploy_logs_inference_output_to_desktop_by_default() -> None:
+    script = (REPO_ROOT / "scripts" / "run-act-jepa-deploy.ps1").read_text(encoding="utf-8")
+
+    assert 'ACT-JEPA推理日志.txt' in script
+    assert "[switch]$NoInferenceLog" in script
+    assert "Tee-Object -FilePath $InferenceLogPath -Append" in script
+
+
+def test_run_act_jepa_deploy_freezes_uncontrolled_state_by_default() -> None:
+    script = (REPO_ROOT / "scripts" / "run-act-jepa-deploy.ps1").read_text(encoding="utf-8")
+
+    assert "[bool]$FreezeUncontrolledState = $true" in script
+    assert '$actArgs += "--freeze_uncontrolled_state"' in script
+    assert "FreezeUncontrolledState: $FreezeUncontrolledState" in script
+    assert "[bool]$ClipModelState = $true" in script
+    assert '$actArgs += "--clip_model_state"' in script
+    assert "[bool]$ClipActionToStats = $true" in script
+    assert '$actArgs += "--clip_action_to_stats"' in script
+    assert '[string]$TranslationAxes = "x,y,z"' in script
+    assert '"--translation_axes", "$TranslationAxes"' in script
+    assert "[double]$TranslationDeadbandUm = 0.0" in script
+    assert '"--translation_deadband_um", "$TranslationDeadbandUm"' in script

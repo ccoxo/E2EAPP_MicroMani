@@ -426,6 +426,17 @@ def test_hal_direct_dds_control_server_replaces_backend_http_control_plane() -> 
     assert "HalFastDdsBridge" not in source
 
 
+def test_hal_dds_motion_state_telemetry_publishes_at_100hz() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "HalDdsControlServer.cpp").read_text(encoding="utf-8")
+    loop_body = source.split("void loop()", 1)[1].split("void emergencyLoop()", 1)[0]
+    telemetry_body = source.split("void publishTelemetry()", 1)[1].split("void publishJson", 1)[0]
+
+    assert "publishJson(motionWriter_, jsonMotionState(motion_.readState()))" in telemetry_body
+    assert "100 Hz" in loop_body
+    assert "std::chrono::milliseconds(10)" in loop_body
+    assert "std::chrono::milliseconds(50)" not in loop_body
+
+
 def test_hal_build_links_fastdds_for_direct_hal_dds() -> None:
     build_cmd = (REPO_ROOT / "hal" / "build_hal.cmd").read_text(encoding="utf-8")
     cmake = (REPO_ROOT / "hal" / "CMakeLists.txt").read_text(encoding="utf-8")
@@ -1228,8 +1239,9 @@ def test_frontend_hal_native_gripper_commands_are_not_blocked_by_cached_enabled_
     store = (REPO_ROOT / "frontend" / "src" / "stores" / "telemetry.ts").read_text(encoding="utf-8")
     settings = (REPO_ROOT / "frontend" / "src" / "views" / "SettingsView.tsx").read_text(encoding="utf-8")
 
-    assert "config.teleop.engine !== 'hal_native'" in store
-    assert "const canCommandGripper = gripperEnabled || config.teleop.engine === 'hal_native'" in settings
+    assert "config.teleop.engine" not in store
+    assert "config.teleop.engine" not in settings
+    assert "const canCommandGripper = true" in settings
     assert "disabled={!canCommandGripper}" in settings
 
 
@@ -1408,6 +1420,33 @@ def test_hal_native_gripper_follow_uses_physical_hands_without_arm_logical_gate(
     assert "if (!logicalConnected_[sourceIndex])" not in body
 
 
+def test_hal_native_gripper_defaults_follow_operator_to_hardware_mapping() -> None:
+    header = (REPO_ROOT / "hal" / "include" / "NativeTeleopController.h").read_text(encoding="utf-8")
+
+    assert 'std::array<std::string, 2> gripperSourceHand{{"PhysicalRight", "PhysicalLeft"}};' in header
+
+
+def test_hal_native_status_reports_gripper_source_diagnostics() -> None:
+    header = (REPO_ROOT / "hal" / "include" / "NativeTeleopController.h").read_text(encoding="utf-8")
+    source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
+    tick_body = source.split("void NativeTeleopController::tickGrippers(", 1)[1].split(
+        "void NativeTeleopController::enqueueGripperCommand",
+        1,
+    )[0]
+    status_body = source.split("std::string NativeTeleopController::statusJson() const", 1)[1].split(
+        "void NativeTeleopController::loop()",
+        1,
+    )[0]
+
+    assert "std::array<double, 2> gripperSourceGapMm_" in header
+    assert "std::array<bool, 2> gripperSourceGapAvailable_" in header
+    assert "gripperSourceGapAvailable_[targetIndex] = hand.gripperGapAvailable;" in tick_body
+    assert "gripperSourceGapMm_[targetIndex] = hand.gripperGapAvailable ? hand.gripperGap * 1000.0 : -1.0;" in tick_body
+    assert 'sourceHand\\":\\"' in status_body
+    assert 'sourceGapAvailable\\":' in status_body
+    assert 'sourceGapMm\\":' in status_body
+
+
 def test_hal_native_incremental_below_threshold_input_stops_active_target_like_icf() -> None:
     source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
     body = source.split("void NativeTeleopController::tickSide(", 1)[1].split(
@@ -1551,6 +1590,38 @@ def test_hal_native_action_history_exposes_pulse_and_limit_diagnostics() -> None
     assert '\\"movingBefore\\":' in append_body
     assert '\\"moveStarted\\":' in append_body
     assert '\\"clipped\\":' in append_body
+
+
+def test_hal_native_dds_target_publish_records_action_history() -> None:
+    header = (REPO_ROOT / "hal" / "include" / "NativeTeleopController.h").read_text(encoding="utf-8")
+    source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
+    tick_body = source.split("if (hardwareTargetPublisher_) {", 1)[1].split(
+        "const auto result = motion_.updateTeleopTargetUi(",
+        1,
+    )[0]
+    record_marker = "void NativeTeleopController::recordPublishedTargetActionUnlocked("
+
+    assert "void recordPublishedTargetActionUnlocked(" in header
+    assert record_marker in source
+
+    record_body = source.split(record_marker, 1)[1].split(
+        "void NativeTeleopController::recordActionUnlocked",
+        1,
+    )[0]
+
+    assert "recordPublishedTargetActionUnlocked(sourceSide, target, sourceIndex);" in tick_body
+    assert tick_body.index("hardwareTargetPublisher_(target);") < tick_body.index(
+        "recordPublishedTargetActionUnlocked(sourceSide, target, sourceIndex);"
+    )
+    assert tick_body.index("recordPublishedTargetActionUnlocked(sourceSide, target, sourceIndex);") < tick_body.index(
+        "return;"
+    )
+    assert "action.ts = static_cast<std::int64_t>(target.stampUnixMs);" in record_body
+    assert "action.monotonicS = static_cast<double>(target.stampMonotonicMs) / 1000.0;" in record_body
+    assert "action.deltas = target.deltas;" in record_body
+    assert "action.deltaVector[offset + i] = target.deltas[i];" in record_body
+    assert "lastAction_ = action;" in record_body
+    assert "actionHistory_.push_back(action);" in record_body
 
 
 def test_ltdmc_teleop_reports_axis_launch_and_tracking_state() -> None:
@@ -1791,19 +1862,14 @@ def test_omega7_gripper_gap_uses_direct_encoder_and_angle_fallbacks() -> None:
     assert "item.gripperGapAvailable = haveGap;" in read_body
 
 
-def test_settings_gripper_teleop_toggle_logs_start_stop_and_errors() -> None:
+def test_settings_gripper_teleop_uses_hal_native_status_only() -> None:
     source = (REPO_ROOT / "frontend" / "src" / "views" / "SettingsView.tsx").read_text(encoding="utf-8")
-    body = source.split("const handleTeleopToggle = async () => {", 1)[1].split(
-        "const requestGripperTarget =",
-        1,
-    )[0]
 
-    assert "commandLog(injectLog, '[GRIPPER]'" in body
-    assert "startGripperTeleop()" in body
-    assert "stopGripperTeleop()" in body
-    assert "commandErrorMessage(error)" in body
-    assert "catch (error)" in body
-    assert "/* ignore */" not in body
+    assert "const handleTeleopToggle" not in source
+    assert "startGripperTeleop" not in source
+    assert "stopGripperTeleop" not in source
+    assert "fetchGripperTeleopStatus" not in source
+    assert "主手连接后 HAL-native 会自动接管夹爪" in source
 
 
 def test_hal_native_incremental_honors_continuous_increment_settings() -> None:

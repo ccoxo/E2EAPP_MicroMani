@@ -110,7 +110,6 @@ ICF_RIGHT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -95.0, -30.0, -
 ICF_RIGHT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 5.0, 30.0, 7.0]
 
 ICF_TELEOP_DEFAULTS: dict[str, Any] = {
-    "engine": "hal_native",
     "controlMode": "incremental_position",
     "nativeLoopHz": 100,
     "nativeTranslationDeadzoneM": 0.002,
@@ -384,7 +383,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "commandTorque": 1,
         "icfTargetProtectionEnabled": True,
         "icfTargetMinGapMm": 1.02,
-        "sampleMode": "dual_worker",
         "sampleHz": 30,
         "sampleStaleMs": 500,
         "sampleEnableOnNegative": True,

@@ -15,3 +15,8 @@ def operator_side_for_hardware_side(side: SideName) -> SideName:
 
 def operator_gripper_source_for_side(side: SideName) -> str:
     return "PhysicalLeft" if side == "left" else "PhysicalRight"
+
+
+def gripper_source_for_hardware_side(side: SideName) -> str:
+    operator_side = operator_side_for_hardware_side(side)
+    return operator_gripper_source_for_side(operator_side)

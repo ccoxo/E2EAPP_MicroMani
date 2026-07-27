@@ -771,14 +771,14 @@ class SettingsService:
                 gripper_teleop["leftSourceHand"] = "PhysicalLeft"
                 gripper_teleop["rightSourceHand"] = "PhysicalRight"
         if isinstance(teleop, dict):
-            teleop.setdefault("engine", "hal_native")
+            teleop.pop("engine", None)
             teleop.setdefault("controlMode", "incremental_position")
             teleop.setdefault("mappingMode", ICF_TELEOP_DEFAULTS["mappingMode"])
             if teleop.get("mappingMode") not in {"direct", "legacy"}:
                 teleop["mappingMode"] = ICF_TELEOP_DEFAULTS["mappingMode"]
-            if teleop.get("engine") == "hal_native" and teleop.get("controlMode") == "incremental":
+            if teleop.get("controlMode") == "incremental":
                 teleop["controlMode"] = "incremental_position"
-            if teleop.get("engine") == "hal_native" and teleop.get("controlMode") == "velocity_admittance":
+            if teleop.get("controlMode") == "velocity_admittance":
                 teleop["controlMode"] = "incremental_position"
             teleop.setdefault("nativeLoopHz", 100)
             teleop.setdefault("nativeTranslationDeadzoneM", 0.002)
@@ -992,9 +992,12 @@ class SettingsService:
             gripper_teleop.setdefault("leftSourceHand", "PhysicalLeft")
             gripper_teleop.setdefault("rightSourceHand", "PhysicalRight")
             gripper_teleop.setdefault("leftGapInvert", False)
-            if teleop.get("engine") == "hal_native" and gripper_teleop.get("rightGapInvert") is True:
+            if gripper_teleop.get("rightGapInvert") is True:
                 gripper_teleop["rightGapInvert"] = False
             gripper_teleop.setdefault("rightGapInvert", False)
+        gripper = config.get("gripper", {})
+        if isinstance(gripper, dict):
+            gripper.pop("sampleMode", None)
         return config
 
     def _uses_legacy_motion_profile(self, profile: object) -> bool:

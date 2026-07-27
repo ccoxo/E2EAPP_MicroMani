@@ -435,11 +435,8 @@ export async function gripperCommand(side: ManualControlSide, command: ManualGri
 }
 
 /** 启动对应流程。 */
-export const startGripperTeleop = () => postCommand('/teleop/gripper/start')
 /** 停止对应流程。 */
-export const stopGripperTeleop = () => postCommand('/teleop/gripper/stop')
 /** 从后端读取对应数据。 */
-export const fetchGripperTeleopStatus = () => fetch(`${apiBase}/api/teleop/gripper/status`).then((r) => r.json())
 
 // 说明当前代码块的功能用途。
 /** 描述当前方法的功能边界。 */

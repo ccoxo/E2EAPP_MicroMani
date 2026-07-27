@@ -105,6 +105,35 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getByText('Backend 30Hz')).toBeInTheDocument()
   })
 
+  it('labels dashboard arm panels by their wrist camera side', () => {
+    const frame = structuredClone(useTelemetryStore.getState().frame)
+    useTelemetryStore.setState({
+      frame: {
+        ...frame,
+        cameras: frame.cameras.map((camera) => {
+          if (camera.key === 'wrist_left') return { ...camera, label: 'Left Wrist Camera', health: 'ok' as const }
+          if (camera.key === 'wrist_right') return { ...camera, label: 'Right Wrist Camera', health: 'ok' as const }
+          return camera
+        }),
+      },
+    })
+
+    render(<App />)
+
+    const armPanels = [...document.querySelectorAll<HTMLElement>('.arm-hardware-panel')]
+    expect(armPanels).toHaveLength(2)
+    expect(armPanels[0]).toHaveTextContent('Left Wrist Camera')
+    expect(armPanels[1]).toHaveTextContent('Right Wrist Camera')
+    const leftWristPanel = armPanels.find((panel) => panel.textContent?.includes('Left Wrist Camera'))
+    const rightWristPanel = armPanels.find((panel) => panel.textContent?.includes('Right Wrist Camera'))
+    expect(leftWristPanel).toBeTruthy()
+    expect(rightWristPanel).toBeTruthy()
+    expect(leftWristPanel!).toHaveTextContent('\u5de6\u673a\u68b0\u81c2')
+    expect(leftWristPanel!).not.toHaveTextContent('\u53f3\u673a\u68b0\u81c2')
+    expect(rightWristPanel!).toHaveTextContent('\u53f3\u673a\u68b0\u81c2')
+    expect(rightWristPanel!).not.toHaveTextContent('\u5de6\u673a\u68b0\u81c2')
+  })
+
   it('coalesces backend telemetry before committing UI frame and chart history updates', async () => {
     vi.useFakeTimers()
 
@@ -705,7 +734,7 @@ describe('AppStation M0 frontend', () => {
       frame: {
         ...state.frame,
         teleopHands: state.frame.teleopHands.map((hand) =>
-          hand.side === 'left'
+          hand.side === 'right'
             ? { ...hand, connected: true, lastReadOk: false, message: 'SDK read timeout' }
             : { ...hand, connected: true, lastReadOk: true },
         ),
@@ -720,71 +749,17 @@ describe('AppStation M0 frontend', () => {
     expect(teleopChip).toHaveTextContent('读数待恢复')
   })
 
-  it('marks a failed gripper teleop port as an error state', async () => {
-    vi.spyOn(api, 'fetchGripperTeleopStatus').mockResolvedValue({
-      data: {
-        running: false,
-        requestedRunning: false,
-        message: 'right gripper serial open failed',
-        ports: [
-          { side: 'right', port: 'COM9', slaveId: 9, baudrate: 115200, ok: false, message: 'serial open failed' },
-        ],
-      },
-    })
-
-    window.history.pushState({}, '', '/settings#gripper-left')
-    render(<App />)
-
-    await waitFor(() => expect(api.fetchGripperTeleopStatus).toHaveBeenCalled())
-    const gripperAlert = document.querySelector<HTMLElement>('#gripper-left .gripper-error-callout')
-    const gripperPort = document.querySelector<HTMLElement>('#gripper-left .gripper-teleop-strip > div:first-child')
-    expect(gripperAlert).toHaveClass('hardware-error-callout')
-    expect(gripperAlert).toHaveTextContent('serial open failed')
-    expect(gripperPort).toHaveClass('gripper-status-error')
-    expect(gripperPort).toHaveTextContent('serial open failed')
-  })
-
-  it('uses a danger style for the running gripper teleop stop button', async () => {
-    vi.spyOn(api, 'fetchGripperTeleopStatus').mockResolvedValue({
-      data: {
-        running: true,
-        requestedRunning: true,
-        ports: [
-          { side: 'left', port: 'COM8', slaveId: 10, baudrate: 115200, ok: true },
-        ],
-      },
-    })
-
-    window.history.pushState({}, '', '/settings#gripper-left')
-    render(<App />)
-
-    await waitFor(() => expect(screen.getAllByText('停止遥操').length).toBeGreaterThan(0))
-    const stopButton = screen.getAllByText('停止遥操')[0].closest('button')
-    expect(stopButton).toHaveClass('ant-btn-dangerous')
-  })
-
-  it('demotes gripper enable controls when HAL-native teleop owns the gripper', async () => {
-    vi.spyOn(api, 'fetchGripperTeleopStatus').mockResolvedValue({
-      data: {
-        running: true,
-        requestedRunning: true,
-        ports: [
-          { side: 'left', port: 'COM8', slaveId: 10, baudrate: 115200, ok: true },
-        ],
-      },
-    })
-
+  it('demotes gripper enable controls when HAL-native teleop owns the gripper', () => {
     window.history.pushState({}, '', '/settings#gripper-left')
     useTelemetryStore.setState((state) => ({
       config: {
         ...state.config,
-        teleop: { ...state.config.teleop, engine: 'hal_native' },
         gripper: { ...state.config.gripper, leftEnabled: false },
+        teleop: { ...state.config.teleop, leftConnected: true },
       },
     }))
     render(<App />)
 
-    await waitFor(() => expect(api.fetchGripperTeleopStatus).toHaveBeenCalled())
     const leftGripperCard = document.querySelector<HTMLElement>('#gripper-left')
     expect(leftGripperCard).toBeTruthy()
     expect(within(leftGripperCard!).getAllByText('随 Omega.7 自动遥操作').length).toBeGreaterThan(0)
@@ -1401,9 +1376,9 @@ describe('AppStation M0 frontend', () => {
     expect(motionButton).toBeTruthy()
     fireEvent.click(motionButton!)
     expect(window.location.pathname).toBe('/settings')
-    expect(window.location.hash).toBe('#motion-left')
-    expect(screen.getByText('左臂运动控制卡 · Card 0')).toBeInTheDocument()
-    expect(screen.getByText('硬件右侧通道')).toBeInTheDocument()
+    expect(window.location.hash).toBe('#motion-right')
+    expect(screen.getByText('\u53f3\u81c2\u8fd0\u52a8\u63a7\u5236\u5361 \u00b7 Card 1')).toBeInTheDocument()
+    expect(screen.getByText('\u786c\u4ef6\u5de6\u4fa7\u901a\u9053')).toBeInTheDocument()
   })
 
   it('maps manual motion stop to the backend command route', async () => {
@@ -1539,7 +1514,7 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getAllByText('命令更新周期 ms').length).toBeGreaterThan(0)
     expect(screen.getAllByText('Off / Free').length).toBeGreaterThan(0)
     expect(defaultConfig.teleop.stabilityMode).toBe('off')
-    expect(defaultConfig.teleop.engine).toBe('hal_native')
+    expect(defaultConfig.teleop).not.toHaveProperty('engine')
     expect(defaultConfig.teleop.controlMode).toBe('incremental_position')
     expect(defaultConfig.teleop.mappingMode).toBe('direct')
     expect(defaultConfig.teleop.nativeLoopHz).toBe(100)
@@ -1963,6 +1938,30 @@ describe('AppStation M0 frontend', () => {
     await waitFor(() => expect(disconnectButton!).not.toBeDisabled())
     fireEvent.click(disconnectButton!)
     await waitFor(() => expect(useTelemetryStore.getState().config.teleop.leftConnected).toBe(false))
+  })
+
+  it('keeps teleop connect pending while background sync waits for telemetry', async () => {
+    vi.spyOn(api, 'connectTeleopHand').mockResolvedValue({
+      ok: true,
+      data: { connected: true, backgroundSync: true },
+      ts: Date.now(),
+    })
+    const disconnectSpy = vi.spyOn(api, 'disconnectTeleopHand')
+    window.history.pushState({}, '', '/settings#teleop-left')
+    render(<App />)
+    const teleopCard = document.querySelector<HTMLElement>('#teleop-left')
+    expect(teleopCard).toBeTruthy()
+    const connectButton = teleopCard!.querySelectorAll<HTMLButtonElement>('.hardware-config-actions button')[1]
+    expect(connectButton).toBeTruthy()
+
+    fireEvent.click(connectButton!)
+    await waitFor(() => expect(useTelemetryStore.getState().config.teleop.leftConnected).toBe(true))
+
+    const pendingButton = teleopCard!.querySelectorAll<HTMLButtonElement>('.hardware-config-actions button')[1]
+    expect(pendingButton).toBeTruthy()
+    await waitFor(() => expect(pendingButton!).toBeDisabled())
+    fireEvent.click(pendingButton!)
+    expect(disconnectSpy).not.toHaveBeenCalled()
   })
 
   it('renders work origin controls and the startup return switch', () => {

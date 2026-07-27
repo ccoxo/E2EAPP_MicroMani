@@ -257,6 +257,7 @@ class NativeTeleopController {
   void tickGrippers(const std::array<Omega7State, 2>& hands);
   void enqueueGripperCommand(int targetIndex, Side side, double targetMm, int speed, int torque);
   void setBlockerUnlocked(int sourceIndex, const std::string& state, const std::string& message);
+  void recordPublishedTargetActionUnlocked(Side sourceSide, const TeleopHardwareTarget& target, int sourceIndex);
   void recordActionUnlocked(Side sourceSide, Side targetSide, const TeleopTargetUpdateResult& result);
   void recordZeroStopActionUnlocked(Side sourceSide, Side targetSide);
   void syncIncrementalZeroDeltaUnlocked(
@@ -338,6 +339,8 @@ class NativeTeleopController {
   std::array<int, 2> gripperLastRaw_{{-1, -1}};
   std::array<std::chrono::steady_clock::time_point, 2> gripperLastCommandAt_{};
   std::array<double, 2> gripperTargetsMm_{{0.0, 0.0}};
+  std::array<double, 2> gripperSourceGapMm_{{-1.0, -1.0}};
+  std::array<bool, 2> gripperSourceGapAvailable_{{false, false}};
   std::array<double, 2> gripperPositionsMm_{{-1.0, -1.0}};
   std::array<bool, 2> gripperLastCommandOk_{{false, false}};
   std::array<std::string, 2> gripperLastMessage_{};

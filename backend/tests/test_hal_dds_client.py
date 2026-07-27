@@ -11,6 +11,7 @@ from backend.hal_client.dds_client import DdsHalClient
 from backend.hal_client.dds_types import (
     TOPIC_HAL_HEALTH,
     TOPIC_HAL_MOTION_STATE,
+    TOPIC_HAL_NATIVE_TELEOP_STATUS,
     HalCommandReply,
     JsonEnvelope,
 )
@@ -87,9 +88,38 @@ def test_dds_hal_client_reads_motion_state_from_topic_cache() -> None:
     state = asyncio.run(client.motion_state())
 
     assert state["positions"] == [1, 2, 3]
-    assert isinstance(state["timestamp_ms"], int)
-    assert isinstance(state["received_timestamp_ms"], int)
-    assert isinstance(state["received_monotonic_ms"], int)
+    assert state["timestamp_ms"] == 123
+    assert state["monotonicMs"] == 456
+    assert state["monotonic_s"] == pytest.approx(0.456)
+    assert state["dds_stamp_unix_ms"] == 123
+    assert state["dds_stamp_monotonic_ms"] == 456
+    assert "received_monotonic_ms" not in state
+
+
+def test_dds_hal_client_reads_native_teleop_status_from_topic_cache() -> None:
+    transport = FakeDdsTransport()
+    transport.latest[TOPIC_HAL_NATIVE_TELEOP_STATUS] = JsonEnvelope(
+        stamp_unix_ms=1111,
+        stamp_monotonic_ms=456000,
+        source="hal-cpp",
+        payload_json=json.dumps({"running": True, "lastAction": {"monotonicMs": 455900}}),
+    )
+
+    client = DdsHalClient(LogService(emit_startup=False), transport=transport)
+    result = asyncio.run(client.command("teleop.native.status", {}))
+
+    assert transport.requests == []
+    assert transport.waits == []
+    assert result["command"] == "teleop.native.status"
+    response = result["response"]
+    assert response["running"] is True
+    assert response["timestamp_ms"] == 1111
+    assert response["monotonicMs"] == 456000
+    assert response["monotonic_s"] == pytest.approx(456.0)
+    assert response["dds_source"] == "hal-cpp"
+    assert response["dds_stamp_unix_ms"] == 1111
+    assert response["dds_stamp_monotonic_ms"] == 456000
+    assert "received_monotonic_ms" not in response
 
 
 def test_dds_hal_client_emergency_stop_uses_dedicated_topic_and_matches_reply() -> None:

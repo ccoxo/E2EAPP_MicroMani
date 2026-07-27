@@ -2363,17 +2363,6 @@ issueManualGripperMove: (side, command, targetMm) => {
     const operatorGripperLabel = operatorSide === 'left' ? '左夹爪' : '右夹爪'
     if (!mockMode) {
       const enabledKey = side === 'left' ? 'leftEnabled' : 'rightEnabled'
-      const config = get().config
-      if (
-        config.teleop.engine !== 'hal_native'
-        && !['enable', 'disable', 'stop'].includes(command)
-        && !config.gripper[enabledKey]
-      ) {
-        set((current) => ({
-          logs: appendLog(current.logs, makeLog('WARNING', `${operatorLabel} gripper ${command} skipped: gripper is disabled`, '[GRIPPER]')),
-        }))
-        return
-      }
       const previousEnabled = Boolean(get().config.gripper[enabledKey])
       // 夹爪启停先乐观更新界面，再由后端持久化和回读校准最终状态。
       // 说明当前代码块的功能用途。

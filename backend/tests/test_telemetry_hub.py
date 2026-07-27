@@ -81,17 +81,9 @@ def test_hal_native_gripper_positions_use_native_status_feedback() -> None:
         telemetry.shutdown()
 
 
-def test_worker_gripper_mode_clears_previous_native_cache_when_samples_are_missing() -> None:
-    class FakeWorkerSamples:
-        def is_enabled(self, _config: dict[str, Any]) -> bool:
-            return True
-
-        def samples(self, _config: dict[str, Any]) -> dict[str, dict[str, Any]]:
-            return {}
-
+def test_refresh_gripper_positions_does_not_replace_hal_native_cache() -> None:
     telemetry = object.__new__(TelemetryHub)
     telemetry.hardware = object()
-    telemetry.gripper_workers = FakeWorkerSamples()
     telemetry.gripper_positions = [2.25, 9.5]
     telemetry.gripper_samples = {
         "left": {"positionMm": 2.25, "message": "native"},
@@ -100,8 +92,8 @@ def test_worker_gripper_mode_clears_previous_native_cache_when_samples_are_missi
     telemetry._last_gripper_sample_at = 123.0
     telemetry._shutdown = False
 
-    telemetry.refresh_gripper_positions({"gripper": {"sampleMode": "dual_worker"}}, now=999.0)
+    telemetry.refresh_gripper_positions({"gripper": {}}, now=999.0)
 
-    assert telemetry.gripper_positions == [-1.0, -1.0]
-    assert telemetry.gripper_samples == {}
-    assert telemetry._last_gripper_sample_at == 0.0
+    assert telemetry.gripper_positions == [2.25, 9.5]
+    assert telemetry.gripper_samples["left"]["message"] == "native"
+    assert telemetry._last_gripper_sample_at == 123.0
