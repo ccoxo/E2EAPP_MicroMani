@@ -92,10 +92,12 @@ HAL：
 - commandTorque：1
 
 安全阈值：
-- Fxy warn/stop：2 N / 4 N
-- Fz warn/stop：3 N / 5 N
-- Moment warn/stop：0.02 Nm / 0.04 Nm
+- Fxy warn/stop：2 N / 30 N
+- Fz warn/stop：3 N / 30 N
+- Moment warn/stop：0.02 Nm / 1 Nm
 - watchdog：50 ms
+
+其中 stop 暂按 HKVL-36A 官方额定量程（力通道 30 N、力矩通道 1 Nm）填写，并非厂家给出的应用安全阈值；warn 与 watchdog 仍为待实机测试收敛的工程暂定值。
 
 自动控制默认：
 - translationStepUm：100

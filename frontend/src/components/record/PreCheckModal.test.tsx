@@ -18,6 +18,10 @@ function makeReadyForRecordPrecheck() {
     diagnostics: structuredClone(defaultDiagnostics).map((item) =>
       item.key === 'omega7' || item.key === 'gripper' ? { ...item, status: 'ok' } : item,
     ),
+    telemetryLink: {
+      state: 'live',
+      lastFrameReceivedAt: Date.now(),
+    },
     frame: {
       ...state.frame,
       motionEnabled: { left: true, right: true },

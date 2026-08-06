@@ -35,6 +35,66 @@ def test_start_hal_passes_configured_port_to_hal_process_and_health_check() -> N
     assert 'url = "http://127.0.0.1:$Port"' in script
 
 
+def test_start_hal_injects_force_runtime_config_from_backend_config() -> None:
+    script = (REPO_ROOT / "scripts" / "start-hal.ps1").read_text(encoding="utf-8")
+
+    assert "$forceRuntimeConfig" in script
+    assert "APPSTATION_FORCE_CONFIG_JSON" in script
+    assert 'leftPort = "COM15"' in script
+    assert 'rightPort = "COM14"' in script
+    assert "leftAxisSign" in script
+    assert "rightAxisSign" in script
+    assert "leftSignedPulsePerUnit" in script
+    assert "rightSignedPulsePerUnit" in script
+    assert "fxyStopN = 30.0" in script
+    assert "fzStopN = 30.0" in script
+    assert "momentStopNm = 1.0" in script
+    for key in (
+        "source",
+        "protocol",
+        "leftPort",
+        "rightPort",
+        "leftAxisSign",
+        "rightAxisSign",
+        "baudrate",
+        "expectedSampleHz",
+        "fxyWarnN",
+        "fzStopN",
+        "momentStopNm",
+        "watchdogMs",
+        "complianceEnabled",
+        "leftComplianceMatrix",
+        "rightComplianceMatrix",
+    ):
+        assert key in script
+
+
+def test_start_hal_binds_hkvl_sides_to_pnp_instance_ids() -> None:
+    script = (REPO_ROOT / "scripts" / "start-hal.ps1").read_text(encoding="utf-8")
+
+    assert r'USB\VID_1A86&PID_55D3\5C7B023865' in script
+    assert r'USB\VID_1A86&PID_55D3\5C7B030018' in script
+    assert "Get-PnpDevice -PresentOnly -Class Ports" in script
+    assert "HKVL serial binding not found" in script
+    assert 'APPSTATION_HKVL_LEFT_PORT' in script
+    assert 'APPSTATION_HKVL_RIGHT_PORT' in script
+
+
+def test_hkvl_capture_script_is_read_only_and_validates_candidate_protocol() -> None:
+    script = (REPO_ROOT / "scripts" / "capture-hkvl-force.ps1").read_text(encoding="utf-8")
+
+    assert '[string]$LeftPort = "COM15"' in script
+    assert '[string]$RightPort = "COM14"' in script
+    assert "[int]$Baudrate = 1000000" in script
+    assert "[double]$DurationSec = 10.0" in script
+    assert "DtrEnable = $false" in script
+    assert "RtsEnable = $false" in script
+    assert ".Write(" not in script
+    assert "CRC-16/Modbus" in script
+    assert "53 54" in script
+    assert "validFrames" in script
+
+
 def test_start_hal_redirects_hal_stdout_to_runtime_logs() -> None:
     script = (REPO_ROOT / "scripts" / "start-hal.ps1").read_text(encoding="utf-8")
 
@@ -299,12 +359,12 @@ def test_run_act_jepa_deploy_logs_inference_output_to_desktop_by_default() -> No
 def test_run_act_jepa_deploy_freezes_uncontrolled_state_by_default() -> None:
     script = (REPO_ROOT / "scripts" / "run-act-jepa-deploy.ps1").read_text(encoding="utf-8")
 
-    assert "[bool]$FreezeUncontrolledState = $true" in script
+    assert "[object]$FreezeUncontrolledState = $true" in script
     assert '$actArgs += "--freeze_uncontrolled_state"' in script
     assert "FreezeUncontrolledState: $FreezeUncontrolledState" in script
-    assert "[bool]$ClipModelState = $true" in script
+    assert "[object]$ClipModelState = $true" in script
     assert '$actArgs += "--clip_model_state"' in script
-    assert "[bool]$ClipActionToStats = $true" in script
+    assert "[object]$ClipActionToStats = $true" in script
     assert '$actArgs += "--clip_action_to_stats"' in script
     assert '[string]$TranslationAxes = "x,y,z"' in script
     assert '"--translation_axes", "$TranslationAxes"' in script

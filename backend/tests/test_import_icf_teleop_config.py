@@ -70,13 +70,13 @@ def test_import_icf_gripper_sources_are_normalized_to_operator_view() -> None:
     assert config["teleop"]["gripperTeleop"]["rightSourceHand"] == "PhysicalRight"
 
 
-def test_import_icf_config_preserves_card0_yaw_safety_policy() -> None:
+def test_import_icf_config_restores_card0_yaw_permission() -> None:
     config = default_config()
 
     apply_icf_config(config, _minimal_icf_ini(), source_path=__file__)
 
     assert config["teleop"]["leftEnabledAxes"] == [True, True, True, True, True, True]
-    assert config["teleop"]["rightEnabledAxes"] == [True, True, True, True, True, False]
+    assert config["teleop"]["rightEnabledAxes"] == [True] * 6
 
 
 def test_import_icf_config_decouples_legacy_rotation_window_from_mechanical_limits() -> None:

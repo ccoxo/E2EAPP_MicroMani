@@ -166,7 +166,7 @@ def test_work_origin_home_all_logs_operation_and_moves(monkeypatch: pytest.Monke
     messages = [entry.msg for entry in logs.list_entries()]
     assert any("event=work_origin_op" in message and "phase=start" in message for message in messages)
     assert any("event=work_origin_move" in message and "axis=left.Yaw" in message for message in messages)
-    assert not any("event=work_origin_move" in message and "axis=right.Yaw" in message for message in messages)
+    assert any("event=work_origin_move" in message and "axis=right.Yaw" in message for message in messages)
     assert any("event=work_origin_op" in message and "phase=complete" in message for message in messages)
 
 

@@ -14,6 +14,7 @@ class HalCommandSpec:
 HAL_COMMANDS: dict[str, HalCommandSpec] = {
     "hal.reconnect": HalCommandSpec("GET", "/health"),
     "motion.emergency_stop": HalCommandSpec("POST", "/motion/emergency_stop"),
+    "motion.acknowledge_estop": HalCommandSpec("POST", "/motion/acknowledge_estop"),
     "motion.home_all": HalCommandSpec("POST", "/motion/home_all"),
     "motion.home_origin_side": HalCommandSpec("POST", "/motion/home_origin_side"),
     "motion.enable_side": HalCommandSpec("POST", "/motion/enable_side"),
@@ -24,6 +25,8 @@ HAL_COMMANDS: dict[str, HalCommandSpec] = {
     "motion.teleop_stop_side": HalCommandSpec("POST", "/motion/teleop_stop_side"),
     "omega7.gravity_compensation": HalCommandSpec("POST", "/omega7/gravity_compensation"),
     "omega7.zero_force_feedback": HalCommandSpec("POST", "/omega7/zero_force_feedback"),
+    "force.configure": HalCommandSpec("POST", "/force/configure"),
+    "force.tare": HalCommandSpec("POST", "/force/tare"),
     "teleop.native.configure": HalCommandSpec("POST", "/teleop/native/configure"),
     "teleop.native.start": HalCommandSpec("POST", "/teleop/native/start"),
     "teleop.native.stop": HalCommandSpec("POST", "/teleop/native/stop"),

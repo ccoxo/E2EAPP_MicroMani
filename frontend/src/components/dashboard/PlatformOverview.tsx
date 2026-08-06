@@ -103,8 +103,8 @@ export function PlatformOverview({
     {
       key: 'safety',
       label: '安全联锁',
-      state: frame.dangerIndex > 0.9 ? 'error' : frame.dangerIndex > 0.65 ? 'warn' : 'ok',
-      primary: `danger_index ${frame.dangerIndex.toFixed(2)}`,
+      state: frame.forceStatus?.safety?.latched || frame.dangerIndex > 0.9 ? 'error' : frame.dangerIndex > 0.65 ? 'warn' : 'ok',
+      primary: frame.forceStatus?.safety?.latched ? '安全锁存' : `danger_index ${frame.dangerIndex.toFixed(2)}`,
       secondary: '真实急停链路需由 Windows HAL 和硬件回报',
       metric: '硬件',
       group: '安全',

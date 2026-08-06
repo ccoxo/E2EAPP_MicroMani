@@ -2,13 +2,18 @@ import { Alert, Button, Checkbox, Modal, Steps } from 'antd'
 import { useEffect, useState } from 'react'
 import { motionSideReturnOriginReady } from '../../motionReturnReady'
 import { useTelemetryStore } from '../../stores/telemetry'
-import type { DiagnosticItem, RecordSessionState, TelemetryFrame } from '../../types'
+import type { DiagnosticItem, RecordSessionState, TelemetryFrame, TelemetryLinkStatus } from '../../types'
 
 interface StepDef {
   title: string
   description: string
   autoCheck: boolean
-  check: ((frame: TelemetryFrame, recordSession: RecordSessionState, diagnostics: DiagnosticItem[]) => boolean) | null
+  check: ((
+    frame: TelemetryFrame,
+    recordSession: RecordSessionState,
+    diagnostics: DiagnosticItem[],
+    telemetryLink: TelemetryLinkStatus,
+  ) => boolean) | null
   required?: boolean
   actionButton?: {
     label: string
@@ -50,7 +55,8 @@ const STEPS: StepDef[] = [
     title: '硬件连接',
     description: '确认 HAL、WebSocket、相机、Omega.7 和夹爪串口均可识别。',
     autoCheck: true,
-    check: (frame, _recordSession, diagnostics) =>
+    check: (frame, _recordSession, diagnostics, telemetryLink) =>
+      telemetryLink.state === 'live' &&
       frame.halOk &&
       frame.wsOk &&
       frame.cameras.every((camera) => camera.health === 'ok') &&
@@ -98,6 +104,7 @@ interface PreCheckModalProps {
 export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckModalProps) {
   const frame = useTelemetryStore((s) => s.frame)
   const diagnostics = useTelemetryStore((s) => s.diagnostics)
+  const telemetryLink = useTelemetryStore((s) => s.telemetryLink)
   const recordSession = useTelemetryStore((s) => s.recordSession)
   const tareRecordForceSensors = useTelemetryStore((s) => s.tareRecordForceSensors)
   const homeRecordArms = useTelemetryStore((s) => s.homeRecordArms)
@@ -110,7 +117,7 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
 
   const stepStatuses = STEPS.map((step, i) => {
     if (step.autoCheck && step.check) {
-      return step.check(frame, recordSession, diagnostics)
+      return step.check(frame, recordSession, diagnostics, telemetryLink)
     }
     return manualChecked[i] ?? false
   })

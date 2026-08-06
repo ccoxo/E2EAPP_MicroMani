@@ -34,7 +34,8 @@ def test_hal_command_dispatcher_does_not_store_unused_gripper_reference() -> Non
     assert "gripper_" not in header
     assert "gripper_(gripper)" not in source
     assert "(void)gripper_" not in source
-    assert "HalCommandDispatcher commandDispatcher(motion, omega, nativeTeleop, started);" in server
+    assert "HalCommandDispatcher commandDispatcher(" in server
+    assert "nativeTeleop,\n      forceRuntime,\n      started);" in server
 
 
 def test_hal_motion_control_thread_keeps_only_polling_lifecycle() -> None:
@@ -802,78 +803,21 @@ def test_hal_ignores_card0_unsupported_sevon_write_without_masking_other_failure
     assert "failures << dmcAxisFailureMessage(\"dmc_write_sevon_pin\", ret, card, axisNo);" in normalized
 
 
-def test_hal_manual_axis_move_rejects_card0_yaw_direct_calls() -> None:
+def test_hal_manual_axis_move_dispatches_card0_yaw_without_special_rejection() -> None:
     source = (REPO_ROOT / "hal" / "src" / "HalCommandDispatcher.cpp").read_text(encoding="utf-8")
     branch = source.split('if (name == "motion.manual_axis_move") {', 1)[1].split(
         'if (name == "motion.teleop_target_update") {',
         1,
     )[0]
-    normalized = " ".join(branch.split())
-
-    assert "cardForSide(side) == 0" in normalized
-    assert "axis == SemanticAxis::Yaw" in normalized
-    assert "Card 0 Yaw motion axis is disabled by safety policy" in branch
-    assert normalized.index("cardForSide(side) == 0") < normalized.index("motion_.moveRelativeUi(")
+    assert "Card 0 Yaw motion axis is disabled by safety policy" not in branch
+    assert "motion_.moveRelativeUi(" in branch
 
 
-def test_ltdmc_driver_blocks_card0_yaw_in_all_motion_paths() -> None:
+def test_ltdmc_driver_has_no_permanent_card0_yaw_gate() -> None:
     source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
-    normalized = " ".join(source.split())
 
-    assert "bool axisMotionPermanentlyDisabled(" in source
-    assert "cardForSide(side) == 0 && axis == appstation::hal::SemanticAxis::Yaw" in normalized
-
-    enable_body = source.split("std::string LTDMCDriver::enableSide(", 1)[1].split(
-        "void LTDMCDriver::homeSide",
-        1,
-    )[0]
-    assert "axisMotionPermanentlyDisabled(side, axis)" in enable_body
-
-    home_side_body = source.split(
-        "void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes)",
-        1,
-    )[1].split("void LTDMCDriver::homeAll", 1)[0]
-    assert "axisMotionPermanentlyDisabled(side, axis)" in home_side_body
-    assert home_side_body.index("axisMotionPermanentlyDisabled(side, axis)") < home_side_body.index("dmcHomeMove(")
-
-    home_all_body = source.split(
-        "void LTDMCDriver::homeAll(\n"
-        "    const std::array<double, 12>& workOriginPulse,\n"
-        "    const std::array<std::array<bool, 6>, 2>& enabledAxes) {",
-        1,
-    )[1].split("void LTDMCDriver::homeOriginSide", 1)[0]
-    assert "axisMotionPermanentlyDisabled(side, axis)" in home_all_body
-    assert home_all_body.index("axisMotionPermanentlyDisabled(side, axis)") < home_all_body.index(
-        "startWorkOriginMoveOrThrow("
-    )
-
-    home_origin_body = source.split(
-        "void LTDMCDriver::homeOriginSide(\n"
-        "    Side side,\n"
-        "    const std::array<double, 6>& workOriginPulse,\n"
-        "    const std::array<bool, 6>& enabledAxes) {",
-        1,
-    )[1].split("void LTDMCDriver::moveRelativeUi", 1)[0]
-    assert "axisMotionPermanentlyDisabled(side, axis)" in home_origin_body
-    assert home_origin_body.index("axisMotionPermanentlyDisabled(side, axis)") < home_origin_body.index(
-        "startWorkOriginMoveOrThrow("
-    )
-
-    manual_body = source.split("void LTDMCDriver::moveRelativeUi(", 1)[1].split(
-        "TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi",
-        1,
-    )[0]
-    assert "axisMotionPermanentlyDisabled(side, axis)" in manual_body
-    assert manual_body.index("axisMotionPermanentlyDisabled(side, axis)") < manual_body.index("dmcPMove(")
-
-    teleop_body = source.split("TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(", 1)[1].split(
-        "void LTDMCDriver::stopTeleopSide",
-        1,
-    )[0]
-    assert "axisMotionPermanentlyDisabled(side, axis)" in teleop_body
-    assert teleop_body.index("axisMotionPermanentlyDisabled(side, axis)") < teleop_body.index(
-        "updateTeleopTargetBestEffort("
-    )
+    assert "axisMotionPermanentlyDisabled" not in source
+    assert "Card 0 Yaw motion axis is disabled by safety policy" not in source
 
 
 def test_hal_stage_axis_and_direction_signs_match_icf_mapping() -> None:

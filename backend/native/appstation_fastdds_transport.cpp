@@ -70,6 +70,7 @@ constexpr const char* kTopicHealth = "AppStation.Hal.Health";
 constexpr const char* kTopicMotionState = "AppStation.Hal.MotionState";
 constexpr const char* kTopicOmegaState = "AppStation.Hal.OmegaState";
 constexpr const char* kTopicNativeTeleopStatus = "AppStation.Hal.NativeTeleopStatus";
+constexpr const char* kTopicForceState = "AppStation.Hal.ForceState";
 constexpr const char* kTopicCommandRequest = "AppStation.Hal.CommandRequest";
 constexpr const char* kTopicCommandReply = "AppStation.Hal.CommandReply";
 constexpr const char* kTopicEmergencyStop = "AppStation.Hal.EmergencyStop";
@@ -85,6 +86,7 @@ enum TopicId {
   kMotion = 1,
   kOmega = 2,
   kNativeTeleop = 3,
+  kForce = 4,
 };
 
 struct JsonEnvelopeSample {
@@ -322,6 +324,7 @@ struct AppStationFastDdsTransport {
   Topic* motionTopic{nullptr};
   Topic* omegaTopic{nullptr};
   Topic* nativeTeleopTopic{nullptr};
+  Topic* forceTopic{nullptr};
   Topic* commandRequestTopic{nullptr};
   Topic* commandReplyTopic{nullptr};
   Topic* emergencyStopTopic{nullptr};
@@ -329,6 +332,7 @@ struct AppStationFastDdsTransport {
   DataReader* motionReader{nullptr};
   DataReader* omegaReader{nullptr};
   DataReader* nativeTeleopReader{nullptr};
+  DataReader* forceReader{nullptr};
   DataReader* commandReplyReader{nullptr};
   DataWriter* commandRequestWriter{nullptr};
   DataWriter* emergencyStopWriter{nullptr};
@@ -387,6 +391,7 @@ struct AppStationFastDdsTransport {
     motionTopic = createTopic(kTopicMotionState, kJsonEnvelopeType);
     omegaTopic = createTopic(kTopicOmegaState, kJsonEnvelopeType);
     nativeTeleopTopic = createTopic(kTopicNativeTeleopStatus, kJsonEnvelopeType);
+    forceTopic = createTopic(kTopicForceState, kJsonEnvelopeType);
     commandRequestTopic = createTopic(kTopicCommandRequest, kCommandRequestType);
     commandReplyTopic = createTopic(kTopicCommandReply, kCommandReplyType);
     emergencyStopTopic = createTopic(kTopicEmergencyStop, kCommandRequestType);
@@ -395,10 +400,11 @@ struct AppStationFastDdsTransport {
     motionReader = subscriber->create_datareader(motionTopic, telemetryReaderQos(false, false, 1));
     omegaReader = subscriber->create_datareader(omegaTopic, telemetryReaderQos(false, false, 1));
     nativeTeleopReader = subscriber->create_datareader(nativeTeleopTopic, telemetryReaderQos(false, false, 1));
+    forceReader = subscriber->create_datareader(forceTopic, telemetryReaderQos(false, false, 1));
     commandReplyReader = subscriber->create_datareader(commandReplyTopic, commandReplyReaderQos());
     commandRequestWriter = publisher->create_datawriter(commandRequestTopic, commandRequestWriterQos());
     emergencyStopWriter = publisher->create_datawriter(emergencyStopTopic, commandRequestWriterQos());
-    if (!healthReader || !motionReader || !omegaReader || !nativeTeleopReader || !commandReplyReader
+    if (!healthReader || !motionReader || !omegaReader || !nativeTeleopReader || !forceReader || !commandReplyReader
         || !commandRequestWriter || !emergencyStopWriter) {
       throw std::runtime_error("create Fast-DDS readers/writer failed");
     }
@@ -435,6 +441,7 @@ struct AppStationFastDdsTransport {
       updated = pollTelemetry(kMotion, motionReader) || updated;
       updated = pollTelemetry(kOmega, omegaReader) || updated;
       updated = pollTelemetry(kNativeTeleop, nativeTeleopReader) || updated;
+      updated = pollTelemetry(kForce, forceReader) || updated;
       updated = pollReplies() || updated;
       std::this_thread::sleep_for(updated ? std::chrono::milliseconds(2) : std::chrono::milliseconds(10));
     }

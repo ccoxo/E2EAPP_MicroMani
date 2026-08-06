@@ -7,6 +7,7 @@
 #include "HalDdsControlServer.h"
 #include "HalHttpServer.h"
 #include "HalJson.h"
+#include "ForceControlRuntime.h"
 #include "JodellGripperDriver.h"
 #include "LTDMCDriver.h"
 #include "MotionControlThread.h"
@@ -34,19 +35,46 @@ int main() {
   omega.initialize(leftOpenId, rightOpenId, swapHands);
 
   NativeTeleopController nativeTeleop(motion, omega, gripper);
+  ForceControlRuntime forceRuntime(
+      [&motion, &nativeTeleop]() {
+        motion.emergencyStop();
+        nativeTeleop.requestEmergencyStop();
+      },
+      [&motion]() {
+        motion.acknowledgeEmergencyStop();
+      });
+  ForceRuntimeConfig forceConfig;
+  const char* rawForceConfig = std::getenv("APPSTATION_FORCE_CONFIG_JSON");
+  if (rawForceConfig && *rawForceConfig) {
+    forceConfig = jsonForceRuntimeConfig(rawForceConfig, forceConfig);
+  }
+  forceRuntime.configure(forceConfig, forceMonotonicMilliseconds());
+  forceRuntime.start();
+
   MotionControlThread motionThread(motion);
   if (motionOk) {
     // 运动卡初始化成功后才启动后台刷新线程，避免无硬件环境反复访问 vendor SDK。
     motionThread.start(1000);
   }
 
-  HalCommandDispatcher commandDispatcher(motion, omega, nativeTeleop, started);
-  HalDdsControlServer ddsControl(commandDispatcher, motion, omega, nativeTeleop, started);
+  HalCommandDispatcher commandDispatcher(
+      motion,
+      omega,
+      nativeTeleop,
+      forceRuntime,
+      started);
+  HalDdsControlServer ddsControl(
+      commandDispatcher,
+      motion,
+      omega,
+      nativeTeleop,
+      forceRuntime,
+      started);
   ddsControl.start();
 
   TeleopLeaderPublisher leaderPublisher;
   TeleopMappingNode teleopMapping(nativeTeleop);
-  TeleopHardwareTargetExecutor teleopExecutor(motion);
+  TeleopHardwareTargetExecutor teleopExecutor(motion, forceRuntime);
   TeleopFollowerTargetSubscriber followerSubscriber(teleopExecutor);
 
   const char* rawTeleopExecutor = std::getenv("APPSTATION_TELEOP_EXECUTOR");
@@ -74,6 +102,7 @@ int main() {
       commandDispatcher);
 
   // 当前 HTTP server 是阻塞入口；只有退出时才按依赖顺序停止后台线程和 DDS listener。
+  forceRuntime.stop();
   nativeTeleop.stop();
   ddsControl.stop();
   teleopMapping.stop();

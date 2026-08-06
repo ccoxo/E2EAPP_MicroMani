@@ -38,6 +38,9 @@ class HalClient:
     async def omega_state(self) -> dict[str, Any]:
         raise NotImplementedError
 
+    async def force_state(self) -> dict[str, Any]:
+        raise NotImplementedError
+
 
 class TestHalClient(HalClient):
     def __init__(self, logs: LogService) -> None:
@@ -130,6 +133,24 @@ class TestHalClient(HalClient):
             ]
         }
 
+    async def force_state(self) -> dict[str, Any]:
+        now_unix_ms = int(time.time() * 1000)
+        now_monotonic_ms = int(time.monotonic() * 1000)
+        return {
+            "timestamp_ms": now_unix_ms,
+            "monotonicMs": now_monotonic_ms,
+            "source": "test",
+            "left": [0.0] * 6,
+            "right": [0.0] * 6,
+            "dangerIndex": 0.0,
+            "sides": {
+                "left": {"healthy": False, "connected": False},
+                "right": {"healthy": False, "connected": False},
+            },
+            "safety": {"latched": False, "reason": ""},
+            "compliance": {"enabled": False},
+        }
+
 
 class RealHalClient(HalClient):
     """带 keep-alive 的 HAL HTTP 客户端：每个工作线程复用自己的 TCP 连接。
@@ -219,6 +240,9 @@ class RealHalClient(HalClient):
 
     async def omega_state(self) -> dict[str, Any]:
         return self._with_receive_timestamp(await self._request("GET", "/omega/state"))
+
+    async def force_state(self) -> dict[str, Any]:
+        return self._with_receive_timestamp(await self._request("GET", "/force/state"))
 
     def _with_receive_timestamp(self, payload: dict[str, Any]) -> dict[str, Any]:
         now_unix_ms = int(time.time() * 1000)

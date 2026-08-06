@@ -1,115 +1,64 @@
 import { Card } from 'antd'
+import { deriveHardwareStatusRows, telemetryLinkLabel, type HardwareStatusTone } from '../../hardwareStatus'
 import { useTelemetryStore } from '../../stores/telemetry'
-import { teleopPairValue } from '../../teleopStatus'
-import type { DiagnosticItem, TelemetryFrame } from '../../types'
 
-interface HwItem {
-  name: string
-  getValue: (frame: TelemetryFrame, diagnostics: DiagnosticItem[]) => string
-  getOk: (frame: TelemetryFrame, diagnostics: DiagnosticItem[]) => boolean
-}
-/** 计算对应的业务值或展示值。 */
-function diagnosticOk(diagnostics: DiagnosticItem[], key: string) {
-  const status = diagnostics.find((item) => item.key === key)?.status
-  return status === 'ok'
-}
-/** 计算对应的业务值或展示值。 */
-function cameraByKey(frame: TelemetryFrame, key: 'global' | 'wrist_left' | 'wrist_right') {
-  return frame.cameras.find((camera) => camera.key === key)
-}
-/** 计算对应的业务值或展示值。 */
-function cameraOk(frame: TelemetryFrame, key: 'global' | 'wrist_left' | 'wrist_right') {
-  const camera = cameraByKey(frame, key)
-  return (camera?.fps ?? 0) >= 25 && camera?.health === 'ok'
-}
-/** 计算对应的业务值或展示值。 */
-function teleopHandsReady(frame: TelemetryFrame) {
-  return frame.teleopHands.every((hand) => hand.connected && hand.lastReadOk)
-}
-/** 计算对应的业务值或展示值。 */
-function teleopHandsValue(frame: TelemetryFrame, diagnostics: DiagnosticItem[]) {
-  if (!diagnosticOk(diagnostics, 'omega7')) return '待确认'
-  return teleopPairValue(frame)
+const toneColor: Record<HardwareStatusTone, string> = {
+  ok: '#3B6D11',
+  warn: '#E65100',
+  error: '#C62828',
+  unknown: '#8c8c8c',
 }
 
-const HW_ITEMS: HwItem[] = [
-  {
-    name: 'HAL Service',
-    getValue: () => '8090',
-    getOk: (frame) => frame.halOk,
-  },
-  {
-    name: 'ATI 左臂',
-    getValue: () => '模拟',
-    getOk: (_frame, diagnostics) => diagnosticOk(diagnostics, 'ati-left'),
-  },
-  {
-    name: 'ATI 右臂',
-    getValue: () => '模拟',
-    getOk: (_frame, diagnostics) => diagnosticOk(diagnostics, 'ati-right'),
-  },
-  {
-    name: '相机 全局',
-    getValue: (frame) => `${(cameraByKey(frame, 'global')?.fps ?? 0).toFixed(1)} Hz`,
-    getOk: (frame) => cameraOk(frame, 'global'),
-  },
-  {
-    name: '相机 左腕',
-    getValue: (frame) => `${(cameraByKey(frame, 'wrist_left')?.fps ?? 0).toFixed(1)} Hz`,
-    getOk: (frame) => cameraOk(frame, 'wrist_left'),
-  },
-  {
-    name: '相机 右腕',
-    getValue: (frame) => `${(cameraByKey(frame, 'wrist_right')?.fps ?? 0).toFixed(1)} Hz`,
-    getOk: (frame) => cameraOk(frame, 'wrist_right'),
-  },
-  {
-    name: 'Omega.7 左/右',
-    getValue: teleopHandsValue,
-    getOk: (frame, diagnostics) => diagnosticOk(diagnostics, 'omega7') && teleopHandsReady(frame),
-  },
-  {
-    name: '夹爪 左/右',
-    getValue: (_frame, diagnostics) => diagnosticOk(diagnostics, 'gripper') ? 'RS485 OK' : '待确认',
-    getOk: (_frame, diagnostics) => diagnosticOk(diagnostics, 'gripper'),
-  },
-]
-/** 计算对应的业务值或展示值。 */
-const dotStyle = (ok: boolean): React.CSSProperties => ({
-  width: 8,
-  height: 8,
-  borderRadius: '50%',
-  background: ok ? '#3B6D11' : '#E65100',
-  flexShrink: 0,
-})
-/** 渲染当前界面单元，并连接所需数据。 */
+function dotStyle(tone: HardwareStatusTone): React.CSSProperties {
+  return {
+    width: 8,
+    height: 8,
+    borderRadius: '50%',
+    background: toneColor[tone],
+    flexShrink: 0,
+  }
+}
+
 export default function HardwareStatusCard() {
-  const frame = useTelemetryStore((s) => s.frame)
-  const diagnostics = useTelemetryStore((s) => s.diagnostics)
+  const frame = useTelemetryStore((state) => state.frame)
+  const config = useTelemetryStore((state) => state.config)
+  const telemetryLink = useTelemetryStore((state) => state.telemetryLink)
+  const rows = deriveHardwareStatusRows(frame, config, telemetryLink)
+  const linkTone: HardwareStatusTone = telemetryLink.state === 'live'
+    ? 'ok'
+    : telemetryLink.state === 'offline'
+      ? 'error'
+      : 'unknown'
 
   return (
-    <Card title="硬件状态" size="small">
+    <Card
+      title="硬件状态"
+      size="small"
+      extra={(
+        <span style={{ color: toneColor[linkTone], fontSize: 10 }}>
+          {telemetryLinkLabel(telemetryLink)}
+        </span>
+      )}
+    >
       <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        {HW_ITEMS.map((item) => {
-          const ok = item.getOk(frame, diagnostics)
-          const value = item.getValue(frame, diagnostics)
-          return (
-            <div
-              key={item.name}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 6,
-                padding: '2px 4px',
-                fontSize: 11,
-              }}
-            >
-              <div style={dotStyle(ok)} />
-              <span style={{ flex: 1, color: ok ? 'inherit' : '#E65100' }}>{item.name}</span>
-              <span style={{ fontFamily: 'monospace', color: '#8c8c8c', fontSize: 10 }}>{value}</span>
-            </div>
-          )
-        })}
+        {rows.map((row) => (
+          <div
+            key={row.key}
+            data-hardware-key={row.key}
+            data-hardware-tone={row.tone}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              padding: '2px 4px',
+              fontSize: 11,
+            }}
+          >
+            <div style={dotStyle(row.tone)} />
+            <span style={{ flex: 1, color: toneColor[row.tone] }}>{row.name}</span>
+            <span style={{ fontFamily: 'monospace', color: '#8c8c8c', fontSize: 10 }}>{row.value}</span>
+          </div>
+        ))}
       </div>
     </Card>
   )

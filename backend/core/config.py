@@ -22,6 +22,7 @@ from backend.core.defaults import (
     ICF_RIGHT_MOTION_SOFT_LIMITS,
     ICF_ROTATION_WORK_LIMIT_DEFAULTS,
     ICF_TELEOP_DEFAULTS,
+    ICF_TELEOP_PREVIOUS_STRATEGY_VERSION,
     ICF_TELEOP_STRATEGY_VERSION,
     ICF_WORK_ORIGIN_DEFAULTS,
     ICF_WORK_ORIGIN_OFFSET_DEFAULTS,
@@ -29,6 +30,7 @@ from backend.core.defaults import (
     default_config,
     rotation_work_limits_from_soft_limits,
 )
+from backend.core.force_config import validate_force_config
 from backend.core.logging import LogService, now_ms, stable_config_hash
 from backend.core.motion_limits import (
     WorkOriginMissing,
@@ -47,7 +49,6 @@ from backend.core.schemas import (
 
 SNAPSHOT_ID_SAFE = re.compile(r"[^a-zA-Z0-9_.-]+")
 AXIS_KEYS = ("x", "y", "z", "roll", "pitch", "yaw")
-CARD0_YAW_DISABLED_AXES = (True, True, True, True, True, False)
 
 
 def _compact_config_value(value: Any) -> Any:
@@ -192,19 +193,6 @@ def _ensure_home_reference_model(config: dict[str, Any], has_current_home_refere
             motion["relativeSoftLimits"][side] = json.loads(json.dumps(ICF_RELATIVE_SOFT_LIMIT_DEFAULTS[side]))
 
 
-def _motion_card_no(config: dict[str, Any], side: str) -> int:
-    motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
-    fallback = 1 if side == "left" else 0
-    try:
-        return int(motion.get(f"{side}CardNo", fallback))
-    except (TypeError, ValueError):
-        return fallback
-
-
-def _origin_validation_axes(config: dict[str, Any], side: str) -> tuple[bool, bool, bool, bool, bool, bool]:
-    return CARD0_YAW_DISABLED_AXES if _motion_card_no(config, side) == 0 else (True, True, True, True, True, True)
-
-
 def _origin_outside_effective_limits(config: dict[str, Any], side: str) -> bool:
     origin = side_origin_ui(config, side)
     if origin is None:
@@ -213,10 +201,7 @@ def _origin_outside_effective_limits(config: dict[str, Any], side: str) -> bool:
         limits = effective_limits_ui(config, side)
     except WorkOriginMissing:
         return False
-    enabled_axes = _origin_validation_axes(config, side)
     for axis_index in range(3, 6):
-        if not enabled_axes[axis_index]:
-            continue
         limit = limits[axis_index]
         target = origin[axis_index]
         if limit.min > limit.max or target < limit.min or target > limit.max:
@@ -292,7 +277,7 @@ def _float_close(value: Any, expected: float, tolerance: float = 1e-6) -> bool:
         return False
 
 
-def _normalize_card0_yaw_disabled(config: dict[str, Any]) -> None:
+def _normalize_yaw_enabled(config: dict[str, Any]) -> None:
     teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
     if not isinstance(teleop, dict):
         return
@@ -303,10 +288,7 @@ def _normalize_card0_yaw_disabled(config: dict[str, Any]) -> None:
             axes = [bool(value) for value in raw[:6]]
         else:
             axes = [True] * 6
-        if _motion_card_no(config, side) == 0:
-            axes[5] = False
-        elif side == "right" and axes == [True, True, True, True, True, False]:
-            axes[5] = True
+        axes[5] = True
         teleop[key] = axes
 
 
@@ -448,6 +430,7 @@ class SettingsService:
             raw_teleop = data.get("teleop", {}) if isinstance(data, dict) else {}
             raw_motion = data.get("motion", {}) if isinstance(data, dict) else {}
             raw_cameras = data.get("cameras", {}) if isinstance(data, dict) else {}
+            raw_force = data.get("force", {}) if isinstance(data, dict) else {}
             has_current_teleop_strategy = (
                 isinstance(raw_teleop, dict)
                 and raw_teleop.get("strategyVersion") == ICF_TELEOP_STRATEGY_VERSION
@@ -464,21 +447,29 @@ class SettingsService:
                 isinstance(raw_cameras, dict)
                 and raw_cameras.get("tuningDefaultsVersion") == ICF_CAMERA_TUNING_DEFAULTS_VERSION
             )
+            has_axis_sign_calibration = (
+                isinstance(raw_force, dict)
+                and isinstance(raw_force.get("axisSign"), dict)
+            )
             merged = self._migrate_config(
                 self._merge_defaults(data),
                 has_current_teleop_strategy,
                 has_current_work_origin_strategy,
                 has_current_home_reference_strategy,
                 has_current_camera_tuning_defaults,
+                has_axis_sign_calibration,
             )
             validated = AppConfig.model_validate(merged).model_dump(mode="json")
             if merged != data:
                 self.save_config(validated, emit_log=False, source="startup")
             return validated
-        except (OSError, json.JSONDecodeError, ValueError):
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
             config = default_config()
             self.save_config(config, source="startup")
-            self.logs.warning("[BACKEND]", "config.json was invalid; default config restored")
+            self.logs.warning(
+                "[BACKEND]",
+                f"config.json was invalid; default config restored: {type(exc).__name__}: {exc}",
+            )
             return config
 
     def save_config(
@@ -497,7 +488,6 @@ class SettingsService:
             except (OSError, json.JSONDecodeError):
                 old_config = {}
         if isinstance(config, dict):
-            _normalize_card0_yaw_disabled(config)
             _normalize_right_pitch_window(config)
             raw_motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
             _ensure_home_reference_model(
@@ -505,6 +495,7 @@ class SettingsService:
                 isinstance(raw_motion, dict)
                 and raw_motion.get("homeReferenceVersion") == ICF_HOME_REFERENCE_VERSION,
             )
+        validate_force_config(config)
         validated = AppConfig.model_validate(config).model_dump(mode="json")
         old_hash = stable_config_hash(old_config) if old_config else "-"
         new_hash = stable_config_hash(validated)
@@ -581,15 +572,21 @@ class SettingsService:
 
     def apply_snapshot(self, snapshot_id: str) -> dict[str, Any]:
         snapshot = self._read_snapshot(snapshot_id)
-        active = self.get_config()
-        if snapshot.scope == "all":
-            next_config = AppConfig.model_validate(snapshot.config).model_dump(mode="json")
-        else:
-            motion_config = MotionCardSnapshotConfig.model_validate(snapshot.config)
-            next_config = self._apply_motion_snapshot(active, snapshot.scope, motion_config)
+        next_config = self._snapshot_config_for_apply(snapshot)
         saved = self.save_config(next_config, emit_log=False)
         self.logs.info("[BACKEND]", f"{self._scope_label(snapshot.scope)}快照已应用：{snapshot.name}")
         return saved
+
+    def preview_snapshot(self, snapshot_id: str) -> dict[str, Any]:
+        snapshot = self._read_snapshot(snapshot_id)
+        return self._snapshot_config_for_apply(snapshot)
+
+    def _snapshot_config_for_apply(self, snapshot: ParameterSnapshot) -> dict[str, Any]:
+        active = self.get_config()
+        if snapshot.scope == "all":
+            return AppConfig.model_validate(snapshot.config).model_dump(mode="json")
+        motion_config = MotionCardSnapshotConfig.model_validate(snapshot.config)
+        return self._apply_motion_snapshot(active, snapshot.scope, motion_config)
 
     def delete_snapshot(self, snapshot_id: str) -> None:
         path = self._snapshot_path(snapshot_id)
@@ -725,9 +722,30 @@ class SettingsService:
         has_current_work_origin_strategy: bool,
         has_current_home_reference_strategy: bool,
         has_current_camera_tuning_defaults: bool,
+        has_axis_sign_calibration: bool,
     ) -> dict[str, Any]:
+        force = config.get("force", {})
+        if isinstance(force, dict) and not has_axis_sign_calibration:
+            compliance = force.get("compliance", {})
+            if isinstance(compliance, dict):
+                compliance["enabled"] = False
+                for side in ("left", "right"):
+                    side_config = compliance.get(side, {})
+                    if isinstance(side_config, dict):
+                        side_config["mappingConfirmed"] = False
         teleop = config.get("teleop", {})
-        if isinstance(teleop, dict) and not has_current_teleop_strategy:
+        has_previous_yaw_disabled_strategy = (
+            isinstance(teleop, dict)
+            and teleop.get("strategyVersion") == ICF_TELEOP_PREVIOUS_STRATEGY_VERSION
+        )
+        if has_previous_yaw_disabled_strategy:
+            _normalize_yaw_enabled(config)
+            teleop["strategyVersion"] = ICF_TELEOP_STRATEGY_VERSION
+        if (
+            isinstance(teleop, dict)
+            and not has_current_teleop_strategy
+            and not has_previous_yaw_disabled_strategy
+        ):
             for key, value in ICF_TELEOP_DEFAULTS.items():
                 teleop[key] = json.loads(json.dumps(value))
             teleop["leftGravityCompensation"] = True
@@ -962,7 +980,6 @@ class SettingsService:
         if isinstance(motion, dict):
             motion.setdefault("rotationWorkLimits", json.loads(json.dumps(ICF_ROTATION_WORK_LIMIT_DEFAULTS)))
             _ensure_home_reference_model(config, has_current_home_reference_strategy)
-        _normalize_card0_yaw_disabled(config)
         _normalize_left_yaw_window(config)
         _normalize_right_roll_window(config)
         _normalize_right_pitch_window(config)

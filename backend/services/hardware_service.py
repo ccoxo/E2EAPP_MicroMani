@@ -22,7 +22,8 @@ class HardwareService:
     def status(self, *, include_gripper: bool = True) -> dict[str, Any]:
         config = self.settings.get_config()
         camera = self.cameras.probe(config)
-        force = self.force.probe(config)
+        force_source = str(config.get("force", {}).get("source", "nidaq")).lower()
+        force = self.force.probe(config) if force_source == "nidaq" else None
         gripper = self.gripper.probe(config) if include_gripper else None
         pico = self.pico.status(config)
         return {
@@ -31,7 +32,15 @@ class HardwareService:
                 "message": camera.message,
                 "cameras": [item.model_dump(mode="json") for item in camera.cameras],
             },
-            "force": {"ok": force.ok, "message": force.message},
+            "force": (
+                {"ok": force.ok, "message": force.message, "source": "nidaq"}
+                if force is not None
+                else {
+                    "ok": None,
+                    "message": "managed by HAL-native HKVL serial runtime",
+                    "source": "hkvl_serial",
+                }
+            ),
             "gripper": (
                 {
                     "ok": gripper.ok,

@@ -27,6 +27,7 @@ from typing import Any
 
 from backend.core.config import SettingsService
 from backend.core.defaults import ICF_KINEMATICS_DEFAULTS, ICF_TELEOP_DEFAULTS
+from backend.core.force_config import hal_force_config_payload
 from backend.core.logging import LogService, now_ms, stable_config_hash
 from backend.core.units import lerobot_to_ui_state, motion_pulse_per_unit, pulses_to_ui_state
 from backend.hal_client.client import HalClient
@@ -504,6 +505,7 @@ class DatasetRecorderService:
         self._last_native_gripper_sample: tuple[tuple[float, float], float] | None = None
         self._record_fps_hz = 30
         self._force_sample_hz = 200.0
+        self._latest_force_state: dict[str, Any] = {}
         self._recording_config_snapshot: dict[str, Any] = {}
         self._last_motion_pulses = [0.0] * 12
         self._source_sample_indices: dict[str, int] = {key: 0 for key in SOURCE_KEYS}
@@ -561,6 +563,15 @@ class DatasetRecorderService:
             raise
 
         try:
+            if (
+                self._real_hardware_mode(config)
+                and str(config.get("force", {}).get("source", "nidaq")).lower() == "hkvl_serial"
+            ):
+                try:
+                    self._latest_force_state = dict(await self.hal.force_state())
+                except Exception as exc:  # noqa: BLE001
+                    self._latest_force_state = {}
+                    self.logs.warning("[FORCE]", f"HKVL metadata state unavailable: {exc}")
             native_started = await self._try_begin_native_dataset(config)
             if not native_started:
                 await self._stop_writer_task()
@@ -1771,8 +1782,19 @@ class DatasetRecorderService:
             )
             return SourceSample("force", sampled_at, value, True, "", target_monotonic_s=target_s)
         started = time.monotonic()
+        source = str(config.get("force", {}).get("source", "nidaq")).lower()
         try:
-            value = self.hardware.force.sample(config)
+            if source == "hkvl_serial":
+                value = asyncio.run(self.hal.force_state())
+                self._latest_force_state = dict(value)
+                sides = value.get("sides", {}) if isinstance(value, dict) else {}
+                left_status = sides.get("left", {}) if isinstance(sides, dict) else {}
+                right_status = sides.get("right", {}) if isinstance(sides, dict) else {}
+                value["ok"] = bool(left_status.get("healthy")) and bool(right_status.get("healthy"))
+                if not value["ok"]:
+                    value["message"] = "HKVL force sample is stale or unhealthy"
+            else:
+                value = self.hardware.force.sample(config)
             ok = bool(getattr(value, "ok", True) if not isinstance(value, dict) else value.get("ok", True))
             raw_message = getattr(value, "message", "") if not isinstance(value, dict) else value.get("message", "")
             message = "" if ok else str(raw_message)
@@ -2752,15 +2774,55 @@ class DatasetRecorderService:
             "hardware": {
                 "cameras": config.get("cameras", {}),
                 "cameraResolutions": self._camera_resolution_summary_from_config(config),
-                "force": {
-                    "leftIp": config.get("force", {}).get("leftIp"),
-                    "rightIp": config.get("force", {}).get("rightIp"),
-                    "sampleHz": config.get("force", {}).get("sampleHz"),
-                },
+                "force": self._force_metadata(config),
                 "motion": self._motion_calibration_snapshot(config),
             },
         }
         self._write_json(path, payload)
+
+    def _force_metadata(self, config: dict[str, Any]) -> dict[str, Any]:
+        force = config.get("force", {}) if isinstance(config.get("force"), dict) else {}
+        source = str(force.get("source", "nidaq")).lower()
+        if source != "hkvl_serial":
+            return {
+                "source": "nidaq",
+                "leftIp": force.get("leftIp"),
+                "rightIp": force.get("rightIp"),
+                "sampleHz": force.get("sampleHz"),
+            }
+        serial = force.get("serial", {}) if isinstance(force.get("serial"), dict) else {}
+        latest = getattr(self, "_latest_force_state", {})
+        sides = latest.get("sides", {}) if isinstance(latest, dict) else {}
+        left = sides.get("left", {}) if isinstance(sides, dict) else {}
+        right = sides.get("right", {}) if isinstance(sides, dict) else {}
+        force_payload = hal_force_config_payload(config)
+        return {
+            "source": source,
+            "protocol": serial.get("protocol"),
+            "serial": deepcopy(serial),
+            "measurementSampleHz": serial.get("expectedSampleHz"),
+            "recordSampleHz": self._force_sample_hz,
+            "axisSign": {
+                "left": list(left.get("axisSign", force_payload["leftAxisSign"])),
+                "right": list(right.get("axisSign", force_payload["rightAxisSign"])),
+            },
+            "tareBias": {
+                "left": list(left.get("tareBias", [0.0] * 6)),
+                "right": list(right.get("tareBias", [0.0] * 6)),
+            },
+            "sensorTareBias": {
+                "left": list(left.get("sensorTareBias", [0.0] * 6)),
+                "right": list(right.get("sensorTareBias", [0.0] * 6)),
+            },
+            "mapping": {
+                side: list(force.get("compliance", {}).get(side, {}).get("matrix", []))
+                for side in ("left", "right")
+            },
+            "compliance": deepcopy(force.get("compliance", {})),
+            "runtimeCompliance": deepcopy(
+                latest.get("compliance", {}) if isinstance(latest, dict) else {}
+            ),
+        }
 
     def _create_native_dataset_metadata(self, dataset_dir: Path, config: dict[str, Any]) -> bool:
         """预检依赖后创建 native LeRobot 数据集并写入 AppStation 元数据。"""
@@ -3121,6 +3183,8 @@ class DatasetRecorderService:
 
     def _force_sample_hz_from_config(self, config: dict[str, Any]) -> float:
         """从配置中读取力传感器采样频率，并限制合法范围。"""
+        if str(config.get("force", {}).get("source", "nidaq")).lower() == "hkvl_serial":
+            return 200.0
         try:
             raw = float(config.get("force", {}).get("sampleHz", 200))
         except (TypeError, ValueError):

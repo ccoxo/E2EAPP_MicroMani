@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ForceControlRuntime.h"
 #include "LTDMCDriver.h"
 #include "TeleopDdsTypes.h"
 
@@ -9,12 +10,15 @@ namespace appstation::hal {
 // 这个类不订阅 DDS，也不做映射计算，只守住最终写硬件的边界。
 class TeleopHardwareTargetExecutor {
  public:
-  explicit TeleopHardwareTargetExecutor(LTDMCDriver& motion);
+  TeleopHardwareTargetExecutor(
+      LTDMCDriver& motion,
+      ForceControlRuntime& forceRuntime);
 
   void apply(const TeleopHardwareTarget& target);
 
  private:
   LTDMCDriver& motion_;
+  ForceControlRuntime& forceRuntime_;
 };
 
 }  // namespace appstation::hal

@@ -17,11 +17,55 @@ set LEISHINE_LIB=%REPO%vendor\leishine\lib\x64\LTDMC.lib
 rem /utf-8 keeps C++ Chinese comments and strings parsed consistently by MSVC.
 rem EPROSIMA_ALL_DYN_LINK imports Fast-DDS/Fast-CDR symbols from the ROS2 DLLs.
 set CXX_FLAGS=/nologo /utf-8 /std:c++20 /EHsc /MD /O2 /DAPPSTATION_ENABLE_VENDOR_SDKS=1 /DAPPSTATION_ENABLE_DDS=1 /DEPROSIMA_ALL_DYN_LINK /D_WIN32_WINNT=0x0601 /I "%INC%" /I "%FASTDDS_ROOT%\include" /I "%FASTDDS_ROOT%\include\fastrtps" /I "%FASTDDS_ROOT%\include\fastcdr"
+set TEST_CXX_FLAGS=/nologo /utf-8 /std:c++20 /EHsc /MD /O2 /D_WIN32_WINNT=0x0601 /I "%INC%"
 
 if not exist "%BUILD%" mkdir "%BUILD%"
 pushd "%BUILD%"
 
+echo Compiling ForceCoreTests.cpp ...
+cl %TEST_CXX_FLAGS% /c "%REPO%tests\ForceCoreTests.cpp" /Fo"ForceCoreTests.next.obj" || goto :err
+
+echo Compiling HkvlForceProtocol.cpp ...
+cl %TEST_CXX_FLAGS% /c "%SRC%\HkvlForceProtocol.cpp" /Fo"HkvlForceProtocol.test.next.obj" || goto :err
+
+echo Compiling ForceSafetyLatch.cpp ...
+cl %TEST_CXX_FLAGS% /c "%SRC%\ForceSafetyLatch.cpp" /Fo"ForceSafetyLatch.test.next.obj" || goto :err
+
+echo Compiling ForceComplianceController.cpp ...
+cl %TEST_CXX_FLAGS% /c "%SRC%\ForceComplianceController.cpp" /Fo"ForceComplianceController.test.next.obj" || goto :err
+
+echo Compiling HkvlForceDriver.cpp ...
+cl %TEST_CXX_FLAGS% /c "%SRC%\HkvlForceDriver.cpp" /Fo"HkvlForceDriver.test.next.obj" || goto :err
+
+echo Compiling ForceControlRuntime.cpp ...
+cl %TEST_CXX_FLAGS% /c "%SRC%\ForceControlRuntime.cpp" /Fo"ForceControlRuntime.test.next.obj" || goto :err
+
+echo Compiling LTDMCDriver.cpp for tests ...
+cl %TEST_CXX_FLAGS% /c "%SRC%\LTDMCDriver.cpp" /Fo"LTDMCDriver.test.next.obj" || goto :err
+
+echo Compiling HalJson.cpp for tests ...
+cl %TEST_CXX_FLAGS% /c "%SRC%\HalJson.cpp" /Fo"HalJson.test.next.obj" || goto :err
+
+echo Linking and running ForceCoreTests.next.exe ...
+link /nologo /OUT:"ForceCoreTests.next.exe" ForceCoreTests.next.obj HkvlForceProtocol.test.next.obj ForceSafetyLatch.test.next.obj ForceComplianceController.test.next.obj HkvlForceDriver.test.next.obj ForceControlRuntime.test.next.obj LTDMCDriver.test.next.obj HalJson.test.next.obj || goto :err
+"ForceCoreTests.next.exe" || goto :err
+
 rem Compile into *.next.obj first so failed builds do not overwrite the last usable objects.
+echo Compiling HkvlForceProtocol.cpp for HAL ...
+cl %CXX_FLAGS% /c "%SRC%\HkvlForceProtocol.cpp" /Fo"HkvlForceProtocol.next.obj" || goto :err
+
+echo Compiling HkvlForceDriver.cpp for HAL ...
+cl %CXX_FLAGS% /c "%SRC%\HkvlForceDriver.cpp" /Fo"HkvlForceDriver.next.obj" || goto :err
+
+echo Compiling ForceSafetyLatch.cpp for HAL ...
+cl %CXX_FLAGS% /c "%SRC%\ForceSafetyLatch.cpp" /Fo"ForceSafetyLatch.next.obj" || goto :err
+
+echo Compiling ForceComplianceController.cpp for HAL ...
+cl %CXX_FLAGS% /c "%SRC%\ForceComplianceController.cpp" /Fo"ForceComplianceController.next.obj" || goto :err
+
+echo Compiling ForceControlRuntime.cpp for HAL ...
+cl %CXX_FLAGS% /c "%SRC%\ForceControlRuntime.cpp" /Fo"ForceControlRuntime.next.obj" || goto :err
+
 echo Compiling LTDMCDriver.cpp ...
 cl %CXX_FLAGS% /c "%SRC%\LTDMCDriver.cpp" /Fo"LTDMCDriver.next.obj" || goto :err
 
@@ -70,7 +114,7 @@ cl %CXX_FLAGS% /c "%SRC%\JodellGripperWorker.cpp" /Fo"JodellGripperWorker.next.o
 rem HalServer links motion, master-hand, gripper, the Winsock HTTP boundary, and optional Fast-DDS.
 echo Linking HalServer.next.exe ...
 link /nologo /OUT:"HalServer.next.exe" ^
-  HalServer.next.obj HalJson.next.obj HalCommandDispatcher.next.obj HalDdsControlServer.next.obj HalHttpServer.next.obj TeleopLeaderPublisher.next.obj TeleopMappingNode.next.obj TeleopHardwareTargetExecutor.next.obj TeleopFollowerTargetSubscriber.next.obj LTDMCDriver.next.obj JodellGripperDriver.next.obj MotionControlThread.next.obj NativeTeleopController.next.obj Omega7Driver.next.obj ^
+  HalServer.next.obj HalJson.next.obj HalCommandDispatcher.next.obj HalDdsControlServer.next.obj HalHttpServer.next.obj TeleopLeaderPublisher.next.obj TeleopMappingNode.next.obj TeleopHardwareTargetExecutor.next.obj TeleopFollowerTargetSubscriber.next.obj HkvlForceProtocol.next.obj HkvlForceDriver.next.obj ForceSafetyLatch.next.obj ForceComplianceController.next.obj ForceControlRuntime.next.obj LTDMCDriver.next.obj JodellGripperDriver.next.obj MotionControlThread.next.obj NativeTeleopController.next.obj Omega7Driver.next.obj ^
   /LIBPATH:"%FASTDDS_ROOT%\Lib" ws2_32.lib iphlpapi.lib "%FASTDDS_ROOT%\Lib\fastrtps-2.14.lib" "%FASTDDS_ROOT%\Lib\fastcdr-2.2.lib" "%FASTDDS_ROOT%\Lib\foonathan_memory-0.7.3.lib" ^
   || goto :err
 

@@ -14,6 +14,7 @@ def test_shared_hal_command_protocol_covers_existing_real_hal_commands() -> None
     expected_paths = {
         "hal.reconnect": ("GET", "/health"),
         "motion.emergency_stop": ("POST", "/motion/emergency_stop"),
+        "motion.acknowledge_estop": ("POST", "/motion/acknowledge_estop"),
         "motion.home_all": ("POST", "/motion/home_all"),
         "motion.home_origin_side": ("POST", "/motion/home_origin_side"),
         "motion.enable_side": ("POST", "/motion/enable_side"),
@@ -24,6 +25,8 @@ def test_shared_hal_command_protocol_covers_existing_real_hal_commands() -> None
         "motion.teleop_stop_side": ("POST", "/motion/teleop_stop_side"),
         "omega7.gravity_compensation": ("POST", "/omega7/gravity_compensation"),
         "omega7.zero_force_feedback": ("POST", "/omega7/zero_force_feedback"),
+        "force.configure": ("POST", "/force/configure"),
+        "force.tare": ("POST", "/force/tare"),
         "teleop.native.configure": ("POST", "/teleop/native/configure"),
         "teleop.native.start": ("POST", "/teleop/native/start"),
         "teleop.native.stop": ("POST", "/teleop/native/stop"),

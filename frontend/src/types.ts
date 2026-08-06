@@ -1,5 +1,12 @@
 export type ConnectionState = 'ok' | 'warn' | 'error' | 'checking' | 'pending'
 
+export type TelemetryLinkState = 'connecting' | 'live' | 'stale' | 'offline'
+
+export interface TelemetryLinkStatus {
+  state: TelemetryLinkState
+  lastFrameReceivedAt: number | null
+}
+
 export type LogLevel = 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR'
 
 export type LogChannel =
@@ -77,6 +84,71 @@ export interface Omega7Telemetry {
   message: string
 }
 
+export interface ForceSideStatus {
+  port?: string
+  connected?: boolean
+  healthy?: boolean
+  sampleAgeMs?: number
+  sampleHz?: number
+  validFrames?: number
+  crcErrors?: number
+  nonFiniteFrames?: number
+  resyncBytes?: number
+  error?: string
+  axisSign?: number[]
+  tareBias?: number[]
+  sensorTareBias?: number[]
+}
+
+export interface ForceStatus {
+  source?: 'nidaq' | 'hkvl_serial' | 'test' | string
+  protocol?: string
+  sensorRawLeft?: number[]
+  sensorRawRight?: number[]
+  leftRightSkewMs?: number
+  sides?: {
+    left?: ForceSideStatus
+    right?: ForceSideStatus
+  }
+  safety?: {
+    latched?: boolean
+    reason?: string
+    side?: string
+    channel?: string
+    value?: number
+    canAcknowledge?: boolean
+    acknowledgeBlocker?: string
+  }
+  compliance?: {
+    enabled?: boolean
+    left?: Record<string, unknown>
+    right?: Record<string, unknown>
+  }
+}
+
+export interface GripperSideStatus {
+  ok?: boolean | null
+  message?: string
+  positionMm?: number | null
+  targetMm?: number | null
+  lastCommandTs?: number
+  serial?: {
+    port?: string
+    slaveId?: number
+    baudrate?: number
+  }
+}
+
+export interface GripperStatus {
+  nativeManaged?: boolean
+  running?: boolean
+  requestedRunning?: boolean
+  sides?: {
+    left?: GripperSideStatus
+    right?: GripperSideStatus
+  }
+}
+
 export interface TelemetryFrame {
   timestamp: number
   elapsedSec: number
@@ -86,6 +158,8 @@ export interface TelemetryFrame {
   motionAxisEnabled: { left: Array<boolean | null>; right: Array<boolean | null> }
   forceLeft: number[]
   forceRight: number[]
+  forceStatus?: ForceStatus
+  gripperStatus?: GripperStatus
   dangerIndex: number
   recording: boolean
   episodeCount: number
@@ -126,6 +200,15 @@ export interface MotionAxisProfile {
 export interface ArmMotionProfile {
   translation: MotionAxisProfile
   rotation: MotionAxisProfile
+}
+
+export interface ForceComplianceSideConfig {
+  mappingConfirmed: boolean
+  matrix: number[]
+  deadbandN: number[]
+  gainUmPerNs: number[]
+  maxStepUm: number[]
+  maxOffsetUm: number[]
 }
 
 export interface MotionKinematicsConfig {
@@ -427,6 +510,7 @@ export interface AppConfig {
     tuning: Record<CameraTelemetry['key'], CameraTuningProfile>
   }
   force: {
+    source: 'nidaq' | 'hkvl_serial'
     leftIp: string
     rightIp: string
     port: number
@@ -443,6 +527,22 @@ export interface AppConfig {
     lowpassEnabled: boolean
     lowpassCutoffHz: number
     swapHands: boolean
+    serial: {
+      protocol: 'hkvl_active_v1'
+      leftPort: string
+      rightPort: string
+      baudrate: number
+      expectedSampleHz: number
+    }
+    axisSign: {
+      left: number[]
+      right: number[]
+    }
+    compliance: {
+      enabled: boolean
+      left: ForceComplianceSideConfig
+      right: ForceComplianceSideConfig
+    }
   }
   motion: {
     leftCardNo: number

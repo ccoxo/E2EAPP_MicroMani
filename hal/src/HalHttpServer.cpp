@@ -97,6 +97,8 @@ void serveConnection(
       if (request.rfind("GET /health ", 0) == 0) {
         // HTTP 入口保留健康检查兼容性；控制命令优先通过 DDS/统一 dispatcher 进入。
         body = commandDispatcher.handle("hal.reconnect", "{}");
+      } else if (request.rfind("GET /force/state ", 0) == 0) {
+        body = commandDispatcher.handle("force.state", "{}");
       } else {
         code = 404;
         body = "{\"ok\":false,\"message\":\"not found\"}";

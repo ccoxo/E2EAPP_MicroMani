@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 from backend.core.config import SettingsService
+from backend.core.defaults import default_config
 from backend.core.logging import LOG_SCHEMA_VERSION, LogService, stable_config_hash
 
 
@@ -171,6 +173,25 @@ def test_settings_save_logs_config_write_hash_and_changed_keys(tmp_path: Path) -
         and "oldHash=" in message
         and "newHash=" in message
         for message in messages
+    )
+
+
+def test_invalid_config_recovery_logs_validation_reason(tmp_path: Path) -> None:
+    logs = LogService(emit_startup=False)
+    invalid = default_config()
+    invalid["teleop"]["translationDeadzone"] = "not-a-number"
+    (tmp_path / "config.json").write_text(json.dumps(invalid), encoding="utf-8")
+
+    config = SettingsService(tmp_path, logs).get_config()
+
+    assert config["teleop"]["translationDeadzone"] == 0.00002
+    assert any(
+        entry.msg
+        == (
+            "config.json was invalid; default config restored: "
+            "ValueError: could not convert string to float: 'not-a-number'"
+        )
+        for entry in logs.list_entries()
     )
 
 

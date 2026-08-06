@@ -9,6 +9,7 @@ import pytest
 from backend.core.logging import LogService
 from backend.hal_client.dds_client import DdsHalClient
 from backend.hal_client.dds_types import (
+    TOPIC_HAL_FORCE_STATE,
     TOPIC_HAL_HEALTH,
     TOPIC_HAL_MOTION_STATE,
     TOPIC_HAL_NATIVE_TELEOP_STATUS,
@@ -94,6 +95,25 @@ def test_dds_hal_client_reads_motion_state_from_topic_cache() -> None:
     assert state["dds_stamp_unix_ms"] == 123
     assert state["dds_stamp_monotonic_ms"] == 456
     assert "received_monotonic_ms" not in state
+
+
+def test_dds_hal_client_reads_force_state_from_topic_cache() -> None:
+    transport = FakeDdsTransport()
+    transport.latest[TOPIC_HAL_FORCE_STATE] = JsonEnvelope(
+        stamp_unix_ms=123,
+        stamp_monotonic_ms=456,
+        source="hal-cpp",
+        payload_json='{"source":"hkvl_serial","left":[1,2,3,4,5,6],"right":[6,5,4,3,2,1],"dangerIndex":0.5}',
+    )
+
+    client = DdsHalClient(LogService(emit_startup=False), transport=transport)
+    state = asyncio.run(client.force_state())
+
+    assert state["source"] == "hkvl_serial"
+    assert state["left"] == [1, 2, 3, 4, 5, 6]
+    assert state["right"] == [6, 5, 4, 3, 2, 1]
+    assert state["dangerIndex"] == 0.5
+    assert state["dds_stamp_monotonic_ms"] == 456
 
 
 def test_dds_hal_client_reads_native_teleop_status_from_topic_cache() -> None:

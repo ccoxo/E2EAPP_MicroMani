@@ -7,6 +7,7 @@ from pathlib import Path
 
 from backend.hal_client.dds_types import (
     TOPIC_HAL_HEALTH,
+    TOPIC_HAL_FORCE_STATE,
     TOPIC_HAL_MOTION_STATE,
     TOPIC_HAL_NATIVE_TELEOP_STATUS,
     TOPIC_HAL_OMEGA_STATE,
@@ -29,6 +30,7 @@ _TOPIC_IDS = {
     TOPIC_HAL_MOTION_STATE: 1,
     TOPIC_HAL_OMEGA_STATE: 2,
     TOPIC_HAL_NATIVE_TELEOP_STATUS: 3,
+    TOPIC_HAL_FORCE_STATE: 4,
 }
 
 

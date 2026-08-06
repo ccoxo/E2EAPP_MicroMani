@@ -3,7 +3,15 @@ import { createElement } from 'react'
 import { vi } from 'vitest'
 
 vi.mock('echarts-for-react', () => ({
-  default: () => createElement('div', { 'data-testid': 'echart-mock' }),
+  default: ({ option }: { option: unknown }) => {
+    const captureOptions = Boolean(
+      (globalThis as { __captureEchartOptions?: boolean }).__captureEchartOptions,
+    )
+    return createElement('div', {
+      'data-testid': 'echart-mock',
+      ...(captureOptions ? { 'data-chart-option': JSON.stringify(option) } : {}),
+    })
+  },
 }))
 
 Object.defineProperty(window, 'matchMedia', {

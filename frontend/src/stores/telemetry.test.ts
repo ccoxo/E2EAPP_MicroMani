@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import * as api from '../api'
 import { defaultConfig, defaultDiagnostics } from '../data'
-import { diagnosticsFromHardwareStatus, normalizeConfig } from './telemetry'
+import { diagnosticsFromHardwareStatus, normalizeConfig, useTelemetryStore } from './telemetry'
 
 describe('telemetry config normalization', () => {
   it('migrates stale PICO and camera hardware defaults', () => {
@@ -72,5 +73,41 @@ describe('hardware diagnostics', () => {
       status: 'warn',
       remediation: 'Backend source changed after process start; restart backend',
     })
+  })
+})
+
+describe('PICO network auto configuration', () => {
+  it('replaces the local settings state with the backend-persisted detection result', async () => {
+    const detectedConfig = structuredClone(defaultConfig)
+    detectedConfig.picoVision.ip = '10.90.140.22'
+    detectedConfig.picoVision.gateway = '10.90.0.1'
+    detectedConfig.picoVision.ifIndex = 13
+    vi.spyOn(api, 'autoConfigurePicoNetwork').mockResolvedValue({
+      ok: true,
+      data: {
+        network: {
+          ifIndex: 13,
+          gateway: '10.90.0.1',
+          localIp: '10.90.1.42',
+          interfaceAlias: 'Ethernet',
+          prefixLength: 17,
+          selection: 'related-address',
+          changed: true,
+        },
+        config: detectedConfig,
+      },
+      ts: Date.now(),
+    })
+
+    const network = await useTelemetryStore.getState().autoConfigurePicoNetwork()
+
+    expect(network.interfaceAlias).toBe('Ethernet')
+    expect(useTelemetryStore.getState().config.picoVision).toMatchObject({
+      ip: '10.90.140.22',
+      gateway: '10.90.0.1',
+      ifIndex: 13,
+    })
+    vi.restoreAllMocks()
+    useTelemetryStore.setState({ config: structuredClone(defaultConfig) })
   })
 })

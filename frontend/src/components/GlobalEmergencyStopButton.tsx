@@ -4,9 +4,10 @@ import { useTelemetryStore } from '../stores/telemetry'
 /** 渲染当前界面单元，并连接所需数据。 */
 export function GlobalEmergencyStopButton() {
   const dangerIndex = useTelemetryStore((state) => state.frame.dangerIndex)
+  const safetyLatched = useTelemetryStore((state) => Boolean(state.frame.forceStatus?.safety?.latched))
   const triggerEmergencyStop = useTelemetryStore((state) => state.triggerEmergencyStop)
   const acknowledgeSafety = useTelemetryStore((state) => state.acknowledgeSafety)
-  const active = dangerIndex >= 1
+  const active = safetyLatched || dangerIndex >= 1
 
   return (
     <div className={`floating-emergency-stack ${active ? 'floating-emergency-stack-active' : ''}`}>

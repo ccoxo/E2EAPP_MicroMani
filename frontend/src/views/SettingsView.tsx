@@ -1,4 +1,4 @@
-import { Button, Dropdown, Form, Input, InputNumber, Modal, Select, Slider, Space, Switch, Tabs, Tag, Typography, type MenuProps } from 'antd'
+import { Button, Dropdown, Form, Input, InputNumber, Modal, Radio, Select, Slider, Space, Switch, Tabs, Tag, Typography, type MenuProps } from 'antd'
 import {
   Activity,
   AlertTriangle,
@@ -50,7 +50,6 @@ import {
   type MotionPreviousRestoreStatus,
 } from '../api'
 import { refreshCameraStream } from '../hooks/useLiveCameraSnapshot'
-import { isManualAxisDisabledForCard } from '../manualAxisRules'
 import {
   armHardwareSpecs,
   axisHardwareSpecs,
@@ -117,6 +116,15 @@ interface PendingComparison {
 
 const sideOrder: RobotSide[] = ['left', 'right']
 const cameraOrder: CameraKey[] = ['global', 'wrist_left', 'wrist_right']
+const forceAxisCalibrationAxes = semanticAxes.map((axis, index) => ({ axis, channel: forceChannels[index], index }))
+const forceAxisCalibrationGroups = [
+  { title: '平移力', unit: 'N', axes: forceAxisCalibrationAxes.slice(0, 3) },
+  { title: '旋转力矩', unit: 'N·m', axes: forceAxisCalibrationAxes.slice(3) },
+]
+const fallbackForceAxisSigns: Record<RobotSide, number[]> = {
+  left: [1, 1, -1, -1, -1, 1],
+  right: [1, -1, 1, -1, 1, -1],
+}
 const defaultCameraTuning: Record<CameraKey, CameraTuningProfile> = {
   global: {
     autoExposure: true,
@@ -551,7 +559,7 @@ function SafetyCard({
   dangerIndex,
   setDangerOverride,
   acknowledgeSafety,
-  injectLog,
+  forceStatus,
 }: {
   config: AppConfig
   updateConfig: (patch: Partial<AppConfig>) => void
@@ -559,16 +567,19 @@ function SafetyCard({
   dangerIndex: number
   setDangerOverride: (danger: number | null) => void
   acknowledgeSafety: () => void
-  injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
+  forceStatus: TelemetryFrame['forceStatus']
 }) {
-  const state: ConnectionState = dangerIndex > 0.85 ? 'error' : dangerIndex > 0.55 ? 'warn' : 'ok'
+  const forceSafety = forceStatus?.safety
+  const latched = Boolean(forceSafety?.latched)
+  const state: ConnectionState = latched || dangerIndex > 0.85 ? 'error' : dangerIndex > 0.55 ? 'warn' : 'ok'
+  const isHkvl = config.force.source === 'hkvl_serial'
   return (
     <HardwareConfigCard
       id="safety"
       focusHash={focusHash}
       icon={<ShieldAlert size={20} />}
       title="安全链路 / 急停 / 软限位"
-      subtitle="ForceMonitor、HAL 急停、MotionControl 软限位三层保护"
+      subtitle={isHkvl ? 'HKVL 原始样本、HAL 全局锁存急停、MotionControl 软限位' : 'NI-DAQ 显示/录制、HAL 人工急停、MotionControl 软限位'}
       state={state}
       badges={<Tag color={stateTone(state)}>danger_index {dangerIndex.toFixed(2)}</Tag>}
       actions={
@@ -576,7 +587,7 @@ function SafetyCard({
           <Button danger icon={<AlertTriangle size={15} />} onClick={() => setDangerOverride(0.92)}>
             模拟危险
           </Button>
-          <Button icon={<RotateCcw size={15} />} onClick={() => { acknowledgeSafety(); commandLog(injectLog, '[SAFETY]', '确认安全态（不恢复运动）') }}>
+          <Button icon={<RotateCcw size={15} />} onClick={acknowledgeSafety}>
             确认安全态
           </Button>
         </Space>
@@ -585,16 +596,29 @@ function SafetyCard({
     >
       <Form layout="vertical" className="hardware-form-grid hardware-form-grid-compact">
         <Form.Item label="Fx/Fy 警告 N"><InputNumber min={0} step={0.1} value={config.safety.fxyWarnN} onChange={(value) => updateConfig({ safety: { ...config.safety, fxyWarnN: Number(value ?? 2) } })} /></Form.Item>
-        <Form.Item label="Fx/Fy 急停 N"><InputNumber min={0} step={0.1} value={config.safety.fxyStopN} onChange={(value) => updateConfig({ safety: { ...config.safety, fxyStopN: Number(value ?? 4) } })} /></Form.Item>
+        <Form.Item label="Fx/Fy 急停 N（暂按量程）"><InputNumber min={0} step={0.1} value={config.safety.fxyStopN} onChange={(value) => updateConfig({ safety: { ...config.safety, fxyStopN: Number(value ?? 30) } })} /></Form.Item>
         <Form.Item label="Fz 警告 N"><InputNumber min={0} step={0.1} value={config.safety.fzWarnN} onChange={(value) => updateConfig({ safety: { ...config.safety, fzWarnN: Number(value ?? 3) } })} /></Form.Item>
-        <Form.Item label="Fz 急停 N"><InputNumber min={0} step={0.1} value={config.safety.fzStopN} onChange={(value) => updateConfig({ safety: { ...config.safety, fzStopN: Number(value ?? 5) } })} /></Form.Item>
+        <Form.Item label="Fz 急停 N（暂按量程）"><InputNumber min={0} step={0.1} value={config.safety.fzStopN} onChange={(value) => updateConfig({ safety: { ...config.safety, fzStopN: Number(value ?? 30) } })} /></Form.Item>
         <Form.Item label="Moment 警告 Nm"><InputNumber min={0} step={0.001} value={config.safety.momentWarnNm} onChange={(value) => updateConfig({ safety: { ...config.safety, momentWarnNm: Number(value ?? 0.02) } })} /></Form.Item>
-        <Form.Item label="Moment 急停 Nm"><InputNumber min={0} step={0.001} value={config.safety.momentStopNm} onChange={(value) => updateConfig({ safety: { ...config.safety, momentStopNm: Number(value ?? 0.04) } })} /></Form.Item>
+        <Form.Item label="Moment 急停 Nm（暂按量程）"><InputNumber min={0} step={0.001} value={config.safety.momentStopNm} onChange={(value) => updateConfig({ safety: { ...config.safety, momentStopNm: Number(value ?? 1) } })} /></Form.Item>
         <Form.Item label="Yaw 软限位 °"><InputNumber value={config.safety.yawSoftLimitDeg} onChange={(value) => updateConfig({ safety: { ...config.safety, yawSoftLimitDeg: Number(value ?? 7) } })} /></Form.Item>
         <Form.Item label="Watchdog ms"><InputNumber value={config.safety.watchdogMs} onChange={(value) => updateConfig({ safety: { ...config.safety, watchdogMs: Number(value ?? 50) } })} /></Form.Item>
       </Form>
+      <div className="hardware-metric-grid">
+        <MetricBox
+          label="HAL 安全锁存"
+          value={latched ? forceSafety?.reason || '已锁存' : '未锁存'}
+          hint={latched ? forceSafety?.acknowledgeBlocker || '等待人工确认安全态' : '确认操作不会恢复伺服'}
+          tone={latched ? 'warn' : 'ok'}
+        />
+        <MetricBox label="确认语义" value="只清锁存" hint="不会恢复伺服；后续使能必须由操作员单独执行" tone="warn" />
+      </div>
       <div className="safety-layer-grid">
-        <MetricBox label="Layer 1" value="ForceMonitor <2ms" hint="NI-DAQmx 采样后直接判断" />
+        <MetricBox
+          label="Layer 1"
+          value={isHkvl ? 'HKVL 全速判定' : 'NI-DAQ 采集'}
+          hint={isHkvl ? '未低通去皮样本直接进入 HAL 安全判断' : '兼容显示、去皮和录制，不承担 HAL 力联锁'}
+        />
         <MetricBox label="Layer 2" value="HAL 急停 5-15ms" hint="HAL 急停入口调用 LTDMC" />
         <MetricBox label="Layer 3" value="软限位 <1ms" hint="Motion Thread 内拦截" />
       </div>
@@ -1124,7 +1148,7 @@ function MotionCard({
       onConfirm: handleRestorePreviousOrigin,
     })
   }
-  const rotationWindowLabel = configCardNo === 0 ? `Roll -95~5\u00b0 / Pitch \u00b130\u00b0 \u00b7 Yaw disabled` : `Roll -5~95\u00b0 / Pitch \u00b130\u00b0 \u00b7 Yaw \u00b17\u00b0`
+  const rotationWindowLabel = configCardNo === 0 ? `Roll -95~5\u00b0 / Pitch \u00b130\u00b0 \u00b7 Yaw \u00b17\u00b0` : `Roll -5~95\u00b0 / Pitch \u00b130\u00b0 \u00b7 Yaw \u00b17\u00b0`
 
   return (
     <HardwareConfigCard
@@ -1493,6 +1517,7 @@ function ForceSensorCard({
   updateConfig,
   focusHash,
   values,
+  forceStatus,
   history,
   injectLog,
 }: {
@@ -1501,6 +1526,7 @@ function ForceSensorCard({
   updateConfig: (patch: Partial<AppConfig>) => void
   focusHash: string
   values: number[]
+  forceStatus: TelemetryFrame['forceStatus']
   history: ReturnType<typeof useTelemetryStore.getState>['history']
   injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
 }) {
@@ -1508,23 +1534,81 @@ function ForceSensorCard({
   const sideSpec = armHardwareSpecs[hardwareSide]
   const operatorLabel = operatorSideLabel(side)
   const ipKey = sideSpec.forceIpKey
-  const state = forceState(values, config)
+  const isHkvl = config.force.source === 'hkvl_serial'
+  const sideStatus = forceStatus?.sides?.[hardwareSide]
+  const state = isHkvl && !sideStatus?.healthy ? 'error' : forceState(values, config)
   const id = `force-${side}`
+  const serialPortKey = hardwareSide === 'left' ? 'leftPort' : 'rightPort'
+  const compliance = config.force.compliance[hardwareSide]
+  const mappingsConfirmed =
+    config.force.compliance.left.mappingConfirmed
+    && config.force.compliance.right.mappingConfirmed
+  const axisSignConfig = config.force.axisSign ?? fallbackForceAxisSigns
+  const axisSigns = axisSignConfig[hardwareSide] ?? fallbackForceAxisSigns[hardwareSide]
+  const [axisCalibrationOpen, setAxisCalibrationOpen] = useState(false)
+  const [axisSignDraft, setAxisSignDraft] = useState<number[]>(axisSigns)
+  const updateCompliance = (nextSide: typeof compliance) => {
+    updateConfig({
+      force: {
+        ...config.force,
+        compliance: {
+          ...config.force.compliance,
+          [hardwareSide]: nextSide,
+        },
+      },
+    })
+  }
+  const updateComplianceArray = (
+    key: 'matrix' | 'deadbandN' | 'gainUmPerNs' | 'maxStepUm' | 'maxOffsetUm',
+    index: number,
+    value: number | null,
+  ) => {
+    const next = [...compliance[key]]
+    next[index] = Number(value ?? 0)
+    updateCompliance({ ...compliance, [key]: next })
+  }
+  const openAxisCalibration = () => {
+    setAxisSignDraft([...axisSigns])
+    setAxisCalibrationOpen(true)
+  }
+  const saveAxisCalibration = () => {
+    updateConfig({
+      force: {
+        ...config.force,
+        axisSign: {
+          ...axisSignConfig,
+          [hardwareSide]: axisSignDraft,
+        },
+        compliance: {
+          ...config.force.compliance,
+          [hardwareSide]: {
+            ...compliance,
+            mappingConfirmed: true,
+          },
+        },
+      },
+    })
+    commandLog(injectLog, '[FORCE]', `${operatorLabel} 六轴方向标定已保存；请释放载荷后重新 Tare`)
+    setAxisCalibrationOpen(false)
+  }
+  const updateAxisSignDraft = (index: number, value: number) => {
+    setAxisSignDraft((current) => current.map((sign, signIndex) => signIndex === index ? value : sign))
+  }
   return (
     <HardwareConfigCard
       id={id}
       focusHash={focusHash}
       icon={<Waves size={20} />}
-      title={`${operatorLabel} Nano-17 六维力`}
-      subtitle={`${nano17Spec.model} · Fx/Fy/Fz=mN · Mx/My/Mz=mN·m`}
+      title={`${operatorLabel} ${isHkvl ? 'HKVL-36A' : 'Nano-17'} 六维力`}
+      subtitle={isHkvl ? 'HAL 原生串口 · N / Nm · 只读主动帧' : `${nano17Spec.model} · Fx/Fy/Fz=mN · Mx/My/Mz=mN·m`}
       state={state}
       actions={
         <Space wrap>
           <Button
             icon={<RotateCcw size={15} />}
             onClick={() => {
-              void tareForceSensor(side)
-              commandLog(injectLog, '[FORCE]', `${operatorLabel} Nano-17 Tare`)
+              void tareForceSensor(hardwareSide)
+              commandLog(injectLog, '[FORCE]', `${operatorLabel} ${isHkvl ? 'HKVL-36A' : 'Nano-17'} Tare`)
             }}
           >
             Tare
@@ -1536,9 +1620,9 @@ function ForceSensorCard({
       }
       wide
     >
-      <div className="force-settings-layout">
-        <div>
-          <ForceChart history={history} side={side} height={170} />
+      <div className={`force-settings-layout${isHkvl ? ' force-settings-layout-hkvl' : ''}`}>
+        <div className="force-visual-area">
+          <ForceChart history={history} side={hardwareSide} height={170} />
           <div className="force-current-grid force-current-grid-settings">
             {forceChannels.map((channel, index) => (
               <span key={channel}>
@@ -1548,21 +1632,44 @@ function ForceSensorCard({
             ))}
           </div>
         </div>
-        <div>
-          <div className="hardware-metric-grid">
-            <MetricBox label="Fx/Fy 量程" value={nano17Spec.range.fxy} />
-            <MetricBox label="Fz 量程" value={nano17Spec.range.fz} />
-            <MetricBox label="Moment 量程" value={nano17Spec.range.moment} />
-            <MetricBox label="NI-DAQmx" value="DIFF ai0:5" hint={`${nano17Spec.fastDaqHz}Hz`} />
-          </div>
+        <div className="force-settings-column">
           <Form layout="vertical" className="hardware-form-grid hardware-form-grid-compact">
-            <Form.Item label="DAQ 通道">
-              <Input value={config.force[ipKey]} onChange={(event) => updateConfig({ force: { ...config.force, [ipKey]: event.target.value } })} />
+            <Form.Item label="数据源">
+              <Select
+                value={config.force.source}
+                options={[
+                  { value: 'nidaq', label: 'ATI Nano-17 / NI-DAQ' },
+                  { value: 'hkvl_serial', label: 'HKVL-36A / HAL 串口' },
+                ]}
+                onChange={(source) => updateConfig({ force: { ...config.force, source } })}
+              />
             </Form.Item>
-            <Form.Item label="保留端口"><InputNumber disabled value={config.force.port} onChange={(value) => updateConfig({ force: { ...config.force, port: Number(value ?? 49152) } })} /></Form.Item>
-            <Form.Item label="采样模式"><Select defaultValue="nidaqmx" options={[{ value: 'nidaqmx', label: 'NI-DAQmx 200Hz' }, { value: 'rdt', label: 'RDT UDP 备用' }]} /></Form.Item>
-            <Form.Item label="采样率 Hz"><InputNumber min={1} value={config.force.sampleHz} onChange={(value) => updateConfig({ force: { ...config.force, sampleHz: Number(value ?? 200) } })} /></Form.Item>
-            <Form.Item label="录制窗口样本"><InputNumber min={0} max={512} value={config.force.recordWindowSamples} onChange={(value) => updateConfig({ force: { ...config.force, recordWindowSamples: Number(value ?? 0) } })} /></Form.Item>
+            {isHkvl ? (
+              <>
+                <Form.Item label="串口">
+                  <Input
+                    value={config.force.serial[serialPortKey]}
+                    onChange={(event) => updateConfig({
+                      force: {
+                        ...config.force,
+                        serial: { ...config.force.serial, [serialPortKey]: event.target.value },
+                      },
+                    })}
+                  />
+                </Form.Item>
+                <Form.Item label="协议"><Input disabled value={config.force.serial.protocol} /></Form.Item>
+                <Form.Item label="波特率"><InputNumber disabled value={config.force.serial.baudrate} /></Form.Item>
+                <Form.Item label="测量采样率 Hz"><InputNumber disabled value={config.force.serial.expectedSampleHz} /></Form.Item>
+              </>
+            ) : (
+              <>
+                <Form.Item label="DAQ 通道">
+                  <Input value={config.force[ipKey]} onChange={(event) => updateConfig({ force: { ...config.force, [ipKey]: event.target.value } })} />
+                </Form.Item>
+                <Form.Item label="采样率 Hz"><InputNumber min={1} value={config.force.sampleHz} onChange={(value) => updateConfig({ force: { ...config.force, sampleHz: Number(value ?? 200) } })} /></Form.Item>
+                <Form.Item label="录制窗口样本"><InputNumber min={0} max={512} value={config.force.recordWindowSamples} onChange={(value) => updateConfig({ force: { ...config.force, recordWindowSamples: Number(value ?? 0) } })} /></Form.Item>
+              </>
+            )}
             <Form.Item label="Tare 样本"><InputNumber min={0} max={512} value={config.force.tareSamples} onChange={(value) => updateConfig({ force: { ...config.force, tareSamples: Number(value ?? 0) } })} /></Form.Item>
             <Form.Item label="低通滤波">
               <Switch
@@ -1573,15 +1680,182 @@ function ForceSensorCard({
               />
             </Form.Item>
             <Form.Item label="低通截止 Hz"><InputNumber min={0} value={config.force.lowpassCutoffHz} onChange={(value) => updateConfig({ force: { ...config.force, lowpassCutoffHz: Number(value ?? 10) } })} /></Form.Item>
-            <Form.Item label="标定证书">
+            {!isHkvl && <Form.Item label="标定证书">
               <Switch
                 checked={config.force.certificateConfirmed}
                 checkedChildren="已确认"
                 unCheckedChildren="待确认"
                 onChange={(checked) => updateConfig({ force: { ...config.force, certificateConfirmed: checked } })}
               />
-            </Form.Item>
+            </Form.Item>}
           </Form>
+          <div className="hardware-metric-grid">
+            {isHkvl ? (
+              <>
+                <MetricBox label="端口" value={sideStatus?.port || config.force.serial[serialPortKey]} hint={`${config.force.serial.baudrate.toLocaleString()} bps · 8N1`} tone={sideStatus?.connected ? 'ok' : 'warn'} />
+                <MetricBox label="采样率" value={`${Number(sideStatus?.sampleHz ?? 0).toFixed(1)} Hz`} hint={`样本年龄 ${Number(sideStatus?.sampleAgeMs ?? 0).toFixed(1)} ms`} tone={sideStatus?.healthy ? 'ok' : 'warn'} />
+                <MetricBox label="帧校验" value={`CRC ${sideStatus?.crcErrors ?? 0}`} hint={`resync ${sideStatus?.resyncBytes ?? 0}`} tone={(sideStatus?.crcErrors ?? 0) > 0 ? 'warn' : 'ok'} />
+                <MetricBox label="连接" value={sideStatus?.healthy ? '健康' : '异常'} hint={sideStatus?.error || `左右偏差 ${Number(forceStatus?.leftRightSkewMs ?? 0).toFixed(1)} ms`} tone={sideStatus?.healthy ? 'ok' : 'warn'} />
+              </>
+            ) : (
+              <>
+                <MetricBox label="Fx/Fy 量程" value={nano17Spec.range.fxy} />
+                <MetricBox label="Fz 量程" value={nano17Spec.range.fz} />
+                <MetricBox label="Moment 量程" value={nano17Spec.range.moment} />
+                <MetricBox label="NI-DAQmx" value="DIFF ai0:5" hint={`${nano17Spec.fastDaqHz}Hz`} />
+              </>
+            )}
+          </div>
+          {isHkvl && (
+            <>
+              <div className="force-control-workbench">
+                <section className="force-control-panel force-coordinate-panel">
+                  <div className="force-control-panel-head">
+                    <div>
+                      <b>六轴坐标方向</b>
+                      <span>操作者视角 · 传感器原始坐标到滑轨坐标</span>
+                    </div>
+                    <Tag color={compliance.mappingConfirmed ? 'success' : 'warning'}>
+                      {compliance.mappingConfirmed ? '已验证' : '待标定'}
+                    </Tag>
+                  </div>
+                  <Button
+                    aria-label={`${operatorLabel}六轴方向标定`}
+                    className="force-calibration-launch"
+                    icon={<Crosshair size={15} />}
+                    disabled={config.force.compliance.enabled}
+                    onClick={openAxisCalibration}
+                  >
+                    六轴方向标定
+                  </Button>
+                  <div className="force-axis-sign-grid" aria-label={`${operatorLabel}已标定方向`}>
+                    {forceAxisCalibrationAxes.map(({ axis, channel, index }) => (
+                      <span className="force-axis-sign" key={axis}>
+                        <small>{channel}</small>
+                        <b>{`${axis}${axisSigns[index] < 0 ? '−' : '+'}`}</b>
+                      </span>
+                    ))}
+                  </div>
+                  <Typography.Text type="secondary" className="force-control-note">
+                    {config.force.compliance.enabled ? '请先关闭位置导纳，才能修改方向标定。' : '保存后会重新加载传感器，随后需在无外力时 Tare。'}
+                  </Typography.Text>
+                </section>
+
+                <section className="force-control-panel force-compliance-panel">
+                  <div className="force-control-panel-head">
+                    <div>
+                      <b>X/Z 顺应</b>
+                      <span>仅作用于新的 Omega.7 原生遥操作目标</span>
+                    </div>
+                    <Switch
+                      aria-label="启用 X/Z 顺应"
+                      checked={config.force.compliance.enabled}
+                      disabled={!mappingsConfirmed && !config.force.compliance.enabled}
+                      checkedChildren="已启用"
+                      unCheckedChildren={mappingsConfirmed ? '已关闭' : '等待标定'}
+                      onChange={(enabled) => updateConfig({
+                        force: {
+                          ...config.force,
+                          compliance: { ...config.force.compliance, enabled },
+                        },
+                      })}
+                    />
+                  </div>
+                  <Form layout="vertical" className="force-compliance-grid">
+                    <Form.Item label="X/Z 映射矩阵">
+                      <Space.Compact block>
+                        {compliance.matrix.map((value, index) => (
+                          <InputNumber
+                            aria-label={`${operatorLabel}映射矩阵 ${index + 1}`}
+                            key={index}
+                            step={0.1}
+                            value={value}
+                            onChange={(next) => updateComplianceArray('matrix', index, next)}
+                          />
+                        ))}
+                      </Space.Compact>
+                    </Form.Item>
+                    {([
+                      ['deadbandN', 'X/Z 死区 N'],
+                      ['gainUmPerNs', 'X/Z 增益 μm/(N·s)'],
+                      ['maxStepUm', '单帧上限 μm'],
+                      ['maxOffsetUm', '会话偏移上限 μm'],
+                    ] as const).map(([key, label]) => (
+                      <Form.Item label={label} key={key}>
+                        <Space.Compact block>
+                          {compliance[key].map((value, index) => (
+                            <InputNumber
+                              aria-label={`${operatorLabel}${label} ${index === 0 ? 'X' : 'Z'}`}
+                              key={index}
+                              min={0}
+                              value={value}
+                              onChange={(next) => updateComplianceArray(key, index, next)}
+                            />
+                          ))}
+                        </Space.Compact>
+                      </Form.Item>
+                    ))}
+                  </Form>
+                </section>
+              </div>
+              <Typography.Text type="secondary" className="force-control-footer-note">
+                停止、急停或配置变化会清空累计偏移；方向标定只改变力坐标解释，不改变滑轨运动方向。
+              </Typography.Text>
+              <Modal
+                title={`${operatorLabel} 六轴方向标定`}
+                width={720}
+                className="force-axis-calibration-modal"
+                open={axisCalibrationOpen}
+                onCancel={() => setAxisCalibrationOpen(false)}
+                onOk={saveAxisCalibration}
+                okText="保存标定"
+                cancelText="取消"
+                okButtonProps={{ disabled: config.force.compliance.enabled }}
+              >
+                <div className="force-calibration-intro">
+                  <div>
+                    <span>操作者视角</span>
+                    <b>{operatorLabel}</b>
+                    <span>{sideStatus?.port || config.force.serial[serialPortKey]}</span>
+                  </div>
+                  <p>选择传感器原始轴相对滑轨运动坐标的方向。此操作不会改变滑轨运动方向。</p>
+                </div>
+                <div className="force-axis-calibration-groups">
+                  {forceAxisCalibrationGroups.map((group) => (
+                    <section className="force-axis-calibration-group" key={group.title}>
+                      <div className="force-axis-calibration-group-head">
+                        <b>{group.title}</b>
+                        <span>{group.unit}</span>
+                      </div>
+                      <div className="force-axis-calibration-axis-grid">
+                        {group.axes.map(({ axis, channel, index }) => (
+                          <div className="force-axis-calibration-axis" key={axis}>
+                            <div>
+                              <b>{axis}</b>
+                              <span>{channel}</span>
+                            </div>
+                            <Radio.Group
+                              aria-label={`${operatorLabel}${axis}方向`}
+                              buttonStyle="solid"
+                              optionType="button"
+                              value={axisSignDraft[index] ?? 1}
+                              onChange={(event) => updateAxisSignDraft(index, Number(event.target.value))}
+                            >
+                              <Radio.Button value={1}>同向 +</Radio.Button>
+                              <Radio.Button value={-1}>反向 −</Radio.Button>
+                            </Radio.Group>
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  ))}
+                </div>
+                <Typography.Text type="secondary" className="force-calibration-warning">
+                  保存会重新加载力传感器。请释放外力、完成 Tare 后，再启用位置导纳。
+                </Typography.Text>
+              </Modal>
+            </>
+          )}
         </div>
       </div>
     </HardwareConfigCard>
@@ -1855,8 +2129,21 @@ function PicoVisionCard({
  const updatePico = (patch: Partial<AppConfig['picoVision']>) => updateConfig({ picoVision: { ...config.picoVision, ...patch } })
  const [pendingPicoAction, setPendingPicoAction] = useState<'connect' | 'status' | 'start' | 'stop' | null>(null)
  const [lastPicoAction, setLastPicoAction] = useState<'idle' | 'connect' | 'status' | 'start' | 'stop'>('idle')
+ const [pendingNetworkDetection, setPendingNetworkDetection] = useState(false)
  const picoConnection = useTelemetryStore((state) => state.picoConnection)
+ const picoNetworkInfo = useTelemetryStore((state) => state.picoNetworkInfo)
+ const autoConfigurePicoNetwork = useTelemetryStore((state) => state.autoConfigurePicoNetwork)
  const setPicoConnectionStatus = useTelemetryStore((state) => state.setPicoConnectionStatus)
+ const runNetworkDetection = async () => {
+    setPendingNetworkDetection(true)
+    try {
+      await autoConfigurePicoNetwork(config.picoVision.ip)
+    } catch (error) {
+      injectLog('ERROR', `自动识别网口失败: ${commandErrorMessage(error)}`, '[CAMERA]')
+    } finally {
+      setPendingNetworkDetection(false)
+    }
+  }
  /** 处理对应的用户交互。 */
  const runPicoAction = async (
     action: 'connect' | 'status' | 'start' | 'stop',
@@ -1912,6 +2199,13 @@ function PicoVisionCard({
             连接无线 ADB
           </Button>
           <Button
+            icon={<Network size={15} />}
+            loading={pendingNetworkDetection}
+            onClick={() => void runNetworkDetection()}
+          >
+            重新识别网口
+          </Button>
+          <Button
             type="primary"
             icon={<Play size={15} />}
             loading={pendingPicoAction === 'start'}
@@ -1953,10 +2247,14 @@ function PicoVisionCard({
           <span>{sourceSpec.label}</span>
           <small>{sourceSpec.device}</small>
         </div>
-        <div className="pico-status-pending">
+        <div className={picoNetworkInfo ? 'pico-status-ok' : 'pico-status-pending'}>
           <b>路由</b>
           <span>{`IF ${config.picoVision.ifIndex} / ${config.picoVision.gateway}`}</span>
-          <small>跨网段时使用网关转发</small>
+          <small>
+            {picoNetworkInfo
+              ? `${picoNetworkInfo.interfaceAlias} · ${picoNetworkInfo.localIp}/${picoNetworkInfo.prefixLength}`
+              : '启动时自动识别；PICO IP 可由操作者校正'}
+          </small>
         </div>
       </div>
       <div className="hardware-metric-grid">
@@ -2108,7 +2406,6 @@ function TeleopHandCard({
  const setGravityScale = (value: number) => updateTeleop(side === 'left' ? { leftGravityScale: value } : { rightGravityScale: value })
   const axisOutputScale = side === 'left' ? config.teleop.leftAxisOutputScale : config.teleop.rightAxisOutputScale
   const enabledAxes = side === 'left' ? config.teleop.leftEnabledAxes : config.teleop.rightEnabledAxes
-  const enabledAxesCardNo = side === 'left' ? config.motion.leftCardNo : config.motion.rightCardNo
  /** 设置当前流程的对应状态。 */
  const setAxisOutputScale = (axisIndex: number, value: number) => {
     const next = [...axisOutputScale]
@@ -2117,7 +2414,6 @@ function TeleopHandCard({
   }
  /** 设置当前流程的对应状态。 */
  const setEnabledAxis = (axisIndex: number, value: boolean) => {
-    if (enabledAxesCardNo === 0 && axisIndex === 5) return
     const next = [...enabledAxes]
     next[axisIndex] = value
     updateTeleop(side === 'left' ? { leftEnabledAxes: next } : { rightEnabledAxes: next })
@@ -2438,9 +2734,8 @@ function TeleopHandCard({
             <small>{axis}</small>
             <InputNumber min={0} step={0.05} value={axisOutputScale[axisIndex] ?? 1} onChange={(value) => setAxisOutputScale(axisIndex, Number(value ?? 1))} />
             <Switch
-              checked={enabledAxesCardNo === 0 && axisIndex === 5 ? false : enabledAxes[axisIndex] ?? true}
+              checked={enabledAxes[axisIndex] ?? true}
               checkedChildren="On"
-              disabled={enabledAxesCardNo === 0 && axisIndex === 5}
               unCheckedChildren="Off"
               onChange={(value) => setEnabledAxis(axisIndex, value)}
             />
@@ -2562,7 +2857,6 @@ function ManualArmControl({
   const motionCardNo = hardwareSide === 'left' ? config.motion.leftCardNo : config.motion.rightCardNo
   const operatorLabel = operatorSideLabel(side)
   const selectedAxis = manualControl.selectedSide === hardwareSide ? manualControl.selectedAxis : 'X'
-  const card0YawDisabled = isManualAxisDisabledForCard(motionCardNo, selectedAxis)
   const axisIndex = manualAxisOrder.indexOf(selectedAxis)
   const axisKey = manualAxisSoftKey(selectedAxis)
   const unit = manualAxisUnit(selectedAxis)
@@ -2572,8 +2866,8 @@ function ManualArmControl({
   const stepValue = unit === 'um' ? manualControl.axisStepUm : manualControl.axisStepDeg
   const stepLimit = manualAxisStepLimit(config, hardwareSide, axisIndex, manualControl.speedMode)
   const boundedStepValue = clampManualAxisStep(stepValue, stepLimit)
-  const manualAxisBlocked = displayLimits.blocked || card0YawDisabled
-  const manualAxisBlockedText = card0YawDisabled ? 'Card 0 Yaw disabled' : 'work_origin_missing'
+  const manualAxisBlocked = displayLimits.blocked
+  const manualAxisBlockedText = 'work_origin_missing'
   const softMargin = manualAxisBlocked || translationSoftLimitDisabled ? 0 : Math.min(Math.abs(position - displayLimits.min), Math.abs(displayLimits.max - position))
   const profile = hardwareSide === 'left' ? config.motion.leftProfile : config.motion.rightProfile
   const group = axisIndex < 3 ? profile.translation : profile.rotation
@@ -2670,9 +2964,8 @@ function ManualArmControl({
           <div className="manual-axis-chip-grid">
             {manualAxisOrder.map((axis) => {
               const active = manualControl.selectedSide === hardwareSide && manualControl.selectedAxis === axis
-              const axisDisabled = isManualAxisDisabledForCard(motionCardNo, axis)
               return (
-                <Button key={axis} type={active ? 'primary' : 'default'} disabled={axisDisabled} onClick={() => selectManualAxis(hardwareSide, axis)}>
+                <Button key={axis} type={active ? 'primary' : 'default'} onClick={() => selectManualAxis(hardwareSide, axis)}>
                   {axis}
                 </Button>
               )
@@ -3099,6 +3392,19 @@ export function SettingsView() {
   const [comparisonRunning, setComparisonRunning] = useState(false)
   const [pendingTeleopReturnOriginSide, setPendingTeleopReturnOriginSide] = useState<RobotSide | null>(null)
   const [previousRestoreStatus, setPreviousRestoreStatus] = useState<MotionPreviousRestoreStatus | null>(null)
+  const [applyingConfig, setApplyingConfig] = useState(false)
+
+  const applyRuntimeConfig = async () => {
+    setApplyingConfig(true)
+    try {
+      await appApi.applyConfig(config)
+      injectLog('INFO', '配置已由 HAL 安全检查并应用', '[HAL]')
+    } catch (error) {
+      injectLog('ERROR', `配置应用失败：${commandErrorMessage(error)}`, '[HAL]')
+    } finally {
+      setApplyingConfig(false)
+    }
+  }
 
   const refreshMotionOriginStatus = useCallback(async () => {
     try {
@@ -3213,6 +3519,9 @@ const openSnapshotModal = (scope: ParameterSnapshotScope) => setSnapshotDraft({ 
           <Button type="primary" icon={<Save size={16} />} onClick={() => openSnapshotModal('all')}>
             保存硬件快照
           </Button>
+          <Button icon={<Play size={16} />} loading={applyingConfig} onClick={() => void applyRuntimeConfig()}>
+            应用配置
+          </Button>
         </Space>
       </section>
 
@@ -3229,7 +3538,11 @@ const openSnapshotModal = (scope: ParameterSnapshotScope) => setSnapshotDraft({ 
                   <MetricBox label="平台轴数" value="12 轴 + 2 夹爪" />
                   <MetricBox label="运动控制卡" value="Card 0 DMC5C10 / Card 1 DMC3C00" hint="Card 1 左，Card 0 右" />
                   <MetricBox label="相机" value="3x IMX335" hint="按原始比例预览" />
-                  <MetricBox label="力觉" value="2× ATI Nano-17" hint="显示 mN / mN·m" />
+                  <MetricBox
+                    label="力觉"
+                    value={config.force.source === 'hkvl_serial' ? '2× HKVL-36A' : '2× ATI Nano-17'}
+                    hint={config.force.source === 'hkvl_serial' ? 'HAL 双串口 · N / Nm' : 'NI-DAQ · 显示/录制'}
+                  />
                 </div>
                 <div className="hardware-settings-grid">
                   <HalCard config={config} updateConfig={updateConfig} focusHash={focusHash} injectLog={injectLog} />
@@ -3240,7 +3553,7 @@ const openSnapshotModal = (scope: ParameterSnapshotScope) => setSnapshotDraft({ 
                     dangerIndex={frame.dangerIndex}
                     setDangerOverride={setDangerOverride}
                     acknowledgeSafety={acknowledgeSafety}
-                    injectLog={injectLog}
+                    forceStatus={frame.forceStatus}
                   />
                   {sideOrder.map((side) => (
                     (() => {
@@ -3286,6 +3599,7 @@ const openSnapshotModal = (scope: ParameterSnapshotScope) => setSnapshotDraft({ 
                       updateConfig={updateConfig}
                       focusHash={focusHash}
                       values={hardwareSideForOperatorSide(side) === 'left' ? frame.forceLeft : frame.forceRight}
+                      forceStatus={frame.forceStatus}
                       history={history}
                       injectLog={injectLog}
                     />

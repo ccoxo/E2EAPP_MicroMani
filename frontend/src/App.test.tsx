@@ -1,15 +1,17 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { MemoryRouter } from 'react-router-dom'
 import * as api from './api'
 import { formatApiErrorMessage, stopMotionSide } from './api'
 import App from './App'
 import { ActionCompareModal } from './components/ActionCompareModal'
 import { LogPanel } from './components/LogPanel'
 import { defaultConfig, defaultDiagnostics } from './data'
+import { telemetryStaleAfterMs } from './hardwareStatus'
 import { chartHistoryIntervalMs, uiFrameIntervalMs, useTelemetryStore } from './stores/telemetry'
-import { isManualAxisDisabled, isManualAxisDisabledForCard } from './manualAxisRules'
 import type { TelemetryFrame } from './types'
 import { DatasetView } from './views/DatasetView'
+import { SettingsView } from './views/SettingsView'
 
 afterEach(() => {
   useTelemetryStore.getState().parameterSnapshots.forEach((snapshot) => useTelemetryStore.getState().deleteParameterSnapshot(snapshot.id))
@@ -21,6 +23,7 @@ afterEach(() => {
     config: structuredClone(defaultConfig),
     diagnostics: structuredClone(defaultDiagnostics),
     picoConnection: { state: 'pending', message: '尚未检查 PICO ADB', checkedAt: null },
+    picoNetworkInfo: null,
     manualControl: {
       selectedSide: 'left',
       selectedAxis: 'X',
@@ -58,6 +61,7 @@ afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  ;(globalThis as { __captureEchartOptions?: boolean }).__captureEchartOptions = false
 })
 
 describe('AppStation M0 frontend', () => {
@@ -200,6 +204,12 @@ describe('AppStation M0 frontend', () => {
     expect(state.history.length).toBeGreaterThanOrEqual(6)
     expect(state.history.length).toBeLessThanOrEqual(Math.ceil((30 * 33) / chartHistoryIntervalMs) + 2)
     expect(state.history.length).toBeLessThan(state.tick)
+    expect(state.telemetryLink.state).toBe('live')
+
+    await vi.advanceTimersByTimeAsync(telemetryStaleAfterMs + 250)
+
+    expect(useTelemetryStore.getState().telemetryLink.state).toBe('stale')
+    expect(useTelemetryStore.getState().frame.wsOk).toBe(false)
   })
 
   it('renders the operator navigation in the requested order', () => {
@@ -209,7 +219,7 @@ describe('AppStation M0 frontend', () => {
     expect(labels).toEqual(['主页', '录制', '数据集', '模型', '微调', '自动', '设置'])
   })
 
-  it('keeps the global emergency stop available across pages', () => {
+  it('keeps the global emergency stop available across pages', async () => {
     render(<App />)
     fireEvent.click(screen.getByRole('link', { name: '数据集' }))
 
@@ -223,7 +233,211 @@ describe('AppStation M0 frontend', () => {
     expect(resetButton).toHaveTextContent('确认安全态')
     fireEvent.click(resetButton)
 
-    expect(useTelemetryStore.getState().frame.dangerIndex).toBe(0)
+    await waitFor(() => expect(useTelemetryStore.getState().frame.dangerIndex).toBe(0))
+  })
+
+  it('keeps the safety acknowledgement visible after a latched force trip is unloaded', () => {
+    useTelemetryStore.setState((state) => ({
+      frame: {
+        ...state.frame,
+        dangerIndex: 0.2,
+        forceStatus: {
+          source: 'hkvl_serial',
+          safety: {
+            latched: true,
+            reason: 'left Fz stop threshold',
+            canAcknowledge: true,
+          },
+        },
+      },
+    }))
+
+    render(<App />)
+
+    expect(screen.getByRole('button', { name: '确认安全态' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '全局急停' })).toHaveTextContent('已急停')
+  })
+
+  it('keeps the safety latch visible when acknowledgement is rejected', async () => {
+    vi.spyOn(api, 'acknowledgeSafety').mockRejectedValueOnce(
+      new Error('双侧健康稳定时间不足 500 ms'),
+    )
+    useTelemetryStore.setState((state) => ({
+      dangerOverride: 1.1,
+      frame: {
+        ...state.frame,
+        dangerIndex: 1.1,
+        forceStatus: {
+          source: 'hkvl_serial',
+          safety: {
+            latched: true,
+            reason: 'left Fz stop threshold',
+            canAcknowledge: false,
+            acknowledgeBlocker: '双侧健康稳定时间不足 500 ms',
+          },
+        },
+      },
+    }))
+
+    useTelemetryStore.getState().acknowledgeSafety()
+
+    await waitFor(() => {
+      expect(useTelemetryStore.getState().frame.dangerIndex).toBe(1.1)
+      expect(useTelemetryStore.getState().logs.at(-1)?.msg).toContain('500 ms')
+    })
+  })
+
+  it('shows HKVL serial health, latch reason, and disabled unconfirmed compliance', async () => {
+    window.history.pushState({}, '', '/settings#force-left')
+    useTelemetryStore.setState((state) => ({
+      config: {
+        ...state.config,
+        force: {
+          ...state.config.force,
+          source: 'hkvl_serial',
+        },
+      },
+      frame: {
+        ...state.frame,
+        forceStatus: {
+          source: 'hkvl_serial',
+          protocol: 'hkvl_active_v1',
+          sides: {
+            left: {
+              port: 'COM15',
+              connected: true,
+              healthy: true,
+              sampleAgeMs: 2.5,
+              sampleHz: 999.4,
+              crcErrors: 3,
+            },
+            right: {
+              port: 'COM14',
+              connected: true,
+              healthy: true,
+              sampleAgeMs: 3.0,
+              sampleHz: 1000.2,
+              crcErrors: 1,
+            },
+          },
+          safety: {
+            latched: true,
+            reason: 'left Fz stop threshold',
+            canAcknowledge: false,
+            acknowledgeBlocker: '等待双侧卸载并稳定 500 ms',
+          },
+          compliance: { enabled: false },
+        },
+      },
+    }))
+
+    render(
+      <MemoryRouter initialEntries={['/settings#force-left']}>
+        <SettingsView />
+      </MemoryRouter>,
+    )
+
+    expect((await screen.findAllByText(/HKVL-36A/)).length).toBeGreaterThan(0)
+    const operatorLeftCard = document.getElementById('force-left')
+    const operatorRightCard = document.getElementById('force-right')
+    expect(operatorLeftCard).toHaveTextContent('COM14')
+    expect(operatorRightCard).toHaveTextContent('COM15')
+    expect(operatorLeftCard?.querySelector('.force-settings-layout-hkvl')).toBeTruthy()
+    expect(operatorLeftCard?.querySelector('.force-visual-area')).toBeTruthy()
+    expect(operatorLeftCard?.querySelector('.force-settings-column .force-control-workbench')).toBeTruthy()
+    expect(document.body).toHaveTextContent('CRC 3')
+    expect(screen.getByText('left Fz stop threshold')).toBeInTheDocument()
+    expect(screen.getByText(/不会恢复伺服/)).toBeInTheDocument()
+    expect(screen.getAllByRole('switch', { name: '启用 X/Z 顺应' })[0]).toBeDisabled()
+  }, 60000)
+
+  it('opens the operator-side six-axis force direction calibration', () => {
+    window.history.pushState({}, '', '/settings#force-left')
+    useTelemetryStore.setState((state) => ({
+      config: {
+        ...state.config,
+        force: {
+          ...state.config.force,
+          source: 'hkvl_serial',
+        },
+      },
+      frame: {
+        ...state.frame,
+        forceStatus: {
+          source: 'hkvl_serial',
+          sides: {
+            left: { port: 'COM15', connected: true, healthy: true },
+            right: { port: 'COM14', connected: true, healthy: true },
+          },
+        },
+      },
+    }))
+
+    render(
+      <MemoryRouter initialEntries={['/settings#force-left']}>
+        <SettingsView />
+      </MemoryRouter>,
+    )
+
+    const calibrationButton = document.querySelector<HTMLButtonElement>('[aria-label="左臂六轴方向标定"]')
+    expect(calibrationButton).not.toBeNull()
+    fireEvent.click(calibrationButton!)
+
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]')
+    expect(dialog?.textContent).toContain('左臂 六轴方向标定')
+    expect(dialog?.querySelector('[aria-label="左臂X方向"]')).not.toBeNull()
+  })
+
+  it("plots force history from the card's mapped hardware side", () => {
+    ;(globalThis as { __captureEchartOptions?: boolean }).__captureEchartOptions = true
+    useTelemetryStore.setState((state) => ({
+      config: {
+        ...state.config,
+        force: {
+          ...state.config.force,
+          source: 'hkvl_serial',
+        },
+      },
+      frame: {
+        ...state.frame,
+        forceStatus: {
+          source: 'hkvl_serial',
+          sides: {
+            left: { port: 'COM15', connected: true, healthy: true },
+            right: { port: 'COM14', connected: true, healthy: true },
+          },
+        },
+      },
+      history: [{
+        time: 1,
+        joints: Array.from({ length: 12 }, () => 0),
+        forceLeft: [0.014, 0, 0, 0, 0, 0],
+        forceRight: [1.527, 0, 0, 0, 0, 0],
+        danger: 0,
+        queueLeft: 0,
+        queueRight: 0,
+      }],
+    }))
+
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <SettingsView />
+      </MemoryRouter>,
+    )
+
+    const operatorLeftCard = document.getElementById('force-left')
+    const operatorRightCard = document.getElementById('force-right')
+    expect(operatorLeftCard).toBeTruthy()
+    expect(operatorRightCard).toBeTruthy()
+    const operatorLeftOption = JSON.parse(
+      within(operatorLeftCard!).getByTestId('echart-mock').getAttribute('data-chart-option') ?? '{}',
+    )
+    const operatorRightOption = JSON.parse(
+      within(operatorRightCard!).getByTestId('echart-mock').getAttribute('data-chart-option') ?? '{}',
+    )
+
+    expect(operatorLeftOption.series[0].data).toEqual([1527])
+    expect(operatorRightOption.series[0].data).toEqual([14])
   })
 
   it('navigates to the record workflow', () => {
@@ -248,13 +462,50 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getByText('平移阈值 v_th')).toBeInTheDocument()
     expect(screen.getByText('旋转测量方差 R')).toBeInTheDocument()
     expect(screen.getByText('旋转阈值 v_th')).toBeInTheDocument()
-    expect(document.querySelector('.record-page-side')).toContainElement(screen.getByText('卡尔曼滤波'))
+    const recordSidebar = document.querySelector('.record-page-side')
+    expect(recordSidebar).toContainElement(screen.getByText('卡尔曼滤波'))
+    expect(recordSidebar?.textContent?.indexOf('录制历史')).toBeLessThan(
+      recordSidebar?.textContent?.indexOf('卡尔曼滤波') ?? -1,
+    )
+    expect(recordSidebar?.textContent?.indexOf('硬件状态')).toBeLessThan(
+      recordSidebar?.textContent?.indexOf('卡尔曼滤波') ?? -1,
+    )
 
     const toggle = screen.getByRole('switch', { name: '卡尔曼滤波开关' })
     expect(toggle).not.toBeChecked()
     fireEvent.click(toggle)
 
     expect(useTelemetryStore.getState().config.teleop.kalmanFilterEnabled).toBe(true)
+  })
+
+  it('shows current-session recording history and opens the dataset page', async () => {
+    window.history.pushState({}, '', '/record')
+    useTelemetryStore.setState((state) => ({
+      recordSession: {
+        ...state.recordSession,
+        episodeHistory: [
+          {
+            index: 7,
+            frameCount: 321,
+            durationS: 10.7,
+            status: 'ok',
+            maxForceLeft: 2.1,
+            maxForceRight: 2.3,
+            lateFrames: 0,
+            cameraDrops: { global: 0, wristLeft: 0, wristRight: 0 },
+          },
+        ],
+      },
+    }))
+    render(<App />)
+
+    expect(screen.getByText('#007')).toBeInTheDocument()
+    expect(screen.getByText('321 帧 / 10.7s')).toBeInTheDocument()
+    expect(screen.getByText('OK')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '查看全部 ->' }))
+
+    expect(await screen.findByText('数据集质检 Dataset')).toBeInTheDocument()
   })
 
   it('returns left and right slave arms to recorded zero from the record controls', async () => {
@@ -774,6 +1025,7 @@ describe('AppStation M0 frontend', () => {
 
   it('runs the record precheck, save, and quality report flow', async () => {
     useTelemetryStore.setState((state) => ({
+      telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
       config: {
         ...state.config,
         teleop: { ...state.config.teleop, leftConnected: true, rightConnected: true },
@@ -1045,6 +1297,7 @@ describe('AppStation M0 frontend', () => {
   it('blocks record precheck until Omega.7 and gripper diagnostics are recognized', async () => {
     window.history.pushState({}, '', '/record')
     useTelemetryStore.setState((state) => ({
+      telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
       diagnostics: state.diagnostics.map((item) =>
         item.key === 'omega7' || item.key === 'gripper' ? { ...item, status: 'error' } : item,
       ),
@@ -1087,6 +1340,7 @@ describe('AppStation M0 frontend', () => {
   it('blocks record precheck until both Omega.7 logical hands are connected', async () => {
     window.history.pushState({}, '', '/record')
     useTelemetryStore.setState((state) => ({
+      telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
       config: {
         ...state.config,
         teleop: { ...state.config.teleop, leftConnected: false, rightConnected: false },
@@ -1480,6 +1734,7 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getAllByText('手册未给出').length).toBeGreaterThan(0)
     expect(screen.getByText('PICO-4 视觉推流')).toBeInTheDocument()
     expect(screen.getByText('连接无线 ADB')).toBeInTheDocument()
+    expect(screen.getByText('重新识别网口')).toBeInTheDocument()
     expect(screen.getByText('启动视觉')).toBeInTheDocument()
     expect(screen.getAllByText('相机采集目标 FPS').length).toBeGreaterThan(0)
     expect(screen.getAllByText('录制 FPS').length).toBeGreaterThan(0)
@@ -1522,7 +1777,7 @@ describe('AppStation M0 frontend', () => {
     expect(defaultConfig.teleop.swapTeleopChannels).toBe(true)
     expect(defaultConfig.teleop.leftSoftLimitMin).toEqual([-25000, -37500, -37500, -5, -30, -7])
     expect(defaultConfig.teleop.leftSoftLimitMax).toEqual([25000, 37500, 37500, 95, 30, 7])
-    expect(defaultConfig.teleop.rightEnabledAxes).toEqual([true, true, true, true, true, false])
+    expect(defaultConfig.teleop.rightEnabledAxes).toEqual([true, true, true, true, true, true])
     expect(defaultConfig.teleop.rightSoftLimitMin).toEqual([-25000, -37500, -37500, -95, -30, -7])
     expect(defaultConfig.teleop.rightSoftLimitMax).toEqual([25000, 37500, 37500, 5, 30, 7])
     expect(defaultConfig.motion.rotationWorkLimits.left.roll).toEqual({ min: -5, max: 95 })
@@ -1819,12 +2074,26 @@ describe('AppStation M0 frontend', () => {
     expect(screen.queryByText('开发者模式')).not.toBeInTheDocument()
   })
 
-  it('disables right-arm Yaw in manual controls', () => {
-    expect(isManualAxisDisabled('left', 'Yaw')).toBe(false)
-    expect(isManualAxisDisabled('right', 'Roll')).toBe(false)
-    expect(isManualAxisDisabled('right', 'Yaw')).toBe(true)
-    expect(isManualAxisDisabledForCard(0, 'Yaw')).toBe(true)
-    expect(isManualAxisDisabledForCard(1, 'Yaw')).toBe(false)
+  it('enables Card 0 Yaw in manual controls', () => {
+    window.history.pushState({}, '', '/settings#manual')
+    render(<App />)
+
+    const operatorLeftCard = screen.getByText('左臂手动控制').closest('article')
+    expect(operatorLeftCard).toBeTruthy()
+    expect(within(operatorLeftCard!).getByRole('button', { name: 'Yaw' })).toBeEnabled()
+  })
+
+  it('allows the Card 0 Yaw teleop axis mask to be controlled', () => {
+    window.history.pushState({}, '', '/settings#teleop-right')
+    render(<App />)
+
+    const teleopCard = document.getElementById('teleop-right')
+    expect(teleopCard).toBeTruthy()
+    const yawRow = within(teleopCard!).getByText('Yaw').parentElement
+    expect(yawRow).toBeTruthy()
+    const yawSwitch = within(yawRow!).getByRole('switch')
+    expect(yawSwitch).toBeEnabled()
+    expect(yawSwitch).toBeChecked()
   })
 
   it('records arm and gripper manual actions into replay memory', () => {
@@ -1974,7 +2243,9 @@ describe('AppStation M0 frontend', () => {
     expect(screen.queryByText('设为采集零点')).not.toBeInTheDocument()
     expect(screen.queryByText('清除零点')).not.toBeInTheDocument()
     expect(screen.getAllByText('Roll -5~95° / Pitch ±30° · Yaw ±7°').length).toBeGreaterThan(0)
-    expect(screen.getAllByText('Roll -95~5° / Pitch ±30° · Yaw disabled').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Roll -95~5° / Pitch ±30° · Yaw ±7°').length).toBeGreaterThan(0)
+    expect(screen.queryByText(/Yaw disabled/)).not.toBeInTheDocument()
+    expect(screen.queryByText('Card 0 Yaw disabled')).not.toBeInTheDocument()
   })
 
   it('disables restoring the previous work origin when the backup is outside effective limits', async () => {

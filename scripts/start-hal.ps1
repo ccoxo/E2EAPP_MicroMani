@@ -133,6 +133,29 @@ function Copy-RuntimeDllIfNewer {
   }
 }
 
+function Resolve-HkvlBoundPort {
+  param(
+    [string]$Side,
+    [string]$InstanceId
+  )
+
+  $devices = @(Get-PnpDevice -PresentOnly -Class Ports | Where-Object {
+      $_.InstanceId -eq $InstanceId
+    })
+  if ($devices.Count -ne 1) {
+    throw "HKVL serial binding not found for hardware $Side side: $InstanceId"
+  }
+  $portMatch = [regex]::Match(
+    [string]$devices[0].FriendlyName,
+    '\((COM\d+)\)\s*$',
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+  )
+  if (!$portMatch.Success) {
+    throw "HKVL serial binding has no COM port for hardware $Side side: $InstanceId"
+  }
+  return $portMatch.Groups[1].Value.ToUpperInvariant()
+}
+
 if ($Restart) {
   Stop-HalRuntimeProcessTrees
   Get-ChildItem -LiteralPath $halBuild -Filter "JodellGripperWorker.runtime-*.exe" -ErrorAction SilentlyContinue |
@@ -186,6 +209,41 @@ $runtimeConfig = Join-Path $repo "backend\runtime\config.json"
 $omegaLeftOpenId = 0
 $omegaRightOpenId = 1
 $omegaSwapHands = $false
+$hkvlLeftInstanceId = "USB\VID_1A86&PID_55D3\5C7B023865"
+$hkvlRightInstanceId = "USB\VID_1A86&PID_55D3\5C7B030018"
+$forceRuntimeConfig = [ordered]@{
+  source = "nidaq"
+  protocol = "hkvl_active_v1"
+  leftPort = "COM15"
+  rightPort = "COM14"
+  leftAxisSign = @(-1.0, 1.0, -1.0, 1.0, -1.0, -1.0)
+  rightAxisSign = @(-1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
+  baudrate = 1000000
+  expectedSampleHz = 1000
+  lowpassEnabled = $true
+  lowpassCutoffHz = 10.0
+  fxyWarnN = 2.0
+  fxyStopN = 30.0
+  fzWarnN = 3.0
+  fzStopN = 30.0
+  momentWarnNm = 0.02
+  momentStopNm = 1.0
+  watchdogMs = 50.0
+  acknowledgeStableMs = 500.0
+  complianceEnabled = $false
+  leftMappingConfirmed = $false
+  leftComplianceMatrix = @(1.0, 0.0, 0.0, 1.0)
+  leftComplianceDeadbandN = @(0.0, 0.0)
+  leftComplianceGainUmPerNs = @(0.0, 0.0)
+  leftComplianceMaxStepUm = @(0.0, 0.0)
+  leftComplianceMaxOffsetUm = @(0.0, 0.0)
+  rightMappingConfirmed = $false
+  rightComplianceMatrix = @(1.0, 0.0, 0.0, 1.0)
+  rightComplianceDeadbandN = @(0.0, 0.0)
+  rightComplianceGainUmPerNs = @(0.0, 0.0)
+  rightComplianceMaxStepUm = @(0.0, 0.0)
+  rightComplianceMaxOffsetUm = @(0.0, 0.0)
+}
 if (Test-Path $runtimeConfig) {
   try {
     $config = Get-Content $runtimeConfig -Raw | ConvertFrom-Json
@@ -194,13 +252,101 @@ if (Test-Path $runtimeConfig) {
       if ($null -ne $config.teleop.rightOpenId) { $omegaRightOpenId = [int]$config.teleop.rightOpenId }
       if ($null -ne $config.teleop.swapHands) { $omegaSwapHands = [bool]$config.teleop.swapHands }
     }
+    if ($null -ne $config.motion -and $null -ne $config.motion.kinematics) {
+      foreach ($axisSignMapping in @(
+        @("left", "leftSignedPulsePerUnit"),
+        @("right", "rightSignedPulsePerUnit")
+      )) {
+        $side = $axisSignMapping[0]
+        $sourceKey = $axisSignMapping[1]
+        $values = @($config.motion.kinematics.$sourceKey)
+        if ($values.Count -ne 6) {
+          throw "motion.kinematics.$sourceKey must contain exactly 6 numbers"
+        }
+        $signs = @()
+        foreach ($item in $values) {
+          $value = [double]$item
+          if ([double]::IsNaN($value) -or [double]::IsInfinity($value) -or $value -eq 0.0) {
+            throw "motion.kinematics.$sourceKey values must be finite and non-zero"
+          }
+          if ($value -lt 0.0) {
+            $signs += -1.0
+          } else {
+            $signs += 1.0
+          }
+        }
+        $forceRuntimeConfig["${side}AxisSign"] = $signs
+      }
+    }
+    if ($null -ne $config.force) {
+      if ($null -ne $config.force.source) { $forceRuntimeConfig.source = [string]$config.force.source }
+      if ($null -ne $config.force.lowpassEnabled) { $forceRuntimeConfig.lowpassEnabled = [bool]$config.force.lowpassEnabled }
+      if ($null -ne $config.force.lowpassCutoffHz) { $forceRuntimeConfig.lowpassCutoffHz = [double]$config.force.lowpassCutoffHz }
+      if ($null -ne $config.force.serial) {
+        foreach ($key in @("protocol", "leftPort", "rightPort", "baudrate", "expectedSampleHz")) {
+          if ($null -ne $config.force.serial.$key) { $forceRuntimeConfig[$key] = $config.force.serial.$key }
+        }
+      }
+      if ($null -ne $config.force.compliance) {
+        if ($null -ne $config.force.compliance.enabled) {
+          $forceRuntimeConfig.complianceEnabled = [bool]$config.force.compliance.enabled
+        }
+        foreach ($side in @("left", "right")) {
+          $sideConfig = $config.force.compliance.$side
+          if ($null -eq $sideConfig) { continue }
+          if ($null -ne $sideConfig.mappingConfirmed) {
+            $forceRuntimeConfig["${side}MappingConfirmed"] = [bool]$sideConfig.mappingConfirmed
+          }
+          foreach ($mapping in @(
+            @("matrix", "Matrix"),
+            @("deadbandN", "DeadbandN"),
+            @("gainUmPerNs", "GainUmPerNs"),
+            @("maxStepUm", "MaxStepUm"),
+            @("maxOffsetUm", "MaxOffsetUm")
+          )) {
+            $sourceKey = $mapping[0]
+            $targetKey = "${side}Compliance$($mapping[1])"
+            if ($null -ne $sideConfig.$sourceKey) {
+              $forceRuntimeConfig[$targetKey] = @($sideConfig.$sourceKey | ForEach-Object { [double]$_ })
+            }
+          }
+        }
+      }
+    }
+    if ($null -ne $config.safety) {
+      foreach ($key in @(
+        "fxyWarnN",
+        "fxyStopN",
+        "fzWarnN",
+        "fzStopN",
+        "momentWarnNm",
+        "momentStopNm",
+        "watchdogMs"
+      )) {
+        if ($null -ne $config.safety.$key) { $forceRuntimeConfig[$key] = [double]$config.safety.$key }
+      }
+    }
   } catch {
-    Write-Warning "Failed to read Omega7 teleop config from $runtimeConfig; using ICF defaults. $($_.Exception.Message)"
+    Write-Warning "Failed to read HAL runtime config from $runtimeConfig; using ICF defaults. $($_.Exception.Message)"
   }
+}
+if ([string]$forceRuntimeConfig.source -eq "hkvl_serial") {
+  $forceRuntimeConfig.leftPort = Resolve-HkvlBoundPort -Side "left" -InstanceId $hkvlLeftInstanceId
+  $forceRuntimeConfig.rightPort = Resolve-HkvlBoundPort -Side "right" -InstanceId $hkvlRightInstanceId
+  if ($forceRuntimeConfig.leftPort -eq $forceRuntimeConfig.rightPort) {
+    throw "HKVL hardware left and right bindings resolved to the same port: $($forceRuntimeConfig.leftPort)"
+  }
+  $env:APPSTATION_HKVL_LEFT_PORT = [string]$forceRuntimeConfig.leftPort
+  $env:APPSTATION_HKVL_RIGHT_PORT = [string]$forceRuntimeConfig.rightPort
+  Write-Host "HKVL bound ports: hardware left=$($forceRuntimeConfig.leftPort), hardware right=$($forceRuntimeConfig.rightPort)"
+} else {
+  Remove-Item Env:APPSTATION_HKVL_LEFT_PORT -ErrorAction SilentlyContinue
+  Remove-Item Env:APPSTATION_HKVL_RIGHT_PORT -ErrorAction SilentlyContinue
 }
 $env:APPSTATION_OMEGA7_LEFT_OPEN_ID = "$omegaLeftOpenId"
 $env:APPSTATION_OMEGA7_RIGHT_OPEN_ID = "$omegaRightOpenId"
 $env:APPSTATION_OMEGA7_SWAP_HANDS = if ($omegaSwapHands) { "true" } else { "false" }
+$env:APPSTATION_FORCE_CONFIG_JSON = $forceRuntimeConfig | ConvertTo-Json -Compress
 $env:APPSTATION_HAL_PORT = "$Port"
 $env:APPSTATION_HAL_DDS_ENABLED = "1"
 if (-not $env:APPSTATION_DDS_DOMAIN_ID) { $env:APPSTATION_DDS_DOMAIN_ID = "42" }

@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import {
   acknowledgeSafety as acknowledgeSafetyApi,
+  autoConfigurePicoNetwork as autoConfigurePicoNetworkApi,
   applyParameterSnapshotApi,
   createParameterSnapshot as createParameterSnapshotApi,
   createSession as createRecordSessionApi,
@@ -25,11 +26,13 @@ import {
   tareForceSensors as tareForceSensorsApi,
   toggleClutch as toggleClutchApi,
   putConfig,
+  type PicoNetworkInfo,
   type RecordEpisodeSaveApi,
   type RecordStatusApi,
   wsUrl,
 } from '../api/index'
 import { defaultConfig, defaultDiagnostics, logChannels, operatorSideForHardwareSide, operatorSideLabel } from '../data'
+import { telemetryStaleAfterMs } from '../hardwareStatus'
 import { manualAxisStepLimitFromPulse } from '../manualMotionLimits'
 import { manualMaxVelocity } from '../manualSpeed'
 import { motionSideReturnOriginReady } from '../motionReturnReady'
@@ -53,6 +56,7 @@ import type {
   RecordQualityReport,
   RecordSessionState,
   TelemetryFrame,
+  TelemetryLinkStatus,
   TelemetrySample,
 } from '../types'
 
@@ -319,6 +323,7 @@ interface TelemetryStore {
   diagnostics: DiagnosticItem[]
   config: AppConfig
   picoConnection: { state: ConnectionState; message: string; checkedAt: number | null }
+  picoNetworkInfo: PicoNetworkInfo | null
   recording: boolean
   autoRunning: boolean
   clutchActive: boolean
@@ -335,6 +340,7 @@ interface TelemetryStore {
   backendWs: WebSocket | null
   backendReconnectTimer: number | null
   backendReconnectAttempts: number
+  telemetryLink: TelemetryLinkStatus
   startMock: () => void
   stopMock: () => void
   startBackend: () => void
@@ -372,6 +378,7 @@ interface TelemetryStore {
   refreshHardwareStatus: () => Promise<void>
   runDiagnostics: () => Promise<void>
   setPicoConnectionStatus: (state: ConnectionState, message: string) => void
+  autoConfigurePicoNetwork: (picoIp?: string) => Promise<PicoNetworkInfo>
   updateConfig: (patch: Partial<AppConfig>) => void
   saveParameterSnapshot: (scope: ParameterSnapshotScope, name: string) => void
   applyParameterSnapshot: (id: string) => void
@@ -399,6 +406,15 @@ const emptyFrame: TelemetryFrame = {
   motionAxisEnabled: { left: Array.from({ length: 6 }, () => null), right: Array.from({ length: 6 }, () => null) },
   forceLeft: [0, 0, 0, 0, 0, 0],
   forceRight: [0, 0, 0, 0, 0, 0],
+  forceStatus: {
+    source: 'nidaq',
+    sides: {
+      left: { connected: false, healthy: false },
+      right: { connected: false, healthy: false },
+    },
+    safety: { latched: false, reason: '', canAcknowledge: false },
+    compliance: { enabled: false },
+  },
   dangerIndex: 0,
   recording: false,
   episodeCount: 0,
@@ -569,6 +585,16 @@ function buildFrame(state: TelemetryStore): TelemetryFrame {
     },
     forceLeft,
     forceRight,
+    forceStatus: {
+      source: state.config.force.source,
+      protocol: state.config.force.serial.protocol,
+      sides: {
+        left: { port: state.config.force.serial.leftPort, connected: true, healthy: true, sampleAgeMs: 1, sampleHz: 1000, crcErrors: 0 },
+        right: { port: state.config.force.serial.rightPort, connected: true, healthy: true, sampleAgeMs: 1, sampleHz: 1000, crcErrors: 0 },
+      },
+      safety: { latched: dangerIndex >= 1, reason: dangerIndex >= 1 ? '模拟安全锁存' : '', canAcknowledge: dangerIndex >= 1 },
+      compliance: { enabled: state.config.force.compliance.enabled },
+    },
     dangerIndex,
     recording: state.recording || recordActive,
     episodeCount: state.recordSession.currentEpisode || state.episodeCount,
@@ -723,6 +749,8 @@ let recordResetSkipInFlight = false
 let pendingBackendFrame: TelemetryFrame | null = null
 let backendFrameDelayTimer: number | null = null
 let backendFrameRaf: number | null = null
+let backendStaleWatchdogTimer: number | null = null
+let lastBackendFrameReceivedAt: number | null = null
 let lastBackendFrameCommitAt = 0
 let lastBackendHistoryCommitAt = 0
 /** Finalize the backend session after the quality-report review flow closes. */
@@ -831,6 +859,10 @@ function commitBackendFrame(set: TelemetryStoreSet, frame: TelemetryFrame, force
     return {
       tick: state.tick + 1,
       frame: nextFrame,
+      telemetryLink: {
+        state: 'live',
+        lastFrameReceivedAt: lastBackendFrameReceivedAt ?? now,
+      },
       recording: nextFrame.recording,
       episodeCount: nextFrame.episodeCount,
       frameCount: nextFrame.frameCount,
@@ -885,6 +917,26 @@ function enqueueBackendFrame(set: TelemetryStoreSet, get: TelemetryStoreGet, fra
   schedulePendingBackendFrame(set, get)
 }
 /** 删除对应数据并同步界面状态。 */
+function startBackendStaleWatchdog(set: TelemetryStoreSet, get: TelemetryStoreGet) {
+  if (backendStaleWatchdogTimer !== null) return
+  backendStaleWatchdogTimer = window.setInterval(() => {
+    const receivedAt = lastBackendFrameReceivedAt
+    if (
+      get().telemetryLink.state === 'live'
+      && receivedAt !== null
+      && Date.now() - receivedAt > telemetryStaleAfterMs
+    ) {
+      set((state) => ({
+        telemetryLink: { state: 'stale', lastFrameReceivedAt: receivedAt },
+        frame: { ...state.frame, wsOk: false },
+      }))
+    }
+  }, 250)
+}
+function stopBackendStaleWatchdog() {
+  if (backendStaleWatchdogTimer !== null) window.clearInterval(backendStaleWatchdogTimer)
+  backendStaleWatchdogTimer = null
+}
 function clearPendingBackendFrameFlush() {
   if (backendFrameDelayTimer !== null) {
     window.clearTimeout(backendFrameDelayTimer)
@@ -997,6 +1049,13 @@ export function diagnosticsFromHardwareStatus(
       return { ...item, status: status.camera.ok ? 'ok' : 'error', remediation: status.camera.message }
     }
     if (item.key.startsWith('ati-') && status.force) {
+      if (status.force.source === 'hkvl_serial') {
+        return {
+          ...item,
+          status: 'pending',
+          remediation: '当前数据源为 HAL 原生 HKVL-36A；NI-DAQ 探测已跳过',
+        }
+      }
       return { ...item, status: status.force.ok ? 'ok' : 'error', remediation: status.force.message }
     }
     if (item.key === 'gripper' && status.gripper) {
@@ -1175,6 +1234,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   diagnostics: defaultDiagnostics,
   config: defaultConfig,
   picoConnection: { state: 'pending', message: '尚未检查 PICO ADB', checkedAt: null },
+  picoNetworkInfo: null,
   recording: false,
   autoRunning: false,
   clutchActive: false,
@@ -1191,6 +1251,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   backendWs: null,
   backendReconnectTimer: null,
   backendReconnectAttempts: 0,
+  telemetryLink: { state: 'connecting', lastFrameReceivedAt: null },
 
 /** 启动对应流程。 */
 startMock: () => {
@@ -1222,6 +1283,7 @@ startMock: () => {
         return {
           tick,
           frame,
+          telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
           recordSession,
           frameCount: frame.frameCount,
           history: state.history.length === 0 || tick % Math.max(1, Math.round(chartHistoryIntervalMs / mockTelemetryIntervalMs)) === 0
@@ -1244,6 +1306,10 @@ stopMock: () => {
 /** 启动对应流程。 */
 startBackend: () => {
     if (get().backendWs) return
+    startBackendStaleWatchdog(set, get)
+    set((state) => ({
+      telemetryLink: { state: 'connecting', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
+    }))
     clearPendingBackendFrameFlush()
     const reconnectTimer = get().backendReconnectTimer
     if (reconnectTimer) {
@@ -1252,7 +1318,14 @@ startBackend: () => {
     }
     // 网页套接字建立前先拉一次静态配置和硬件概况，首屏不会等到下一帧遥测才有数据。
     void fetchConfig()
-      .then((config) => set({ config: normalizeConfig(config) }))
+      .then((config) => {
+        set({ config: normalizeConfig(config) })
+        void get().autoConfigurePicoNetwork().catch((error) => {
+          set((state) => ({
+            logs: appendLog(state.logs, makeLog('WARNING', `PICO network detection failed: ${String(error)}`, '[CAMERA]')),
+          }))
+        })
+      })
       .catch((error) => {
         set((state) => ({
           logs: appendLog(state.logs, makeLog('ERROR', `settings fetch failed: ${String(error)}`, '[BACKEND]')),
@@ -1282,6 +1355,7 @@ startBackend: () => {
     ws.onopen = () => {
       set((state) => ({
         backendReconnectAttempts: 0,
+        telemetryLink: { state: 'connecting', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
         logs: appendLog(state.logs, makeLog('INFO', `Backend WebSocket connected: ${wsUrl}`, '[BACKEND]')),
       }))
     }
@@ -1289,6 +1363,7 @@ startBackend: () => {
       try {
         const message = JSON.parse(String(event.data)) as BackendWsMessage
         if (message.type === 'telemetry') {
+          lastBackendFrameReceivedAt = Date.now()
           const frame = {
             ...message.data,
             motionEnabled: message.data.motionEnabled ?? { left: null, right: null },
@@ -1317,6 +1392,7 @@ startBackend: () => {
     ws.onerror = () => {
       set((state) => ({
         frame: { ...state.frame, wsOk: false },
+        telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
         logs: appendLog(state.logs, makeLog('ERROR', 'Backend WebSocket error', '[BACKEND]')),
       }))
     }
@@ -1336,6 +1412,7 @@ startBackend: () => {
         backendReconnectTimer: reconnectTimer,
         backendReconnectAttempts: attempts,
         frame: { ...state.frame, wsOk: false },
+        telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
         logs: appendLog(
           state.logs,
           makeLog(
@@ -1354,8 +1431,14 @@ stopBackend: () => {
     const ws = get().backendWs
     const timer = get().backendReconnectTimer
     if (timer) window.clearTimeout(timer)
+    stopBackendStaleWatchdog()
     clearPendingBackendFrameFlush()
-    set({ backendWs: null, backendReconnectTimer: null, backendReconnectAttempts: 0 })
+    set((state) => ({
+      backendWs: null,
+      backendReconnectTimer: null,
+      backendReconnectAttempts: 0,
+      telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
+    }))
     if (ws) ws.close()
   },
 
@@ -2035,19 +2118,31 @@ setDangerOverride: (danger) =>
 
 /** 应用对应配置或状态。 */
 acknowledgeSafety: () => {
-    void acknowledgeSafetyApi().catch((error) => {
-      set((state) => ({
-        logs: appendLog(state.logs, makeLog('ERROR', `safety acknowledge failed: ${String(error)}`, '[SAFETY]')),
-      }))
-    })
-    set((state) => ({
-      dangerOverride: null,
-      frame: {
-        ...state.frame,
-        dangerIndex: 0,
-      },
-      logs: appendLog(state.logs, makeLog('INFO', '操作员确认安全态（不恢复运动）', '[SAFETY]')),
-    }))
+    void acknowledgeSafetyApi()
+      .then(() => {
+        set((state) => ({
+          dangerOverride: null,
+          frame: {
+            ...state.frame,
+            dangerIndex: 0,
+            forceStatus: {
+              ...state.frame.forceStatus,
+              safety: {
+                ...state.frame.forceStatus?.safety,
+                latched: false,
+                reason: '',
+                acknowledgeBlocker: '',
+              },
+            },
+          },
+          logs: appendLog(state.logs, makeLog('INFO', '操作员确认安全态（伺服保持关闭）', '[SAFETY]')),
+        }))
+      })
+      .catch((error) => {
+        set((state) => ({
+          logs: appendLog(state.logs, makeLog('ERROR', `safety acknowledge failed: ${String(error)}`, '[SAFETY]')),
+        }))
+      })
   },
 
 /** 描述当前方法的功能边界。 */
@@ -2105,6 +2200,27 @@ sendBackendCommandLog: (level, msg, channel) => {
  /** 设置当前流程的对应状态。 */
  setPicoConnectionStatus: (state, message) => {
     set({ picoConnection: { state, message, checkedAt: Date.now() } })
+  },
+
+/** Detect the active PC network path and accept the config already persisted by the backend. */
+autoConfigurePicoNetwork: async (picoIp) => {
+    const response = await autoConfigurePicoNetworkApi(picoIp)
+    const network = response.data?.network
+    const config = response.data?.config
+    if (!network || !config) throw new Error('PICO network detection returned an incomplete response')
+    set((state) => ({
+      config: normalizeConfig(config),
+      picoNetworkInfo: network,
+      logs: appendLog(
+        state.logs,
+        makeLog(
+          'INFO',
+          `PICO network: ${network.interfaceAlias} IF ${network.ifIndex}, ${network.localIp}/${network.prefixLength}`,
+          '[CAMERA]',
+        ),
+      ),
+    }))
+    return network
   },
 
 /** 描述当前方法的功能边界。 */

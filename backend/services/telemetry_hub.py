@@ -72,6 +72,7 @@ class TelemetryHub:
         motion_enabled: dict[str, bool | None] | None = None,
         motion_axis_enabled: dict[str, list[bool | None]] | None = None,
         omega_hands: list[dict[str, Any]] | None = None,
+        force_state: dict[str, Any] | None = None,
         native_gripper_status: dict[str, Any] | None = None,
         hal_ok: bool = True,
         config: dict[str, Any] | None = None,
@@ -87,6 +88,7 @@ class TelemetryHub:
         self._last_frame_at = now
         config = config if config is not None else self.settings.get_config()
         real_mode = self._real_hardware_mode(config)
+        force_source = str(config.get("force", {}).get("source", "nidaq")).lower()
         if real_mode:
             if motion_positions is not None and len(motion_positions) == 12:
                 # 真机位置以 HAL 返回值为准，本地 offset 只服务于测试模式。
@@ -112,15 +114,51 @@ class TelemetryHub:
             self.estop_active = motion_estop_active
         force_left = self._force_values(elapsed, left=True)
         force_right = self._force_values(elapsed, left=False)
-        if self.hardware is not None and real_mode:
-            # 真机传感器用缓存值出帧，采样频率由后台 future 控制。
-            self._refresh_force_values(config, now)
-            if native_gripper_status is not None:
-                self.apply_native_gripper_status(native_gripper_status, now)
+        force_status: dict[str, Any] = {
+            "source": force_source,
+            "sides": {
+                "left": {"healthy": self.force_ok},
+                "right": {"healthy": self.force_ok},
+            },
+            "safety": {
+                "latched": self.estop_active,
+                "reason": "manual_emergency_stop" if self.estop_active else "",
+            },
+            "compliance": {"enabled": False},
+        }
+        gripper_status = dict(native_gripper_status) if isinstance(native_gripper_status, dict) else {}
+        if real_mode and native_gripper_status is not None:
+            self.apply_native_gripper_status(native_gripper_status, now)
+        if real_mode and force_source == "hkvl_serial":
+            if isinstance(force_state, dict):
+                raw_left = force_state.get("left")
+                raw_right = force_state.get("right")
+                if isinstance(raw_left, list) and len(raw_left) == 6:
+                    self.force_left = [float(value) for value in raw_left]
+                if isinstance(raw_right, list) and len(raw_right) == 6:
+                    self.force_right = [float(value) for value in raw_right]
+                force_status = dict(force_state)
+                sides = force_state.get("sides")
+                self.force_ok = bool(
+                    isinstance(sides, dict)
+                    and isinstance(sides.get("left"), dict)
+                    and isinstance(sides.get("right"), dict)
+                    and sides["left"].get("healthy") is True
+                    and sides["right"].get("healthy") is True
+                )
             force_left = list(self.force_left)
             force_right = list(self.force_right)
-        if real_mode:
-            danger = 1.1 if self.estop_active else 0.0
+        elif self.hardware is not None and real_mode:
+            # 真机传感器用缓存值出帧，采样频率由后台 future 控制。
+            self._refresh_force_values(config, now)
+            force_left = list(self.force_left)
+            force_right = list(self.force_right)
+            force_status["sides"]["left"]["healthy"] = self.force_ok
+            force_status["sides"]["right"]["healthy"] = self.force_ok
+        if real_mode and force_source == "hkvl_serial" and isinstance(force_state, dict):
+            danger = max(0.0, min(1.2, float(force_state.get("dangerIndex", 0.0))))
+        elif real_mode:
+            danger = self._danger_index(force_left, force_right, config)
         else:
             danger = 1.1 if self.estop_active else self._danger_index(force_left, force_right, config)
         if self.recording:
@@ -137,6 +175,8 @@ class TelemetryHub:
             },
             forceLeft=force_left,
             forceRight=force_right,
+            forceStatus=force_status,
+            gripperStatus=gripper_status,
             dangerIndex=danger,
             recording=self.recording,
             episodeCount=self.episode_count,
@@ -263,10 +303,10 @@ class TelemetryHub:
         fxy_stop = float(safety["fxyStopN"])
         fz_stop = float(safety["fzStopN"])
         moment_stop = float(safety["momentStopNm"])
-        values = force_left + force_right
-        return min(
-            1.16,
-            max(
+        danger = 0.0
+        for values in (force_left, force_right):
+            danger = max(
+                danger,
                 abs(values[0]) / fxy_stop,
                 abs(values[1]) / fxy_stop,
                 abs(values[2]) / fz_stop,
@@ -274,8 +314,7 @@ class TelemetryHub:
                 abs(values[4]) / moment_stop,
                 abs(values[5]) / moment_stop,
             )
-            * 0.75,
-        )
+        return min(1.2, danger)
 
     def _cameras(self, elapsed: float, config: dict[str, Any]) -> list[CameraTelemetry]:
         if os.environ.get("APPSTATION_DISABLE_CAMERA_PROBE", "").strip().lower() in {"1", "true", "yes", "on"}:
@@ -535,6 +574,8 @@ class TelemetryHub:
 
     def _refresh_force_values(self, config: dict[str, Any], now: float) -> None:
         if self.hardware is None or getattr(self, "_shutdown", False):
+            return
+        if str(config.get("force", {}).get("source", "nidaq")).lower() != "nidaq":
             return
         if self._force_future is not None and self._force_future.done():
             try:

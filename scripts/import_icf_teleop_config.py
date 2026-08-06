@@ -24,7 +24,7 @@ from backend.core.defaults import (  # noqa: E402
     default_config,
     rotation_work_limits_from_soft_limits,
 )
-from backend.core.config import _ensure_home_reference_model, _normalize_card0_yaw_disabled  # noqa: E402
+from backend.core.config import _ensure_home_reference_model  # noqa: E402
 from backend.core.schemas import AppConfig  # noqa: E402
 
 
@@ -192,7 +192,6 @@ def apply_icf_config(config: dict[str, Any], ini: configparser.ConfigParser, sou
     apply_gripper_config(config, ini)
     apply_motion_profiles_and_limits(config)
     _ensure_home_reference_model(config, has_current_home_reference_strategy=False)
-    _normalize_card0_yaw_disabled(config)
 
 
 def apply_gripper_config(config: dict[str, Any], ini: configparser.ConfigParser) -> None:

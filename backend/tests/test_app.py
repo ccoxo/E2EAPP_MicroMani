@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import time
+from copy import deepcopy
 from pathlib import Path
 from threading import Barrier, BrokenBarrierError, Event, Thread
 from typing import Any, cast
@@ -228,20 +229,164 @@ def test_settings_round_trip(tmp_path: Path) -> None:
     assert client.get("/api/settings").json()["hal"]["apiConfirmed"] is True
 
 
-def test_settings_normalizes_yaw_disable_to_card0_side(tmp_path: Path) -> None:
+def test_force_runtime_settings_are_not_saved_when_hal_rejects_them(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    client = TestClient(create_app(tmp_path))
+    original = client.get("/api/settings").json()
+    candidate = deepcopy(original)
+    candidate["force"]["source"] = "hkvl_serial"
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def reject_force_config(name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls.append((name, payload or {}))
+        raise RuntimeError("force configuration requires all axes stopped and servos disabled")
+
+    monkeypatch.setattr(_app_state(client).hal, "command", reject_force_config)
+
+    response = client.put("/api/settings", json=candidate)
+
+    assert response.status_code == 409
+    assert calls and calls[0][0] == "force.configure"
+    assert client.get("/api/settings").json()["force"]["source"] == original["force"]["source"]
+
+
+def test_apply_settings_does_not_reconfigure_unchanged_hkvl_payload(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    client = TestClient(create_app(tmp_path))
+    config = client.get("/api/settings").json()
+    config["force"]["source"] = "hkvl_serial"
+    _app_state(client).settings.save_config(config, emit_log=False)
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def capture_force_config(
+        name: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        calls.append((name, payload or {}))
+        return {"ok": True}
+
+    monkeypatch.setattr(_app_state(client).hal, "command", capture_force_config)
+
+    response = client.post("/api/settings/apply", json=config)
+
+    assert response.status_code == 200
+    assert calls == []
+
+
+def test_apply_settings_bodyless_request_reapplies_hkvl_force_runtime(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    client = TestClient(create_app(tmp_path))
+    config = client.get("/api/settings").json()
+    config["force"]["source"] = "hkvl_serial"
+    _app_state(client).settings.save_config(config, emit_log=False)
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def capture_force_config(
+        name: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        calls.append((name, payload or {}))
+        return {"ok": True}
+
+    monkeypatch.setattr(_app_state(client).hal, "command", capture_force_config)
+
+    response = client.post("/api/settings/apply")
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0][0] == "force.configure"
+    assert calls[0][1]["source"] == "hkvl_serial"
+
+
+def test_apply_settings_reconfigures_changed_hkvl_force_payload(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    client = TestClient(create_app(tmp_path))
+    current = client.get("/api/settings").json()
+    current["force"]["source"] = "hkvl_serial"
+    _app_state(client).settings.save_config(current, emit_log=False)
+    candidate = deepcopy(current)
+    candidate["force"]["lowpassCutoffHz"] = 15
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def capture_force_config(
+        name: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        calls.append((name, payload or {}))
+        return {"ok": True}
+
+    monkeypatch.setattr(_app_state(client).hal, "command", capture_force_config)
+
+    response = client.post("/api/settings/apply", json=candidate)
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0][0] == "force.configure"
+    assert calls[0][1]["source"] == "hkvl_serial"
+    assert calls[0][1]["lowpassCutoffHz"] == 15.0
+
+
+def test_force_runtime_snapshot_is_not_applied_when_hal_rejects_it(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    client = TestClient(create_app(tmp_path))
+    original = client.get("/api/settings").json()
+    candidate = deepcopy(original)
+    candidate["force"]["source"] = "hkvl_serial"
+    created = client.post(
+        "/api/settings/snapshots",
+        json={"scope": "all", "name": "HKVL", "config": candidate},
+    ).json()["data"]["snapshot"]
+
+    async def reject_force_config(name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        assert name == "force.configure"
+        assert payload and payload["source"] == "hkvl_serial"
+        raise RuntimeError("force configuration requires all axes stopped and servos disabled")
+
+    monkeypatch.setattr(_app_state(client).hal, "command", reject_force_config)
+
+    response = client.post(f"/api/settings/snapshots/{created['id']}/apply")
+
+    assert response.status_code == 409
+    assert client.get("/api/settings").json()["force"]["source"] == original["force"]["source"]
+
+
+def test_settings_restores_yaw_permission_on_card0_side(tmp_path: Path) -> None:
     logs = LogService(log_file_path=tmp_path / "logs" / "test.log", emit_startup=False)
     settings = SettingsService(tmp_path, logs)
     config = default_config()
+    config["teleop"]["strategyVersion"] = "e2e_omega7_native_v31_gravity_scale_20260617"
     config["motion"]["leftCardNo"] = 0
     config["motion"]["rightCardNo"] = 1
-    config["teleop"]["leftEnabledAxes"] = [True, True, True, True, True, True]
-    config["teleop"]["rightEnabledAxes"] = [True, True, True, True, True, False]
-    settings.save_config(config, emit_log=False)
+    config["teleop"]["leftEnabledAxes"] = [True, True, True, True, True, False]
+    config["teleop"]["rightEnabledAxes"] = [True, True, True, True, True, True]
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
     normalized = settings.get_config()
 
-    assert normalized["teleop"]["leftEnabledAxes"] == [True, True, True, True, True, False]
-    assert normalized["teleop"]["rightEnabledAxes"] == [True, True, True, True, True, True]
+    assert normalized["teleop"]["strategyVersion"] == "e2e_omega7_native_v32_card0_yaw_20260804"
+    assert normalized["teleop"]["leftEnabledAxes"] == [True] * 6
+    assert normalized["teleop"]["rightEnabledAxes"] == [True] * 6
+
+
+def test_settings_preserves_explicit_yaw_disable_after_permission_migration(tmp_path: Path) -> None:
+    logs = LogService(log_file_path=tmp_path / "logs" / "test.log", emit_startup=False)
+    settings = SettingsService(tmp_path, logs)
+    config = default_config()
+    config["teleop"]["rightEnabledAxes"] = [True, True, True, True, True, False]
+
+    settings.save_config(config, emit_log=False)
+
+    assert settings.get_config()["teleop"]["rightEnabledAxes"] == [True, True, True, True, True, False]
 
 
 def test_settings_save_and_apply_run_config_methods_off_event_loop(
@@ -311,6 +456,11 @@ def test_settings_snapshot_endpoints_run_snapshot_methods_off_event_loop(
         assert_off_event_loop("apply_snapshot")
         return config
 
+    def fake_preview_snapshot(snapshot_id: str) -> dict[str, Any]:
+        _ = snapshot_id
+        assert_off_event_loop("preview_snapshot")
+        return config
+
     def fake_delete_snapshot(snapshot_id: str) -> None:
         _ = snapshot_id
         assert_off_event_loop("delete_snapshot")
@@ -318,6 +468,7 @@ def test_settings_snapshot_endpoints_run_snapshot_methods_off_event_loop(
     app_state = _app_state(client)
     monkeypatch.setattr(app_state.settings, "list_snapshots", fake_list_snapshots)
     monkeypatch.setattr(app_state.settings, "create_snapshot", fake_create_snapshot)
+    monkeypatch.setattr(app_state.settings, "preview_snapshot", fake_preview_snapshot)
     monkeypatch.setattr(app_state.settings, "apply_snapshot", fake_apply_snapshot)
     monkeypatch.setattr(app_state.settings, "delete_snapshot", fake_delete_snapshot)
 
@@ -334,6 +485,7 @@ def test_settings_snapshot_endpoints_run_snapshot_methods_off_event_loop(
         "list_snapshots",
         "create_snapshot",
         "list_snapshots",
+        "preview_snapshot",
         "apply_snapshot",
         "list_snapshots",
         "delete_snapshot",
@@ -1751,7 +1903,7 @@ def test_home_all_requires_and_sends_captured_work_origin(tmp_path: Path, monkey
         "leftPulse": [0.0] * 6,
         "rightPulse": [0.0] * 6,
         "leftEnabledAxes": [True] * 6,
-        "rightEnabledAxes": [True, True, True, True, True, False],
+        "rightEnabledAxes": [True] * 6,
     }
 
 
@@ -1804,7 +1956,7 @@ def test_home_all_sends_work_origin_without_auto_enabling_motion_sides(
                 "leftPulse": origin["leftPulse"],
                 "rightPulse": origin["rightPulse"],
                 "leftEnabledAxes": [True] * 6,
-                "rightEnabledAxes": [True, True, True, True, True, False],
+                "rightEnabledAxes": [True] * 6,
             },
         ),
     ]
@@ -1901,7 +2053,7 @@ def test_return_origin_side_sends_work_origin_without_auto_enabling_side(
             {
                 "side": "right",
                 "pulse": origin["rightPulse"],
-                "enabledAxes": [True, True, True, True, True, False],
+                "enabledAxes": [True] * 6,
             },
         ),
     ]
@@ -1978,7 +2130,7 @@ def test_return_origin_side_refuses_disabled_side_without_auto_enable(
     assert fake_hal.commands == []
 
 
-def test_return_origin_side_ignores_disabled_right_yaw_soft_limit(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_return_origin_side_validates_card0_yaw_soft_limit(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
 
     class FakeHal:
@@ -2017,17 +2169,8 @@ def test_return_origin_side_ignores_disabled_right_yaw_soft_limit(tmp_path: Path
 
     response = client.post("/api/motion/right/return_origin")
 
-    assert response.status_code == 200
-    assert fake_hal.commands == [
-        (
-            "motion.home_origin_side",
-            {
-                "side": "right",
-                "pulse": origin["rightPulse"],
-                "enabledAxes": [True, True, True, True, True, False],
-            },
-        ),
-    ]
+    assert response.status_code == 503
+    assert fake_hal.commands == []
 
 
 def test_return_origin_and_home_all_are_blocked_during_estop(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -3861,6 +4004,19 @@ def test_create_dataset_can_resume_native_lerobot_recording(tmp_path: Path, monk
 
         finish_response = client.post("/api/record/session/finish")
         assert finish_response.status_code == 200
+
+
+def test_manual_axis_move_allows_card0_yaw(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+
+    response = client.post(
+        "/api/motion/manual_axis_move",
+        json={"side": "right", "axis": "Yaw", "direction": 1, "step": 0.1, "speedMode": "fine"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["applied"] != 0
 
 
 def test_manual_axis_move_rejects_unsafe_step(tmp_path: Path) -> None:
@@ -5907,7 +6063,7 @@ def test_emergency_stop_returns_before_slow_auto_policy_cleanup(
         assert result["response"].status_code == 200
 
 
-def test_acknowledge_safety_restores_enable_snapshot_without_origin_move(
+def test_acknowledge_safety_clears_latch_without_restoring_servos_or_moving_origin(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
@@ -5930,10 +6086,6 @@ def test_acknowledge_safety_restores_enable_snapshot_without_origin_move(
             self.commands.append((name, payload))
             if name == "motion.emergency_stop":
                 self.enabled = [False] * 12
-            if name == "motion.enable_side":
-                start = 0 if payload["side"] == "left" else 6
-                axes = list(payload["enabledAxes"])
-                self.enabled[start : start + 6] = axes
             return {"command": name, "payload": payload}
 
     fake_hal = FakeHal()
@@ -5961,9 +6113,10 @@ def test_acknowledge_safety_restores_enable_snapshot_without_origin_move(
     assert acknowledge_response.status_code == 200
     assert fake_hal.commands == [
         ("motion.emergency_stop", {}),
-        ("motion.enable_side", {"side": "left", "enabledAxes": [True, False, True, False, False, False]}),
-        ("motion.enable_side", {"side": "right", "enabledAxes": [True, True, False, False, False, False]}),
+        ("motion.acknowledge_estop", {}),
     ]
+    assert acknowledge_response.json()["data"]["restoredMotionEnable"] == []
+    assert acknowledge_response.json()["data"]["servoRestored"] is False
     assert client.app.state.settings.get_config()["motion"]["origin"] == origin_before
 
 

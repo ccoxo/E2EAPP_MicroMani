@@ -118,9 +118,9 @@ export default function RecordPage() {
 
         <div className="record-page-side">
           <SafetyMonitorCard />
-          <KalmanFilterCard />
           <HardwareStatusCard />
           <EpisodeHistoryCard />
+          <KalmanFilterCard />
         </div>
       </div>
 

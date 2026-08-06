@@ -1184,7 +1184,7 @@ def test_teleop_start_returns_to_work_origin_before_real_mapper(monkeypatch: pyt
                     "leftPulse": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
                     "rightPulse": [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
                     "leftEnabledAxes": [True, True, True, True, True, True],
-                    "rightEnabledAxes": [True, True, True, True, True, False],
+                    "rightEnabledAxes": [True] * 6,
                 },
             ),
         ]
@@ -1208,7 +1208,7 @@ def test_teleop_start_returns_requested_side_to_origin_before_real_mapper(monkey
                 {
                     "side": "right",
                     "pulse": [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
-                    "enabledAxes": [True, True, True, True, True, False],
+                    "enabledAxes": [True] * 6,
                 },
             ),
         ]
@@ -1489,7 +1489,7 @@ def test_hal_native_payload_gripper_source_fallbacks_use_operator_view() -> None
     assert payload["rightSourceHand"] == "PhysicalLeft"
 
 
-def test_hal_native_payload_disables_yaw_on_card0_side() -> None:
+def test_hal_native_payload_allows_yaw_on_card0_side() -> None:
     config = start_config()
     config["motion"]["leftCardNo"] = 0
     config["motion"]["rightCardNo"] = 1
@@ -1499,8 +1499,8 @@ def test_hal_native_payload_disables_yaw_on_card0_side() -> None:
 
     payload = mapper._native_payload(config)
 
-    assert payload["leftEnabledAxes"] == [True, True, True, True, True, False]
-    assert payload["rightEnabledAxes"] == [True, True, True, True, True, True]
+    assert payload["leftEnabledAxes"] == [True] * 6
+    assert payload["rightEnabledAxes"] == [True] * 6
 
 
 def test_hal_native_payload_disables_translation_limits_and_sends_rotation_work_window() -> None:
@@ -1655,7 +1655,7 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
         30.0,
         7.0,
     ]
-    assert config["teleop"]["rightEnabledAxes"] == [True, True, True, True, True, False]
+    assert config["teleop"]["rightEnabledAxes"] == [True] * 6
     assert config["teleop"]["rightSoftLimitMin"] == [
         -25000.0,
         -37500.0,
@@ -2011,7 +2011,7 @@ def test_settings_migration_keeps_left_yaw_limit_anchored_to_home_reference(tmp_
     assert limits[5].min == pytest.approx(home_reference[5] - 7.0)
     assert limits[5].max == pytest.approx(home_reference[5] + 7.0)
     assert migrated["teleop"]["leftEnabledAxes"][5] is True
-    assert migrated["teleop"]["rightEnabledAxes"][5] is False
+    assert migrated["teleop"]["rightEnabledAxes"][5] is True
 
 
 def test_settings_migration_adds_home_reference_model_and_preserves_left_roll_mechanical_limit(tmp_path: Any) -> None:
@@ -2070,7 +2070,7 @@ def test_settings_migration_updates_prior_right_pitch_window_and_yaw_axis(tmp_pa
 
     migrated = SettingsService(runtime_dir, LogService()).get_config()
 
-    assert migrated["teleop"]["rightEnabledAxes"] == [True, True, True, True, True, False]
+    assert migrated["teleop"]["rightEnabledAxes"] == [True] * 6
     assert migrated["teleop"]["rightSoftLimitMin"][4] == -30.0
     assert migrated["teleop"]["rightSoftLimitMax"][4] == 30.0
     assert migrated["motion"]["rotationWorkLimits"]["right"]["pitch"] == {"min": -30.0, "max": 30.0}

@@ -209,7 +209,7 @@ export async function fetchConfig(): Promise<AppConfig> {
 
 export interface HardwareProbeStatus {
   camera?: { ok: boolean; message: string }
-  force?: { ok: boolean; message: string }
+  force?: { ok: boolean | null; message: string; source?: 'nidaq' | 'hkvl_serial' | string }
   gripper?: {
     ok: boolean | null
     message: string
@@ -282,7 +282,7 @@ export async function applyConfig(config?: AppConfig) {
     headers: { 'Content-Type': 'application/json' },
     body: config ? JSON.stringify(config) : undefined,
   })
-  if (!response.ok) throw new Error(`settings apply failed: ${response.status}`)
+  if (!response.ok) throw await commandErrorFromResponse(response)
   return response.json() as Promise<unknown>
 }
 /** 从后端读取对应数据。 */
@@ -342,6 +342,45 @@ export interface PicoCommandResponse {
     stderr?: string
   }
   ts?: number
+}
+export interface PicoNetworkInfo {
+  ifIndex: number
+  gateway: string
+  localIp: string
+  interfaceAlias: string
+  prefixLength: number
+  selection: 'direct-subnet' | 'related-address' | 'system-route' | 'active-interface'
+  changed: boolean
+}
+export interface PicoNetworkAutoConfigureResponse {
+  ok: boolean
+  data: {
+    network: PicoNetworkInfo
+    config: AppConfig
+  }
+  ts?: number
+}
+/** Detect and persist the PC-side network path used for the configured PICO IP. */
+export async function autoConfigurePicoNetwork(picoIp?: string): Promise<PicoNetworkAutoConfigureResponse> {
+  if (mockMode) {
+    return {
+      ok: true,
+      data: {
+        network: {
+          ifIndex: defaultConfig.picoVision.ifIndex,
+          gateway: defaultConfig.picoVision.gateway,
+          localIp: '10.90.1.42',
+          interfaceAlias: 'Ethernet',
+          prefixLength: 17,
+          selection: 'related-address',
+          changed: false,
+        },
+        config: structuredClone(defaultConfig),
+      },
+      ts: Date.now(),
+    }
+  }
+  return postCommand('/pico/network/auto-configure', picoIp ? { picoIp } : undefined) as Promise<PicoNetworkAutoConfigureResponse>
 }
 /** 发送或封装对应的后端命令。 */
 export const connectPicoAdb = () => postCommand('/pico/adb/connect') as Promise<PicoCommandResponse>

@@ -6,23 +6,22 @@
 
 namespace appstation::hal {
 
-namespace {
-unsigned short cardForSide(Side side) {
-  return side == Side::Left ? static_cast<unsigned short>(1) : static_cast<unsigned short>(0);
-}
-}  // namespace
-
 HalCommandDispatcher::HalCommandDispatcher(
     LTDMCDriver& motion,
     Omega7Driver& omega,
     NativeTeleopController& nativeTeleop,
+    ForceControlRuntime& forceRuntime,
     const std::chrono::steady_clock::time_point& started)
     : motion_(motion),
       omega_(omega),
       nativeTeleop_(nativeTeleop),
+      forceRuntime_(forceRuntime),
       started_(started) {}
 
 std::string HalCommandDispatcher::handleEmergencyStop() {
+  forceRuntime_.recordExternalEmergencyStop(
+      "manual_emergency_stop",
+      forceMonotonicMilliseconds());
   motion_.emergencyStop();
   nativeTeleop_.requestEmergencyStop();
   return "{\"ok\":true}";
@@ -49,11 +48,46 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     omega_.zeroForceFeedback(static_cast<int>(jsonNumberValue(bodyText, "openId", -1)));
     return "{\"ok\":true}";
   }
+  if (name == "force.state") {
+    return forceRuntime_.forceStateJson(forceMonotonicMilliseconds());
+  }
+  if (name == "force.configure") {
+    if (nativeTeleop_.running()) {
+      throw std::runtime_error("force configuration requires native teleop to be stopped");
+    }
+    const auto motionState = motion_.readState();
+    for (const auto& axis : motionState.axes) {
+      if (axis.moving || axis.enabled) {
+        throw std::runtime_error(
+            "force configuration requires all axes stopped and servos disabled");
+      }
+    }
+    forceRuntime_.configure(
+        jsonForceRuntimeConfig(bodyText, forceRuntime_.config()),
+        forceMonotonicMilliseconds());
+    return "{\"ok\":true}";
+  }
+  if (name == "force.tare") {
+    const auto sideValue = lowercase(jsonStringValueOr(bodyText, "side", "all"));
+    int side = -1;
+    if (sideValue == "left") {
+      side = 0;
+    } else if (sideValue == "right") {
+      side = 1;
+    } else if (sideValue != "all" && sideValue != "both") {
+      throw std::runtime_error("force.tare side must be left, right, or all");
+    }
+    forceRuntime_.tare(
+        side,
+        static_cast<int>(jsonNumberValue(bodyText, "samples", 200)));
+    return "{\"ok\":true}";
+  }
   if (name == "teleop.native.configure") {
     nativeTeleop_.configure(jsonNativeTeleopConfig(bodyText));
     return "{\"ok\":true}";
   }
   if (name == "teleop.native.start") {
+    forceRuntime_.resetCompliance();
     nativeTeleop_.configure(jsonNativeTeleopConfig(bodyText));
     omega_.ensureReady();
     nativeTeleop_.start(
@@ -63,6 +97,7 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
   }
   if (name == "teleop.native.stop") {
     nativeTeleop_.stop();
+    forceRuntime_.resetCompliance();
     return "{\"ok\":true}";
   }
   if (name == "teleop.native.status") {
@@ -88,6 +123,10 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
   }
   if (name == "motion.emergency_stop") {
     return handleEmergencyStop();
+  }
+  if (name == "motion.acknowledge_estop") {
+    forceRuntime_.acknowledgeEmergencyStop(forceMonotonicMilliseconds());
+    return "{\"ok\":true,\"servoRestored\":false}";
   }
   if (name == "motion.home_all") {
     motion_.ensureMotionReturnAllowed();
@@ -122,10 +161,6 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
   if (name == "motion.manual_axis_move") {
     const auto side = parseSide(jsonStringValue(bodyText, "side"));
     const auto axis = parseAxis(jsonStringValue(bodyText, "axis"));
-    // 右侧卡 0 的 Yaw 轴在现场接线中禁用，手动点动也必须守住同一安全策略。
-    if (cardForSide(side) == 0 && axis == SemanticAxis::Yaw) {
-      throw std::runtime_error("Card 0 Yaw motion axis is disabled by safety policy");
-    }
     const auto direction = jsonNumberValue(bodyText, "direction", 0);
     const auto step = jsonNumberValue(bodyText, "step", 0);
     const auto maxVelocity = jsonNumberValue(bodyText, "maxVelocityUiPerSec", 0);

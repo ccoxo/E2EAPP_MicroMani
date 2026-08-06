@@ -43,6 +43,22 @@ def test_real_hal_ok_is_not_reported_faulted_when_force_probe_is_unavailable() -
         telemetry.shutdown()
 
 
+def test_nidaq_force_status_reports_the_motion_estop_latch() -> None:
+    telemetry = TelemetryHub(FakeSettings(), FakeHardware())
+    try:
+        frame = telemetry.next_frame(
+            hal_ok=True,
+            motion_estop_active=True,
+        )
+
+        assert frame.forceStatus["safety"] == {
+            "latched": True,
+            "reason": "manual_emergency_stop",
+        }
+    finally:
+        telemetry.shutdown()
+
+
 def test_hal_native_gripper_positions_do_not_fall_back_to_targets_when_feedback_is_missing() -> None:
     settings = FakeSettings()
     settings.config["gripper"]["targetLeftMm"] = 26.0
@@ -75,6 +91,8 @@ def test_hal_native_gripper_positions_use_native_status_feedback() -> None:
         )
 
         assert frame.gripperPositions == [2.25, 9.5]
+        assert frame.gripperStatus["sides"]["left"]["ok"] is True
+        assert frame.gripperStatus["sides"]["right"]["positionMm"] == 9.5
         assert telemetry.gripper_samples["left"]["positionMm"] == 2.25
         assert telemetry.gripper_samples["right"]["positionMm"] == 9.5
     finally:
@@ -97,3 +115,34 @@ def test_refresh_gripper_positions_does_not_replace_hal_native_cache() -> None:
     assert telemetry.gripper_positions == [2.25, 9.5]
     assert telemetry.gripper_samples["left"]["message"] == "native"
     assert telemetry._last_gripper_sample_at == 123.0
+
+
+def test_hkvl_force_state_drives_real_force_telemetry_and_danger() -> None:
+    settings = FakeSettings()
+    settings.config["force"]["source"] = "hkvl_serial"
+    telemetry = TelemetryHub(settings, FakeHardware())
+    force_state = {
+        "source": "hkvl_serial",
+        "left": [1.0, 0.0, 2.5, 0.0, 0.0, 0.0],
+        "right": [0.0, 0.0, 0.0, 0.0, 0.03, 0.0],
+        "dangerIndex": 0.75,
+        "sides": {
+            "left": {"healthy": True, "sampleAgeMs": 1.0},
+            "right": {"healthy": True, "sampleAgeMs": 2.0},
+        },
+        "safety": {"latched": False, "reason": ""},
+        "compliance": {"enabled": False},
+    }
+    try:
+        frame = telemetry.next_frame(
+            hal_ok=True,
+            force_state=force_state,
+        )
+
+        assert frame.forceLeft == force_state["left"]
+        assert frame.forceRight == force_state["right"]
+        assert frame.dangerIndex == 0.75
+        assert frame.forceStatus["source"] == "hkvl_serial"
+        assert telemetry._force_future is None
+    finally:
+        telemetry.shutdown()

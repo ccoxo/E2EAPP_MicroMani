@@ -43,7 +43,6 @@ from backend.services.telemetry_hub import TelemetryHub
 
 AXIS_ORDER = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
 AXIS_LABELS = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
-CARD0_YAW_DISABLED_AXES = [True, True, True, True, True, False]
 MANUAL_AXIS_STEP_LIMIT_PULSE = 100000.0
 MANUAL_TRANSLATION_STEP_LIMIT_UM = 5000.0
 MANUAL_ROTATION_STEP_LIMIT_DEG = 2.0
@@ -103,7 +102,6 @@ class CommandService:
         if self.gripper_router is None:
             self.gripper_router = GripperRouter(native=NativeGripperAdapter(hal, teleop))
         self._origin_mutation_locked = origin_mutation_locked or (lambda: False)
-        self._motion_enable_restore_snapshot: dict[str, list[bool]] | None = None
 
     def set_origin_mutation_lock_checker(self, checker: Callable[[], bool]) -> None:
         self._origin_mutation_locked = checker
@@ -171,8 +169,6 @@ class CommandService:
 
     async def emergency_stop(self) -> dict[str, object]:
         # 先更新本地遥测状态，再请求 HAL 急停，让 UI 能立即进入安全态。
-        if self._motion_enable_restore_snapshot is None:
-            self._motion_enable_restore_snapshot = self._motion_enable_snapshot()
         self.telemetry.emergency_stop()
         result = await self.hal.command("motion.emergency_stop")
         self.logs.error("[SAFETY]", "hardware emergency stop requested")
@@ -577,39 +573,40 @@ class CommandService:
         return {"origin": saved["motion"]["origin"], "config": saved}
 
     async def acknowledge_safety(self) -> dict[str, object]:
-        restored_sides: list[str] = []
-        snapshot = self._motion_enable_restore_snapshot
-        if snapshot:
-            for side in ("left", "right"):
-                enabled_axes = snapshot.get(side)
-                if enabled_axes is None or not any(enabled_axes):
-                    continue
-                await self.hal.command("motion.enable_side", {"side": side, "enabledAxes": list(enabled_axes)})
-                await self._refresh_motion_enabled(side)
-                restored_sides.append(side)
-            self._motion_enable_restore_snapshot = None
+        result = await self.hal.command("motion.acknowledge_estop", {})
         self.telemetry.acknowledge_safety()
-        restored = ",".join(restored_sides) if restored_sides else "none"
-        self.logs.info("[SAFETY]", f"safety state acknowledged; restored_motion_enable={restored}")
-        return {"accepted": True, "restoredMotionEnable": restored_sides}
+        self.logs.info("[SAFETY]", "safety state acknowledged; servos remain disabled")
+        return {
+            "accepted": True,
+            "servoRestored": False,
+            "restoredMotionEnable": [],
+            "hal": result,
+        }
 
     async def tare_force(self, side: str | None = None) -> dict[str, object]:
         # 真机模式优先执行传感器 tare；测试模式仅重置本地模拟力数据。
         config = await self._get_config_async()
-        if self.hardware is not None and self._real_hardware_mode(config):
+        force = config.get("force", {}) if isinstance(config.get("force"), dict) else {}
+        source = str(force.get("source", "nidaq")).lower()
+        if self._real_hardware_mode(config) and source == "hkvl_serial":
+            payload: dict[str, object] = {"side": side or "all"}
+            tare_samples = int(force.get("tareSamples", 0) or 0)
+            if tare_samples > 0:
+                payload["samples"] = tare_samples
+            await self.hal.command("force.tare", payload)
+        elif self.hardware is not None and self._real_hardware_mode(config):
             result = await asyncio.to_thread(self.hardware.force.tare, config, side)
             if not result.ok:
                 self.logs.error("[FORCE]", result.message)
                 raise RuntimeError(result.message)
         self.telemetry.tare_force()
         label = "both sides" if side is None else ("left" if side == "left" else "right")
-        self.logs.info("[FORCE]", f"{label} Nano-17 tare requested")
-        return {"side": side or "all"}
+        self.logs.info("[FORCE]", f"{label} {source} tare requested")
+        return {"side": side or "all", "source": source}
 
     async def manual_axis_move(self, request: ManualAxisMoveRequest) -> dict[str, object]:
         config = await self._get_config_async()
         # 所有手动 jog 都先过后端安全边界，再决定发往真机还是本地模拟。
-        self._validate_manual_axis_policy(config, request)
         self._validate_manual_axis_safety(config, request)
         effective_direction = self._manual_axis_effective_direction(request.side, request.axis, request.direction)
         op_id = self.logs.new_op_id("manual")
@@ -991,10 +988,6 @@ class CommandService:
         if self._axis_profile(config, request)["maxVelocity"] <= 0:
             raise RuntimeError("manual axis velocity must be positive")
 
-    def _validate_manual_axis_policy(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> None:
-        if request.axis == "Yaw" and self._motion_card_no(config, request.side) == 0:
-            raise RuntimeError(f"{request.side} Yaw motion axis is disabled by safety policy")
-
     def _manual_axis_step_pulse(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> float:
         return abs(float(request.step)) * self._manual_axis_pulse_per_ui_unit(config, request.side, request.axis)
 
@@ -1045,18 +1038,6 @@ class CommandService:
         if axis_index < 3:
             return pulse_per_unit / 1000.0
         return pulse_per_unit
-
-    def _motion_enable_snapshot(self) -> dict[str, list[bool]]:
-        snapshot: dict[str, list[bool]] = {}
-        for side in ("left", "right"):
-            side_enabled = self.telemetry.motion_enabled.get(side)
-            raw_axes = list(self.telemetry.motion_axis_enabled.get(side, [None] * 6))[:6]
-            while len(raw_axes) < 6:
-                raw_axes.append(None)
-            enabled_axes = [value is True or (value is None and side_enabled is True) for value in raw_axes]
-            if any(enabled_axes):
-                snapshot[side] = enabled_axes
-        return snapshot
 
     async def _refresh_motion_enabled(self, side: str) -> None:
         state = await self.hal.motion_state()
@@ -1324,18 +1305,8 @@ class CommandService:
         if side not in {"left", "right"}:
             raise RuntimeError("side must be left or right")
 
-    def _motion_card_no(self, config: dict[str, Any] | None, side: str) -> int:
-        motion = config.get("motion", {}) if isinstance(config, dict) else {}
-        fallback = 1 if side == "left" else 0
-        if not isinstance(motion, dict):
-            return fallback
-        try:
-            return int(motion.get(f"{side}CardNo", fallback))
-        except (TypeError, ValueError):
-            return fallback
-
     def _home_enabled_axes(self, side: str, config: dict[str, Any] | None = None) -> list[bool]:
-        return list(CARD0_YAW_DISABLED_AXES if self._motion_card_no(config, side) == 0 else [True] * 6)
+        return [True] * 6
 
     def _motion_state_pulses(self, state: dict[str, Any]) -> list[float]:
         raw_pulses = state.get("pulses")

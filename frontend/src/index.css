@@ -3068,8 +3068,294 @@ select {
   align-items: start;
 }
 
+.force-settings-layout-hkvl {
+  grid-template-areas:
+    "visual config"
+    "controls status"
+    "note status";
+  grid-template-columns: minmax(520px, 1.22fr) minmax(380px, 0.98fr);
+}
+
+.force-settings-layout-hkvl > .force-visual-area {
+  grid-area: visual;
+}
+
+.force-settings-layout-hkvl > .force-settings-column {
+  display: contents;
+}
+
+.force-settings-layout-hkvl > .force-settings-column > .hardware-form-grid {
+  grid-area: config;
+}
+
+.force-settings-layout-hkvl > .force-settings-column > .hardware-metric-grid {
+  grid-area: status;
+  align-self: start;
+}
+
+.force-settings-layout-hkvl > .force-settings-column > .force-control-workbench {
+  grid-area: controls;
+}
+
+.force-settings-layout-hkvl > .force-settings-column > .force-control-footer-note {
+  grid-area: note;
+}
+
 .force-current-grid-settings {
   margin-top: 8px;
+}
+
+.force-control-workbench {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.74fr) minmax(390px, 1.26fr);
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.force-settings-layout-hkvl .force-control-workbench {
+  margin-top: 0;
+}
+
+.force-control-panel {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #dfe7f0;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #fbfdff 0%, #f5f9fd 100%);
+}
+
+.force-coordinate-panel {
+  border-left: 3px solid #4f8fdd;
+}
+
+.force-compliance-panel {
+  border-left: 3px solid #77a98d;
+}
+
+.force-control-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 9px;
+}
+
+.force-control-panel-head > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.force-control-panel-head b {
+  color: #193654;
+  font-size: 13px;
+}
+
+.force-control-panel-head span,
+.force-control-note,
+.force-control-footer-note {
+  color: #718197;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.force-calibration-launch {
+  width: 100%;
+  margin-bottom: 8px;
+  border-color: #8bb7eb;
+  color: #185ca8;
+  background: #f5faff;
+}
+
+.force-calibration-launch:not(:disabled):hover {
+  border-color: #4f8fdd;
+  color: #124e91;
+  background: #eaf4ff;
+}
+
+.force-axis-sign-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.force-axis-sign {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  padding: 5px 2px;
+  border: 1px solid #dbe6f2;
+  border-radius: 6px;
+  background: #fff;
+  text-align: center;
+}
+
+.force-axis-sign small {
+  color: #8392a5;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.force-axis-sign b {
+  color: #264b73;
+  font-size: 12px;
+  line-height: 1.1;
+}
+
+.force-control-note {
+  display: block;
+  margin-top: 8px;
+}
+
+.force-compliance-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 10px;
+}
+
+.force-compliance-grid .ant-form-item {
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.force-compliance-grid .ant-form-item-label {
+  padding-bottom: 3px;
+}
+
+.force-compliance-grid .ant-form-item-label > label {
+  color: #53657a;
+  font-size: 11px;
+}
+
+.force-compliance-grid .ant-input-number {
+  width: 100%;
+}
+
+.force-control-footer-note {
+  display: block;
+  margin-top: 7px;
+}
+
+.force-axis-calibration-modal .ant-modal-content {
+  overflow: hidden;
+  border-radius: 12px;
+}
+
+.force-axis-calibration-modal .ant-modal-header {
+  padding-bottom: 12px;
+  border-bottom: 1px solid #e7edf4;
+}
+
+.force-calibration-intro {
+  display: grid;
+  gap: 7px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid #d7e6f6;
+  border-radius: 8px;
+  background: #f5faff;
+}
+
+.force-calibration-intro > div {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #55708d;
+  font-size: 12px;
+}
+
+.force-calibration-intro b {
+  color: #1d4f83;
+}
+
+.force-calibration-intro p {
+  margin: 0;
+  color: #61738a;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.force-axis-calibration-groups {
+  display: grid;
+  gap: 12px;
+}
+
+.force-axis-calibration-group {
+  padding: 10px;
+  border: 1px solid #e2e9f1;
+  border-radius: 9px;
+  background: #fcfdff;
+}
+
+.force-axis-calibration-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.force-axis-calibration-group-head b {
+  color: #294662;
+  font-size: 12px;
+}
+
+.force-axis-calibration-group-head span {
+  color: #8493a5;
+  font-size: 11px;
+}
+
+.force-axis-calibration-axis-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.force-axis-calibration-axis {
+  display: grid;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid #dde7f2;
+  border-radius: 7px;
+  background: #fff;
+}
+
+.force-axis-calibration-axis > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.force-axis-calibration-axis > div b {
+  color: #1b3f65;
+  font-size: 13px;
+}
+
+.force-axis-calibration-axis > div span {
+  color: #7a8ca0;
+  font-size: 11px;
+}
+
+.force-axis-calibration-axis .ant-radio-group {
+  display: flex;
+  width: 100%;
+}
+
+.force-axis-calibration-axis .ant-radio-button-wrapper {
+  flex: 1;
+  height: 28px;
+  padding-inline: 4px;
+  line-height: 26px;
+  font-size: 11px;
+  text-align: center;
+}
+
+.force-calibration-warning {
+  display: block;
+  margin-top: 12px;
+  color: #8a6428 !important;
+  font-size: 12px;
 }
 
 .mapping-chip-row {
@@ -3922,6 +4208,10 @@ select {
   .camera-settings-panel {
     grid-template-columns: 1fr;
   }
+
+  .force-settings-layout-hkvl .force-control-workbench {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 1200px) {
@@ -3951,6 +4241,7 @@ select {
   .arm-hardware-layout,
   .hardware-settings-grid,
   .force-settings-layout,
+  .force-control-workbench,
   .manual-control-grid,
   .manual-arm-layout,
   .manual-gripper-body {
@@ -3961,6 +4252,15 @@ select {
     grid-column: auto;
   }
 
+  .force-settings-layout-hkvl {
+    grid-template-areas:
+      "visual"
+      "config"
+      "status"
+      "controls"
+      "note";
+  }
+
   .hardware-focus-strip,
   .hardware-metric-grid,
   .manual-page-summary,
@@ -3968,6 +4268,7 @@ select {
   .hardware-form-grid,
   .hardware-form-grid-compact,
   .motion-profile-grid,
+  .force-compliance-grid,
   .force-oscilloscope-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -4089,6 +4390,14 @@ select {
 }
 
 @media (max-width: 760px) {
+  .force-axis-calibration-modal {
+    max-width: calc(100vw - 24px);
+  }
+
+  .force-axis-calibration-axis-grid {
+    grid-template-columns: 1fr;
+  }
+
   body {
     overflow: auto;
   }

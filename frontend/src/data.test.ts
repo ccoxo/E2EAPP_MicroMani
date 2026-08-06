@@ -27,6 +27,33 @@ describe('Omega7 teleop defaults', () => {
     expect(defaultConfig.teleop.rightForceFeedback).toBe(true)
     expect(defaultConfig.teleop.leftGravityScale).toBe(0.45)
     expect(defaultConfig.teleop.rightGravityScale).toBe(1.0)
-    expect(defaultConfig.teleop.strategyVersion).toBe('e2e_omega7_native_v31_gravity_scale_20260617')
+    expect(defaultConfig.teleop.strategyVersion).toBe('e2e_omega7_native_v32_card0_yaw_20260804')
+  })
+})
+
+describe('HKVL-36A force safety defaults', () => {
+  it('uses the published full-scale ratings as provisional stop ceilings', () => {
+    expect(defaultConfig.safety.fxyWarnN).toBe(2)
+    expect(defaultConfig.safety.fxyStopN).toBe(30)
+    expect(defaultConfig.safety.fzWarnN).toBe(3)
+    expect(defaultConfig.safety.fzStopN).toBe(30)
+    expect(defaultConfig.safety.momentWarnNm).toBe(0.02)
+    expect(defaultConfig.safety.momentStopNm).toBe(1)
+  })
+})
+
+describe('HKVL-36A hardware-side binding', () => {
+  it('binds hardware left to COM15/Card1 and hardware right to COM14/Card0', () => {
+    expect(defaultConfig.force.serial.leftPort).toBe('COM15')
+    expect(defaultConfig.force.serial.rightPort).toBe('COM14')
+    expect(defaultConfig.motion.leftCardNo).toBe(1)
+    expect(defaultConfig.motion.rightCardNo).toBe(0)
+    expect(defaultConfig.force.compliance.enabled).toBe(false)
+    expect(defaultConfig.force.compliance.left.mappingConfirmed).toBe(false)
+    expect(defaultConfig.force.compliance.right.mappingConfirmed).toBe(false)
+    expect(defaultConfig.force.compliance.left.matrix).toEqual([1, 0, 0, 1])
+    expect(defaultConfig.force.compliance.right.matrix).toEqual([1, 0, 0, 1])
+    expect(defaultConfig.force.axisSign.left).toEqual([1, 1, -1, -1, -1, 1])
+    expect(defaultConfig.force.axisSign.right).toEqual([1, -1, 1, -1, 1, -1])
   })
 })

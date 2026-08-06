@@ -3,6 +3,7 @@
 #include <chrono>
 #include <string>
 
+#include "ForceControlRuntime.h"
 #include "LTDMCDriver.h"
 #include "NativeTeleopController.h"
 #include "Omega7Driver.h"
@@ -17,6 +18,7 @@ class HalCommandDispatcher {
       LTDMCDriver& motion,
       Omega7Driver& omega,
       NativeTeleopController& nativeTeleop,
+      ForceControlRuntime& forceRuntime,
       const std::chrono::steady_clock::time_point& started);
 
   // bodyText 是上层传入的 JSON 字符串；返回值保持 JSON 字符串，便于传输层原样转发。
@@ -27,6 +29,7 @@ class HalCommandDispatcher {
   LTDMCDriver& motion_;
   Omega7Driver& omega_;
   NativeTeleopController& nativeTeleop_;
+  ForceControlRuntime& forceRuntime_;
   const std::chrono::steady_clock::time_point& started_;
 };
 

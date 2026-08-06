@@ -18,6 +18,7 @@ from starlette.websockets import WebSocketState
 
 from backend.app_factory import create_services
 from backend.core.config import SettingsService
+from backend.core.force_config import hal_force_config_payload
 from backend.core.logging import LOG_SCHEMA_VERSION, LogService, now_ms, stable_config_hash
 from backend.core.operator_view import hardware_side_for_operator_side
 from backend.core.schemas import (
@@ -39,6 +40,7 @@ from backend.services.command_service import (
 )
 from backend.services.dataset_recorder import DatasetSaveError
 from backend.services.gripper_backend import native_teleop_enabled
+from backend.services.pico_network import PicoNetworkDetectionError, detect_pico_network
 from backend.services.policy_bridge import build_policy_action_plan, lerobot_state_from_ui
 from backend.services.teleop_mapping import SideName
 
@@ -817,19 +819,45 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 保存新的应用配置。
     @app.put("/api/settings")
     async def put_settings(config: AppConfig) -> dict[str, Any]:
-        saved = await asyncio.to_thread(settings.save_config, config.model_dump(mode="json"))
-        return saved
+        try:
+            current = await get_config_async()
+            candidate = config.model_dump(mode="json")
+            if hal_force_config_payload(current) != hal_force_config_payload(candidate):
+                await hal.command("force.configure", hal_force_config_payload(candidate))
+            return await asyncio.to_thread(settings.save_config, candidate)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "VALIDATION_ERROR", "message": str(exc)},
+            ) from exc
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "HAL_REJECTED", "message": str(exc)},
+            ) from exc
 
     # 应用传入配置或重新应用当前配置。
     @app.post("/api/settings/apply")
     async def apply_settings(config: AppConfig | None = None) -> ApiEnvelope:
         try:
+            current = await get_config_async()
+            candidate = (
+                config.model_dump(mode="json")
+                if config is not None
+                else current
+            )
+            current_force_payload = hal_force_config_payload(current)
+            candidate_force_payload = hal_force_config_payload(candidate)
+            if config is None or current_force_payload != candidate_force_payload:
+                await hal.command("force.configure", candidate_force_payload)
             active = await asyncio.to_thread(
                 settings.apply_config,
-                config.model_dump(mode="json") if config is not None else None,
+                candidate,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": str(exc)}) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail={"code": "HAL_REJECTED", "message": str(exc)}) from exc
         return envelope({"config": active})
 
     # 列出配置快照。
@@ -848,9 +876,23 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/settings/snapshots/{snapshot_id}/apply")
     async def apply_snapshot(snapshot_id: str) -> ApiEnvelope:
         try:
+            current = await get_config_async()
+            candidate = await asyncio.to_thread(settings.preview_snapshot, snapshot_id)
+            if hal_force_config_payload(current) != hal_force_config_payload(candidate):
+                await hal.command("force.configure", hal_force_config_payload(candidate))
             config = await asyncio.to_thread(settings.apply_snapshot, snapshot_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "snapshot not found"}) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "VALIDATION_ERROR", "message": str(exc)},
+            ) from exc
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "HAL_REJECTED", "message": str(exc)},
+            ) from exc
         snapshots = await asyncio.to_thread(settings.list_snapshots)
         return envelope({"config": config, "snapshots": snapshots})
 
@@ -1574,6 +1616,48 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         devices = await asyncio.to_thread(hardware.cameras.enumerate_devices, config)
         return envelope({"devices": devices})
 
+    # 自动识别通往 PICO 网段的本机网口；可同时接收操作员刚修正的 PICO IP。
+    @app.post("/api/pico/network/auto-configure")
+    async def pico_network_auto_configure(
+        payload: Annotated[dict[str, Any] | None, Body()] = None,
+    ) -> ApiEnvelope:
+        config = await get_config_async()
+        pico = config["picoVision"]
+        original_pico_ip = str(pico.get("ip", ""))
+        requested_pico_ip = str((payload or {}).get("picoIp", "")).strip()
+        if requested_pico_ip:
+            pico["ip"] = requested_pico_ip
+        try:
+            network = await asyncio.to_thread(
+                detect_pico_network,
+                str(pico["ip"]),
+                preferred_gateway=str(pico.get("gateway", "")),
+            )
+        except PicoNetworkDetectionError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "PICO_NETWORK_DETECTION_FAILED", "message": str(exc)},
+            ) from exc
+        changed = original_pico_ip != str(pico["ip"])
+        changed = changed or int(pico.get("ifIndex", -1)) != int(network["ifIndex"])
+        gateway = str(network.get("gateway", "")).strip()
+        if gateway:
+            changed = changed or str(pico.get("gateway", "")) != gateway
+            pico["gateway"] = gateway
+        pico["ifIndex"] = int(network["ifIndex"])
+        saved = (
+            await asyncio.to_thread(settings.save_config, config, source="pico-network-auto")
+            if changed
+            else config
+        )
+        network["changed"] = changed
+        logs.info(
+            "[CAMERA]",
+            f"PICO network selected {network['interfaceAlias']} IF {network['ifIndex']} "
+            f"{network['localIp']}/{network['prefixLength']} gateway={gateway or '-'}",
+        )
+        return envelope({"network": network, "config": saved})
+
     # 连接 PICO ADB 设备。
     @app.post("/api/pico/adb/connect")
     async def pico_adb_connect() -> ApiEnvelope:
@@ -1847,8 +1931,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         last_health_at = time.monotonic()
         cached_motion_state: dict[str, Any] | None = None
         cached_omega_hands: list[dict[str, Any]] | None = None
+        cached_force_state: dict[str, Any] | None = None
         last_motion_state_at = 0.0
         last_omega_state_at = 0.0
+        last_force_state_at = 0.0
         # 30Hz upstream is plenty for charts/UI; the underlying motion thread runs at 1kHz.
         # Higher rates were the dominant source of frontend jank.
         ws_period = float(os.environ.get("APPSTATION_WS_PERIOD_SEC", "0.033"))
@@ -1944,6 +2030,17 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                                 cached_omega_hands = None
                                 logs.error("[HAL]", f"omega state failed: {exc}")
                         omega_hands = cached_omega_hands
+                    force_state: dict[str, Any] | None = None
+                    force_source = str(active_config.get("force", {}).get("source", "nidaq")).lower()
+                    if force_source == "hkvl_serial" and hal_health.connected:
+                        if now - last_force_state_at >= min(state_period, 0.02):
+                            last_force_state_at = now
+                            try:
+                                cached_force_state = await hal.force_state()
+                            except RuntimeError as exc:
+                                cached_force_state = None
+                                logs.error("[FORCE]", f"HAL force state failed: {exc}")
+                        force_state = cached_force_state
                     hal_ok = hal_health.connected and (hal_health.mode != "real" or hal_health.ltdmc_ok)
                     active_native_gripper_status = (
                         await gripper_router.status(active_config)
@@ -1957,6 +2054,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         motion_enabled=motion_enabled,
                         motion_axis_enabled=motion_axis_enabled,
                         omega_hands=omega_hands,
+                        force_state=force_state,
                         native_gripper_status=active_native_gripper_status,
                         hal_ok=hal_ok,
                         config=active_config,

@@ -10,13 +10,14 @@ export function StatusBar() {
   const picoVision = useTelemetryStore((state) => state.config.picoVision)
   const picoConnection = useTelemetryStore((state) => state.picoConnection)
   const dangerIndex = useTelemetryStore((state) => state.frame.dangerIndex)
+  const safetyLatched = useTelemetryStore((state) => Boolean(state.frame.forceStatus?.safety?.latched))
   const episodeCount = useTelemetryStore((state) => state.frame.episodeCount)
   const frameCount = useTelemetryStore((state) => state.frame.frameCount)
   const uiFps = useTelemetryStore((state) => state.frame.resource.uiFps)
   const phase = useTelemetryStore((state) => state.recordSession.phase)
   const recorderFps = useTelemetryStore((state) => state.recordSession.recorderFps)
   const recorderLateFrames = useTelemetryStore((state) => state.recordSession.recorderLateFrames)
-  const dangerState = dangerIndex >= 1 ? 'error' : dangerIndex > 0.7 ? 'warn' : 'ok'
+  const dangerState = safetyLatched || dangerIndex >= 1 ? 'error' : dangerIndex > 0.7 ? 'warn' : 'ok'
   const recordingFpsState = recorderFps >= 28 ? 'ok' : recorderFps >= 20 ? 'warn' : 'error'
   const cameraTotal = cameras.length || 3
   const cameraOk = cameras.filter((camera) => camera.health === 'ok').length
@@ -48,7 +49,7 @@ export function StatusBar() {
         label={`PICO ${picoStateText} ${picoVision.ip}`}
         tip={`${picoVision.ip}:${picoVision.adbPort} · ${picoConnection.message}`}
       />
-      <MetricPill state={dangerState} label={`Safety ${dangerIndex.toFixed(2)}`} />
+      <MetricPill state={dangerState} label={`Safety ${safetyLatched ? 'LOCK' : dangerIndex.toFixed(2)}`} />
       {phase === 'recording' && (
         <Tag color="error" style={{ animation: 'blink 1s step-end infinite' }}>
           ● REC

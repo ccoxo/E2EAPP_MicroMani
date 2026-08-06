@@ -184,10 +184,6 @@ unsigned short cardForSide(appstation::hal::Side side) {
   return side == appstation::hal::Side::Left ? static_cast<unsigned short>(1) : static_cast<unsigned short>(0);
 }
 
-bool axisMotionPermanentlyDisabled(appstation::hal::Side side, appstation::hal::SemanticAxis axis) {
-  return cardForSide(side) == 0 && axis == appstation::hal::SemanticAxis::Yaw;
-}
-
 const char* sideName(appstation::hal::Side side) {
   return side == appstation::hal::Side::Left ? "left" : "right";
 }
@@ -618,6 +614,16 @@ void LTDMCDriver::emergencyStop() {
   publishStateSnapshotLocked();
 }
 
+void LTDMCDriver::acknowledgeEmergencyStop() {
+  // Invalidate older in-flight operations before clearing the current latch.
+  estopSequence_.fetch_add(1, std::memory_order_acq_rel);
+  estopActive_.store(false, std::memory_order_release);
+  std::unique_lock<std::mutex> stateLock(mutex_, std::try_to_lock);
+  if (stateLock.owns_lock()) {
+    publishStateSnapshotLocked();
+  }
+}
+
 void LTDMCDriver::stopAllAxesBestEffort() noexcept {
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   // 先尝试整卡急停，再逐轴 stop，尽可能覆盖不同 LTDMC 固件行为。
@@ -666,7 +672,9 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled) {
 std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bool, 6>& enabledAxes) {
   std::scoped_lock lock(mutex_);
   ensureInitialized();
-  const auto estopSequenceAtStart = estopSequence_.load(std::memory_order_acquire);
+  if (enabled) {
+    throwIfEstopActive();
+  }
   int succeeded = 0;
   int failed = 0;
   std::ostringstream failures;
@@ -677,7 +685,7 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bo
   const auto card = cardForSide(side);
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     const auto axis = static_cast<SemanticAxis>(axisIndex);
-    const auto axisEnabled = enabled && enabledAxes[axisIndex] && !axisMotionPermanentlyDisabled(side, axis);
+    const auto axisEnabled = enabled && enabledAxes[axisIndex];
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
     if (!axisEnabled && dmcCheckDone(card, axisNo) == 0) {
       // 轴运动中禁止关闭伺服，否则可能让机构失控或丢步。
@@ -727,14 +735,13 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bo
 #else
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     const auto axis = static_cast<SemanticAxis>(axisIndex);
-    const auto axisEnabled = enabled && enabledAxes[axisIndex] && !axisMotionPermanentlyDisabled(side, axis);
+    const auto axisEnabled = enabled && enabledAxes[axisIndex];
     const auto index = stateIndex(side, axis);
     enabled_[index] = axisEnabled;
     commandedEnabled_[index] = axisEnabled;
     ++succeeded;
   }
 #endif
-  clearEstopIfUnchanged(estopSequenceAtStart);
   // 伺服状态变化后旧 teleop 目标不再可信，下一帧必须重新建立目标。
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     teleopTargetActive_[stateIndex(side, static_cast<SemanticAxis>(axisIndex))] = false;
@@ -767,7 +774,7 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes) {
   const auto card = cardForSide(side);
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     const auto axis = static_cast<SemanticAxis>(axisIndex);
-    if (!enabledAxes[axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
+    if (!enabledAxes[axisIndex]) {
       continue;
     }
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
@@ -778,7 +785,7 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes) {
   }
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     const auto axis = static_cast<SemanticAxis>(axisIndex);
-    if (!enabledAxes[axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
+    if (!enabledAxes[axisIndex]) {
       continue;
     }
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
@@ -851,7 +858,7 @@ void LTDMCDriver::homeAll(
     const auto card = cardForSide(side);
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
       const auto axis = static_cast<SemanticAxis>(axisIndex);
-      if (!enabledAxes[sideIndex][axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
+      if (!enabledAxes[sideIndex][axisIndex]) {
         continue;
       }
       if (!axisMotionEnabled(side, axis)) {
@@ -868,7 +875,7 @@ void LTDMCDriver::homeAll(
     const auto card = cardForSide(side);
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
       const auto axis = static_cast<SemanticAxis>(axisIndex);
-      if (!enabledAxes[sideIndex][axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
+      if (!enabledAxes[sideIndex][axisIndex]) {
         continue;
       }
       const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
@@ -918,7 +925,7 @@ void LTDMCDriver::homeAll(
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
       const auto axis = static_cast<SemanticAxis>(axisIndex);
-      if (!enabledAxes[sideIndex][axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
+      if (!enabledAxes[sideIndex][axisIndex]) {
         continue;
       }
       if (!axisMotionEnabled(side, axis)) {
@@ -957,7 +964,7 @@ void LTDMCDriver::homeOriginSide(
   // 单侧回工作原点与 homeAll 逻辑一致，但只处理调用方指定侧。
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     const auto axis = static_cast<SemanticAxis>(axisIndex);
-    if (!enabledAxes[axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
+    if (!enabledAxes[axisIndex]) {
       continue;
     }
     if (!axisMotionEnabled(side, axis)) {
@@ -969,7 +976,7 @@ void LTDMCDriver::homeOriginSide(
   waitForAxesDone(homeAxes, homeAxisCount, "home_origin_side pre-move", 3000);
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     const auto axis = static_cast<SemanticAxis>(axisIndex);
-    if (!enabledAxes[axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
+    if (!enabledAxes[axisIndex]) {
       continue;
     }
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
@@ -1009,7 +1016,7 @@ void LTDMCDriver::homeOriginSide(
 #else
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     const auto axis = static_cast<SemanticAxis>(axisIndex);
-    if (!enabledAxes[axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
+    if (!enabledAxes[axisIndex]) {
       continue;
     }
     if (!axisMotionEnabled(side, axis)) {
@@ -1045,9 +1052,6 @@ void LTDMCDriver::moveRelativeUi(
   }
   if (maxVelocityUiPerSec <= 0) {
     throw std::runtime_error("max velocity must be positive");
-  }
-  if (axisMotionPermanentlyDisabled(side, axis)) {
-    throw std::runtime_error("Card 0 Yaw motion axis is disabled by safety policy");
   }
   const auto index = stateIndex(side, axis);
   const auto deltaPulse = static_cast<long>(std::llround(uiToPulse(deltaUi, side, axis)));
@@ -1155,7 +1159,7 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
     result.requestedDeltaUi[axisIndex] = delta;
     result.targetPulse[axisIndex] = actualPulse;
     result.targetUi[axisIndex] = pulseToUi(actualPulse, side, axis);
-    if (!enabledAxes[axisIndex] || axisMotionPermanentlyDisabled(side, axis)) {
+    if (!enabledAxes[axisIndex]) {
       // 被软件掩码禁用的轴不更新目标，防止重新使能后继续沿旧目标运动。
       teleopTargetActive_[index] = false;
       continue;
@@ -1351,11 +1355,6 @@ void LTDMCDriver::stopTeleopSide(Side side) {
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     const auto axis = static_cast<SemanticAxis>(axisIndex);
     const auto index = stateIndex(side, axis);
-    if (axisMotionPermanentlyDisabled(side, axis)) {
-      teleopTargetActive_[index] = false;
-      teleopTargetPulse_[index] = pulse_[index];
-      continue;
-    }
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
     if (dmcStop) {
       // stopTeleopSide 是“停止遥操作保持当前位置”，不是急停；停止后仍同步目标到当前位置。
@@ -1425,7 +1424,7 @@ void LTDMCDriver::throwIfEstopActive() const {
 
 bool LTDMCDriver::axisMotionEnabled(Side side, SemanticAxis axis) const {
   // 运动许可读软件缓存，兼容没有可靠 sevon 反馈的轴。
-  return !axisMotionPermanentlyDisabled(side, axis) && enabled_[stateIndex(side, axis)];
+  return enabled_[stateIndex(side, axis)];
 }
 
 }  // namespace appstation::hal

@@ -17,6 +17,7 @@ from backend.hal_client.client import HalClient, HalHealth
 from backend.hal_client.dds_types import (
     DEFAULT_DDS_DOMAIN_ID,
     TOPIC_HAL_HEALTH,
+    TOPIC_HAL_FORCE_STATE,
     TOPIC_HAL_MOTION_STATE,
     TOPIC_HAL_NATIVE_TELEOP_STATUS,
     TOPIC_HAL_OMEGA_STATE,
@@ -143,6 +144,9 @@ class DdsHalClient(HalClient):
 
     async def omega_state(self) -> dict[str, Any]:
         return self._read_cached_payload(TOPIC_HAL_OMEGA_STATE)
+
+    async def force_state(self) -> dict[str, Any]:
+        return self._read_cached_payload(TOPIC_HAL_FORCE_STATE)
 
     def close(self) -> None:
         self.transport.close()

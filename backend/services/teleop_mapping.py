@@ -1630,25 +1630,12 @@ class TeleopMappingService:
         offset = 0 if side == "left" else 6
         return float(motion_pulse_per_unit(config)[offset + AXES.index(axis)])
 
-    def _motion_card_no(self, side: SideName, config: dict[str, Any]) -> int:
-        motion = config.get("motion", {})
-        fallback = 1 if side == "left" else 0
-        if not isinstance(motion, dict):
-            return fallback
-        try:
-            return int(motion.get(f"{side}CardNo", fallback))
-        except (TypeError, ValueError):
-            return fallback
-
     def _enabled_axes(self, side: SideName, config: dict[str, Any]) -> list[bool]:
         key = f"{side}EnabledAxes"
         raw = config.get("teleop", {}).get(key, DEFAULT_ENABLED_AXES)
         if not isinstance(raw, list) or len(raw) != 6:
             raw = DEFAULT_ENABLED_AXES
-        axes = [bool(value) for value in raw]
-        if self._motion_card_no(side, config) == 0:
-            axes[5] = False
-        return axes
+        return [bool(value) for value in raw]
 
     def _motion_state_pulses(self, state: dict[str, Any]) -> list[float]:
         raw_pulses = state.get("pulses")

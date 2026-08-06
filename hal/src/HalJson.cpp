@@ -542,6 +542,96 @@ std::string jsonStringValueOr(const std::string& body, const std::string& key, c
   return value.empty() ? fallback : value;
 }
 
+appstation::hal::ForceRuntimeConfig jsonForceRuntimeConfig(
+    const std::string& body,
+    const appstation::hal::ForceRuntimeConfig& fallback) {
+  auto config = fallback;
+  config.source = jsonStringValueOr(body, "source", config.source);
+  config.serial.protocol =
+      jsonStringValueOr(body, "protocol", config.serial.protocol);
+  config.serial.leftPort =
+      jsonStringValueOr(body, "leftPort", config.serial.leftPort);
+  config.serial.rightPort =
+      jsonStringValueOr(body, "rightPort", config.serial.rightPort);
+  config.serial.baudrate = static_cast<int>(
+      jsonNumberValue(body, "baudrate", config.serial.baudrate));
+  config.serial.expectedSampleHz = static_cast<int>(
+      jsonNumberValue(body, "expectedSampleHz", config.serial.expectedSampleHz));
+  config.serial.lowpassEnabled =
+      jsonBoolValue(body, "lowpassEnabled", config.serial.lowpassEnabled);
+  config.serial.lowpassCutoffHz =
+      jsonNumberValue(body, "lowpassCutoffHz", config.serial.lowpassCutoffHz);
+  config.axisSign[0] =
+      jsonNumberArray6(body, "leftAxisSign", config.axisSign[0]);
+  config.axisSign[1] =
+      jsonNumberArray6(body, "rightAxisSign", config.axisSign[1]);
+
+  const double fxyWarn =
+      jsonNumberValue(body, "fxyWarnN", config.safety.warn[0]);
+  const double fxyStop =
+      jsonNumberValue(body, "fxyStopN", config.safety.stop[0]);
+  const double fzWarn =
+      jsonNumberValue(body, "fzWarnN", config.safety.warn[2]);
+  const double fzStop =
+      jsonNumberValue(body, "fzStopN", config.safety.stop[2]);
+  const double momentWarn =
+      jsonNumberValue(body, "momentWarnNm", config.safety.warn[3]);
+  const double momentStop =
+      jsonNumberValue(body, "momentStopNm", config.safety.stop[3]);
+  config.safety.warn = {
+      fxyWarn, fxyWarn, fzWarn, momentWarn, momentWarn, momentWarn};
+  config.safety.stop = {
+      fxyStop, fxyStop, fzStop, momentStop, momentStop, momentStop};
+  config.safety.watchdogMs =
+      jsonNumberValue(body, "watchdogMs", config.safety.watchdogMs);
+  config.safety.acknowledgeStableMs = jsonNumberValue(
+      body,
+      "acknowledgeStableMs",
+      config.safety.acknowledgeStableMs);
+
+  config.compliance.enabled =
+      jsonBoolValue(body, "complianceEnabled", config.compliance.enabled);
+  const std::array<std::string, 2> prefixes{{"left", "right"}};
+  for (std::size_t side = 0; side < prefixes.size(); ++side) {
+    auto& sideConfig = config.compliance.sides[side];
+    const auto& prefix = prefixes[side];
+    sideConfig.mappingConfirmed = jsonBoolValue(
+        body,
+        prefix + "MappingConfirmed",
+        sideConfig.mappingConfirmed);
+    for (std::size_t index = 0; index < sideConfig.matrix.size(); ++index) {
+      (void)jsonNumberArrayValue(
+          body,
+          prefix + "ComplianceMatrix",
+          index,
+          &sideConfig.matrix[index]);
+    }
+    for (std::size_t index = 0; index < 2; ++index) {
+      (void)jsonNumberArrayValue(
+          body,
+          prefix + "ComplianceDeadbandN",
+          index,
+          &sideConfig.deadbandN[index]);
+      (void)jsonNumberArrayValue(
+          body,
+          prefix + "ComplianceGainUmPerNs",
+          index,
+          &sideConfig.gainUmPerNs[index]);
+      (void)jsonNumberArrayValue(
+          body,
+          prefix + "ComplianceMaxStepUm",
+          index,
+          &sideConfig.maxStepUm[index]);
+      (void)jsonNumberArrayValue(
+          body,
+          prefix + "ComplianceMaxOffsetUm",
+          index,
+          &sideConfig.maxOffsetUm[index]);
+    }
+  }
+  return config;
+}
+
 appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& body) {
   using appstation::hal::AxisLimit;
   using appstation::hal::NativeTeleopConfig;

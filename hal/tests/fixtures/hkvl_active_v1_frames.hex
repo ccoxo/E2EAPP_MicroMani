@@ -1,0 +1,4 @@
+# Sanitized HKVL-36A frames captured read-only at 1,000,000 baud on 2026-07-27.
+# Format: 53 54 + six little-endian float32 values + CRC-16/Modbus (low byte first).
+53 54 40 4D 13 40 00 E8 4B BF 00 CD 73 C0 00 B0 7A BD 00 00 38 BB 00 40 E6 BC F2 7D
+53 54 00 03 D3 3F 00 E3 8A BF 80 5D 4B C0 00 00 B2 3C 00 00 9D BB 00 A0 B8 3C ED 71

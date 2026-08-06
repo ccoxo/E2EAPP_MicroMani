@@ -5,6 +5,7 @@
 #include <string>
 
 #include "HalTypes.h"
+#include "ForceControlRuntime.h"
 #include "NativeTeleopController.h"
 #include "Omega7Driver.h"
 
@@ -49,6 +50,9 @@ std::array<AxisLimit, 6> jsonAxisLimits(
     const std::string& maxKey,
     const std::array<AxisLimit, 6>& fallback);
 std::string jsonStringValueOr(const std::string& body, const std::string& key, const std::string& fallback);
+ForceRuntimeConfig jsonForceRuntimeConfig(
+    const std::string& body,
+    const ForceRuntimeConfig& fallback = {});
 NativeTeleopConfig jsonNativeTeleopConfig(const std::string& body);
 double effectiveGripperTargetMm(const NativeTeleopConfig& config, double targetMm);
 Side parseSide(const std::string& value);

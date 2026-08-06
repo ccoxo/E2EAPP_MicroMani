@@ -155,6 +155,45 @@ class StabilityMonitorService:
         if not self._real_hardware_mode(config):
             force_status["skippedTestMode"] = int(force_status["skippedTestMode"]) + 1
             return
+        source = str(config.get("force", {}).get("source", "nidaq")).lower()
+        force_status["source"] = source
+        if source == "hkvl_serial":
+            force_status["samples"] = int(force_status["samples"]) + 1
+            try:
+                state = await self.hal.force_state()
+            except Exception as exc:  # noqa: BLE001
+                message = f"HKVL force state failed: {exc}"
+                force_status["failures"] = int(force_status["failures"]) + 1
+                force_status["lastError"] = message
+                self._append_error(message)
+                return
+            sides = state.get("sides", {}) if isinstance(state, dict) else {}
+            left_status = sides.get("left", {}) if isinstance(sides, dict) else {}
+            right_status = sides.get("right", {}) if isinstance(sides, dict) else {}
+            healthy = bool(left_status.get("healthy")) and bool(right_status.get("healthy"))
+            if not healthy:
+                message = "HKVL force state is stale or unhealthy"
+                force_status["failures"] = int(force_status["failures"]) + 1
+                force_status["lastError"] = message
+                self._append_error(message)
+                return
+            left = list(state.get("left", [0.0] * 6))
+            right = list(state.get("right", [0.0] * 6))
+            force_status["okSamples"] = int(force_status["okSamples"]) + 1
+            force_status["maxAbsLeftN"] = max(
+                float(force_status["maxAbsLeftN"]),
+                self._max_abs_force([left]),
+            )
+            force_status["maxAbsRightN"] = max(
+                float(force_status["maxAbsRightN"]),
+                self._max_abs_force([right]),
+            )
+            force_status["leftSampleHz"] = float(left_status.get("sampleHz", 0.0))
+            force_status["rightSampleHz"] = float(right_status.get("sampleHz", 0.0))
+            force_status["leftCrcErrors"] = int(left_status.get("crcErrors", 0))
+            force_status["rightCrcErrors"] = int(right_status.get("crcErrors", 0))
+            force_status["leftRightSkewMs"] = float(state.get("leftRightSkewMs", 0.0))
+            return
         sample_hz = self._sample_hz(config)
         sample_count = min(max(int(round(sample_hz * 0.1)), 1), 512)
         result = await asyncio.to_thread(self.hardware.force.sample_window, config, sample_count)
@@ -226,11 +265,17 @@ class StabilityMonitorService:
                 "lastReconnectError": "",
             },
             "force": {
+                "source": "",
                 "samples": 0,
                 "okSamples": 0,
                 "failures": 0,
                 "skippedTestMode": 0,
                 "sampleHz": 0.0,
+                "leftSampleHz": 0.0,
+                "rightSampleHz": 0.0,
+                "leftCrcErrors": 0,
+                "rightCrcErrors": 0,
+                "leftRightSkewMs": 0.0,
                 "windowSamples": 0,
                 "maxAbsLeftN": 0.0,
                 "maxAbsRightN": 0.0,

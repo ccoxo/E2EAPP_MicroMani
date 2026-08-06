@@ -123,7 +123,8 @@ function GlobalHardwarePanel({
   const globalCamera = cameraByKey(frame.cameras, 'global')
   const omegaState = teleopPairState(frame, diagnostics)
   const halState: ConnectionState = frame.halOk ? 'ok' : 'error'
-  const safetyState: ConnectionState = frame.dangerIndex > 0.85 ? 'error' : frame.dangerIndex > 0.6 ? 'warn' : 'ok'
+  const safetyLatched = Boolean(frame.forceStatus?.safety?.latched)
+  const safetyState: ConnectionState = safetyLatched || frame.dangerIndex > 0.85 ? 'error' : frame.dangerIndex > 0.6 ? 'warn' : 'ok'
  /** 描述当前方法的功能边界。 */
  const go = (hash: string) => navigate(`/settings#${hash}`)
 
@@ -135,7 +136,7 @@ function GlobalHardwarePanel({
           <MetricPill state={halState} label="HAL" />
           <MetricPill state={globalCamera?.health ?? 'pending'} label="全局相机" />
           <MetricPill state={omegaState} label="主手" />
-          <MetricPill state={safetyState} label={`Safety ${frame.dangerIndex.toFixed(2)}`} />
+          <MetricPill state={safetyState} label={`Safety ${safetyLatched ? 'LOCK' : frame.dangerIndex.toFixed(2)}`} />
         </Space>
       </div>
       <div className="global-hardware-layout">
@@ -168,7 +169,7 @@ function GlobalHardwarePanel({
           <HardwareStatusButton
             label="安全链路"
             state={safetyState}
-            value={`danger_index ${frame.dangerIndex.toFixed(2)}`}
+            value={safetyLatched ? '安全锁存' : `danger_index ${frame.dangerIndex.toFixed(2)}`}
             detail="外部急停、软限位和力觉保护汇总"
             icon={<ShieldCheck size={15} />}
             onClick={() => go('safety')}
@@ -205,7 +206,7 @@ function ArmHardwarePanel({
   const teleopState = teleopHandState(frame, diagnostics, side)
   const motionState: ConnectionState = frame.halOk ? 'ok' : 'error'
   const forceNorm = forceMagnitude(forceValues)
-  const safetyState: ConnectionState = forceNorm > 2.5 || frame.dangerIndex > 0.65 ? 'warn' : 'ok'
+  const safetyState: ConnectionState = frame.forceStatus?.safety?.latched || forceNorm > 2.5 || frame.dangerIndex > 0.65 ? 'warn' : 'ok'
   const gripperValue = formatGripperValue(frame.gripperPositions[isHardwareLeft ? 0 : 1])
  /** 描述当前方法的功能边界。 */
  const go = (hash: string) => navigate(`/settings#${hash}`)

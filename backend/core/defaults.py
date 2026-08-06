@@ -18,7 +18,8 @@ DEFAULT_MOTION_PROFILE: dict[str, Any] = {
     },
 }
 
-ICF_TELEOP_STRATEGY_VERSION = "e2e_omega7_native_v31_gravity_scale_20260617"
+ICF_TELEOP_PREVIOUS_STRATEGY_VERSION = "e2e_omega7_native_v31_gravity_scale_20260617"
+ICF_TELEOP_STRATEGY_VERSION = "e2e_omega7_native_v32_card0_yaw_20260804"
 ICF_WORK_ORIGIN_VERSION = "icf_work_origin_20260521_rotation_limit_v2"
 ICF_HOME_REFERENCE_VERSION = "icf_home_reference_20260602_v1"
 ICF_CAMERA_TUNING_DEFAULTS_VERSION = "auto_awb_exposure_20260616"
@@ -173,7 +174,7 @@ ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "continuousMicroConfirmTicks": 0,
     "diagLog": False,
     "leftEnabledAxes": [True, True, True, True, True, True],
-    "rightEnabledAxes": [True, True, True, True, True, False],
+    "rightEnabledAxes": [True, True, True, True, True, True],
     "softLimitUnitSpec": list(ICF_TELEOP_SOFT_LIMIT_UNIT_SPEC),
     "leftSoftLimitMin": list(ICF_LEFT_TELEOP_SOFT_LIMIT_MIN),
     "leftSoftLimitMax": list(ICF_LEFT_TELEOP_SOFT_LIMIT_MAX),
@@ -325,6 +326,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "cameras": deepcopy(ICF_CAMERA_DEFAULTS),
     "force": {
+        "source": "nidaq",
         "leftIp": "Dev5/ai0:5",
         "rightIp": "Dev3/ai0:5",
         "port": 49152,
@@ -341,6 +343,36 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "lowpassEnabled": True,
         "lowpassCutoffHz": 10,
         "swapHands": False,
+        "serial": {
+            "protocol": "hkvl_active_v1",
+            "leftPort": "COM15",
+            "rightPort": "COM14",
+            "baudrate": 1_000_000,
+            "expectedSampleHz": 1000,
+        },
+        "axisSign": {
+            "left": [1.0, 1.0, -1.0, -1.0, -1.0, 1.0],
+            "right": [1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
+        },
+        "compliance": {
+            "enabled": False,
+            "left": {
+                "mappingConfirmed": False,
+                "matrix": [1.0, 0.0, 0.0, 1.0],
+                "deadbandN": [0.0, 0.0],
+                "gainUmPerNs": [0.0, 0.0],
+                "maxStepUm": [0.0, 0.0],
+                "maxOffsetUm": [0.0, 0.0],
+            },
+            "right": {
+                "mappingConfirmed": False,
+                "matrix": [1.0, 0.0, 0.0, 1.0],
+                "deadbandN": [0.0, 0.0],
+                "gainUmPerNs": [0.0, 0.0],
+                "maxStepUm": [0.0, 0.0],
+                "maxOffsetUm": [0.0, 0.0],
+            },
+        },
     },
     "motion": {
         "leftCardNo": 1,
@@ -396,11 +428,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "safety": {
         "fxyWarnN": 2,
-        "fxyStopN": 4,
+        "fxyStopN": 30,
         "fzWarnN": 3,
-        "fzStopN": 5,
+        "fzStopN": 30,
         "momentWarnNm": 0.02,
-        "momentStopNm": 0.04,
+        "momentStopNm": 1,
         "yawSoftLimitDeg": 7,
         "watchdogMs": 50,
     },

@@ -72,6 +72,7 @@ constexpr const char* kTopicHealth = "AppStation.Hal.Health";
 constexpr const char* kTopicMotionState = "AppStation.Hal.MotionState";
 constexpr const char* kTopicOmegaState = "AppStation.Hal.OmegaState";
 constexpr const char* kTopicNativeTeleopStatus = "AppStation.Hal.NativeTeleopStatus";
+constexpr const char* kTopicForceState = "AppStation.Hal.ForceState";
 constexpr const char* kTopicCommandRequest = "AppStation.Hal.CommandRequest";
 constexpr const char* kTopicCommandReply = "AppStation.Hal.CommandReply";
 constexpr const char* kTopicEmergencyStop = "AppStation.Hal.EmergencyStop";
@@ -285,6 +286,7 @@ struct HalDdsControlServer::Impl {
   LTDMCDriver& motion_;
   Omega7Driver& omega_;
   NativeTeleopController& nativeTeleop_;
+  ForceControlRuntime& forceRuntime_;
   const std::chrono::steady_clock::time_point& started_;
   bool enabled{false};
   std::atomic<bool> running{false};
@@ -298,6 +300,7 @@ struct HalDdsControlServer::Impl {
   Topic* motionTopic{nullptr};
   Topic* omegaTopic{nullptr};
   Topic* nativeTeleopTopic{nullptr};
+  Topic* forceTopic{nullptr};
   Topic* commandRequestTopic{nullptr};
   Topic* commandReplyTopic{nullptr};
   Topic* emergencyStopTopic{nullptr};
@@ -305,6 +308,7 @@ struct HalDdsControlServer::Impl {
   DataWriter* motionWriter_{nullptr};
   DataWriter* omegaWriter_{nullptr};
   DataWriter* nativeTeleopWriter_{nullptr};
+  DataWriter* forceWriter_{nullptr};
   DataWriter* replyWriter_{nullptr};
   DataReader* commandReader_{nullptr};
   DataReader* emergencyStopReader_{nullptr};
@@ -317,11 +321,13 @@ struct HalDdsControlServer::Impl {
       LTDMCDriver& motion,
       Omega7Driver& omega,
       NativeTeleopController& nativeTeleop,
+      ForceControlRuntime& forceRuntime,
       const std::chrono::steady_clock::time_point& started)
       : commandDispatcher_(commandDispatcher),
         motion_(motion),
         omega_(omega),
         nativeTeleop_(nativeTeleop),
+        forceRuntime_(forceRuntime),
         started_(started),
         enabled(envBoolValue("APPSTATION_HAL_DDS_ENABLED", true)) {
     if (!enabled) {
@@ -375,6 +381,7 @@ struct HalDdsControlServer::Impl {
     motionTopic = createTopic(kTopicMotionState, kJsonEnvelopeType);
     omegaTopic = createTopic(kTopicOmegaState, kJsonEnvelopeType);
     nativeTeleopTopic = createTopic(kTopicNativeTeleopStatus, kJsonEnvelopeType);
+    forceTopic = createTopic(kTopicForceState, kJsonEnvelopeType);
     commandRequestTopic = createTopic(kTopicCommandRequest, kCommandRequestType);
     commandReplyTopic = createTopic(kTopicCommandReply, kCommandReplyType);
     emergencyStopTopic = createTopic(kTopicEmergencyStop, kCommandRequestType);
@@ -383,10 +390,12 @@ struct HalDdsControlServer::Impl {
     motionWriter_ = publisher->create_datawriter(motionTopic, telemetryWriterQos(false, false, 1));
     omegaWriter_ = publisher->create_datawriter(omegaTopic, telemetryWriterQos(false, false, 1));
     nativeTeleopWriter_ = publisher->create_datawriter(nativeTeleopTopic, telemetryWriterQos(false, false, 1));
+    forceWriter_ = publisher->create_datawriter(forceTopic, telemetryWriterQos(false, false, 1));
     replyWriter_ = publisher->create_datawriter(commandReplyTopic, commandReplyWriterQos());
     commandReader_ = subscriber->create_datareader(commandRequestTopic, commandRequestReaderQos());
     emergencyStopReader_ = subscriber->create_datareader(emergencyStopTopic, commandRequestReaderQos());
-    if (!healthWriter_ || !motionWriter_ || !omegaWriter_ || !nativeTeleopWriter_ || !replyWriter_ || !commandReader_
+    if (!healthWriter_ || !motionWriter_ || !omegaWriter_ || !nativeTeleopWriter_ || !forceWriter_
+        || !replyWriter_ || !commandReader_
         || !emergencyStopReader_) {
       throw std::runtime_error("create HAL DDS control readers/writers failed");
     }
@@ -422,6 +431,7 @@ struct HalDdsControlServer::Impl {
 
   void loop() {
     auto nextTelemetryAt = std::chrono::steady_clock::now();
+    auto nextForceAt = nextTelemetryAt;
     while (running) {
       const bool handledCommand = pollCommands();
       const auto now = std::chrono::steady_clock::now();
@@ -429,6 +439,10 @@ struct HalDdsControlServer::Impl {
         // 遥测以 100 Hz 发布，控制命令有数据时优先被处理。
         publishTelemetry();
         nextTelemetryAt = now + std::chrono::milliseconds(10);
+      }
+      if (now >= nextForceAt) {
+        publishForceState();
+        nextForceAt = now + std::chrono::milliseconds(5);
       }
       if (!handledCommand) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -541,6 +555,16 @@ struct HalDdsControlServer::Impl {
     }
   }
 
+  void publishForceState() {
+    try {
+      publishJson(
+          forceWriter_,
+          forceRuntime_.forceStateJson(forceMonotonicMilliseconds()));
+    } catch (const std::exception& exc) {
+      std::cerr << "Fast-DDS HAL force telemetry publish failed: " << exc.what() << "\n";
+    }
+  }
+
   void publishJson(DataWriter* writer, const std::string& payloadJson) {
     if (!writer) {
       return;
@@ -559,8 +583,15 @@ HalDdsControlServer::HalDdsControlServer(
     LTDMCDriver& motion,
     Omega7Driver& omega,
     NativeTeleopController& nativeTeleop,
+    ForceControlRuntime& forceRuntime,
     const std::chrono::steady_clock::time_point& started)
-    : impl_(std::make_unique<Impl>(commandDispatcher, motion, omega, nativeTeleop, started)) {}
+    : impl_(std::make_unique<Impl>(
+          commandDispatcher,
+          motion,
+          omega,
+          nativeTeleop,
+          forceRuntime,
+          started)) {}
 
 HalDdsControlServer::~HalDdsControlServer() = default;
 

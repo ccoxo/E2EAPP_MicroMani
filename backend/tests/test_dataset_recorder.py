@@ -1804,6 +1804,97 @@ def test_dataset_recorder_samples_current_force_without_window(monkeypatch) -> N
     assert recorder.hardware.force.window_calls == 0
 
 
+def test_dataset_recorder_samples_hkvl_force_from_hal_without_nidaq(monkeypatch) -> None:
+    class FakeHal:
+        async def force_state(self) -> dict[str, object]:
+            return {
+                "source": "hkvl_serial",
+                "left": [1.0] * 6,
+                "right": [2.0] * 6,
+                "monotonic_s": 2.5,
+                "sides": {
+                    "left": {"healthy": True},
+                    "right": {"healthy": True},
+                },
+            }
+
+    class ForbiddenForce:
+        def sample(self, _config: dict[str, object]) -> object:
+            raise AssertionError("HKVL recording must not sample NI-DAQ")
+
+    recorder = object.__new__(DatasetRecorderService)
+    recorder.hal = FakeHal()
+    recorder.hardware = SimpleNamespace(force=ForbiddenForce())
+    recorder._latest_force_state = {}
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    result = recorder._sample_force_source_sync(
+        {"hal": {"mode": "real"}, "force": {"source": "hkvl_serial"}},
+        2.0,
+    )
+
+    assert result.ok is True
+    assert result.monotonic_s == 2.5
+    assert result.value["left"] == [1.0] * 6
+    assert recorder._latest_force_state["right"] == [2.0] * 6
+
+
+def test_dataset_recorder_appstation_info_records_hkvl_configuration_and_tare(
+    tmp_path: Path,
+) -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._dataset_name = "unit"
+    recorder._native_use_videos = False
+    recorder._record_fps_hz = 30
+    recorder._force_sample_hz = 200.0
+    recorder._latest_force_state = {
+        "sides": {
+            "left": {
+                "axisSign": [-1.0, 1.0, -1.0, 1.0, -1.0, -1.0],
+                "tareBias": [-0.1, 0.2, -0.3, 0.4, -0.5, -0.6],
+                "sensorTareBias": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            },
+            "right": {
+                "axisSign": [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0],
+                "tareBias": [-0.2, -0.2, -0.2, 0.2, 0.2, 0.2],
+                "sensorTareBias": [0.2] * 6,
+            },
+        },
+        "compliance": {
+            "enabled": True,
+            "left": {
+                "requestedUm": [1.0, -2.0],
+                "actualUm": [0.8, -1.5],
+                "cumulativeOffsetUm": [5.0, -4.0],
+                "clipReason": ["motion_limit", ""],
+            },
+        },
+    }
+    config = default_config()
+    config["force"]["source"] = "hkvl_serial"
+    dataset_dir = tmp_path / "dataset"
+
+    recorder._write_appstation_info(dataset_dir, config)
+
+    payload = json.loads(
+        (dataset_dir / "meta" / "appstation_info.json").read_text(encoding="utf-8")
+    )
+    force = payload["hardware"]["force"]
+    assert force["source"] == "hkvl_serial"
+    assert force["serial"]["leftPort"] == "COM15"
+    assert force["serial"]["rightPort"] == "COM14"
+    assert force["protocol"] == "hkvl_active_v1"
+    assert force["axisSign"]["left"] == [-1.0, 1.0, -1.0, 1.0, -1.0, -1.0]
+    assert force["axisSign"]["right"] == [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]
+    assert force["tareBias"]["left"] == [-0.1, 0.2, -0.3, 0.4, -0.5, -0.6]
+    assert force["tareBias"]["right"] == [-0.2, -0.2, -0.2, 0.2, 0.2, 0.2]
+    assert force["sensorTareBias"]["left"] == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    assert force["sensorTareBias"]["right"] == [0.2] * 6
+    assert force["compliance"] == config["force"]["compliance"]
+    assert force["runtimeCompliance"]["left"]["actualUm"] == [0.8, -1.5]
+    assert force["runtimeCompliance"]["left"]["clipReason"] == ["motion_limit", ""]
+
+
 def test_dataset_recorder_composes_14d_state_and_absolute_action() -> None:
     class FakeTeleop:
         def status(self) -> dict[str, object]:

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <memory>
 
+#include "ForceControlRuntime.h"
 #include "HalCommandDispatcher.h"
 #include "LTDMCDriver.h"
 #include "NativeTeleopController.h"
@@ -19,6 +20,7 @@ class HalDdsControlServer {
       LTDMCDriver& motion,
       Omega7Driver& omega,
       NativeTeleopController& nativeTeleop,
+      ForceControlRuntime& forceRuntime,
       const std::chrono::steady_clock::time_point& started);
   ~HalDdsControlServer();
 

@@ -21,6 +21,8 @@ class LTDMCDriver {
   MotionState readState();
   // 立即急停所有轴并尽力关闭伺服，随后需要由回零/使能流程清除急停状态。
   void emergencyStop();
+  // Clears only the software latch. It never enables axes or restores prior state.
+  void acknowledgeEmergencyStop();
   bool estopActive() const;
   // 回工作原点前的安全检查，急停未清除时直接拒绝运动。
   void ensureMotionReturnAllowed() const;

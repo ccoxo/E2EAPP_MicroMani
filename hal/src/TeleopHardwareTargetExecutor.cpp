@@ -4,7 +4,11 @@
 
 namespace appstation::hal {
 
-TeleopHardwareTargetExecutor::TeleopHardwareTargetExecutor(LTDMCDriver& motion) : motion_(motion) {}
+TeleopHardwareTargetExecutor::TeleopHardwareTargetExecutor(
+    LTDMCDriver& motion,
+    ForceControlRuntime& forceRuntime)
+    : motion_(motion),
+      forceRuntime_(forceRuntime) {}
 
 void TeleopHardwareTargetExecutor::apply(const TeleopHardwareTarget& target) {
   if (motion_.estopActive()) {
@@ -16,10 +20,18 @@ void TeleopHardwareTargetExecutor::apply(const TeleopHardwareTarget& target) {
     limits[i] = AxisLimit{target.softLimitMin[i], target.softLimitMax[i]};
   }
 
+  auto deltas = target.deltas;
+  const int sideIndex = target.side == 0 ? 0 : 1;
+  const auto compliance = forceRuntime_.complianceCorrection(
+      sideIndex,
+      target.stampMonotonicMs);
+  deltas[0] += compliance.correctionUm[0];
+  deltas[2] += compliance.correctionUm[1];
+
   // Follower 端只做最终落地，不改变 Mapping 端算好的步长、死区、速度和软限位。
-  (void)motion_.updateTeleopTargetUi(
+  const auto result = motion_.updateTeleopTargetUi(
       target.side == 0 ? Side::Left : Side::Right,
-      target.deltas,
+      deltas,
       target.translationStepLimitPulse,
       target.rotationStepLimitPulse,
       target.translationPulseDeadband,
@@ -33,6 +45,13 @@ void TeleopHardwareTargetExecutor::apply(const TeleopHardwareTarget& target) {
       target.rotationStartVelocityUiPerSec,
       target.accTimeSec,
       target.decTimeSec);
+  forceRuntime_.commitCompliance(
+      sideIndex,
+      compliance.correctionUm,
+      {{
+          result.appliedDeltaUi[0] - target.deltas[0],
+          result.appliedDeltaUi[2] - target.deltas[2],
+      }});
 }
 
 }  // namespace appstation::hal

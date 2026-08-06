@@ -9,6 +9,11 @@ option(APPSTATION_ENABLE_VENDOR_SDKS "Compile LTDMC and Omega.7 vendor SDK calls
 
 # 核心库只包含硬件访问、单位换算、teleop 映射和夹爪控制，不包含 HTTP 传输层。
 add_library(appstation_hal_core
+  src/ForceComplianceController.cpp
+  src/ForceControlRuntime.cpp
+  src/ForceSafetyLatch.cpp
+  src/HkvlForceDriver.cpp
+  src/HkvlForceProtocol.cpp
   src/JodellGripperDriver.cpp
   src/LTDMCDriver.cpp
   src/MotionControlThread.cpp
