@@ -334,6 +334,7 @@ class FrameAssembler:
             motion_pulses = [float(value) for value in raw_pulses]
             recorder._remember_motion_pulses(motion_pulses)
         motion_positions = recorder._recording_motion_positions(config, motion_positions, motion_pulses)
+        recording_motion_pulses = motion_pulses[6:12] + motion_pulses[0:6]
         force_values = recorder._force_values_from_sample(force_sample.value)
         if force_values is not None:
             force_left, force_right = force_values
@@ -357,9 +358,9 @@ class FrameAssembler:
             "frame_index": frame_index,
             "episode_index": recorder._episode_index,
             "observation.state": observation_state,
-            "observation.pulses": motion_pulses,
-            "observation.force_left": force_left,
-            "observation.force_right": force_right,
+            "observation.pulses": recording_motion_pulses,
+            "observation.force_left": force_right,
+            "observation.force_right": force_left,
             "action": recorder._latest_action_vector(observation_state, config, target_monotonic_s),
             "images": image_payload,
         }
@@ -2814,6 +2815,9 @@ class DatasetRecorderService:
                 "left": list(left.get("sensorTareBias", [0.0] * 6)),
                 "right": list(right.get("sensorTareBias", [0.0] * 6)),
             },
+            "calibration": deepcopy(
+                latest.get("calibration", {}) if isinstance(latest, dict) else {}
+            ),
             "mapping": {
                 side: list(force.get("compliance", {}).get(side, {}).get("matrix", []))
                 for side in ("left", "right")
@@ -3576,8 +3580,9 @@ class DatasetRecorderService:
 
     def _compose_observation_state(self, motion_positions: list[float], gripper_positions: list[Any]) -> list[float]:
         # 将运动状态和夹爪位置组合成 LeRobot v3 的 state。
-        """把 12 维运动位姿和左右夹爪值拼成 14 维 LeRobot state。"""
+        """交换左右两组运动位姿和夹爪值后，拼成 14 维 LeRobot state。"""
         motion = (list(motion_positions) + [0.0] * 12)[:12]
+        motion = motion[6:12] + motion[0:6]
         gripper = [self._float_or_zero(value) for value in (list(gripper_positions) + [0.0, 0.0])[:2]]
         return [
             motion[0],
@@ -3586,14 +3591,14 @@ class DatasetRecorderService:
             motion[3] * 1000.0,
             motion[4] * 1000.0,
             motion[5] * 1000.0,
-            gripper[0],
+            gripper[1],
             motion[6],
             motion[7],
             motion[8],
             motion[9] * 1000.0,
             motion[10] * 1000.0,
             motion[11] * 1000.0,
-            gripper[1],
+            gripper[0],
         ]
 
     def _lerobot14_to_ui_motion_state(self, state: list[float]) -> list[float]:
@@ -3782,16 +3787,17 @@ class DatasetRecorderService:
         base = (list(observation_state) + [0.0] * 14)[:14] if observation_state is not None else [0.0] * 14
         config = config or {}
         vector = self._latest_action_delta_vector(target_monotonic_s)
+        vector = vector[7:14] + vector[0:7]
         action = [base[index] + vector[index] for index in range(14)]
         native_gripper_targets = self._latest_native_gripper_targets(config)
         if native_gripper_targets is not None:
-            action[6], action[13] = native_gripper_targets
+            action[6], action[13] = native_gripper_targets[1], native_gripper_targets[0]
             return action
         if not self._using_real_hal_native_teleop(config):
             gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
             if gripper:
-                action[6] = self._float_or_zero(gripper.get("targetLeftMm", base[6]))
-                action[13] = self._float_or_zero(gripper.get("targetRightMm", base[13]))
+                action[6] = self._float_or_zero(gripper.get("targetRightMm", base[6]))
+                action[13] = self._float_or_zero(gripper.get("targetLeftMm", base[13]))
         return action
 
     def _latest_native_gripper_targets(self, config: dict[str, Any]) -> tuple[float, float] | None:

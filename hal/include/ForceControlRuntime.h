@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <iosfwd>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -56,7 +57,7 @@ class ForceControlRuntime {
   void acknowledgeEmergencyStop(double nowMonotonicMs);
   bool safetyLatched() const;
 
-  void tare(int side, int sampleCount);
+  std::string tare(int side, int sampleCount);
   ForceComplianceResult complianceCorrection(
       int side,
       std::uint64_t targetMonotonicMs);
@@ -68,10 +69,21 @@ class ForceControlRuntime {
   std::string forceStateJson(double nowMonotonicMs);
 
  private:
+  friend struct ForceControlRuntimeTestAccess;
+
   static void validateConfig(const ForceRuntimeConfig& config);
   void monitorLoop();
   void invokeEmergencyStopIfNeeded(
       const std::optional<ForceSafetyTrip>& trip);
+  void appendCalibrationJson(std::ostringstream& out) const;
+
+  struct CalibrationState {
+    std::string state{"not_required"};
+    int progress{0};
+    std::string reason;
+    bool hasResult{false};
+    HkvlTareResult result{};
+  };
 
   EmergencyStopCallback emergencyStop_;
   AcknowledgeCallback acknowledge_;
@@ -86,6 +98,7 @@ class ForceControlRuntime {
   std::array<bool, 2> hasSample_{{false, false}};
   std::array<ForceComplianceResult, 2> lastCompliance_{};
   std::array<std::array<double, 2>, 2> lastComplianceActualUm_{};
+  CalibrationState calibration_{};
   HkvlForceDriver driver_;
   std::atomic<bool> running_{false};
   std::thread monitor_;

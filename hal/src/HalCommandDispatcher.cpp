@@ -27,6 +27,20 @@ std::string HalCommandDispatcher::handleEmergencyStop() {
   return "{\"ok\":true}";
 }
 
+void HalCommandDispatcher::requireForceMutationSafe(const char* operation) {
+  if (nativeTeleop_.running()) {
+    throw std::runtime_error(
+        std::string(operation) + " requires native teleop to be stopped");
+  }
+  const auto motionState = motion_.readState();
+  for (const auto& axis : motionState.axes) {
+    if (axis.moving || axis.enabled) {
+      throw std::runtime_error(
+          std::string(operation) + " requires all axes stopped and servos disabled");
+    }
+  }
+}
+
 std::string HalCommandDispatcher::handle(const std::string& name, const std::string& bodyText) {
   // DDS command request 使用和 Python backend 相同的 command name；
   // 这里复用既有 HTTP 路由语义，避免两套控制面出现行为分叉。
@@ -52,22 +66,14 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     return forceRuntime_.forceStateJson(forceMonotonicMilliseconds());
   }
   if (name == "force.configure") {
-    if (nativeTeleop_.running()) {
-      throw std::runtime_error("force configuration requires native teleop to be stopped");
-    }
-    const auto motionState = motion_.readState();
-    for (const auto& axis : motionState.axes) {
-      if (axis.moving || axis.enabled) {
-        throw std::runtime_error(
-            "force configuration requires all axes stopped and servos disabled");
-      }
-    }
+    requireForceMutationSafe("force configuration");
     forceRuntime_.configure(
         jsonForceRuntimeConfig(bodyText, forceRuntime_.config()),
         forceMonotonicMilliseconds());
     return "{\"ok\":true}";
   }
   if (name == "force.tare") {
+    requireForceMutationSafe("force tare");
     const auto sideValue = lowercase(jsonStringValueOr(bodyText, "side", "all"));
     int side = -1;
     if (sideValue == "left") {
@@ -77,10 +83,9 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     } else if (sideValue != "all" && sideValue != "both") {
       throw std::runtime_error("force.tare side must be left, right, or all");
     }
-    forceRuntime_.tare(
+    return forceRuntime_.tare(
         side,
         static_cast<int>(jsonNumberValue(bodyText, "samples", 200)));
-    return "{\"ok\":true}";
   }
   if (name == "teleop.native.configure") {
     nativeTeleop_.configure(jsonNativeTeleopConfig(bodyText));

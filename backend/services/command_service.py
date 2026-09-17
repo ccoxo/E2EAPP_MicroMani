@@ -588,21 +588,24 @@ class CommandService:
         config = await self._get_config_async()
         force = config.get("force", {}) if isinstance(config.get("force"), dict) else {}
         source = str(force.get("source", "nidaq")).lower()
-        if self._real_hardware_mode(config) and source == "hkvl_serial":
+        hal_result: dict[str, object] | None = None
+        real_hardware = self._real_hardware_mode(config)
+        if real_hardware and source == "hkvl_serial":
             payload: dict[str, object] = {"side": side or "all"}
             tare_samples = int(force.get("tareSamples", 0) or 0)
             if tare_samples > 0:
                 payload["samples"] = tare_samples
-            await self.hal.command("force.tare", payload)
-        elif self.hardware is not None and self._real_hardware_mode(config):
+            hal_result = await self.hal.command("force.tare", payload)
+        elif self.hardware is not None and real_hardware:
             result = await asyncio.to_thread(self.hardware.force.tare, config, side)
             if not result.ok:
                 self.logs.error("[FORCE]", result.message)
                 raise RuntimeError(result.message)
-        self.telemetry.tare_force()
+        if not (real_hardware and source == "hkvl_serial"):
+            self.telemetry.tare_force()
         label = "both sides" if side is None else ("left" if side == "left" else "right")
         self.logs.info("[FORCE]", f"{label} {source} tare requested")
-        return {"side": side or "all", "source": source}
+        return {"side": side or "all", "source": source, "hal": hal_result}
 
     async def manual_axis_move(self, request: ManualAxisMoveRequest) -> dict[str, object]:
         config = await self._get_config_async()

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "HkvlForceProtocol.h"
+
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -49,9 +51,21 @@ struct HkvlDriverSnapshot {
   std::array<HkvlSideSnapshot, 2> sides{};
 };
 
+struct HkvlTareSideResult {
+  std::array<double, 6> bias{};
+  HkvlSampleStatistics before{};
+  HkvlSampleStatistics after{};
+};
+
+struct HkvlTareResult {
+  std::array<HkvlTareSideResult, 2> sides{};
+  std::int64_t completedAtUnixMs{0};
+};
+
 class HkvlForceDriver {
  public:
   using SampleCallback = std::function<void(const HkvlDriverSample&)>;
+  using TareProgressCallback = std::function<void(const std::string&, int)>;
 
   HkvlForceDriver();
   ~HkvlForceDriver();
@@ -62,10 +76,11 @@ class HkvlForceDriver {
   void start(const HkvlSerialConfig& config, SampleCallback callback);
   void stop();
   bool running() const;
-  void tare(
+  HkvlTareResult tare(
       int side,
       int sampleCount = 200,
-      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000),
+      TareProgressCallback progress = {});
   HkvlDriverSnapshot snapshot(double nowMonotonicMs) const;
 
  private:

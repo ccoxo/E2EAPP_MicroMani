@@ -62,7 +62,6 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
   const discardRecordEpisode = useTelemetryStore((s) => s.discardRecordEpisode)
   const finishRecordSession = useTelemetryStore((s) => s.finishRecordSession)
   const skipRecordReset = useTelemetryStore((s) => s.skipRecordReset)
-  const tareRecordForceSensors = useTelemetryStore((s) => s.tareRecordForceSensors)
   const toggleRecordClutch = useTelemetryStore((s) => s.toggleRecordClutch)
   const setRecordSpeedMode = useTelemetryStore((s) => s.setRecordSpeedMode)
   const returnRecordMotionOrigin = useTelemetryStore((s) => s.returnRecordMotionOrigin)
@@ -164,9 +163,6 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
         <div className="record-action-stack">
           <Button type="primary" block onClick={onStartSession}>
             开始采集会话
-          </Button>
-          <Button size="small" block onClick={tareRecordForceSensors}>
-            力觉 Tare
           </Button>
         </div>
       )}

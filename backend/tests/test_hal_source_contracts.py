@@ -98,6 +98,17 @@ def test_hal_home_all_requires_work_origin_payload() -> None:
     assert "home_origin_side requires pulse[6] work origin payload" in json_source
 
 
+def test_hal_force_tare_reuses_force_configuration_motion_guard() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "HalCommandDispatcher.cpp").read_text(encoding="utf-8")
+    normalized = " ".join(source.split())
+
+    assert "void HalCommandDispatcher::requireForceMutationSafe" in source
+    assert normalized.count("requireForceMutationSafe(\"force configuration\")") == 1
+    assert normalized.count("requireForceMutationSafe(\"force tare\")") == 1
+    assert "nativeTeleop_.running()" in source
+    assert "axis.moving || axis.enabled" in source
+
+
 def test_hal_hardware_home_logs_per_axis_diagnostics() -> None:
     source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
     body = source.split("void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes)", 1)[

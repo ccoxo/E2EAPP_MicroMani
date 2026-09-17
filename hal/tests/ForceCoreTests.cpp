@@ -17,6 +17,17 @@
 #include <string>
 #include <vector>
 
+namespace appstation::hal {
+
+struct ForceControlRuntimeTestAccess {
+  static void markCalibrationReady(ForceControlRuntime& runtime) {
+    std::scoped_lock lock(runtime.mutex_);
+    runtime.calibration_.state = "ready_for_ack";
+  }
+};
+
+}  // namespace appstation::hal
+
 namespace {
 
 using appstation::hal::ForceComplianceConfig;
@@ -27,6 +38,7 @@ using appstation::hal::ForceSafetyConfig;
 using appstation::hal::ForceSafetyLatch;
 using appstation::hal::HkvlForceFrame;
 using appstation::hal::HkvlForceParser;
+using appstation::hal::HkvlSampleAccumulator;
 using appstation::hal::LTDMCDriver;
 
 void require(bool condition, const std::string& message) {
@@ -119,6 +131,37 @@ void testParser() {
   frames = parser.feed(nonFinite);
   require(frames.empty(), "NaN frame must be invalid");
   require(parser.stats().nonFiniteFrames == 1, "NaN frame must increment nonFiniteFrames");
+}
+
+void testHkvlTareWindowValidation() {
+  HkvlSampleAccumulator stable;
+  for (int sample = 0; sample < 200; ++sample) {
+    const double noise = sample % 2 == 0 ? -0.01 : 0.01;
+    stable.add({1.2 + noise, -0.4, 2.8 - noise, 0.001, -0.002, 0.003});
+  }
+  const auto stableStats = stable.statistics();
+  require(stableStats.sampleCount == 200, "tare window sample count mismatch");
+  require(
+      appstation::hal::hkvlTareStabilityBlocker(stableStats).empty(),
+      "small stationary sensor noise must pass tare stability validation");
+
+  HkvlSampleAccumulator moving;
+  for (int sample = 0; sample < 200; ++sample) {
+    moving.add({sample % 2 == 0 ? -0.4 : 0.4, 0, 0, 0, 0, 0});
+  }
+  require(
+      appstation::hal::hkvlTareStabilityBlocker(moving.statistics()).find("Fx")
+          != std::string::npos,
+      "changing force must block tare and identify the unstable channel");
+
+  HkvlSampleAccumulator residual;
+  for (int sample = 0; sample < 200; ++sample) {
+    residual.add({0.2, 0, 0, 0, 0, 0});
+  }
+  require(
+      appstation::hal::hkvlTareResidualBlocker(residual.statistics()).find("Fx")
+          != std::string::npos,
+      "non-zero post-tare residual must fail validation");
 }
 
 ForceSafetyConfig safetyConfig() {
@@ -271,6 +314,7 @@ void testForceRuntime() {
   config.safety = safetyConfig();
   config.safety.watchdogMs = 1000.0;
   runtime.configure(config, 0.0);
+  appstation::hal::ForceControlRuntimeTestAccess::markCalibrationReady(runtime);
   require(runtime.safetyLatched(), "HKVL configuration must begin in a safety latch");
   require(emergencyStops == 1, "HKVL configuration must invoke the global emergency stop");
 
@@ -332,6 +376,7 @@ void testForceRuntimeAlignsAllSixChannelsBeforeStandardConsumption() {
   config.safety.watchdogMs = 1000.0;
   config.compliance = complianceConfig();
   runtime.configure(config, 0.0);
+  appstation::hal::ForceControlRuntimeTestAccess::markCalibrationReady(runtime);
 
   runtime.acceptSample(
       0,
@@ -405,6 +450,63 @@ void testNidaqRuntimeDoesNotLatchForceSafetyForManualEstop() {
       "NI-DAQ mode must not report a force safety latch for manual estop");
 }
 
+void testHkvlRuntimeBlocksSafetyAcknowledgeUntilStartupTareCompletes() {
+  int acknowledgements = 0;
+  ForceControlRuntime runtime([]() {}, [&acknowledgements]() { ++acknowledgements; });
+  ForceRuntimeConfig config;
+  config.source = "hkvl_serial";
+  config.safety = safetyConfig();
+  config.safety.watchdogMs = 1000.0;
+  runtime.configure(config, 0.0);
+
+  const std::array<double, 6> unloaded{};
+  runtime.acceptSample(0, unloaded, unloaded, 1.0, 1001);
+  runtime.acceptSample(1, unloaded, unloaded, 1.0, 1001);
+  runtime.acceptSample(0, unloaded, unloaded, 501.0, 1501);
+  runtime.acceptSample(1, unloaded, unloaded, 501.0, 1501);
+
+  bool rejected = false;
+  try {
+    runtime.acknowledgeEmergencyStop(501.0);
+  } catch (const std::runtime_error& error) {
+    rejected = std::string(error.what()).find("startup force self-check")
+        != std::string::npos;
+  }
+  require(rejected, "HKVL safety acknowledgement must require completed startup tare");
+  require(acknowledgements == 0, "blocked force acknowledgement must not reach motion");
+
+  const auto json = runtime.forceStateJson(501.0);
+  require(
+      json.find("\"calibration\":{\"state\":\"waiting_sensors\"")
+          != std::string::npos,
+      "force state must expose the pending startup calibration state");
+  require(
+      json.find("\"canAcknowledge\":false") != std::string::npos
+          && json.find("startup force self-check is not complete") != std::string::npos,
+      "force state must not advertise acknowledgement before startup tare");
+}
+
+void testFailedHkvlTareKeepsSafetyLatchedAndPublishesFailure() {
+  ForceControlRuntime runtime([]() {}, []() {});
+  ForceRuntimeConfig config;
+  config.source = "hkvl_serial";
+  runtime.configure(config, 0.0);
+
+  bool failed = false;
+  try {
+    runtime.tare(-1, 200);
+  } catch (const std::runtime_error&) {
+    failed = true;
+  }
+
+  require(failed, "tare without a running sensor driver must fail");
+  require(runtime.safetyLatched(), "failed tare must keep force safety latched");
+  const auto json = runtime.forceStateJson(1.0);
+  require(
+      json.find("\"calibration\":{\"state\":\"failed\"") != std::string::npos,
+      "failed tare must publish a failed calibration state");
+}
+
 void testMotionAcknowledge() {
   LTDMCDriver motion;
   motion.emergencyStop();
@@ -452,6 +554,7 @@ void testForceConfigJson() {
 int main() {
   try {
     testParser();
+    testHkvlTareWindowValidation();
     testOfficialHkvlSafetyDefaults();
     testOfficialHkvlHardwareSidePorts();
     testOfficialHkvlMotionAlignedAxisSigns();
@@ -460,6 +563,8 @@ int main() {
     testForceRuntime();
     testForceRuntimeAlignsAllSixChannelsBeforeStandardConsumption();
     testNidaqRuntimeDoesNotLatchForceSafetyForManualEstop();
+    testHkvlRuntimeBlocksSafetyAcknowledgeUntilStartupTareCompletes();
+    testFailedHkvlTareKeepsSafetyLatchedAndPublishesFailure();
     testMotionAcknowledge();
     testForceConfigJson();
     std::cout << "ForceCoreTests passed\n";

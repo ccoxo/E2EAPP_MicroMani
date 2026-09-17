@@ -35,6 +35,12 @@ std::int64_t unixMilliseconds() {
 }  // namespace
 
 struct HkvlForceDriver::Impl {
+  enum class TarePhase {
+    idle,
+    stability,
+    validation,
+  };
+
   struct SideState {
     mutable std::mutex mutex;
     std::condition_variable tareCondition;
@@ -54,10 +60,9 @@ struct HkvlForceDriver::Impl {
     std::uint64_t rateWindowFrames{0};
     HkvlForceParserStats parserStats{};
     std::string error;
-    bool tarePending{false};
+    TarePhase tarePhase{TarePhase::idle};
     int tareRemaining{0};
-    int tareRequested{0};
-    std::array<double, 6> tareSum{};
+    HkvlSampleAccumulator tareWindow;
   };
 
   HkvlSerialConfig config;
@@ -65,6 +70,7 @@ struct HkvlForceDriver::Impl {
   std::array<SideState, 2> sides;
   std::array<std::thread, 2> workers;
   std::atomic<bool> running{false};
+  std::mutex tareMutex;
 
   void resetSide(int side, const std::string& port) {
     auto& state = sides[side];
@@ -85,10 +91,9 @@ struct HkvlForceDriver::Impl {
     state.rateWindowFrames = 0;
     state.parserStats = {};
     state.error.clear();
-    state.tarePending = false;
+    state.tarePhase = TarePhase::idle;
     state.tareRemaining = 0;
-    state.tareRequested = 0;
-    state.tareSum = {};
+    state.tareWindow.reset();
   }
 
   void updateConnection(int side, bool connected, const std::string& error) {
@@ -127,25 +132,26 @@ struct HkvlForceDriver::Impl {
       state.error.clear();
       state.raw = frame.values;
 
-      if (state.tarePending) {
-        for (std::size_t axis = 0; axis < state.tareSum.size(); ++axis) {
-          state.tareSum[axis] += frame.values[axis];
-        }
+      if (state.tarePhase == TarePhase::stability) {
+        state.tareWindow.add(frame.values);
         --state.tareRemaining;
         if (state.tareRemaining <= 0) {
-          for (std::size_t axis = 0; axis < state.tareBias.size(); ++axis) {
-            state.tareBias[axis] =
-                state.tareSum[axis] / static_cast<double>(state.tareRequested);
-          }
-          state.filterInitialized = false;
-          state.previousFilterMonotonicMs = 0.0;
-          state.tarePending = false;
+          state.tarePhase = TarePhase::idle;
           state.tareCondition.notify_all();
         }
       }
 
       for (std::size_t axis = 0; axis < state.tared.size(); ++axis) {
         state.tared[axis] = frame.values[axis] - state.tareBias[axis];
+      }
+
+      if (state.tarePhase == TarePhase::validation) {
+        state.tareWindow.add(state.tared);
+        --state.tareRemaining;
+        if (state.tareRemaining <= 0) {
+          state.tarePhase = TarePhase::idle;
+          state.tareCondition.notify_all();
+        }
       }
 
       if (!config.lowpassEnabled || !state.filterInitialized) {
@@ -322,10 +328,12 @@ bool HkvlForceDriver::running() const {
   return impl_->running.load(std::memory_order_acquire);
 }
 
-void HkvlForceDriver::tare(
+HkvlTareResult HkvlForceDriver::tare(
     int side,
     int sampleCount,
-    std::chrono::milliseconds timeout) {
+    std::chrono::milliseconds timeout,
+    TareProgressCallback progress) {
+  std::scoped_lock operationLock(impl_->tareMutex);
   if (!running()) {
     throw std::runtime_error("HKVL force driver is not running");
   }
@@ -334,33 +342,124 @@ void HkvlForceDriver::tare(
   }
   const int first = side < 0 ? 0 : side;
   const int last = side < 0 ? 1 : side;
-  for (int index = first; index <= last; ++index) {
-    auto& state = impl_->sides[index];
-    std::scoped_lock lock(state.mutex);
-    if (!state.connected) {
-      throw std::runtime_error(state.port + " is not connected");
-    }
-    state.tarePending = true;
-    state.tareRemaining = sampleCount;
-    state.tareRequested = sampleCount;
-    state.tareSum = {};
-  }
 
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  for (int index = first; index <= last; ++index) {
-    auto& state = impl_->sides[index];
-    std::unique_lock lock(state.mutex);
-    if (!state.tareCondition.wait_until(
-            lock,
-            deadline,
-            [&state]() { return !state.tarePending || !state.connected; })) {
-      state.tarePending = false;
-      throw std::runtime_error(state.port + " tare timed out");
+  auto cancelCollection = [&]() {
+    for (int index = first; index <= last; ++index) {
+      auto& state = impl_->sides[index];
+      std::scoped_lock lock(state.mutex);
+      state.tarePhase = Impl::TarePhase::idle;
+      state.tareRemaining = 0;
     }
-    if (!state.connected) {
-      state.tarePending = false;
-      throw std::runtime_error(state.port + " disconnected during tare");
+  };
+
+  auto collect = [&](Impl::TarePhase phase) {
+    for (int index = first; index <= last; ++index) {
+      auto& state = impl_->sides[index];
+      std::scoped_lock lock(state.mutex);
+      if (!state.connected || !state.hasSample) {
+        throw std::runtime_error(state.port + " is not ready");
+      }
+      state.tareWindow.reset();
+      state.tareRemaining = sampleCount;
+      state.tarePhase = phase;
     }
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (int index = first; index <= last; ++index) {
+      auto& state = impl_->sides[index];
+      std::unique_lock lock(state.mutex);
+      if (!state.tareCondition.wait_until(
+              lock,
+              deadline,
+              [&state]() {
+                return state.tarePhase == Impl::TarePhase::idle
+                    || !state.connected;
+              })) {
+        state.tarePhase = Impl::TarePhase::idle;
+        throw std::runtime_error(state.port + " tare sampling timed out");
+      }
+      if (!state.connected) {
+        state.tarePhase = Impl::TarePhase::idle;
+        throw std::runtime_error(state.port + " disconnected during tare");
+      }
+    }
+
+    std::array<HkvlSampleStatistics, 2> statistics{};
+    for (int index = first; index <= last; ++index) {
+      const auto& state = impl_->sides[index];
+      std::scoped_lock lock(state.mutex);
+      statistics[index] = state.tareWindow.statistics();
+    }
+    return statistics;
+  };
+
+  std::array<std::array<double, 6>, 2> previousBias{};
+  bool biasApplied = false;
+  auto restoreBias = [&]() {
+    if (!biasApplied) {
+      return;
+    }
+    std::scoped_lock lock(impl_->sides[0].mutex, impl_->sides[1].mutex);
+    for (int index = first; index <= last; ++index) {
+      auto& state = impl_->sides[index];
+      state.tareBias = previousBias[index];
+      state.filterInitialized = false;
+      state.previousFilterMonotonicMs = 0.0;
+    }
+  };
+
+  try {
+    if (progress) {
+      progress("checking_stability", 10);
+    }
+    const auto before = collect(Impl::TarePhase::stability);
+    for (int index = first; index <= last; ++index) {
+      const auto blocker = hkvlTareStabilityBlocker(before[index]);
+      if (!blocker.empty()) {
+        throw std::runtime_error(
+            std::string(index == 0 ? "left " : "right ") + blocker);
+      }
+    }
+
+    if (progress) {
+      progress("taring", 50);
+    }
+    {
+      std::scoped_lock lock(impl_->sides[0].mutex, impl_->sides[1].mutex);
+      for (int index = first; index <= last; ++index) {
+        auto& state = impl_->sides[index];
+        previousBias[index] = state.tareBias;
+        state.tareBias = before[index].mean;
+        state.filterInitialized = false;
+        state.previousFilterMonotonicMs = 0.0;
+      }
+      biasApplied = true;
+    }
+
+    if (progress) {
+      progress("validating", 70);
+    }
+    const auto after = collect(Impl::TarePhase::validation);
+    for (int index = first; index <= last; ++index) {
+      const auto blocker = hkvlTareResidualBlocker(after[index]);
+      if (!blocker.empty()) {
+        throw std::runtime_error(
+            std::string(index == 0 ? "left " : "right ") + blocker);
+      }
+    }
+
+    HkvlTareResult result;
+    for (int index = first; index <= last; ++index) {
+      result.sides[index].bias = before[index].mean;
+      result.sides[index].before = before[index];
+      result.sides[index].after = after[index];
+    }
+    result.completedAtUnixMs = unixMilliseconds();
+    return result;
+  } catch (...) {
+    cancelCollection();
+    restoreBias();
+    throw;
   }
 }
 

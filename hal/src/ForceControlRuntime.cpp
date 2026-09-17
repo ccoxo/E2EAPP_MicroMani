@@ -94,6 +94,11 @@ void ForceControlRuntime::configure(
     hasSample_ = {false, false};
     lastCompliance_ = {};
     lastComplianceActualUm_ = {};
+    calibration_ = {};
+    if (config.source == "hkvl_serial") {
+      calibration_.state = "waiting_sensors";
+      calibration_.reason = "operator must confirm both sensors are unloaded";
+    }
   }
   invokeEmergencyStopIfNeeded(pendingTrip);
   if (restart) {
@@ -220,6 +225,10 @@ void ForceControlRuntime::acknowledgeEmergencyStop(
     double nowMonotonicMs) {
   std::scoped_lock lock(mutex_);
   if (config_.source == "hkvl_serial") {
+    if (calibration_.state != "ready_for_ack"
+        && calibration_.state != "ready") {
+      throw std::runtime_error("startup force self-check is not complete");
+    }
     safety_.acknowledge(nowMonotonicMs);
   }
   compliance_.reset();
@@ -229,6 +238,9 @@ void ForceControlRuntime::acknowledgeEmergencyStop(
   if (acknowledge_) {
     acknowledge_();
   }
+  if (config_.source == "hkvl_serial") {
+    calibration_.state = "ready";
+  }
 }
 
 bool ForceControlRuntime::safetyLatched() const {
@@ -236,11 +248,58 @@ bool ForceControlRuntime::safetyLatched() const {
   return safety_.latched();
 }
 
-void ForceControlRuntime::tare(int side, int sampleCount) {
+std::string ForceControlRuntime::tare(int side, int sampleCount) {
   if (!usesHkvl()) {
     throw std::runtime_error("force.tare is only available for hkvl_serial");
   }
-  driver_.tare(side, sampleCount);
+  if (side != -1) {
+    throw std::runtime_error("HKVL startup force self-check requires side=all");
+  }
+  std::optional<ForceSafetyTrip> pendingTrip;
+  {
+    std::scoped_lock lock(mutex_);
+    pendingTrip = safety_.latchExternal(
+        "force_tare_pending",
+        forceMonotonicMilliseconds());
+    compliance_.reset();
+    lastCompliance_ = {};
+    lastComplianceActualUm_ = {};
+    calibration_.state = "checking_stability";
+    calibration_.progress = 5;
+    calibration_.reason.clear();
+    calibration_.hasResult = false;
+  }
+  invokeEmergencyStopIfNeeded(pendingTrip);
+  try {
+    const auto result = driver_.tare(
+        side,
+        sampleCount,
+        std::chrono::milliseconds(2000),
+        [this](const std::string& state, int progress) {
+          std::scoped_lock lock(mutex_);
+          calibration_.state = state;
+          calibration_.progress = progress;
+          calibration_.reason.clear();
+        });
+    std::scoped_lock lock(mutex_);
+    calibration_.state = "ready_for_ack";
+    calibration_.progress = 100;
+    calibration_.reason.clear();
+    calibration_.hasResult = true;
+    calibration_.result = result;
+    std::ostringstream out;
+    out << "{\"ok\":true,\"calibration\":";
+    appendCalibrationJson(out);
+    out << "}";
+    return out.str();
+  } catch (const std::exception& error) {
+    std::scoped_lock lock(mutex_);
+    calibration_.state = "failed";
+    calibration_.progress = 0;
+    calibration_.reason = error.what();
+    calibration_.hasResult = false;
+    throw;
+  }
 }
 
 ForceComplianceResult ForceControlRuntime::complianceCorrection(
@@ -306,6 +365,8 @@ std::string ForceControlRuntime::forceStateJson(
   out << ",\"sensorRawRight\":";
   appendArray(out, driverSnapshot.sides[1].raw);
   out << ",\"dangerIndex\":" << safety_.dangerIndex();
+  out << ",\"calibration\":";
+  appendCalibrationJson(out);
   const double skewMs = hasSample_[0] && hasSample_[1]
       ? std::abs(latestMonotonicMs_[0] - latestMonotonicMs_[1])
       : 0.0;
@@ -348,8 +409,14 @@ std::string ForceControlRuntime::forceStateJson(
   }
   const auto& trip = safety_.trip();
   std::string acknowledgeBlocker;
-  const bool canAcknowledge =
-      safety_.canAcknowledge(nowMonotonicMs, &acknowledgeBlocker);
+  bool canAcknowledge = false;
+  if (config_.source == "hkvl_serial"
+      && calibration_.state != "ready_for_ack"
+      && calibration_.state != "ready") {
+    acknowledgeBlocker = "startup force self-check is not complete";
+  } else {
+    canAcknowledge = safety_.canAcknowledge(nowMonotonicMs, &acknowledgeBlocker);
+  }
   out << "},\"safety\":{\"latched\":"
       << (safety_.latched() ? "true" : "false")
       << ",\"reason\":\"" << escapeJson(trip.reason) << "\""
@@ -382,6 +449,38 @@ std::string ForceControlRuntime::forceStateJson(
   }
   out << "}}";
   return out.str();
+}
+
+void ForceControlRuntime::appendCalibrationJson(std::ostringstream& out) const {
+  out << "{\"state\":\"" << escapeJson(calibration_.state) << "\""
+      << ",\"progress\":" << calibration_.progress
+      << ",\"reason\":\"" << escapeJson(calibration_.reason) << "\""
+      << ",\"completedAtUnixMs\":"
+      << (calibration_.hasResult ? calibration_.result.completedAtUnixMs : 0)
+      << ",\"sides\":{";
+  for (int side = 0; side < 2; ++side) {
+    if (side > 0) {
+      out << ",";
+    }
+    const auto& result = calibration_.result.sides[side];
+    out << "\"" << (side == 0 ? "left" : "right") << "\":{";
+    out << "\"bias\":";
+    appendArray(out, result.bias);
+    out << ",\"preMean\":";
+    appendArray(out, result.before.mean);
+    out << ",\"preStdDev\":";
+    appendArray(out, result.before.standardDeviation);
+    out << ",\"prePeakToPeak\":";
+    appendArray(out, result.before.peakToPeak);
+    out << ",\"residualMean\":";
+    appendArray(out, result.after.mean);
+    out << ",\"residualStdDev\":";
+    appendArray(out, result.after.standardDeviation);
+    out << ",\"residualPeakToPeak\":";
+    appendArray(out, result.after.peakToPeak);
+    out << "}";
+  }
+  out << "}}";
 }
 
 void ForceControlRuntime::validateConfig(

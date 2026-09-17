@@ -20,15 +20,40 @@ param(
   [int]$SignConfirmFrames = 3,
   [double]$TranslationDeadbandUm = 0.0,
   [int]$PolicyUpdateInterval = 1,
+  [string]$ControlledSides = "right",
+  [string]$HardwareSides = "",
+  [switch]$FreezeUncontrolledState,
   [switch]$Send,
+  [switch]$UseExistingStack,
   [switch]$SkipStartupHome,
-  [switch]$WithFrontend
+  [switch]$WithFrontend,
+  [switch]$LogToDesktop,
+  [string]$LogPath = ""
 )
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $backendUrl = "http://127.0.0.1:$BackendPort"
 $cameraIdParts = @($CameraIds.Split(",") | ForEach-Object { $_.Trim() })
+$transcriptStarted = $false
+$actOutputLogPath = ""
+
+if ($LogToDesktop -or -not [string]::IsNullOrWhiteSpace($LogPath)) {
+  if ([string]::IsNullOrWhiteSpace($LogPath)) {
+    $desktop = [Environment]::GetFolderPath("Desktop")
+    if ([string]::IsNullOrWhiteSpace($desktop)) {
+      $desktop = Join-Path $env:USERPROFILE "Desktop"
+    }
+    $LogPath = Join-Path $desktop ("ACT-JEPA-Deploy-{0}.txt" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+  }
+  $logDirectory = Split-Path -Parent $LogPath
+  $logBaseName = [System.IO.Path]::GetFileNameWithoutExtension($LogPath)
+  $actOutputLogPath = Join-Path $logDirectory ($logBaseName + "-ACT.txt")
+  Start-Transcript -Path $LogPath -Force | Out-Host
+  $transcriptStarted = $true
+  Write-Host "Logging deploy output to $LogPath"
+  Write-Host "Logging ACT subprocess output to $actOutputLogPath"
+}
 
 if (-not (Test-Path -LiteralPath $CondaExe)) {
   throw "Conda executable not found: $CondaExe"
@@ -50,7 +75,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $DeployDir "act_deploy.py"))) {
   throw "act_deploy.py not found in deploy directory: $DeployDir"
 }
 
-if ($WithFrontend) {
+if ($UseExistingStack) {
+  Write-Host "Using existing HAL/backend at $backendUrl; startup/restart is skipped."
+} elseif ($WithFrontend) {
   $stackArgs = @(
     "-ExecutionPolicy", "Bypass",
     "-File", (Join-Path $repo "scripts\start-stack.ps1"),
@@ -137,19 +164,37 @@ $actArgs = @(
   "--flip_damping", "$FlipDamping",
   "--sign_confirm_frames", "$SignConfirmFrames",
   "--translation_deadband_um", "$TranslationDeadbandUm",
-  "--policy_update_interval", "$PolicyUpdateInterval"
+  "--policy_update_interval", "$PolicyUpdateInterval",
+  "--controlled_sides", $ControlledSides
 )
+if (-not [string]::IsNullOrWhiteSpace($HardwareSides)) {
+  $actArgs += @("--hardware_sides", $HardwareSides)
+}
 if ($Send) {
   $actArgs += "--send"
 }
+if ($FreezeUncontrolledState) {
+  $actArgs += "--freeze_uncontrolled_state"
+}
 
-Write-Host "Starting ACT deploy. Send=$([bool]$Send), cameras=$CameraIds, deployDir=$DeployDir"
+Write-Host "Starting ACT deploy. Send=$([bool]$Send), cameras=$CameraIds, controlledSides=$ControlledSides, hardwareSides=$HardwareSides, deployDir=$DeployDir"
 if ($cameraIdParts.Count -ge 3) {
   Write-Host "Camera mapping: global=$($cameraIdParts[0]), wrist_left=$($cameraIdParts[1]), wrist_right=$($cameraIdParts[2])"
 }
 Push-Location -LiteralPath $DeployDir
 try {
-  & $CondaExe @actArgs
+  if ($transcriptStarted) {
+    & $CondaExe @actArgs 2>&1 | Tee-Object -FilePath $actOutputLogPath -Append
+    $actExitCode = $LASTEXITCODE
+    if ($actExitCode -ne 0) {
+      throw "ACT deploy exited with code $actExitCode"
+    }
+  } else {
+    & $CondaExe @actArgs
+  }
 } finally {
   Pop-Location
+  if ($transcriptStarted) {
+    Stop-Transcript | Out-Host
+  }
 }

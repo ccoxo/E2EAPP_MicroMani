@@ -100,6 +100,16 @@ export interface ForceSideStatus {
   sensorTareBias?: number[]
 }
 
+export interface ForceCalibrationSideStatus {
+  bias?: number[]
+  preMean?: number[]
+  preStdDev?: number[]
+  prePeakToPeak?: number[]
+  residualMean?: number[]
+  residualStdDev?: number[]
+  residualPeakToPeak?: number[]
+}
+
 export interface ForceStatus {
   source?: 'nidaq' | 'hkvl_serial' | 'test' | string
   protocol?: string
@@ -109,6 +119,16 @@ export interface ForceStatus {
   sides?: {
     left?: ForceSideStatus
     right?: ForceSideStatus
+  }
+  calibration?: {
+    state?: 'not_required' | 'waiting_sensors' | 'checking_stability' | 'taring' | 'validating' | 'ready_for_ack' | 'ready' | 'failed' | string
+    progress?: number
+    reason?: string
+    completedAtUnixMs?: number
+    sides?: {
+      left?: ForceCalibrationSideStatus
+      right?: ForceCalibrationSideStatus
+    }
   }
   safety?: {
     latched?: boolean
@@ -345,7 +365,6 @@ export interface RecordSessionState {
   resetReturnedSides: ManualControlSide[]
   resetReady: boolean
   returnOriginInFlight: boolean
-  forceTareActive: boolean
   speedMode: ManualSpeedMode
 }
 

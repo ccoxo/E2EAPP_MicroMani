@@ -40,6 +40,7 @@ def test_start_hal_injects_force_runtime_config_from_backend_config() -> None:
 
     assert "$forceRuntimeConfig" in script
     assert "APPSTATION_FORCE_CONFIG_JSON" in script
+    assert 'source = "hkvl_serial"' in script
     assert 'leftPort = "COM15"' in script
     assert 'rightPort = "COM14"' in script
     assert "leftAxisSign" in script
