@@ -162,6 +162,87 @@ public static class AppstationDirectShowCameraEnum
         return sb.ToString();
     }
 
+    [ComImport, Guid("28F54685-06FD-11D2-B27A-00A0C9223196"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IKsControl
+    {
+        [PreserveSig]
+        int KsProperty(IntPtr property, int propertySize, IntPtr data, int dataSize, out int returned);
+        [PreserveSig]
+        int KsMethod(IntPtr property, int propertySize, IntPtr data, int dataSize, out int returned);
+        [PreserveSig]
+        int KsEvent(IntPtr property, int propertySize, IntPtr data, int dataSize, out int returned);
+    }
+
+    public static string SetFixedFrameRate(string devicePath)
+    {
+        var type = Type.GetTypeFromCLSID(new Guid("62BE5D10-60EB-11D0-BD3B-00A0C911CE86"));
+        var devEnum = (ICreateDevEnum)Activator.CreateInstance(type);
+        IEnumMoniker enumerator = null;
+        try
+        {
+            Guid category = new Guid("860BB310-5D01-11D0-BD3B-00A0C911CE86");
+            if (devEnum.CreateClassEnumerator(ref category, out enumerator, 0) != 0)
+                throw new InvalidOperationException("Camera enumeration failed");
+            var monikers = new IMoniker[1];
+            while (enumerator.Next(1, monikers, IntPtr.Zero) == 0)
+            {
+                try
+                {
+                    if (!String.Equals(ReadBag(monikers[0], "DevicePath"), devicePath,
+                                       StringComparison.OrdinalIgnoreCase)) continue;
+                    object filter;
+                    Guid iid = new Guid("56A86895-0AD4-11CE-B03A-0020AF0BA770");
+                    monikers[0].BindToObject(null, null, ref iid, out filter);
+                    try { return DisableLowLightCompensation((IKsControl)filter); }
+                    finally { Marshal.ReleaseComObject(filter); }
+                }
+                finally { Marshal.ReleaseComObject(monikers[0]); }
+            }
+            throw new InvalidOperationException("Camera device path not found");
+        }
+        finally
+        {
+            if (enumerator != null) Marshal.ReleaseComObject(enumerator);
+            Marshal.ReleaseComObject(devEnum);
+        }
+    }
+
+    static string DisableLowLightCompensation(IKsControl control)
+    {
+        // KSPROPERTY_CAMERACONTROL_S is 40 bytes with 8-byte alignment on Windows.
+        IntPtr data = Marshal.AllocCoTaskMem(40);
+        try
+        {
+            for (int i = 0; i < 40; i += 4) Marshal.WriteInt32(data, i, 0);
+            PriorityHeader(data, 1);
+            int returned;
+            Marshal.ThrowExceptionForHR(control.KsProperty(data, 40, data, 40, out returned));
+            int before = Marshal.ReadInt32(data, 24);
+            if (before != 0)
+            {
+                PriorityHeader(data, 2);
+                Marshal.WriteInt32(data, 24, 0);
+                Marshal.WriteInt32(data, 28, 2); // KSPROPERTY_CAMERACONTROL_FLAGS_MANUAL
+                Marshal.ThrowExceptionForHR(control.KsProperty(data, 40, data, 40, out returned));
+            }
+            // Get may overwrite the property header, so rebuild it for each call.
+            PriorityHeader(data, 1);
+            Marshal.ThrowExceptionForHR(control.KsProperty(data, 40, data, 40, out returned));
+            if (Marshal.ReadInt32(data, 24) != 0)
+                throw new InvalidOperationException("Low-light compensation remained enabled");
+            return "fixed_frame_rate=1 previous_priority=" + before;
+        }
+        finally { Marshal.FreeCoTaskMem(data); }
+    }
+
+    static void PriorityHeader(IntPtr data, int operation)
+    {
+        Marshal.StructureToPtr(new Guid("C6E13370-30AC-11D0-A18C-00A0C9118956"), data, false);
+        Marshal.WriteInt32(data, 16, 19); // KSPROPERTY_CAMERACONTROL_AUTO_EXPOSURE_PRIORITY
+        Marshal.WriteInt32(data, 20, operation);
+    }
+
     static string ReadBag(IMoniker moniker, string name)
     {
         object bagObj;
@@ -1056,6 +1137,8 @@ class OpenCVCameraDriver:
         backend_label = ""
         worker_fallback = False
         profile = self._camera_tuning(config, camera) if config is not None and camera is not None else None
+        if camera in {"wrist_left", "wrist_right"} and profile and profile["autoExposure"]:
+            self._disable_low_light_compensation(index)
         backend_candidates = _backend_candidates(cv2)
         if self._process_capture_enabled(cv2, backend_candidates):
             capture = self._start_process_capture(cv2, index, width, height, fps, camera, profile, backend_candidates)
@@ -1180,6 +1263,28 @@ class OpenCVCameraDriver:
         self._start_encoder(cv2, index)
         self._log("info", f"{camera or 'camera'} opened index {index} via {backend_label} {width}x{height}@{fps:g}")
         return capture
+
+    def _disable_low_light_compensation(self, index: int) -> None:
+        if sys.platform != "win32":
+            return
+        device_path = self._camera_identities_by_index().get(index, {}).get("devicePath", "")
+        if not device_path:
+            return
+        # Reapply on every open: USB power cycles can restore variable frame rate.
+        script = DIRECTSHOW_CAMERA_ENUM_SCRIPT.split("$listing =", 1)[0]
+        script += "\n$ErrorActionPreference = 'Stop'\n"
+        script += "[AppstationDirectShowCameraEnum]::SetFixedFrameRate('" + device_path.replace("'", "''") + "')"
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True, text=True, timeout=8, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode != 0 or "fixed_frame_rate=1" not in result.stdout:
+                self._log("warning", f"camera index {index}: low-light compensation could not be disabled")
+            else:
+                self._log("info", f"camera index {index}: low-light compensation disabled; fixed frame rate")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._log("warning", f"camera index {index}: fixed frame rate setup failed: {exc}")
 
     def _process_capture_enabled(self, cv2: Any, backend_candidates: list[tuple[int, str]]) -> bool:
         mode = os.environ.get("APPSTATION_CAMERA_CAPTURE_MODE", "").strip().lower()
