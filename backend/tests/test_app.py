@@ -236,7 +236,7 @@ def test_force_runtime_settings_are_not_saved_when_hal_rejects_them(
     client = TestClient(create_app(tmp_path))
     original = client.get("/api/settings").json()
     candidate = deepcopy(original)
-    candidate["force"]["source"] = "hkvl_serial"
+    candidate["force"]["lowpassCutoffHz"] = 15
     calls: list[tuple[str, dict[str, Any]]] = []
 
     async def reject_force_config(name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -341,7 +341,7 @@ def test_force_runtime_snapshot_is_not_applied_when_hal_rejects_it(
     client = TestClient(create_app(tmp_path))
     original = client.get("/api/settings").json()
     candidate = deepcopy(original)
-    candidate["force"]["source"] = "hkvl_serial"
+    candidate["force"]["lowpassCutoffHz"] = 15
     created = client.post(
         "/api/settings/snapshots",
         json={"scope": "all", "name": "HKVL", "config": candidate},
@@ -5216,6 +5216,71 @@ def test_camera_identity_overrides_stale_index(monkeypatch: MonkeyPatch) -> None
     assert resolved["global"] == 2
 
 
+def test_camera_identity_uses_parent_serial_and_usb_location(monkeypatch: MonkeyPatch) -> None:
+    config = default_config()
+    config["cameras"]["globalIdentity"] = "20250606105"
+    config["cameras"]["wristLeftIdentity"] = "PCIROOT(0)#USBROOT(0)#USB(5)#USB(3)#USB(4)"
+    config["cameras"]["wristRightIdentity"] = "PCIROOT(0)#USBROOT(0)#USB(2)#USB(4)#USB(2)"
+    driver = OpenCVCameraDriver()
+
+    monkeypatch.setattr(
+        driver,
+        "_camera_identities_by_index",
+        lambda: {
+            0: {
+                "name": "USB Camera",
+                "devicePath": "camera-zero",
+                "displayName": "",
+                "parentId": "USB\\VID_0ABD&PID_8050\\20250606105",
+                "locationPath": "PCIROOT(0)#USBROOT(0)#USB(1)",
+            },
+            1: {
+                "name": "USB Camera",
+                "devicePath": "camera-one",
+                "displayName": "",
+                "parentId": "USB\\VID_0ABD&PID_8050\\generated-one",
+                "locationPath": "PCIROOT(0)#USBROOT(0)#USB(5)#USB(3)#USB(4)",
+            },
+            2: {
+                "name": "USB Camera",
+                "devicePath": "camera-two",
+                "displayName": "",
+                "parentId": "USB\\VID_0ABD&PID_8050\\generated-two",
+                "locationPath": "PCIROOT(0)#USBROOT(0)#USB(2)#USB(4)#USB(2)",
+            },
+        },
+    )
+
+    resolved = driver._resolved_indices(object(), config, 30)  # noqa: SLF001
+
+    assert resolved == {"global": 0, "wrist_left": 1, "wrist_right": 2}
+
+
+def test_partial_camera_identity_mismatch_does_not_swap_roles(monkeypatch: MonkeyPatch) -> None:
+    config = default_config()
+    config["cameras"]["global"] = "IMX335 / index 0"
+    config["cameras"]["globalIdentity"] = "USB\\VID_0ABD&PID_8050&MI_00\\missing-global"
+    config["cameras"]["wristLeft"] = "IMX335 / index 1"
+    config["cameras"]["wristLeftIdentity"] = "current-left"
+    config["cameras"]["wristRight"] = "IMX335 / index 2"
+    config["cameras"]["wristRightIdentity"] = "current-right"
+    driver = OpenCVCameraDriver()
+
+    monkeypatch.setattr(
+        driver,
+        "_camera_identities_by_index",
+        lambda: {
+            0: {"name": "USB Camera", "devicePath": "current-left", "displayName": ""},
+            1: {"name": "USB Camera", "devicePath": "current-global", "displayName": ""},
+            2: {"name": "USB Camera", "devicePath": "current-right", "displayName": ""},
+        },
+    )
+
+    resolved = driver._resolved_indices(object(), config, 30)  # noqa: SLF001
+
+    assert resolved == {"global": -1, "wrist_left": 0, "wrist_right": 2}
+
+
 def test_current_camera_identity_mapping_binds_reenumerated_wrist_roles(monkeypatch: MonkeyPatch) -> None:
     config = default_config()
     driver = OpenCVCameraDriver()
@@ -5228,23 +5293,29 @@ def test_current_camera_identity_mapping_binds_reenumerated_wrist_roles(monkeypa
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&398f0a3&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:left",
+                "parentId": "USB\\VID_0ABD&PID_8050\\20250606105",
+                "locationPath": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(1)",
             },
             1: {
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&1396f44d&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:global",
+                "parentId": "USB\\VID_0ABD&PID_8050\\generated-left",
+                "locationPath": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)",
             },
             2: {
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#8&3724732e&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:right",
+                "parentId": "USB\\VID_0ABD&PID_8050\\generated-right",
+                "locationPath": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)",
             },
         },
     )
 
     resolved = driver._resolved_indices(object(), config, 30)  # noqa: SLF001
 
-    assert resolved == {"global": 1, "wrist_left": 0, "wrist_right": 2}
+    assert resolved == {"global": 0, "wrist_left": 1, "wrist_right": 2}
 
 
 def test_camera_identities_lock_all_role_indices(monkeypatch: MonkeyPatch) -> None:
@@ -5262,34 +5333,40 @@ def test_camera_identities_lock_all_role_indices(monkeypatch: MonkeyPatch) -> No
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&398f0a3&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:right",
+                "parentId": "USB\\VID_0ABD&PID_8050\\20250606105",
+                "locationPath": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(1)",
             },
             1: {
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&1396f44d&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:global",
+                "parentId": "USB\\VID_0ABD&PID_8050\\generated-left",
+                "locationPath": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)",
             },
             2: {
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#8&3724732e&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:right",
+                "parentId": "USB\\VID_0ABD&PID_8050\\generated-right",
+                "locationPath": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)",
             },
         },
     )
 
     resolved = driver._resolved_indices(object(), config, 30)
 
-    assert resolved == {"global": 1, "wrist_left": 0, "wrist_right": 2}
+    assert resolved == {"global": 0, "wrist_left": 1, "wrist_right": 2}
 
 
 def test_default_camera_mapping_matches_deployment_hardware() -> None:
     config = default_config()
 
-    assert config["cameras"]["global"] == "IMX335 / index 1"
-    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000"
-    assert config["cameras"]["wristLeft"] == "IMX335 / index 0"
-    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
+    assert config["cameras"]["global"] == "IMX335 / index 0"
+    assert config["cameras"]["globalIdentity"] == "20250606105"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 1"
+    assert config["cameras"]["wristLeftIdentity"] == "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)"
     assert config["cameras"]["wristRight"] == "IMX335 / index 2"
-    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000"
+    assert config["cameras"]["wristRightIdentity"] == "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)"
     assert config["cameras"]["previewResolution"] == "640x480"
     assert config["cameras"]["globalResolution"] == "640x480"
     assert config["cameras"]["wristLeftResolution"] == "640x480"

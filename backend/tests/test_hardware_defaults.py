@@ -147,10 +147,10 @@ def test_work_origin_defaults_match_icf_reference_position() -> None:
     assert origin["rightPulse"] == [99772.0, 382486.0, 881207.0, 19527.0, -175127.0, -9668.0]
 
 
-def test_force_defaults_match_nidaq_reference_project() -> None:
+def test_force_defaults_start_with_hkvl_reference_project() -> None:
     config = default_config()
 
-    assert config["force"]["source"] == "nidaq"
+    assert config["force"]["source"] == "hkvl_serial"
     assert config["force"]["leftIp"] == "Dev5/ai0:5"
     assert config["force"]["rightIp"] == "Dev3/ai0:5"
     assert config["force"]["sampleHz"] == 200
@@ -198,12 +198,12 @@ def test_pico_script_defaults_point_to_reference_tools() -> None:
 def test_storage_defaults_separate_recording_fps_from_camera_preview() -> None:
     config = default_config()
 
-    assert config["cameras"]["global"] == "IMX335 / index 1"
-    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000"
-    assert config["cameras"]["wristLeft"] == "IMX335 / index 0"
-    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
+    assert config["cameras"]["global"] == "IMX335 / index 0"
+    assert config["cameras"]["globalIdentity"] == "20250606105"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 1"
+    assert config["cameras"]["wristLeftIdentity"] == "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)"
     assert config["cameras"]["wristRight"] == "IMX335 / index 2"
-    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000"
+    assert config["cameras"]["wristRightIdentity"] == "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)"
     assert config["cameras"]["previewResolution"] == "640x480"
     assert config["cameras"]["fps"] == 30
     assert config["storage"]["recordFps"] == 30

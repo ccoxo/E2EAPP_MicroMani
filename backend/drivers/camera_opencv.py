@@ -184,7 +184,31 @@ public static class AppstationDirectShowCameraEnum
 }
 '@
 Add-Type -TypeDefinition $code -Language CSharp
-[AppstationDirectShowCameraEnum]::List()
+$listing = [AppstationDirectShowCameraEnum]::List()
+foreach ($line in ($listing -split "\r?\n")) {
+    Write-Output $line
+    if (-not $line.StartsWith("DevicePath=")) { continue }
+    $devicePath = $line.Substring("DevicePath=".Length)
+    if ([string]::IsNullOrWhiteSpace($devicePath)) { continue }
+    try {
+        $instanceId = if ($devicePath.StartsWith('\\?\')) { $devicePath.Substring(4) } else { $devicePath }
+        $instanceId = ($instanceId -split '#\{', 2)[0]
+        $instanceId = $instanceId -replace '#', '\'
+        $parentProperty = Get-PnpDeviceProperty `
+            -InstanceId $instanceId `
+            -KeyName 'DEVPKEY_Device_Parent' `
+            -ErrorAction Stop
+        $parentId = $parentProperty.Data
+        Write-Output ("ParentId=" + $parentId)
+        $locationProperty = Get-PnpDeviceProperty `
+            -InstanceId $parentId `
+            -KeyName 'DEVPKEY_Device_LocationPaths' `
+            -ErrorAction Stop
+        $locationPath = $locationProperty.Data | Select-Object -First 1
+        Write-Output ("LocationPath=" + $locationPath)
+    }
+    catch { }
+}
 """
 
 
@@ -202,6 +226,8 @@ def _identity_matches(expected: str, identity: dict[str, str]) -> bool:
                 identity.get("name", ""),
                 identity.get("devicePath", ""),
                 identity.get("displayName", ""),
+                identity.get("parentId", ""),
+                identity.get("locationPath", ""),
             ]
         )
     )
@@ -649,6 +675,59 @@ class OpenCVCameraDriver:
                 self._drop_capture(index)
             self._clear_probe_cache()
 
+    def wrist_candidates(self, config: dict[str, Any]) -> list[dict[str, Any]]:
+        self._identity_cache = None
+        identities = self._camera_identities_by_index()
+        global_identity = str(config["cameras"].get("globalIdentity", "")).strip()
+        if not global_identity:
+            raise ValueError("请先设置全局相机身份，再识别腕部相机")
+        devices = []
+        for index, device in identities.items():
+            if self._is_directshow_software_source(device) or not device.get("devicePath"):
+                continue
+            if _identity_matches(global_identity, device):
+                continue
+            parent = device.get("parentId", "")
+            serial = parent.rsplit("\\", 1)[-1]
+            identity = parent if parent and serial and "&" not in serial else device.get("locationPath", "")
+            if not identity:
+                continue
+            devices.append({
+                "index": index, "devicePath": device["devicePath"], "identity": identity,
+                "name": device.get("name", "USB Camera"),
+            })
+        return devices
+
+    def identify_wrists(self, config: dict[str, Any]) -> list[dict[str, Any]]:
+        devices = self.wrist_candidates(config)
+        for device in devices:
+            with self._capture_lock:
+                already_open = device["index"] in self._captures
+            preview_config = {**config, "cameras": {
+                **config["cameras"], "wristLeftIdentity": device["devicePath"], "wristRightIdentity": "",
+                "wristRight": "index -1",
+            }}
+            try:
+                jpeg = self.snapshot(preview_config, "wrist_left")
+                device["preview"] = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
+            except RuntimeError as exc:
+                device["error"] = str(exc)
+            finally:
+                if not already_open:
+                    with self._capture_lock:
+                        self._drop_capture(device["index"])
+        return devices
+
+    def wrist_binding(self, config: dict[str, Any], left: str, right: str) -> dict[str, Any]:
+        devices = {device["devicePath"]: device for device in self.wrist_candidates(config)}
+        if left == right or left not in devices or right not in devices:
+            raise ValueError("请选择两台不同且仍在线的相机；设备变化后请重新扫描")
+        cameras = dict(config["cameras"])
+        for key, path in (("wristLeft", left), ("wristRight", right)):
+            cameras[key] = f"IMX335 / index {devices[path]['index']}"
+            cameras[f"{key}Identity"] = devices[path]["identity"]
+        return cameras
+
     def enumerate_devices(self, config: dict[str, Any], max_index: int = 3) -> list[dict[str, Any]]:
         try:
             cv2 = import_module("cv2")
@@ -795,10 +874,14 @@ class OpenCVCameraDriver:
             )
             for role, config_key in CAMERA_DESCRIPTOR_KEYS.items()
         }
-        resolved.update(self._resolve_indices_by_identity(cameras))
+        identity_resolved = self._resolve_indices_by_identity(cameras)
+        for role, identity_key in CAMERA_IDENTITY_KEYS.items():
+            if str(cameras.get(identity_key, "")).strip():
+                resolved[role] = identity_resolved.get(role, -1)
         resolved = self._remap_software_sources(resolved, max_index)
         wrist_indices = {resolved["wrist_left"], resolved["wrist_right"]}
-        if resolved["global"] < 0 or resolved["global"] in wrist_indices:
+        global_has_identity = bool(str(cameras.get(CAMERA_IDENTITY_KEYS["global"], "")).strip())
+        if not global_has_identity and (resolved["global"] < 0 or resolved["global"] in wrist_indices):
             readable = self._discover_readable_indices(cv2, *CAMERA_CAPTURE_SIZES["global"], fps, max_index)
             remaining = [index for index in readable if index not in wrist_indices]
             if remaining:
@@ -913,6 +996,8 @@ class OpenCVCameraDriver:
                 "name": current.get("FriendlyName", ""),
                 "devicePath": current.get("DevicePath", ""),
                 "displayName": current.get("DisplayName", ""),
+                "parentId": current.get("ParentId", ""),
+                "locationPath": current.get("LocationPath", ""),
             }
 
         for line in output.splitlines():

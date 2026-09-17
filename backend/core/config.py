@@ -4,6 +4,8 @@ import json
 import os
 import re
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -418,6 +420,7 @@ class SettingsService:
         self.snapshot_dir = runtime_dir / "snapshots"
         self.work_origin_backup_dir = runtime_dir / "_work_origin_backups"
         self.logs = logs
+        self._config_io_lock = threading.RLock()
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
         self.work_origin_backup_dir.mkdir(parents=True, exist_ok=True)
@@ -425,8 +428,12 @@ class SettingsService:
             self.save_config(default_config(), emit_log=False)
 
     def get_config(self) -> dict[str, Any]:
+        with self._config_io_lock:
+            return self._get_config_locked()
+
+    def _get_config_locked(self) -> dict[str, Any]:
         try:
-            data = json.loads(self.config_path.read_text(encoding="utf-8"))
+            data = self._read_json_with_retry(self.config_path)
             raw_teleop = data.get("teleop", {}) if isinstance(data, dict) else {}
             raw_motion = data.get("motion", {}) if isinstance(data, dict) else {}
             raw_cameras = data.get("cameras", {}) if isinstance(data, dict) else {}
@@ -463,7 +470,13 @@ class SettingsService:
             if merged != data:
                 self.save_config(validated, emit_log=False, source="startup")
             return validated
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
+        except OSError as exc:
+            self.logs.warning(
+                "[BACKEND]",
+                f"config.json was temporarily unavailable; persisted config preserved: {type(exc).__name__}: {exc}",
+            )
+            raise
+        except (json.JSONDecodeError, ValueError) as exc:
             config = default_config()
             self.save_config(config, source="startup")
             self.logs.warning(
@@ -480,10 +493,21 @@ class SettingsService:
         source: str = "ui",
         op_id: str | None = None,
     ) -> dict[str, Any]:
+        with self._config_io_lock:
+            return self._save_config_locked(config, emit_log, source=source, op_id=op_id)
+
+    def _save_config_locked(
+        self,
+        config: dict[str, Any],
+        emit_log: bool = True,
+        *,
+        source: str = "ui",
+        op_id: str | None = None,
+    ) -> dict[str, Any]:
         old_config: dict[str, Any] = {}
         if self.config_path.exists():
             try:
-                loaded = json.loads(self.config_path.read_text(encoding="utf-8"))
+                loaded = self._read_json_with_retry(self.config_path)
                 old_config = loaded if isinstance(loaded, dict) else {}
             except (OSError, json.JSONDecodeError):
                 old_config = {}
@@ -684,12 +708,29 @@ class SettingsService:
                 temp_file.write(json.dumps(payload, ensure_ascii=False, indent=2))
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
-            os.replace(temp_name, path)
+            for attempt in range(3):
+                try:
+                    os.replace(temp_name, path)
+                    break
+                except PermissionError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.05)
         finally:
             if temp_name is not None:
                 temp_path = Path(temp_name)
                 if temp_path.exists():
                     temp_path.unlink(missing_ok=True)
+
+    def _read_json_with_retry(self, path: Path) -> Any:
+        for attempt in range(3):
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.05)
+        raise AssertionError("unreachable")
 
     def _read_snapshot(self, snapshot_id: str) -> ParameterSnapshot:
         path = self._snapshot_path(snapshot_id)
@@ -935,11 +976,20 @@ class SettingsService:
                 and cameras.get("wristLeft") == "IMX335 / index 2"
                 and cameras.get("wristRight") == "IMX335 / index 0"
             )
+            has_previous_device_path_camera_bindings = (
+                cameras.get("global") == "IMX335 / index 1"
+                and cameras.get("globalIdentity") == "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000"
+                and cameras.get("wristLeft") == "IMX335 / index 0"
+                and cameras.get("wristLeftIdentity") == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
+                and cameras.get("wristRight") == "IMX335 / index 2"
+                and cameras.get("wristRightIdentity") == "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000"
+            )
             if (
                 has_legacy_reversed_wrist_cameras
                 or has_legacy_cyclic_camera_roles
                 or has_previous_imx258_camera_defaults
                 or has_previous_imx335_camera_defaults
+                or has_previous_device_path_camera_bindings
             ):
                 for key, value in ICF_CAMERA_DEFAULTS.items():
                     if key == "tuning":

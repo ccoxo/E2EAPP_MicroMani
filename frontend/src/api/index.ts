@@ -333,6 +333,21 @@ export const reconnectCamera = (camera: CameraTelemetry['key']) =>
 /** 应用对应配置或状态。 */
 export const applyCameraTuning = (camera: CameraTelemetry['key'], config?: AppConfig) =>
   postCommand(`/cameras/${camera}/tuning/apply`, config)
+export interface WristCameraCandidate {
+  index: number
+  devicePath: string
+  name: string
+  preview?: string
+  error?: string
+}
+export const identifyWristCameras = () => postCommand('/cameras/wrists/identify') as Promise<{
+  data: { devices: WristCameraCandidate[] }
+}>
+export const bindWristCameras = (left: string, right: string) =>
+  postCommand('/cameras/wrists/bind', { left, right }) as Promise<{
+    data: { cameras: AppConfig['cameras']; connected: boolean; message: string }
+  }>
+
 export interface PicoCommandResponse {
   ok: boolean
   data?: {

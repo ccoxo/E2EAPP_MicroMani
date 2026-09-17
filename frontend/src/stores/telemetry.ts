@@ -23,7 +23,6 @@ import {
   startAutoExecution,
   skipReset as skipRecordResetApi,
   stopAutoExecution,
-  tareForceSensors as tareForceSensorsApi,
   toggleClutch as toggleClutchApi,
   putConfig,
   type PicoNetworkInfo,
@@ -208,7 +207,6 @@ const initialRecordSession: RecordSessionState = {
   resetReturnedSides: [],
   resetReady: false,
   returnOriginInFlight: false,
-  forceTareActive: false,
   speedMode: 'fine',
 }
 /** 读取对应的本地状态或存储数据。 */
@@ -362,7 +360,6 @@ interface TelemetryStore {
   rejectRecordQualityReport: () => void
   finishRecordSession: () => void
   skipRecordReset: () => void
-  tareRecordForceSensors: () => void
   toggleRecordClutch: () => void
   setRecordSpeedMode: (mode: ManualSpeedMode) => void
   homeRecordArms: () => void
@@ -540,29 +537,11 @@ function buildFrame(state: TelemetryStore): TelemetryFrame {
     Math.sin(t * 1.4) * 0.013,
     Math.cos(t * 0.6) * 0.007,
   ]
-  const forceLeft = state.recordSession.forceTareActive
-    ? [
-        Math.sin(t * 0.9) * 0.035,
-        Math.cos(t * 0.8) * 0.028,
-        Math.sin(t * 0.7) * 0.045,
-        Math.sin(t * 0.6) * 0.003,
-        Math.cos(t * 0.55) * 0.003,
-        Math.sin(t * 0.5) * 0.002,
-      ]
-    : forceLeftRaw
-  const forceRight = state.recordSession.forceTareActive
-    ? [
-        Math.cos(t * 0.75) * 0.033,
-        Math.sin(t * 0.85) * 0.03,
-        Math.cos(t * 0.65) * 0.042,
-        Math.cos(t * 0.5) * 0.003,
-        Math.sin(t * 0.58) * 0.003,
-        Math.cos(t * 0.48) * 0.002,
-      ]
-    : forceRightRaw
+  const forceLeft = forceLeftRaw
+  const forceRight = forceRightRaw
   const pulse = Math.sin(t * 0.18) > 0.92 ? 0.38 : 0
   const computedDanger = Math.min(1.16, Math.max(0, Math.sin(t * 0.31) * 0.48 + pulse))
-  const dangerIndex = state.dangerOverride ?? (state.recordSession.forceTareActive ? Math.min(0.18, computedDanger) : computedDanger)
+  const dangerIndex = state.dangerOverride ?? computedDanger
   const recordActive = state.recordSession.phase === 'recording'
   const frameCount = recordActive ? state.recordSession.recorderFrameCount : state.recording ? state.frameCount + 1 : state.frameCount
   const queueLeft = Math.round(45 + Math.sin(t * 1.1) * 22 + (state.autoRunning ? 18 : -24))
@@ -980,6 +959,13 @@ export function normalizeConfig(config: AppConfig): AppConfig {
     config.cameras.global === 'IMX335 / index 1'
     && config.cameras.wristLeft === 'IMX335 / index 2'
     && config.cameras.wristRight === 'IMX335 / index 0'
+  const hasPreviousDevicePathCameraBindings =
+    config.cameras.global === 'IMX335 / index 1'
+    && config.cameras.globalIdentity === 'USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000'
+    && config.cameras.wristLeft === 'IMX335 / index 0'
+    && config.cameras.wristLeftIdentity === 'USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000'
+    && config.cameras.wristRight === 'IMX335 / index 2'
+    && config.cameras.wristRightIdentity === 'USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000'
   const hasLegacyReversedWristCameras =
     config.cameras.global === 'AR0234 / index 2'
     && config.cameras.wristLeft === 'IMX258 / index 1'
@@ -992,6 +978,7 @@ export function normalizeConfig(config: AppConfig): AppConfig {
   if (
     !hasPreviousImx258CameraDefaults
     && !hasPreviousImx335CameraDefaults
+    && !hasPreviousDevicePathCameraBindings
     && !hasLegacyReversedWristCameras
     && !hasLegacyCyclicCameraRoles
     && !hasStalePicoIp
@@ -1002,6 +989,7 @@ export function normalizeConfig(config: AppConfig): AppConfig {
   if (
     hasPreviousImx258CameraDefaults
     || hasPreviousImx335CameraDefaults
+    || hasPreviousDevicePathCameraBindings
     || hasLegacyReversedWristCameras
     || hasLegacyCyclicCameraRoles
   ) {
@@ -1882,25 +1870,6 @@ skipRecordReset: () => {
       .finally(() => {
         recordResetSkipInFlight = false
       })
-  },
-
-/** 发送或封装对应的后端命令。 */
-tareRecordForceSensors: () => {
-    void tareForceSensorsApi()
-    set((state) => ({
-      dangerOverride: 0,
-      frame: {
-        ...state.frame,
-        dangerIndex: 0,
-        forceLeft: [0, 0, 0, 0, 0, 0],
-        forceRight: [0, 0, 0, 0, 0, 0],
-      },
-      recordSession: {
-        ...state.recordSession,
-        forceTareActive: true,
-      },
-      logs: appendLog(state.logs, makeLog('INFO', '力觉 Tare 已执行', '[FORCE]')),
-    }))
   },
 
 /** 发送或封装对应的后端命令。 */

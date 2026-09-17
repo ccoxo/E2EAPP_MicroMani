@@ -255,7 +255,30 @@ describe('AppStation M0 frontend', () => {
     render(<App />)
 
     expect(screen.getByRole('button', { name: '确认安全态' })).toBeInTheDocument()
+    expect(document.querySelector('.floating-safety-reset')).toBeEnabled()
     expect(screen.getByRole('button', { name: '全局急停' })).toHaveTextContent('已急停')
+  })
+
+  it('disables the global safety acknowledgement until HKVL startup tare is ready', () => {
+    useTelemetryStore.setState((state) => ({
+      frame: {
+        ...state.frame,
+        dangerIndex: 0.2,
+        forceStatus: {
+          source: 'hkvl_serial',
+          calibration: { state: 'waiting_sensors', progress: 0 },
+          safety: {
+            latched: true,
+            canAcknowledge: false,
+            acknowledgeBlocker: 'startup force self-check is not complete',
+          },
+        },
+      },
+    }))
+
+    render(<App />)
+
+    expect(document.querySelector('.floating-safety-reset')).toBeDisabled()
   })
 
   it('keeps the safety latch visible when acknowledgement is rejected', async () => {
@@ -338,6 +361,7 @@ describe('AppStation M0 frontend', () => {
     )
 
     expect((await screen.findAllByText(/HKVL-36A/)).length).toBeGreaterThan(0)
+    expect(Array.from(document.querySelectorAll('button')).some((button) => button.textContent?.includes('启动力觉自检'))).toBe(true)
     const operatorLeftCard = document.getElementById('force-left')
     const operatorRightCard = document.getElementById('force-right')
     expect(operatorLeftCard).toHaveTextContent('COM14')
@@ -1664,7 +1688,7 @@ describe('AppStation M0 frontend', () => {
     expect(picoStrip).toBeTruthy()
     expect(picoStrip).toHaveTextContent('10.90.129.166:5555')
     expect(picoStrip).toHaveTextContent('IF 13')
-    expect(picoStrip).toHaveTextContent('IMX335 / index 1')
+    expect(picoStrip).toHaveTextContent('IMX335 / index 0')
 
     const cameraCards = [
       document.querySelector<HTMLElement>('#camera-global'),
@@ -1676,8 +1700,8 @@ describe('AppStation M0 frontend', () => {
       expect(card).toHaveTextContent('IMX335')
       expect(card?.querySelector('.camera-status-strip')).toBeTruthy()
     }
-    expect(defaultConfig.cameras.global).toBe('IMX335 / index 1')
-    expect(defaultConfig.cameras.wristLeft).toBe('IMX335 / index 0')
+    expect(defaultConfig.cameras.global).toBe('IMX335 / index 0')
+    expect(defaultConfig.cameras.wristLeft).toBe('IMX335 / index 1')
     expect(defaultConfig.cameras.wristRight).toBe('IMX335 / index 2')
   })
 

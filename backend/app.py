@@ -1609,6 +1609,35 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.post("/api/cameras/wrists/identify")
+    async def identify_wrist_cameras() -> ApiEnvelope:
+        record_status = await asyncio.to_thread(recorder.status)
+        if record_status.get("active") or record_status.get("recording"):
+            raise HTTPException(status_code=409, detail={"message": "请先结束录制会话，再识别相机"})
+        try:
+            config = await get_config_async()
+            devices = await asyncio.to_thread(hardware.cameras.identify_wrists, config)
+            return envelope({"devices": devices})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+
+    @app.post("/api/cameras/wrists/bind")
+    async def bind_wrist_cameras(payload: dict[str, str]) -> ApiEnvelope:
+        record_status = await asyncio.to_thread(recorder.status)
+        if record_status.get("active") or record_status.get("recording"):
+            raise HTTPException(status_code=409, detail={"message": "请先结束录制会话，再更改相机绑定"})
+        try:
+            config = await get_config_async()
+            cameras = await asyncio.to_thread(
+                hardware.cameras.wrist_binding, config, payload.get("left", ""), payload.get("right", "")
+            )
+            config["cameras"] = cameras
+            saved = await asyncio.to_thread(settings.save_config, config)
+            probe = await asyncio.to_thread(hardware.cameras.reconnect, saved)
+            return envelope({"cameras": saved["cameras"], "connected": probe.ok, "message": probe.message})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+
     # 枚举系统相机设备。
     @app.get("/api/cameras/enumerate")
     async def camera_enumerate_all() -> ApiEnvelope:

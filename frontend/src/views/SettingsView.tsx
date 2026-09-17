@@ -26,6 +26,7 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { useLocation } from 'react-router-dom'
 import { ActionCompareModal, type ActionCompareItem } from '../components/ActionCompareModal'
 import { CameraPreview } from '../components/CameraPreview'
+import { WristCameraIdentification } from '../components/WristCameraIdentification'
 import { ForceChart } from '../components/Charts'
 import * as appApi from '../api'
 import {
@@ -41,6 +42,7 @@ import {
   restorePreviousMotionOrigin,
   setTeleopGravityCompensation,
   tareForceSensor,
+  tareForceSensors,
   zeroTeleopForceFeedback,
   stopMotionSide,
   fetchMotionOrigin,
@@ -560,6 +562,8 @@ function SafetyCard({
   setDangerOverride,
   acknowledgeSafety,
   forceStatus,
+  runForceStartupCheck,
+  forceStartupCheckRunning,
 }: {
   config: AppConfig
   updateConfig: (patch: Partial<AppConfig>) => void
@@ -568,11 +572,33 @@ function SafetyCard({
   setDangerOverride: (danger: number | null) => void
   acknowledgeSafety: () => void
   forceStatus: TelemetryFrame['forceStatus']
+  runForceStartupCheck: () => void
+  forceStartupCheckRunning: boolean
 }) {
   const forceSafety = forceStatus?.safety
+  const calibration = forceStatus?.calibration
+  const leftForce = forceStatus?.sides?.left
+  const rightForce = forceStatus?.sides?.right
   const latched = Boolean(forceSafety?.latched)
   const state: ConnectionState = latched || dangerIndex > 0.85 ? 'error' : dangerIndex > 0.55 ? 'warn' : 'ok'
   const isHkvl = config.force.source === 'hkvl_serial'
+  const calibrationReady = calibration?.state === 'ready_for_ack' || calibration?.state === 'ready'
+  const calibrationStateLabel: Record<string, string> = {
+    waiting_sensors: '等待操作者确认空载',
+    checking_stability: '检查双侧稳定性',
+    taring: '双侧同步 Tare',
+    validating: '验证零后残差',
+    ready_for_ack: '可确认安全态',
+    ready: '已就绪',
+    failed: '自检失败',
+    not_required: '无需 HAL 自检',
+  }
+  const residualSummary = (values: number[] | undefined) => {
+    if (!values || values.length < 6) return '等待验证'
+    const forceResidual = Math.max(...values.slice(0, 3).map((value) => Math.abs(value)))
+    const momentResidual = Math.max(...values.slice(3, 6).map((value) => Math.abs(value)))
+    return `${forceResidual.toFixed(3)} N / ${momentResidual.toFixed(4)} Nm`
+  }
   return (
     <HardwareConfigCard
       id="safety"
@@ -584,10 +610,24 @@ function SafetyCard({
       badges={<Tag color={stateTone(state)}>danger_index {dangerIndex.toFixed(2)}</Tag>}
       actions={
         <Space wrap>
+          {isHkvl && (
+            <Button
+              type="primary"
+              icon={<RotateCcw size={15} />}
+              loading={forceStartupCheckRunning}
+              onClick={runForceStartupCheck}
+            >
+              启动力觉自检
+            </Button>
+          )}
           <Button danger icon={<AlertTriangle size={15} />} onClick={() => setDangerOverride(0.92)}>
             模拟危险
           </Button>
-          <Button icon={<RotateCcw size={15} />} onClick={acknowledgeSafety}>
+          <Button
+            icon={<RotateCcw size={15} />}
+            disabled={!latched || (isHkvl && !forceSafety?.canAcknowledge)}
+            onClick={acknowledgeSafety}
+          >
             确认安全态
           </Button>
         </Space>
@@ -605,6 +645,34 @@ function SafetyCard({
         <Form.Item label="Watchdog ms"><InputNumber value={config.safety.watchdogMs} onChange={(value) => updateConfig({ safety: { ...config.safety, watchdogMs: Number(value ?? 50) } })} /></Form.Item>
       </Form>
       <div className="hardware-metric-grid">
+        {isHkvl && (
+          <>
+            <MetricBox
+              label="启动力觉自检"
+              value={`${calibrationStateLabel[calibration?.state ?? 'waiting_sensors'] ?? calibration?.state ?? '等待状态'} · ${calibration?.progress ?? 0}%`}
+              hint={calibration?.reason || '请确认双侧传感器空载，且伺服、运动和遥操作均已停止'}
+              tone={calibrationReady ? 'ok' : 'warn'}
+            />
+            <MetricBox
+              label="左侧力传感器"
+              value={`${leftForce?.port ?? '--'} · ${leftForce?.sampleHz?.toFixed(1) ?? '0.0'} Hz`}
+              hint={leftForce?.error || (leftForce?.healthy ? '连接和采样正常' : '等待连接或新鲜样本')}
+              tone={leftForce?.healthy ? 'ok' : 'warn'}
+            />
+            <MetricBox
+              label="右侧力传感器"
+              value={`${rightForce?.port ?? '--'} · ${rightForce?.sampleHz?.toFixed(1) ?? '0.0'} Hz`}
+              hint={rightForce?.error || (rightForce?.healthy ? '连接和采样正常' : '等待连接或新鲜样本')}
+              tone={rightForce?.healthy ? 'ok' : 'warn'}
+            />
+            <MetricBox
+              label="零后最大残差"
+              value={`左 ${residualSummary(calibration?.sides?.left?.residualMean)}`}
+              hint={`右 ${residualSummary(calibration?.sides?.right?.residualMean)}`}
+              tone={calibrationReady ? 'ok' : 'warn'}
+            />
+          </>
+        )}
         <MetricBox
           label="HAL 安全锁存"
           value={latched ? forceSafety?.reason || '已锁存' : '未锁存'}
@@ -1588,7 +1656,7 @@ function ForceSensorCard({
         },
       },
     })
-    commandLog(injectLog, '[FORCE]', `${operatorLabel} 六轴方向标定已保存；请释放载荷后重新 Tare`)
+    commandLog(injectLog, '[FORCE]', `${operatorLabel} 六轴方向标定已保存；请释放载荷后重新执行启动力觉自检`)
     setAxisCalibrationOpen(false)
   }
   const updateAxisSignDraft = (index: number, value: number) => {
@@ -1604,15 +1672,17 @@ function ForceSensorCard({
       state={state}
       actions={
         <Space wrap>
-          <Button
-            icon={<RotateCcw size={15} />}
-            onClick={() => {
-              void tareForceSensor(hardwareSide)
-              commandLog(injectLog, '[FORCE]', `${operatorLabel} ${isHkvl ? 'HKVL-36A' : 'Nano-17'} Tare`)
-            }}
-          >
-            Tare
-          </Button>
+          {!isHkvl && (
+            <Button
+              icon={<RotateCcw size={15} />}
+              onClick={() => {
+                void tareForceSensor(hardwareSide)
+                commandLog(injectLog, '[FORCE]', `${operatorLabel} Nano-17 Tare`)
+              }}
+            >
+              Tare
+            </Button>
+          )}
           <Button icon={<Download size={15} />} onClick={() => commandLog(injectLog, '[FORCE]', `${operatorLabel} 力数据导出`)}>
             CSV
           </Button>
@@ -3393,6 +3463,7 @@ export function SettingsView() {
   const [pendingTeleopReturnOriginSide, setPendingTeleopReturnOriginSide] = useState<RobotSide | null>(null)
   const [previousRestoreStatus, setPreviousRestoreStatus] = useState<MotionPreviousRestoreStatus | null>(null)
   const [applyingConfig, setApplyingConfig] = useState(false)
+  const [forceStartupCheckRunning, setForceStartupCheckRunning] = useState(false)
 
   const applyRuntimeConfig = async () => {
     setApplyingConfig(true)
@@ -3404,6 +3475,28 @@ export function SettingsView() {
     } finally {
       setApplyingConfig(false)
     }
+  }
+
+  const runForceStartupCheck = async () => {
+    setForceStartupCheckRunning(true)
+    try {
+      await tareForceSensors()
+      injectLog('INFO', '双侧力传感器启动自检完成；等待稳定窗口后可确认安全态', '[FORCE]')
+    } catch (error) {
+      injectLog('ERROR', `启动力觉自检失败：${commandErrorMessage(error)}`, '[FORCE]')
+    } finally {
+      setForceStartupCheckRunning(false)
+    }
+  }
+
+  const requestForceStartupCheck = () => {
+    Modal.confirm({
+      title: '确认双侧力传感器空载',
+      content: '请移除夹具外载和接触力，并确认全部伺服、运动及遥操作均已停止。系统无法区分恒定外载与零点偏置。',
+      okText: '确认空载并开始',
+      cancelText: '取消',
+      onOk: runForceStartupCheck,
+    })
   }
 
   const refreshMotionOriginStatus = useCallback(async () => {
@@ -3554,6 +3647,8 @@ const openSnapshotModal = (scope: ParameterSnapshotScope) => setSnapshotDraft({ 
                     setDangerOverride={setDangerOverride}
                     acknowledgeSafety={acknowledgeSafety}
                     forceStatus={frame.forceStatus}
+                    runForceStartupCheck={requestForceStartupCheck}
+                    forceStartupCheckRunning={forceStartupCheckRunning}
                   />
                   {sideOrder.map((side) => (
                     (() => {
@@ -3579,6 +3674,7 @@ const openSnapshotModal = (scope: ParameterSnapshotScope) => setSnapshotDraft({ 
                       )
                     })()
                   ))}
+                  <WristCameraIdentification onSaved={(cameras) => updateConfig({ cameras })} />
                   {cameraOrder.map((cameraKey) => (
                     <CameraCard
                       key={cameraKey}
