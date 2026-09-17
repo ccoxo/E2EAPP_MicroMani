@@ -424,7 +424,7 @@ export const defaultConfig: AppConfig = {
     },
   },
   force: {
-    source: 'nidaq',
+    source: 'hkvl_serial',
     leftIp: 'Dev5/ai0:5',
     rightIp: 'Dev3/ai0:5',
     port: 49152,

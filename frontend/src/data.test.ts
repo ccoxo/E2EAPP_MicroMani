@@ -40,6 +40,10 @@ describe('HKVL-36A force safety defaults', () => {
     expect(defaultConfig.safety.momentWarnNm).toBe(0.02)
     expect(defaultConfig.safety.momentStopNm).toBe(1)
   })
+
+  it('starts with HKVL as the force source', () => {
+    expect(defaultConfig.force.source).toBe('hkvl_serial')
+  })
 })
 
 describe('HKVL-36A hardware-side binding', () => {

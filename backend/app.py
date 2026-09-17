@@ -18,6 +18,11 @@ from starlette.websockets import WebSocketState
 
 from backend.app_factory import create_services
 from backend.core.config import SettingsService
+from backend.core.data_contract import (
+    data_contract_metadata,
+    hardware_to_dataset_motion,
+    validate_data_contract,
+)
 from backend.core.force_config import hal_force_config_payload
 from backend.core.logging import LOG_SCHEMA_VERSION, LogService, now_ms, stable_config_hash
 from backend.core.operator_view import hardware_side_for_operator_side
@@ -53,6 +58,23 @@ def envelope(data: dict[str, Any] | None = None) -> ApiEnvelope:
 AXIS_NAMES = ("X", "Y", "Z", "Roll", "Pitch", "Yaw")
 BACKEND_STARTED_AT = time.time()
 TELEOP_GRAVITY_SCALE_DEFAULTS = {"left": 0.45, "right": 1.0}
+REQUIRED_HAL_CAPABILITIES = ("force_calibration_state_v1",)
+
+
+def hal_capability_status(health: Any) -> dict[str, Any]:
+    capabilities = health.capabilities if isinstance(getattr(health, "capabilities", None), list) else []
+    missing = [capability for capability in REQUIRED_HAL_CAPABILITIES if capability not in capabilities]
+    return {
+        "compatible": not missing,
+        "required": list(REQUIRED_HAL_CAPABILITIES),
+        "reported": list(capabilities),
+        "missing": missing,
+        "message": (
+            "HAL capability check passed"
+            if not missing
+            else "HAL binary is stale; rebuild and deploy hal/build/HalServer.exe before recording"
+        ),
+    }
 
 
 def teleop_gravity_scale(teleop: dict[str, Any], side: str) -> float:
@@ -87,6 +109,8 @@ def _binary_pair_deployment_status(build_dir: Path, stem: str) -> dict[str, Any]
         "nextPath": str(next_binary),
         "deployedExists": deployed.exists(),
         "nextExists": next_binary.exists(),
+        "targetMtime": deployed.stat().st_mtime if deployed.exists() else None,
+        "nextMtime": next_binary.stat().st_mtime if next_binary.exists() else None,
         "deployedSha256": deployed_hash,
         "nextSha256": next_hash,
         "pendingNext": pending_next,
@@ -100,15 +124,23 @@ def hal_deployment_status(repo_root: Path | None = None) -> dict[str, Any]:
         "HalServer": _binary_pair_deployment_status(build_dir, "HalServer"),
         "JodellGripperWorker": _binary_pair_deployment_status(build_dir, "JodellGripperWorker"),
     }
+    native_sources = [*build_dir.parent.glob("src/*.cpp"), *build_dir.parent.glob("include/*")]
+    latest_source_mtime = max((path.stat().st_mtime for path in native_sources if path.exists()), default=0.0)
+    for status in components.values():
+        deployed_mtime = status.get("targetMtime", 0.0) or 0.0
+        status["sourceStale"] = bool(deployed_mtime and latest_source_mtime > deployed_mtime + 1.0)
+    stale = [f"{name}.exe is older than HAL sources" for name, status in components.items() if status["sourceStale"]]
     pending = [
         f"{name}.next.exe differs from {name}.exe"
         for name, status in components.items()
         if status["pendingNext"]
     ]
+    pending.extend(stale)
     return {
         "buildDir": str(build_dir),
         "restartRequired": bool(pending),
         "components": components,
+        "requiredCapabilities": ["force_calibration_state_v1"],
         "message": "; ".join(pending) if pending else "HAL build artifacts are deployed",
     }
 
@@ -792,7 +824,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             "ok": True,
             "backend": "running",
             "mode": hal_health.mode,
-            "hal": hal_health.__dict__,
+            "hal": {**hal_health.__dict__, "capabilityCheck": hal_capability_status(hal_health)},
             "hardware": hardware_status,
             "runtime": runtime_status,
             "ts": now_ms(),
@@ -1216,6 +1248,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 if isinstance(raw_pulses, list) and len(raw_pulses) == 12:
                     pulses = [float(value) for value in raw_pulses]
                     joint_positions = relative_motion_positions(config, joint_positions, pulses)
+                    pulses = hardware_to_dataset_motion(pulses)
                 telemetry.motion_positions = list(joint_positions)
             except RuntimeError as exc:
                 logs.error("[POLICY]", f"policy observation failed: {exc}")
@@ -1234,8 +1267,9 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             {
                 "state": lerobot_state_from_ui(joint_positions, grippers),
                 "pulses": pulses if pulses is not None else [0.0] * 12,
-                "force_left": [float(value) for value in force_left],
-                "force_right": [float(value) for value in force_right],
+                "force_left": [float(value) for value in force_right],
+                "force_right": [float(value) for value in force_left],
+                "dataContract": data_contract_metadata(),
             }
         )
 
@@ -1247,6 +1281,13 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 status_code=400,
                 detail={"code": "BAD_POLICY_ACTION", "message": "action must be a 14-element list"},
             )
+        try:
+            validate_data_contract(payload.get("dataContract"))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "POLICY_DATA_CONTRACT_MISMATCH", "message": str(exc)},
+            ) from exc
         dry_run = bool(payload.get("dryRun", True))
         config = await get_config_async()
         current_state = lerobot_state_from_ui(list(telemetry.motion_positions), _policy_gripper_positions(config))
@@ -1262,7 +1303,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail={"code": "POLICY_ACTION_BLOCKED", "message": str(exc)}) from exc
         if dry_run:
-            return envelope({"dryRun": True, "sent": False, "plan": plan})
+            return envelope({"dryRun": True, "sent": False, "plan": plan, "dataContract": data_contract_metadata()})
         raw_controlled_sides = payload.get("controlledSides")
         controlled_sides = (
             [side for side in raw_controlled_sides if side in {"left", "right"}]
@@ -1278,30 +1319,40 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         try:
             for side in controlled_sides:
                 motion_plan = plan["motion"][side]
-                await commands.enable_motion_side(side)
+                hardware_side = hardware_side_for_operator_side(cast(SideName, side))
+                await commands.enable_motion_side(hardware_side)
                 results["motion"][side] = await hal.command(
                     "motion.teleop_target_update",
-                    _policy_motion_payload(side, motion_plan, config),
+                    _policy_motion_payload(hardware_side, motion_plan, config),
                 )
             for side, target_key in (("left", "leftMm"), ("right", "rightMm")):
                 if side not in controlled_sides:
                     continue
-                if not bool(config.get("gripper", {}).get(f"{side}Enabled", False)):
+                hardware_side = hardware_side_for_operator_side(cast(SideName, side))
+                if not bool(config.get("gripper", {}).get(f"{hardware_side}Enabled", False)):
                     continue
-                gripper_side = cast(SideName, side)
+                gripper_side = cast(SideName, hardware_side)
                 request = GripperCommandRequest(
                     side=gripper_side,
                     command="target",
                     targetMm=plan["grippers"][target_key],
                 )
-                results["grippers"][gripper_side] = await commands.gripper_command(request)
+                results["grippers"][side] = await commands.gripper_command(request)
         except RuntimeError as exc:
             logs.error("[POLICY]", f"policy action send failed: {exc}")
             raise HTTPException(
                 status_code=503,
                 detail={"code": "POLICY_ACTION_UNAVAILABLE", "message": str(exc)},
             ) from exc
-        return envelope({"dryRun": False, "sent": True, "plan": plan, "results": results})
+        return envelope(
+            {
+                "dryRun": False,
+                "sent": True,
+                "plan": plan,
+                "results": results,
+                "dataContract": data_contract_metadata(),
+            }
+        )
 
     def _real_hardware_mode(config: dict[str, Any]) -> bool:
         mode = os.environ.get("APPSTATION_HAL_MODE") or config.get("hal", {}).get("mode", "real")
@@ -2060,7 +2111,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                                 logs.error("[HAL]", f"omega state failed: {exc}")
                         omega_hands = cached_omega_hands
                     force_state: dict[str, Any] | None = None
-                    force_source = str(active_config.get("force", {}).get("source", "nidaq")).lower()
+                    force_source = str(active_config.get("force", {}).get("source", "hkvl_serial")).lower()
                     if force_source == "hkvl_serial" and hal_health.connected:
                         if now - last_force_state_at >= min(state_period, 0.02):
                             last_force_state_at = now

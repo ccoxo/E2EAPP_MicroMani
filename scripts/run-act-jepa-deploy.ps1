@@ -158,6 +158,8 @@ do {
       $response.data.state.Count -eq 14 -and
       $response.data.pulses.Count -eq 12 -and
       $response.data.force_left.Count -eq 6 -and
+      $response.data.dataContract.version -eq "appstation.dual_arm.operator_sides.v2" -and
+      $response.data.dataContract.sideOrder -eq "operator_left_then_operator_right" -and
       $response.data.force_right.Count -eq 6
     ) {
       break
@@ -168,7 +170,7 @@ do {
 } while ((Get-Date) -lt $deadline)
 
 if ((Get-Date) -ge $deadline) {
-  throw "Policy bridge did not become ready at $backendUrl/api/policy/observation"
+  throw "Policy bridge did not expose the required numeric side-order contract at $backendUrl/api/policy/observation"
 }
 
 $env:PYTHONPATH = "$PolicySourceDir;$env:PYTHONPATH"

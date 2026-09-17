@@ -9,6 +9,7 @@ option(APPSTATION_ENABLE_VENDOR_SDKS "Compile LTDMC and Omega.7 vendor SDK calls
 
 # 核心库只包含硬件访问、单位换算、teleop 映射和夹爪控制，不包含 HTTP 传输层。
 add_library(appstation_hal_core
+  include/HalVersion.h
   src/ForceComplianceController.cpp
   src/ForceControlRuntime.cpp
   src/ForceSafetyLatch.cpp
@@ -34,6 +35,7 @@ endif()
 
 # HalServer 串起 HTTP 控制、主手 DDS 发布、HAL 映射和 follower 目标执行。
 add_executable(HalServer
+  include/HalVersion.h
   include/HalCommandDispatcher.h
   include/HalDdsControlServer.h
   include/HalHttpServer.h

@@ -48,3 +48,19 @@
 | “重构 X 模块” | “确保重构前后，所有已有测试都能通过” |
 
 对于多步骤任务，需要列出一个包含验证环节的简要计划[reference:12]：
+
+## 5. E2EAPP_MicroMani 架构与 GitHub 提交契约
+
+本仓库的数值通道、硬件默认和部署要求以
+`docs/github-upload-contract.md` 及 `docs/data-contract-and-deployment.md` 为准。
+后续修改必须遵守以下不变量：
+
+- 硬件/HAL 使用硬件左侧在前、硬件右侧在后的原始顺序；LeRobot 数据集和 policy API 使用操作者左侧（硬件右侧）在前、操作者右侧（硬件左侧）在后的顺序。
+- backend 是模型数据与 HAL 指令之间唯一的侧别转换边界；不得在录制、外部 policy 程序和 HAL 之间重复交换。
+- 数值侧别转换不得交换相机角色；原点、kinematics、HAL force sides 和物理端口仍按硬件侧记录。
+- 新 native 数据集必须写入并校验数值通道契约；缺少、未知或不兼容契约的数据不得直接续录、消费或归一化。
+- 默认力源为 `hkvl_serial`；只有用户明确选择 `nidaq` 时才允许访问 NI-DAQ，不得自动 fallback。
+- 修改 HAL 源码或 capability 后必须重新构建并部署配套的 `HalServer.exe` 与 `JodellGripperWorker.exe`；不得通过放宽自检兼容旧二进制。
+- 提交前必须运行受影响测试并记录实际结果，不得把模拟或离线编译写成实机验证；不得提交 runtime 配置、SDK/DLL、模型权重或临时产物。
+
+完整上传核对项见 `docs/github-upload-contract.md`。

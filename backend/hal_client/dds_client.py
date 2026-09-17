@@ -16,8 +16,8 @@ from backend.core.logging import LogService
 from backend.hal_client.client import HalClient, HalHealth
 from backend.hal_client.dds_types import (
     DEFAULT_DDS_DOMAIN_ID,
-    TOPIC_HAL_HEALTH,
     TOPIC_HAL_FORCE_STATE,
+    TOPIC_HAL_HEALTH,
     TOPIC_HAL_MOTION_STATE,
     TOPIC_HAL_NATIVE_TELEOP_STATUS,
     TOPIC_HAL_OMEGA_STATE,
@@ -99,6 +99,11 @@ class DdsHalClient(HalClient):
             connected=True,
             mode="real",
             message=payload.get("message") if isinstance(payload.get("message"), str) else None,
+            capabilities=(
+                [str(value) for value in payload["capabilities"]]
+                if isinstance(payload.get("capabilities"), list)
+                else None
+            ),
         )
 
     async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:

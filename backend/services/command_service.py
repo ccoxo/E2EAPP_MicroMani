@@ -587,7 +587,7 @@ class CommandService:
         # 真机模式优先执行传感器 tare；测试模式仅重置本地模拟力数据。
         config = await self._get_config_async()
         force = config.get("force", {}) if isinstance(config.get("force"), dict) else {}
-        source = str(force.get("source", "nidaq")).lower()
+        source = str(force.get("source", "hkvl_serial")).lower()
         hal_result: dict[str, object] | None = None
         real_hardware = self._real_hardware_mode(config)
         if real_hardware and source == "hkvl_serial":

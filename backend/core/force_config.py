@@ -50,7 +50,7 @@ def _force_axis_signs(config: dict[str, Any]) -> dict[str, list[float]]:
 def validate_force_config(config: dict[str, Any]) -> None:
     force = _mapping(config.get("force"), "force")
     safety = _mapping(config.get("safety"), "safety")
-    source = str(force.get("source", "nidaq")).lower()
+    source = str(force.get("source", "hkvl_serial")).lower()
     if source not in {"nidaq", "hkvl_serial"}:
         raise ValueError("force.source must be nidaq or hkvl_serial")
 
@@ -115,7 +115,7 @@ def hal_force_config_payload(config: dict[str, Any]) -> dict[str, Any]:
     safety = _mapping(config["safety"], "safety")
     compliance = _mapping(force["compliance"], "force.compliance")
     axis_signs = _force_axis_signs(config)
-    source = str(force["source"]).lower()
+    source = str(force.get("source", "hkvl_serial")).lower()
     left_port = str(serial["leftPort"])
     right_port = str(serial["rightPort"])
     if source == "hkvl_serial":

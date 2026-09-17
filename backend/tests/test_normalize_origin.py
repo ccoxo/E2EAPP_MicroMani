@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from backend.core.data_contract import data_contract_metadata
 from backend.core.defaults import default_config
 
 
@@ -25,18 +26,18 @@ def test_normalize_frame_to_origin_updates_motion_state_and_action_only() -> Non
         "observation.state": [999.0] * 14,
         "action": [1000.0] * 14,
         "observation.pulses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
             100.0,
             200.0,
             300.0,
             1666.666667,
             -2500.0,
             -3333.333,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
         ],
     }
     target_origin = {
@@ -53,34 +54,63 @@ def test_normalize_frame_to_origin_updates_motion_state_and_action_only() -> Non
         0.0,
         0.0,
         0.0,
-        1000.0,
-        1000.0,
-        1000.0,
+        0.0,
+        0.0,
+        0.0,
         999.0,
-        -0.0,
-        -0.0,
-        -0.0,
         0.0,
         0.0,
         0.0,
+        1000.0,
+        1000.0,
+        1000.0,
         999.0,
     ]
     assert result["action"] == [
         1.0,
         1.0,
         1.0,
-        1001.0,
-        1001.0,
-        1001.0,
+        1.0,
+        1.0,
+        1.0,
         1000.0,
         1.0,
         1.0,
         1.0,
-        1.0,
-        1.0,
-        1.0,
+        1001.0,
+        1001.0,
+        1001.0,
         1000.0,
     ]
+
+
+def test_normalize_frame_with_same_hardware_origin_is_idempotent_for_dataset_order() -> None:
+    module = load_normalize_origin_module()
+    config = default_config()
+    frame = {
+        # Dataset order is operator-left (hardware-right) then operator-right (hardware-left).
+        "observation.pulses": [0.0, 10000.0, 0.0, 0.0, 0.0, 0.0] + [0.0] * 6,
+        "observation.state": [0.0] * 14,
+        "action": [0.0] * 14,
+        "observation.force_left": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "observation.force_right": [-1.0, -2.0, -3.0, -4.0, -5.0, -6.0],
+    }
+    target_origin = {
+        "leftValid": True,
+        "rightValid": True,
+        "leftPulse": [0.0] * 6,
+        "rightPulse": [0.0, 10000.0, 0.0, 0.0, 0.0, 0.0],
+    }
+
+    result = module.normalize_frame_to_origin(frame, target_origin, config)
+
+    assert result["needs_manual_review"] is False
+    assert result["changed"] is False
+    assert result["observation.state"] == frame["observation.state"]
+    assert result["action"] == frame["action"]
+    assert result["observation.pulses"] == frame["observation.pulses"]
+    assert result["observation.force_left"] == frame["observation.force_left"]
+    assert result["observation.force_right"] == frame["observation.force_right"]
 
 
 def test_normalize_origin_dataset_dry_run_and_apply_rewrite_parquet(tmp_path: Path) -> None:
@@ -107,12 +137,15 @@ def test_normalize_origin_dataset_dry_run_and_apply_rewrite_parquet(tmp_path: Pa
         "motionOrigin": origin,
         "motionCalibration": {"configHash": "same"},
     }
+    (dataset_dir / "meta" / "appstation_info.json").write_text(
+        json.dumps({"dataContract": data_contract_metadata()}), encoding="utf-8"
+    )
     (dataset_dir / "meta" / "episodes.jsonl").write_text(json.dumps(episode) + "\n", encoding="utf-8")
     table = pa.table(
         {
             "episode_index": pa.array([0]),
             "observation.pulses": pa.array(
-                [[100.0, 200.0, 300.0, 1666.666667, -2500.0, -3333.333, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+                [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100.0, 200.0, 300.0, 1666.666667, -2500.0, -3333.333]],
                 type=pa.list_(pa.float32()),
             ),
             "observation.state": pa.array([[999.0] * 14], type=pa.list_(pa.float32())),

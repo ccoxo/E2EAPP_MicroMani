@@ -26,6 +26,13 @@ from types import SimpleNamespace
 from typing import Any
 
 from backend.core.config import SettingsService
+from backend.core.data_contract import (
+    data_contract_metadata,
+    hardware_to_dataset_grippers,
+    hardware_to_dataset_motion,
+    hardware_to_dataset_state,
+    validate_data_contract,
+)
 from backend.core.defaults import ICF_KINEMATICS_DEFAULTS, ICF_TELEOP_DEFAULTS
 from backend.core.force_config import hal_force_config_payload
 from backend.core.logging import LogService, now_ms, stable_config_hash
@@ -334,7 +341,7 @@ class FrameAssembler:
             motion_pulses = [float(value) for value in raw_pulses]
             recorder._remember_motion_pulses(motion_pulses)
         motion_positions = recorder._recording_motion_positions(config, motion_positions, motion_pulses)
-        recording_motion_pulses = motion_pulses[6:12] + motion_pulses[0:6]
+        recording_motion_pulses = hardware_to_dataset_motion(motion_pulses)
         force_values = recorder._force_values_from_sample(force_sample.value)
         if force_values is not None:
             force_left, force_right = force_values
@@ -535,6 +542,9 @@ class DatasetRecorderService:
             dataset_root = self._dataset_root(config)
             dataset_dir = dataset_root / next_dataset_id
             await asyncio.to_thread(dataset_root.mkdir, parents=True, exist_ok=True)
+            contract_error = self._dataset_contract_error(dataset_dir)
+            if contract_error:
+                raise RuntimeError(contract_error)
 
             async with self._lock:
                 self._recording_config_snapshot = deepcopy(config)
@@ -566,7 +576,7 @@ class DatasetRecorderService:
         try:
             if (
                 self._real_hardware_mode(config)
-                and str(config.get("force", {}).get("source", "nidaq")).lower() == "hkvl_serial"
+                and str(config.get("force", {}).get("source", "hkvl_serial")).lower() == "hkvl_serial"
             ):
                 try:
                     self._latest_force_state = dict(await self.hal.force_state())
@@ -860,6 +870,7 @@ class DatasetRecorderService:
                 continue
             app_info = self._read_json(dataset_dir / "meta" / "appstation_info.json")
             native_format = self._is_native_dataset(dataset_dir, info)
+            contract_error = self._dataset_contract_error(dataset_dir)
             episodes = self._read_episodes(dataset_dir)
             if not episodes and native_format:
                 episodes = self._native_episodes_from_meta(dataset_dir, info)
@@ -881,6 +892,11 @@ class DatasetRecorderService:
                         app_info.get("format")
                         or info.get("format")
                         or ("lerobot-v3-native" if native_format else "lerobot-v3-native-required")
+                    ),
+                    "dataContract": (
+                        app_info.get("dataContract")
+                        or info.get("dataContract")
+                        or {"status": "unknown", "message": contract_error}
                     ),
                     "episodes": [
                         self._episode_for_api(dataset_dir, dataset_dir.name, episode, include_samples=False)
@@ -1007,6 +1023,7 @@ class DatasetRecorderService:
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
             raise FileNotFoundError(dataset_id)
+        self._require_dataset_contract(dataset_dir)
         episodes = self._visible_episodes_for_dataset(dataset_dir, info)
         status_counts: dict[str, int] = {}
         warnings: list[str] = []
@@ -1048,6 +1065,7 @@ class DatasetRecorderService:
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
             raise FileNotFoundError(dataset_id)
+        self._require_dataset_contract(dataset_dir)
         episode = next(
             (
                 item
@@ -1783,7 +1801,7 @@ class DatasetRecorderService:
             )
             return SourceSample("force", sampled_at, value, True, "", target_monotonic_s=target_s)
         started = time.monotonic()
-        source = str(config.get("force", {}).get("source", "nidaq")).lower()
+        source = str(config.get("force", {}).get("source", "hkvl_serial")).lower()
         try:
             if source == "hkvl_serial":
                 value = asyncio.run(self.hal.force_state())
@@ -1794,8 +1812,10 @@ class DatasetRecorderService:
                 value["ok"] = bool(left_status.get("healthy")) and bool(right_status.get("healthy"))
                 if not value["ok"]:
                     value["message"] = "HKVL force sample is stale or unhealthy"
-            else:
+            elif source == "nidaq":
                 value = self.hardware.force.sample(config)
+            else:
+                value = {"ok": False, "message": f"unsupported force source: {source}"}
             ok = bool(getattr(value, "ok", True) if not isinstance(value, dict) else value.get("ok", True))
             raw_message = getattr(value, "message", "") if not isinstance(value, dict) else value.get("message", "")
             message = "" if ok else str(raw_message)
@@ -2753,6 +2773,7 @@ class DatasetRecorderService:
             "name": str(info.get("name") or self._dataset_name),
             "status": str(info.get("status", "local")) if info else "local",
             "format": "lerobot-v3-native",
+            "dataContract": data_contract_metadata(),
             "codebase_version": "v3.0",
             "nativeLeRobotAvailable": True,
             "useVideos": self._native_use_videos,
@@ -2780,11 +2801,18 @@ class DatasetRecorderService:
             },
         }
         self._write_json(path, payload)
+        info_path = dataset_dir / "meta" / "info.json"
+        info = self._read_json(info_path)
+        if info:
+            info["dataContract"] = data_contract_metadata()
+            self._write_json(info_path, info)
 
     def _force_metadata(self, config: dict[str, Any]) -> dict[str, Any]:
         force = config.get("force", {}) if isinstance(config.get("force"), dict) else {}
-        source = str(force.get("source", "nidaq")).lower()
+        source = str(force.get("source", "hkvl_serial")).lower()
         if source != "hkvl_serial":
+            if source != "nidaq":
+                return {"source": source, "message": f"unsupported force source: {source}"}
             return {
                 "source": "nidaq",
                 "leftIp": force.get("leftIp"),
@@ -2887,6 +2915,9 @@ class DatasetRecorderService:
             raise RuntimeError("record dataset is not initialized")
         LeRobotDataset, _np = imports
         dataset_dir = self._dataset_dir
+        contract_error = self._dataset_contract_error(dataset_dir)
+        if contract_error:
+            raise RuntimeError(contract_error)
         repo_id = f"local/{self._dataset_id}"
         self._native_use_videos = self._native_use_videos_requested()
         try:
@@ -3085,6 +3116,26 @@ class DatasetRecorderService:
         app_info = self._read_json(dataset_dir / "meta" / "appstation_info.json")
         return str(app_info.get("format", "")) == "lerobot-v3-native"
 
+    def _dataset_contract_error(self, dataset_dir: Path) -> str:
+        """Reject native datasets whose numeric side order cannot be proven."""
+        info = self._read_json(dataset_dir / "meta" / "info.json")
+        app_info = self._read_json(dataset_dir / "meta" / "appstation_info.json")
+        if not info and not app_info:
+            return ""
+        if not self._is_native_dataset(dataset_dir, info):
+            return ""
+        try:
+            validate_data_contract(app_info.get("dataContract") or info.get("dataContract"))
+        except ValueError as exc:
+            return f"dataset numeric channel order is not compatible: {exc}"
+        return ""
+
+    def _require_dataset_contract(self, dataset_dir: Path) -> None:
+        """Reject native reads when the numeric side order is missing or incompatible."""
+        contract_error = self._dataset_contract_error(dataset_dir)
+        if contract_error:
+            raise RuntimeError(contract_error)
+
     def _open_native_dataset_for_read(self, dataset_id: str, dataset_dir: Path, LeRobotDataset: Any) -> Any:
         """以兼容不同 LeRobot 版本的方式打开数据集用于预览读取。"""
         try:
@@ -3187,7 +3238,7 @@ class DatasetRecorderService:
 
     def _force_sample_hz_from_config(self, config: dict[str, Any]) -> float:
         """从配置中读取力传感器采样频率，并限制合法范围。"""
-        if str(config.get("force", {}).get("source", "nidaq")).lower() == "hkvl_serial":
+        if str(config.get("force", {}).get("source", "hkvl_serial")).lower() == "hkvl_serial":
             return 200.0
         try:
             raw = float(config.get("force", {}).get("sampleHz", 200))
@@ -3314,6 +3365,7 @@ class DatasetRecorderService:
         max_samples: int = 300,
     ) -> list[dict[str, Any]]:
         """为 episode 生成预览样本，native 数据集和 fallback jsonl 分别处理。"""
+        self._require_dataset_contract(dataset_dir)
         native_episode = bool(episode.get("native", False))
         native_dataset = self._is_native_dataset(dataset_dir, self._read_json(dataset_dir / "meta" / "info.json"))
         if native_episode or native_dataset:
@@ -3580,10 +3632,9 @@ class DatasetRecorderService:
 
     def _compose_observation_state(self, motion_positions: list[float], gripper_positions: list[Any]) -> list[float]:
         # 将运动状态和夹爪位置组合成 LeRobot v3 的 state。
-        """交换左右两组运动位姿和夹爪值后，拼成 14 维 LeRobot state。"""
-        motion = (list(motion_positions) + [0.0] * 12)[:12]
-        motion = motion[6:12] + motion[0:6]
-        gripper = [self._float_or_zero(value) for value in (list(gripper_positions) + [0.0, 0.0])[:2]]
+        """按操作者左（硬件右）、操作者右（硬件左）拼成 14 维 state。"""
+        motion = hardware_to_dataset_motion(motion_positions)
+        gripper = [self._float_or_zero(value) for value in hardware_to_dataset_grippers(gripper_positions)]
         return [
             motion[0],
             motion[1],
@@ -3591,14 +3642,14 @@ class DatasetRecorderService:
             motion[3] * 1000.0,
             motion[4] * 1000.0,
             motion[5] * 1000.0,
-            gripper[1],
+            gripper[0],
             motion[6],
             motion[7],
             motion[8],
             motion[9] * 1000.0,
             motion[10] * 1000.0,
             motion[11] * 1000.0,
-            gripper[0],
+            gripper[1],
         ]
 
     def _lerobot14_to_ui_motion_state(self, state: list[float]) -> list[float]:
@@ -3786,18 +3837,21 @@ class DatasetRecorderService:
         """根据 observation、teleop 增量和夹爪目标生成 14 维 action。"""
         base = (list(observation_state) + [0.0] * 14)[:14] if observation_state is not None else [0.0] * 14
         config = config or {}
-        vector = self._latest_action_delta_vector(target_monotonic_s)
-        vector = vector[7:14] + vector[0:7]
+        vector = hardware_to_dataset_state(self._latest_action_delta_vector(target_monotonic_s))
         action = [base[index] + vector[index] for index in range(14)]
         native_gripper_targets = self._latest_native_gripper_targets(config)
         if native_gripper_targets is not None:
-            action[6], action[13] = native_gripper_targets[1], native_gripper_targets[0]
+            action[6], action[13] = hardware_to_dataset_grippers(list(native_gripper_targets))
             return action
         if not self._using_real_hal_native_teleop(config):
             gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
             if gripper:
-                action[6] = self._float_or_zero(gripper.get("targetRightMm", base[6]))
-                action[13] = self._float_or_zero(gripper.get("targetLeftMm", base[13]))
+                action[6], action[13] = hardware_to_dataset_grippers(
+                    [
+                        self._float_or_zero(gripper.get("targetLeftMm", base[13])),
+                        self._float_or_zero(gripper.get("targetRightMm", base[6])),
+                    ]
+                )
         return action
 
     def _latest_native_gripper_targets(self, config: dict[str, Any]) -> tuple[float, float] | None:

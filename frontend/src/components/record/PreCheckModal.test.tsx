@@ -31,6 +31,12 @@ function makeReadyForRecordPrecheck() {
       },
       halOk: true,
       wsOk: true,
+      forceStatus: {
+        ...state.frame.forceStatus,
+        source: 'hkvl_serial',
+        calibration: { state: 'ready', progress: 1 },
+        safety: { latched: false, reason: '', canAcknowledge: true },
+      },
       cameras: state.frame.cameras.map((camera) => ({ ...camera, fps: 30, health: 'ok' })),
       teleopHands: state.frame.teleopHands.map((hand) =>
         hand.side === 'left'

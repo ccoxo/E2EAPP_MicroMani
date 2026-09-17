@@ -9,6 +9,8 @@
 #include <thread>
 #include <utility>
 
+#include "HalVersion.h"
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -492,7 +494,7 @@ HalHealth LTDMCDriver::health(double uptimeS) const {
   if (!lock.owns_lock()) {
     return cachedHealth(uptimeS);
   }
-  HalHealth health{initialized_, false, "hal-real/0.1", uptimeS};
+  HalHealth health{initialized_, false, kHalVersion, uptimeS};
   if (!lastError_.empty()) {
     health.version += " " + lastError_;
   }
@@ -557,7 +559,7 @@ MotionState LTDMCDriver::cachedStateSnapshot() const {
 
 HalHealth LTDMCDriver::cachedHealth(double uptimeS) const {
   std::scoped_lock snapshotLock(snapshotMutex_);
-  HalHealth health{cachedInitialized_, false, "hal-real/0.1", uptimeS};
+  HalHealth health{cachedInitialized_, false, kHalVersion, uptimeS};
   if (!cachedLastError_.empty()) {
     health.version += " " + cachedLastError_;
   }

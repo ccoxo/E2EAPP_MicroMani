@@ -14,8 +14,9 @@ import pytest
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
-from backend.app import create_app, backend_deployment_status, hal_deployment_status, relative_motion_positions
+from backend.app import backend_deployment_status, create_app, hal_deployment_status, relative_motion_positions
 from backend.core.config import SettingsService
+from backend.core.data_contract import data_contract_metadata
 from backend.core.defaults import default_config
 from backend.core.logging import LogService
 from backend.core.motion_limits import effective_limits_ui, side_home_reference_ui
@@ -80,6 +81,7 @@ def _write_dataset_fixture(dataset_root: Path, dataset_id: str = "unit_dataset")
                 "fps": 30,
                 "createdAt": 1000,
                 "updatedAt": 2000,
+                "dataContract": data_contract_metadata(),
             }
         ),
         encoding="utf-8",
@@ -1279,6 +1281,27 @@ def test_hal_deployment_status_reports_pending_next_binary(tmp_path: Path) -> No
     assert status["components"]["HalServer"]["pendingNext"] is True
     assert status["components"]["JodellGripperWorker"]["pendingNext"] is False
     assert "HalServer.next.exe differs from HalServer.exe" in status["message"]
+
+
+def test_hal_deployment_status_reports_source_newer_than_deployed_binary(tmp_path: Path) -> None:
+    build_dir = tmp_path / "hal" / "build"
+    source_dir = tmp_path / "hal" / "src"
+    build_dir.mkdir(parents=True)
+    source_dir.mkdir(parents=True)
+    (build_dir / "HalServer.exe").write_bytes(b"old-hal")
+    (build_dir / "JodellGripperWorker.exe").write_bytes(b"old-worker")
+    source = source_dir / "HalJson.cpp"
+    source.write_text("// newer source\n", encoding="utf-8")
+    os.utime(build_dir / "HalServer.exe", (1_000.0, 1_000.0))
+    os.utime(build_dir / "JodellGripperWorker.exe", (1_000.0, 1_000.0))
+    os.utime(source, (2_000.0, 2_000.0))
+
+    status = hal_deployment_status(tmp_path)
+
+    assert status["restartRequired"] is True
+    assert status["components"]["HalServer"]["sourceStale"] is True
+    assert status["components"]["JodellGripperWorker"]["sourceStale"] is True
+    assert "older than HAL sources" in status["message"]
 
 
 def test_backend_deployment_status_reports_source_newer_than_process(tmp_path: Path) -> None:
@@ -5882,19 +5905,19 @@ def test_dataset_recorder_action_vector_prefers_teleop_delta_vector() -> None:
     recorder.teleop = FakeTeleop()
 
     assert recorder._latest_action_vector() == [
-        10.0,
-        0.0,
-        0.0,
-        500.0,
-        0.0,
-        0.0,
-        0.0,
         -20.0,
         0.0,
         0.0,
         0.0,
         0.0,
         -100.0,
+        0.0,
+        10.0,
+        0.0,
+        0.0,
+        500.0,
+        0.0,
+        0.0,
         0.0,
     ]
 

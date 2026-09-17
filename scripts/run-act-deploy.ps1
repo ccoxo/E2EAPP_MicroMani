@@ -134,7 +134,12 @@ $deadline = (Get-Date).AddSeconds(20)
 do {
   try {
     $response = Invoke-RestMethod -Uri "$backendUrl/api/policy/observation" -Method GET -TimeoutSec 5
-    if ($response.ok -eq $true -and $response.data.state.Count -eq 14) {
+    if (
+      $response.ok -eq $true -and
+      $response.data.state.Count -eq 14 -and
+      $response.data.dataContract.version -eq "appstation.dual_arm.operator_sides.v2" -and
+      $response.data.dataContract.sideOrder -eq "operator_left_then_operator_right"
+    ) {
       break
     }
   } catch {
@@ -143,7 +148,7 @@ do {
 } while ((Get-Date) -lt $deadline)
 
 if ((Get-Date) -ge $deadline) {
-  throw "Policy bridge did not become ready at $backendUrl/api/policy/observation"
+  throw "Policy bridge did not expose the required numeric side-order contract at $backendUrl/api/policy/observation"
 }
 
 $actArgs = @(

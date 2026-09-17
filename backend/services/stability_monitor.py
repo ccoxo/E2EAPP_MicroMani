@@ -155,7 +155,7 @@ class StabilityMonitorService:
         if not self._real_hardware_mode(config):
             force_status["skippedTestMode"] = int(force_status["skippedTestMode"]) + 1
             return
-        source = str(config.get("force", {}).get("source", "nidaq")).lower()
+        source = str(config.get("force", {}).get("source", "hkvl_serial")).lower()
         force_status["source"] = source
         if source == "hkvl_serial":
             force_status["samples"] = int(force_status["samples"]) + 1
@@ -193,6 +193,11 @@ class StabilityMonitorService:
             force_status["leftCrcErrors"] = int(left_status.get("crcErrors", 0))
             force_status["rightCrcErrors"] = int(right_status.get("crcErrors", 0))
             force_status["leftRightSkewMs"] = float(state.get("leftRightSkewMs", 0.0))
+            return
+        if source != "nidaq":
+            force_status["failures"] = int(force_status["failures"]) + 1
+            force_status["lastError"] = f"unsupported force source: {source}"
+            self._append_error(force_status["lastError"])
             return
         sample_hz = self._sample_hz(config)
         sample_count = min(max(int(round(sample_hz * 0.1)), 1), 512)

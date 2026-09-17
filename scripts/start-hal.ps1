@@ -133,6 +133,33 @@ function Copy-RuntimeDllIfNewer {
   }
 }
 
+function Assert-HalBuildMatchesSource {
+  $sourceFiles = @(
+    Get-ChildItem -LiteralPath (Join-Path $repo "hal\src") -File -Include *.cpp,*.h -Recurse -ErrorAction SilentlyContinue
+    Get-ChildItem -LiteralPath (Join-Path $repo "hal\include") -File -Include *.cpp,*.h -Recurse -ErrorAction SilentlyContinue
+    Get-Item -LiteralPath (Join-Path $repo "hal\CMakeLists.txt"), (Join-Path $repo "hal\build_hal.cmd") -ErrorAction SilentlyContinue
+  )
+  $latestSource = $sourceFiles | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+  if ($null -eq $latestSource) {
+    return
+  }
+  foreach ($pair in @(
+    @($halExe, $halNextExe),
+    @($workerExe, $workerNextExe)
+  )) {
+    $target, $candidate = $pair
+    if (!(Test-Path -LiteralPath $target)) {
+      continue
+    }
+    $targetIsStale = (Get-Item -LiteralPath $target).LastWriteTimeUtc -lt $latestSource.LastWriteTimeUtc
+    $candidateIsFresh = (Test-Path -LiteralPath $candidate) -and
+      ((Get-Item -LiteralPath $candidate).LastWriteTimeUtc -ge $latestSource.LastWriteTimeUtc)
+    if ($targetIsStale -and !$candidateIsFresh) {
+      throw "HAL binary is older than native sources ($($latestSource.Name)); run hal\build_hal.cmd or an isolated CMake build, then deploy the resulting .next.exe files. Automatic compilation is disabled."
+    }
+  }
+}
+
 function Resolve-HkvlBoundPort {
   param(
     [string]$Side,
@@ -161,6 +188,8 @@ if ($Restart) {
   Get-ChildItem -LiteralPath $halBuild -Filter "JodellGripperWorker.runtime-*.exe" -ErrorAction SilentlyContinue |
     Remove-Item -Force -ErrorAction SilentlyContinue
 }
+
+Assert-HalBuildMatchesSource
 
 $existing = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
   Select-Object -ExpandProperty OwningProcess -First 1

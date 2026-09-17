@@ -2,8 +2,19 @@ import { describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
 import { defaultConfig, defaultDiagnostics } from '../data'
 import { diagnosticsFromHardwareStatus, normalizeConfig, useTelemetryStore } from './telemetry'
+import type { AppConfig } from '../types'
 
 describe('telemetry config normalization', () => {
+  it('fills a missing force source with HKVL while preserving explicit NI-DAQ', () => {
+    const missingSourceConfig = structuredClone(defaultConfig) as AppConfig
+    Object.assign(missingSourceConfig.force, { source: undefined })
+    const explicitNidaq = structuredClone(defaultConfig)
+    explicitNidaq.force.source = 'nidaq'
+
+    expect(normalizeConfig(missingSourceConfig).force.source).toBe('hkvl_serial')
+    expect(normalizeConfig(explicitNidaq).force.source).toBe('nidaq')
+  })
+
   it('migrates stale PICO and camera hardware defaults', () => {
     const staleConfig = structuredClone(defaultConfig)
     staleConfig.picoVision.ip = '10.90.132.51'

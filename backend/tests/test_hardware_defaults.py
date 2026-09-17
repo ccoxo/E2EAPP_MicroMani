@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from backend.core.defaults import default_config
+from backend.core.force_config import hal_force_config_payload, validate_force_config
 
 
 def _target_arm_gain(config: dict, side: str, axis_index: int) -> float:
@@ -173,6 +174,25 @@ def test_force_defaults_start_with_hkvl_reference_project() -> None:
     assert config["force"]["compliance"]["right"]["matrix"] == [1.0, 0.0, 0.0, 1.0]
     assert config["force"]["compliance"]["left"]["gainUmPerNs"] == [0.0, 0.0]
     assert config["force"]["compliance"]["right"]["gainUmPerNs"] == [0.0, 0.0]
+
+
+@pytest.mark.parametrize("source", ["hkvl_serial", "nidaq"])
+def test_explicit_force_source_is_preserved(source: str) -> None:
+    config = default_config()
+    config["force"]["source"] = source
+
+    validate_force_config(config)
+
+    assert hal_force_config_payload(config)["source"] == source
+
+
+def test_missing_force_source_uses_hkvl_without_enabling_nidaq() -> None:
+    config = default_config()
+    del config["force"]["source"]
+
+    validate_force_config(config)
+
+    assert hal_force_config_payload(config)["source"] == "hkvl_serial"
 
 
 def test_safety_defaults_are_stored_in_backend_units() -> None:

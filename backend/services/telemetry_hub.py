@@ -88,7 +88,7 @@ class TelemetryHub:
         self._last_frame_at = now
         config = config if config is not None else self.settings.get_config()
         real_mode = self._real_hardware_mode(config)
-        force_source = str(config.get("force", {}).get("source", "nidaq")).lower()
+        force_source = str(config.get("force", {}).get("source", "hkvl_serial")).lower()
         if real_mode:
             if motion_positions is not None and len(motion_positions) == 12:
                 # 真机位置以 HAL 返回值为准，本地 offset 只服务于测试模式。
@@ -575,7 +575,7 @@ class TelemetryHub:
     def _refresh_force_values(self, config: dict[str, Any], now: float) -> None:
         if self.hardware is None or getattr(self, "_shutdown", False):
             return
-        if str(config.get("force", {}).get("source", "nidaq")).lower() != "nidaq":
+        if str(config.get("force", {}).get("source", "hkvl_serial")).lower() != "nidaq":
             return
         if self._force_future is not None and self._force_future.done():
             try:

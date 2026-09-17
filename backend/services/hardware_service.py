@@ -22,7 +22,7 @@ class HardwareService:
     def status(self, *, include_gripper: bool = True) -> dict[str, Any]:
         config = self.settings.get_config()
         camera = self.cameras.probe(config)
-        force_source = str(config.get("force", {}).get("source", "nidaq")).lower()
+        force_source = str(config.get("force", {}).get("source", "hkvl_serial")).lower()
         force = self.force.probe(config) if force_source == "nidaq" else None
         gripper = self.gripper.probe(config) if include_gripper else None
         pico = self.pico.status(config)
@@ -35,6 +35,12 @@ class HardwareService:
             "force": (
                 {"ok": force.ok, "message": force.message, "source": "nidaq"}
                 if force is not None
+                else {
+                    "ok": False,
+                    "message": f"unsupported force source: {force_source}",
+                    "source": force_source,
+                }
+                if force_source not in {"hkvl_serial", "nidaq"}
                 else {
                     "ok": None,
                     "message": "managed by HAL-native HKVL serial runtime",

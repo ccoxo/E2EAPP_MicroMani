@@ -7,6 +7,8 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "HalVersion.h"
+
 namespace appstation::hal {
 
 const std::array<bool, 6> kAllAxesEnabled{true, true, true, true, true, true};
@@ -57,6 +59,7 @@ std::string jsonHealth(const appstation::hal::HalHealth& motionHealth, bool omeg
       << ",\"omega7_ok\":" << (omegaOk ? "true" : "false")
       << ",\"version\":\"" << motionHealth.version << "\""
       << ",\"uptime_s\":" << motionHealth.uptimeS
+      << ",\"capabilities\":[\"" << kHalCapabilityForceCalibrationState << "\"]"
       << ",\"message\":\"" << jsonEscape(message) << "\"}";
   return out.str();
 }

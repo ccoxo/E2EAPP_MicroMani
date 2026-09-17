@@ -1911,7 +1911,10 @@ def test_dataset_recorder_samples_current_force_without_window(monkeypatch) -> N
     recorder.hardware = FakeHardware()
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
 
-    result = recorder._sample_force_source_sync({"hal": {"mode": "real"}}, 1.0)
+    result = recorder._sample_force_source_sync(
+        {"hal": {"mode": "real"}, "force": {"source": "nidaq"}},
+        1.0,
+    )
 
     assert result.value == {"ok": True, "left": [1.0] * 6, "right": [2.0] * 6}
     assert recorder.hardware.force.sample_calls == 1

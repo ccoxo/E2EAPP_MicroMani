@@ -16,7 +16,7 @@
 namespace appstation::hal {
 
 struct ForceRuntimeConfig {
-  std::string source{"nidaq"};
+  std::string source{"hkvl_serial"};
   HkvlSerialConfig serial{};
   std::array<std::array<double, 6>, 2> axisSign{{
       {{-1.0, 1.0, -1.0, 1.0, -1.0, -1.0}},

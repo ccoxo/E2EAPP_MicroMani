@@ -404,7 +404,7 @@ const emptyFrame: TelemetryFrame = {
   forceLeft: [0, 0, 0, 0, 0, 0],
   forceRight: [0, 0, 0, 0, 0, 0],
   forceStatus: {
-    source: 'nidaq',
+    source: 'hkvl_serial',
     sides: {
       left: { connected: false, healthy: false },
       right: { connected: false, healthy: false },
@@ -951,6 +951,7 @@ function mergeConfig(current: AppConfig, patch: Partial<AppConfig>): AppConfig {
 
 /** 应用当前现场硬件的前端配置迁移。 */
 export function normalizeConfig(config: AppConfig): AppConfig {
+  const hasMissingForceSource = !config.force?.source
   const hasPreviousImx258CameraDefaults =
     config.cameras.global === 'AR0234 / index 1'
     && config.cameras.wristLeft === 'IMX258 / index 2'
@@ -982,10 +983,12 @@ export function normalizeConfig(config: AppConfig): AppConfig {
     && !hasLegacyReversedWristCameras
     && !hasLegacyCyclicCameraRoles
     && !hasStalePicoIp
+    && !hasMissingForceSource
   ) {
     return config
   }
   const next = cloneConfig(config)
+  if (!next.force.source) next.force.source = defaultConfig.force.source
   if (
     hasPreviousImx258CameraDefaults
     || hasPreviousImx335CameraDefaults

@@ -23,6 +23,7 @@ class HalHealth:
     connected: bool = True
     mode: str = "real"
     message: str | None = None
+    capabilities: list[str] | None = None
 
 
 class HalClient:
@@ -192,6 +193,11 @@ class RealHalClient(HalClient):
             connected=True,
             mode="real",
             message=payload.get("message") if isinstance(payload.get("message"), str) else None,
+            capabilities=(
+                [str(value) for value in payload["capabilities"]]
+                if isinstance(payload.get("capabilities"), list)
+                else None
+            ),
         )
 
     async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
