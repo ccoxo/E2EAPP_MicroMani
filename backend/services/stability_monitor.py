@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：运行稳定性观察任务，采集 HAL、相机和力状态并记录诊断结果。
+# 先看：StabilityMonitorService。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import asyncio
@@ -155,7 +160,7 @@ class StabilityMonitorService:
         if not self._real_hardware_mode(config):
             force_status["skippedTestMode"] = int(force_status["skippedTestMode"]) + 1
             return
-        source = str(config.get("force", {}).get("source", "nidaq")).lower()
+        source = str(config.get("force", {}).get("source", "hkvl_serial")).lower()
         force_status["source"] = source
         if source == "hkvl_serial":
             force_status["samples"] = int(force_status["samples"]) + 1

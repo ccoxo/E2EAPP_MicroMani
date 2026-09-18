@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：应用工厂、API 路由、配置、硬件状态、录制和安全行为的集成契约。
+# 先看：create_mock_record_client → test_backend_app_import_does_not_create_runtime_services → test_create_app_exposes_gripper_router → test_create_app_exposes_app_services_and_legacy_state_attrs。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import asyncio
@@ -1210,59 +1215,43 @@ def test_websocket_reports_card0_dmc5c10_enabled_feedback_as_unknown(
     assert frame["motionEnabled"]["right"] is None
 
 
-def test_startup_home_can_be_skipped_by_environment(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+@pytest.mark.parametrize("legacy_skip", [None, "false", "true"])
+def test_startup_never_moves_with_legacy_home_config(tmp_path: Path, monkeypatch: MonkeyPatch, legacy_skip) -> None:
+    from unittest.mock import AsyncMock
 
-    class FakeHal:
-        def __init__(self) -> None:
-            self.commands: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    if legacy_skip is None:
+        monkeypatch.delenv("APPSTATION_SKIP_STARTUP_HOME", raising=False)
+    else:
+        monkeypatch.setenv("APPSTATION_SKIP_STARTUP_HOME", legacy_skip)
+    config = default_config()
+    config["motion"]["homeOnStartup"] = {"enabled": True, "mode": "work_origin"}
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    app = create_app(tmp_path)
+    settings = app.state.settings
 
-        async def health(self) -> HalHealth:
-            return HalHealth(
-                ltdmc_ok=True,
-                omega7_ok=True,
-                version="fake-hal",
-                uptime_s=1.0,
-                connected=True,
-                mode="real",
-            )
+    # 读取旧文件、再次保存旧客户端配置都必须去掉废弃项。
+    assert "homeOnStartup" not in settings.get_config()["motion"]
+    assert "homeOnStartup" not in settings.save_config(deepcopy(config), emit_log=False)["motion"]
+    assert "homeOnStartup" not in json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))["motion"]
 
-        async def motion_state(self) -> dict[str, Any]:
-            return {
-                "positions": [0.0] * 12,
-                "pulses": [0.0] * 12,
-                "enabled": [True] * 12,
-                "estop_active": False,
-            }
-
-        async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
-            self.commands.append((name, payload or {}))
-            return {"command": name, "payload": payload or {}}
-
-    def write_startup_home_config(runtime_dir: Path) -> None:
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        config = default_config()
-        config["motion"]["homeOnStartup"]["enabled"] = True
-        (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
-
-    runtime_without_skip = tmp_path / "without-skip"
-    write_startup_home_config(runtime_without_skip)
-    fake_without_skip = FakeHal()
-    monkeypatch.delenv("APPSTATION_SKIP_STARTUP_HOME", raising=False)
-    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: fake_without_skip)
-    with TestClient(create_app(runtime_without_skip)):
-        pass
-    assert any(name == "motion.home_all" for name, _payload in fake_without_skip.commands)
-
-    runtime_with_skip = tmp_path / "with-skip"
-    write_startup_home_config(runtime_with_skip)
-    fake_with_skip = FakeHal()
-    monkeypatch.setenv("APPSTATION_SKIP_STARTUP_HOME", "true")
-    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: fake_with_skip)
-    with TestClient(create_app(runtime_with_skip)):
-        pass
-
-    assert not any(name == "motion.home_all" for name, _payload in fake_with_skip.commands)
+    # 绕过迁移直接交给启动入口，旧开关也不能引发运动。
+    monkeypatch.setattr(settings, "get_config", lambda: config)
+    monkeypatch.setattr("backend.app.native_teleop_enabled", lambda _config: True)
+    config["teleop"]["leftConnected"] = False
+    config["teleop"]["rightConnected"] = False
+    home = AsyncMock(side_effect=AssertionError("startup must never move"))
+    command = AsyncMock(return_value={})
+    stop = AsyncMock()
+    monkeypatch.setattr(app.state.commands, "home_all", home)
+    monkeypatch.setattr(app.state.commands.hal, "command", command)
+    monkeypatch.setattr(app.state.teleop_mapper, "stop", stop)
+    startup = next(handler for handler in app.router.on_startup if handler.__name__ == "reconcile_startup_hal_state")
+    # 只执行目标启动协程，不进入相机/串口等设备生命周期。
+    asyncio.run(startup())
+    home.assert_not_awaited()
+    command.assert_awaited_once_with("teleop.native.stop", {})
+    stop.assert_awaited_once_with("teleop-connect")
 
 
 def test_hal_deployment_status_reports_pending_next_binary(tmp_path: Path) -> None:
@@ -6067,6 +6056,7 @@ def test_acknowledge_safety_clears_latch_without_restoring_servos_or_moving_orig
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+    from backend.tests.test_control_watchdog import confirm_mock_browser_lease
 
     class FakeHal:
         def __init__(self) -> None:
@@ -6086,6 +6076,8 @@ def test_acknowledge_safety_clears_latch_without_restoring_servos_or_moving_orig
             self.commands.append((name, payload))
             if name == "motion.emergency_stop":
                 self.enabled = [False] * 12
+            if name == "control.lease":
+                return {"response": {"ok": True, "leaseFresh": True, "timeoutMs": 2500}}
             return {"command": name, "payload": payload}
 
     fake_hal = FakeHal()
@@ -6108,10 +6100,11 @@ def test_acknowledge_safety_clears_latch_without_restoring_servos_or_moving_orig
     emergency_response = client.post("/api/motion/emergency_stop")
     assert emergency_response.status_code == 200
 
+    asyncio.run(confirm_mock_browser_lease(client.app.state.control_watchdog))
     acknowledge_response = client.post("/api/motion/safety/acknowledge")
 
     assert acknowledge_response.status_code == 200
-    assert fake_hal.commands == [
+    assert [(name, payload) for name, payload in fake_hal.commands if name != "control.lease"] == [
         ("motion.emergency_stop", {}),
         ("motion.acknowledge_estop", {}),
     ]

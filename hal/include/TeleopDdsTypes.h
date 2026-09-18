@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：定义固定大小的 TeleopHardwareTarget，明确映射端与执行端的数据边界。
+ * 先看：TeleopHardwareTarget。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #pragma once
 
 #include <array>

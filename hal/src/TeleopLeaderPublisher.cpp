@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：把主手采样状态发布到 DDS LeaderState 主题。
+ * 先看：JsonEnvelopeSample → JsonEnvelopeTopicDataType → TeleopLeaderPublisher → TeleopLeaderPublisher::enabled。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "TeleopLeaderPublisher.h"
 
 #include "HalJson.h"
@@ -225,7 +231,9 @@ struct TeleopLeaderPublisher::Impl {
     sample.stamp_monotonic_ms = monotonicMs();
     sample.source = "hal-master";
     sample.payload_json = payloadJson;
-    (void)writer_->write(&sample);
+    if (writer_->write(&sample) != ReturnCode_t::RETCODE_OK) {
+      throw std::runtime_error("Fast-DDS leader state publication failed");
+    }
   }
 };
 

@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：物理网卡选择及 PICO 自动网络配置持久化。
+# 先看：test_select_pico_network_prefers_related_physical_lan_over_virtual_default_route → test_pico_network_endpoint_preserves_operator_ip_and_persists_detected_pc_fields。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from pathlib import Path

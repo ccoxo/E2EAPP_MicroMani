@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：硬件默认值、标定、轴映射、相机与运动参数的版本约定。
+# 先看：test_hal_defaults_use_backend_hal_boundary → test_motion_translation_profile_uses_um_units → test_omega7_teleop_defaults_match_icf_strategy → test_motion_kinematics_defaults_match_icf_mapping。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import pytest
@@ -147,10 +152,10 @@ def test_work_origin_defaults_match_icf_reference_position() -> None:
     assert origin["rightPulse"] == [99772.0, 382486.0, 881207.0, 19527.0, -175127.0, -9668.0]
 
 
-def test_force_defaults_match_nidaq_reference_project() -> None:
+def test_force_defaults_use_hkvl_and_preserve_nidaq_backup_settings() -> None:
     config = default_config()
 
-    assert config["force"]["source"] == "nidaq"
+    assert config["force"]["source"] == "hkvl_serial"
     assert config["force"]["leftIp"] == "Dev5/ai0:5"
     assert config["force"]["rightIp"] == "Dev3/ai0:5"
     assert config["force"]["sampleHz"] == 200

@@ -1,8 +1,22 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：HAL C++ 源码中的安全与接口约束；文本契约不等于实机验收。
+# 先看：test_hal_motion_state_json_exposes_axis_moving_flags → test_hal_removes_orphaned_axis_diagnostics_entrypoint → test_hal_command_dispatcher_does_not_store_unused_gripper_reference → test_hal_motion_control_thread_keeps_only_polling_lifecycle。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def frontend_settings_source() -> str:
+    """检查设置域的契约，不依赖硬件卡是否仍内联在页面壳层。"""
+    views = REPO_ROOT / "frontend" / "src" / "views"
+    paths = [views / "SettingsView.tsx", *sorted((views / "settings").rglob("*.ts*"))]
+    return "\n".join(
+        path.read_text(encoding="utf-8") for path in paths if ".test." not in path.name
+    )
 
 
 def test_hal_motion_state_json_exposes_axis_moving_flags() -> None:
@@ -89,10 +103,10 @@ def test_hal_home_all_requires_work_origin_payload() -> None:
     normalized = " ".join(command_source.split())
 
     assert "const auto enabledAxes = jsonHomeAllEnabledAxes(bodyText);" in normalized
-    assert "motion_.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes)" in normalized
+    assert "motion_.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes, commandEpoch)" in normalized
     assert "jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled)" in normalized
-    assert "motion_.enableSide(side, true, jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled))" in normalized
-    assert "motion_.homeSide(side, jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled))" in normalized
+    assert "motion_.enableSide(side, true, jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled), commandEpoch)" in normalized
+    assert "motion_.homeSide(side, jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled), commandEpoch)" in normalized
     assert "home_all requires leftPulse[6] work origin payload" in json_source
     assert "home_all requires rightPulse[6] work origin payload" in json_source
     assert "home_origin_side requires pulse[6] work origin payload" in json_source
@@ -100,7 +114,7 @@ def test_hal_home_all_requires_work_origin_payload() -> None:
 
 def test_hal_hardware_home_logs_per_axis_diagnostics() -> None:
     source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
-    body = source.split("void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes)", 1)[
+    body = source.split("void LTDMCDriver::homeSide(", 1)[
         1
     ].split("void LTDMCDriver::homeAll", 1)[0]
 
@@ -132,7 +146,7 @@ def test_hal_teleop_target_update_uses_absolute_target_mode() -> None:
         "void LTDMCDriver::stopTeleopSide", 1
     )[0]
 
-    assert "const auto updateTargetPulse = static_cast<long>(std::llround(leadLimitedTargetPulse));" in normalized
+    assert "const auto updateTargetPulse = checkedMotionPulse(leadLimitedTargetPulse);" in normalized
     assert "updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse)" in normalized
     assert "TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(" in source
     assert "result.appliedDeltaUi[axisIndex]" in source
@@ -241,9 +255,9 @@ def test_hal_teleop_stops_moving_axis_when_limit_holds_target_at_current_pulse()
     )[0]
 
     assert "struct AxisHoldResult" in source
-    assert "stopTeleopAxisAtCurrentBestEffort(card, axisNo)" in zero_delta_branch
+    assert "stopTeleopAxisAtCurrentBestEffort(card, axisNo, [&]() { checkMotionCommand(estopSequenceAtStart); })" in zero_delta_branch
     assert "const bool targetHeldAtBase = std::abs(appliedTargetPulse - basePulse) <= 0.5;" in body
-    assert "stopTeleopAxisAtCurrentBestEffort(card, axisNo)" in held_target_branch
+    assert "stopTeleopAxisAtCurrentBestEffort(card, axisNo, [&]() { checkMotionCommand(estopSequenceAtStart); })" in held_target_branch
     assert body.index("if (targetHeldAtBase && moving) {") < body.index("const bool shouldLaunchMove = !moving;")
 
 
@@ -680,7 +694,7 @@ def test_hal_omega7_force_output_is_wired_to_sdk() -> None:
     command_source = (REPO_ROOT / "hal" / "src" / "HalCommandDispatcher.cpp").read_text(encoding="utf-8")
     protocol_source = (REPO_ROOT / "backend" / "hal_client" / "protocol.py").read_text(encoding="utf-8")
 
-    assert "void setGravityCompensation(bool leftEnabled, bool rightEnabled, double leftScale, double rightScale)" in header_source
+    assert "void setGravityCompensation(bool leftEnabled, bool rightEnabled, double leftScale, double rightScale," in header_source
     assert "std::array<bool, 2> forceOutputEnabled_{{true, true}}" in header_source
     assert "std::array<double, 2> gravityScale_{{0.45, 1.0}}" in header_source
     assert "DhdSetStandardGravity" in driver_source
@@ -835,8 +849,8 @@ def test_runtime_launch_disables_pagehide_auto_shutdown_and_stop_stack_kills_all
     stop_stack = (REPO_ROOT / "scripts" / "stop-stack.ps1").read_text(encoding="utf-8")
 
     assert "VITE_AUTO_SHUTDOWN_ON_CLOSE" not in start_stack
-    assert "[switch]$SkipStartupHome" in start_stack
-    assert "APPSTATION_SKIP_STARTUP_HOME" in start_stack
+    assert "SkipStartupHome" not in start_stack
+    assert "APPSTATION_SKIP_STARTUP_HOME" not in start_stack
     assert "Sort-Object -Unique" in stop_stack
     assert "Select-Object -ExpandProperty OwningProcess -First 1" not in stop_stack
     assert "$currentPid = $PID" in stop_stack
@@ -881,7 +895,8 @@ def test_hal_native_teleop_controller_is_wired_to_server_and_build() -> None:
     source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
 
     assert "NativeTeleopController nativeTeleop" in server
-    assert "nativeTeleop.stop()" in server
+    assert "shutdown{motion, omega, nativeTeleop, ddsControl" in server
+    assert "attempt([&] { native.stop(); });" in server
 
     assert "src/NativeTeleopController.cpp" in cmake
     assert "src/JodellGripperDriver.cpp" in cmake
@@ -934,9 +949,9 @@ def test_hal_native_home_stops_controller_and_waits_for_motion_done() -> None:
     assert "motion_.enableHomeAxes" not in home_all_branch
     assert "const auto enabledAxes = jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled);" in home_side_branch
     assert "motion_.enableHomeAxes" not in home_side_branch
-    assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_all pre-move\", 3000)" in motion
-    assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_all\", 60000)" in motion
-    assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_origin_side\", 60000)" in motion
+    assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_all pre-move\", 3000, [&]() { checkMotionCommand(estopSequenceAtStart); })" in motion
+    assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_all\", 60000, [&]() { checkMotionCommand(estopSequenceAtStart); })" in motion
+    assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_origin_side\", 60000, [&]() { checkMotionCommand(estopSequenceAtStart); })" in motion
     assert "teleopTargetActive_[index] = false;" in motion
 
 
@@ -953,8 +968,8 @@ def test_hal_native_home_origin_moves_to_absolute_work_origin_like_icf() -> None
 
     for body in (home_all_body, home_side_body):
         assert "const auto currentPulse = dmcGetPosition(card, axisNo);" in body
-        assert "const auto deltaPulse = targetPulse - currentPulse;" in body
-        assert "startWorkOriginMoveOrThrow(card, axisNo, targetPulse, deltaPulse, currentPulse)" in body
+        assert "const auto deltaPulse = checkedMotionPulse(static_cast<double>(targetPulse) - currentPulse);" in body
+        assert "startWorkOriginMoveOrThrow(card, axisNo, targetPulse, deltaPulse, currentPulse, [&]() { checkMotionCommand(estopSequenceAtStart); })" in body
 
     assert "constexpr long kWorkOriginSettledPulseTolerance = 100;" in motion
     assert "std::abs(deltaPulse) <= kWorkOriginSettledPulseTolerance" in motion
@@ -990,10 +1005,16 @@ def test_hal_emergency_stop_preempts_long_motion_waits() -> None:
     assert "dmcStop(card, static_cast<unsigned short>(axisNo), 1);" in emergency_body
     assert "dmcWriteSevonPin(card, static_cast<unsigned short>(axisNo), 0);" in emergency_body
     assert "std::unique_lock<std::mutex> stateLock(mutex_, std::try_to_lock);" in emergency_body
-    assert "std::atomic_bool estopActive_{false};" in header
-    assert "std::atomic_uint64_t estopSequence_{0};" in header
+    assert "EmergencyStopState estop_;" in header
+    assert "estop_.trip();" in emergency_body
+    lease = (REPO_ROOT / "hal" / "include" / "ControlLeaseState.h").read_text(encoding="utf-8")
+    assert "controlLease_.acknowledge(estop_, expectedEpoch);" in motion
+    assert "stop.acknowledge(epoch)" in lease
+    assert "control lease expired during acknowledgement" in lease
     assert "void disableAllAxesBestEffort() noexcept;" in header
-    assert "void clearEstopIfUnchanged(std::uint64_t sequenceAtStart);" in header
+    assert "void checkMotionCommand(std::uint64_t epoch);" in header
+    assert "clearEstopIfUnchanged" not in motion
+    assert "checkCurrent();" in motion
 
 
 def test_hal_emergency_stop_uses_nonblocking_dispatch_path() -> None:
@@ -1026,8 +1047,15 @@ def test_hal_emergency_stop_uses_nonblocking_dispatch_path() -> None:
     assert "return handleEmergencyStop();" in emergency_branch
     assert "worker_.join()" not in controller_emergency_body
     assert "stopTeleopSide" not in controller_emergency_body
-    assert "running_.store(false" in controller_emergency_body
-    assert "gripperCv_.notify_all();" in controller_emergency_body
+    assert "latchControlStop();" in controller_emergency_body
+    atomic_stop = controller.split("void NativeTeleopController::latchControlStop() noexcept", 1)[1].split(
+        "void NativeTeleopController::requestEmergencyStop", 1
+    )[0]
+    assert "running_.store(false" in atomic_stop
+    assert "gripperWorkerRunning_.store(false" in atomic_stop
+    assert "gripperCv_.notify_all();" in atomic_stop
+    for stop in ("motion_.latchEmergencyStop();", "nativeTeleop_.latchControlStop();", "omega_.latchForceStop();"):
+        assert emergency_body.index(stop) < emergency_body.index("motion_.emergencyStop();")
 
 
 def test_hal_dds_emergency_stop_has_dedicated_reader_thread() -> None:
@@ -1041,7 +1069,9 @@ def test_hal_dds_emergency_stop_has_dedicated_reader_thread() -> None:
     assert "Topic* emergencyStopTopic" in source
     assert "DataReader* emergencyStopReader_" in source
     assert "std::thread emergencyWorker" in source
-    assert "emergencyWorker = std::thread([this]() { emergencyLoop(); });" in source
+    emergency_worker = source.split("emergencyWorker = std::thread([this]()", 1)[1].split("catch (...)" , 1)[0]
+    assert "runWorkerBoundary([this]() { emergencyLoop(); }" in emergency_worker
+    assert "reportWorkerFailure(error)" in emergency_worker
     assert "void emergencyLoop()" in source
     assert "pollEmergencyStops()" in source
     assert "handleEmergencyStopCommand(samples[i]);" in source
@@ -1064,23 +1094,19 @@ def test_hal_motion_entries_reject_after_estop_latch() -> None:
         1,
     )[0]
     home_all_body = motion.split(
-        "void LTDMCDriver::homeAll(\n"
-        "    const std::array<double, 12>& workOriginPulse,\n"
-        "    const std::array<std::array<bool, 6>, 2>& enabledAxes) {",
+        "void LTDMCDriver::homeAll(",
         1,
     )[1].split("void LTDMCDriver::homeOriginSide", 1)[0]
     home_side_body = motion.split(
-        "void LTDMCDriver::homeOriginSide(\n"
-        "    Side side,\n"
-        "    const std::array<double, 6>& workOriginPulse,\n"
-        "    const std::array<bool, 6>& enabledAxes) {",
+        "void LTDMCDriver::homeOriginSide(",
         1,
     )[1].split("void LTDMCDriver::moveRelativeUi", 1)[0]
 
     for body in (move_relative_body, teleop_body, home_all_body, home_side_body):
         assert "throwIfEstopActive();" in body
     assert "void LTDMCDriver::throwIfEstopActive() const {" in motion
-    assert "if (motion_.estopActive())" in executor
+    assert "if (motion_.estopActive()" in executor
+    assert "target.stampUnixMs <= motion_.lastEmergencyStopUnixMs()" in executor
     assert "return;" in executor.split("void TeleopHardwareTargetExecutor::apply", 1)[1].split(
         "std::array<AxisLimit, 6> limits",
         1,
@@ -1127,16 +1153,11 @@ def test_hal_direct_work_origin_home_rejects_estop_before_enable_or_motion() -> 
         1,
     )[0]
     home_all_body = motion.split(
-        "void LTDMCDriver::homeAll(\n"
-        "    const std::array<double, 12>& workOriginPulse,\n"
-        "    const std::array<std::array<bool, 6>, 2>& enabledAxes) {",
+        "void LTDMCDriver::homeAll(",
         1,
     )[1].split("void LTDMCDriver::homeOriginSide", 1)[0]
     home_side_body = motion.split(
-        "void LTDMCDriver::homeOriginSide(\n"
-        "    Side side,\n"
-        "    const std::array<double, 6>& workOriginPulse,\n"
-        "    const std::array<bool, 6>& enabledAxes) {",
+        "void LTDMCDriver::homeOriginSide(",
         1,
     )[1].split("void LTDMCDriver::moveRelativeUi", 1)[0]
 
@@ -1170,23 +1191,25 @@ def test_hal_native_gripper_manual_endpoint_uses_native_controller_queue() -> No
     assert "void configureGripper(const JodellGripperConfig& config);" in controller_header
     assert (
         "bool commandGripperTarget(Side side, double targetMm, int speed, int torque, "
-        "std::string* message = nullptr);"
+        "std::string* message = nullptr,"
     ) in controller_header
     assert "nativeTeleop_.configureGripper(config.gripper)" in branch
     assert "nativeTeleop_.configure(config)" not in branch
-    assert "nativeTeleop_.commandGripperTarget(side, targetMm, speed, torque, &message)" in branch
+    assert "nativeTeleop_.commandGripperTarget(side, targetMm, speed, torque, &message, commandEpoch)" in branch
     assert "gripper_.commandTarget(side, targetMm, speed, torque, &message)" not in branch
     assert "jsonNativeTeleopConfig(bodyText)" in branch
 
 
-def test_frontend_hal_native_gripper_commands_are_not_blocked_by_cached_enabled_state() -> None:
+def test_frontend_gripper_commands_keep_the_shared_backend_command_route() -> None:
     store = (REPO_ROOT / "frontend" / "src" / "stores" / "telemetry.ts").read_text(encoding="utf-8")
-    settings = (REPO_ROOT / "frontend" / "src" / "views" / "SettingsView.tsx").read_text(encoding="utf-8")
+    api = (REPO_ROOT / "frontend" / "src" / "api" / "index.ts").read_text(encoding="utf-8")
+    settings = frontend_settings_source()
 
     assert "config.teleop.engine" not in store
     assert "config.teleop.engine" not in settings
-    assert "const canCommandGripper = true" in settings
-    assert "disabled={!canCommandGripper}" in settings
+    assert "gripperCommandApi(side, command, targetMm" in store
+    assert "`/gripper/${side}/command`" in api
+    # 请求启停标志为 false 时仍可从两种 UI 入口下发目标，由 App.test.tsx 验证。
 
 
 def test_manual_axis_direction_corrections_are_backend_authoritative() -> None:
@@ -1557,7 +1580,7 @@ def test_hal_native_dds_target_publish_records_action_history() -> None:
     assert tick_body.index("hardwareTargetPublisher_(target);") < tick_body.index(
         "recordPublishedTargetActionUnlocked(sourceSide, target, sourceIndex);"
     )
-    assert tick_body.index("recordPublishedTargetActionUnlocked(sourceSide, target, sourceIndex);") < tick_body.index(
+    assert tick_body.index("recordPublishedTargetActionUnlocked(sourceSide, target, sourceIndex);") < tick_body.rindex(
         "return;"
     )
     assert "action.ts = static_cast<std::int64_t>(target.stampUnixMs);" in record_body
@@ -1673,7 +1696,7 @@ def test_hal_native_throttles_repeated_zero_delta_actions() -> None:
     assert "return;" in body
 
 
-def test_hal_native_tick_isolates_one_hand_errors_from_other_hand_and_grippers() -> None:
+def test_hal_native_tick_contains_unexpected_errors_and_latches_control() -> None:
     header = (REPO_ROOT / "hal" / "include" / "NativeTeleopController.h").read_text(encoding="utf-8")
     source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
     tick_body = source.split("void NativeTeleopController::tick(double dtSec)", 1)[1].split(
@@ -1696,8 +1719,15 @@ def test_hal_native_tick_isolates_one_hand_errors_from_other_hand_and_grippers()
     assert "try {" in helper_body
     assert "tickSide(sourceIndex, hand, dtSec);" in helper_body
     assert "catch (const std::exception& exc)" in helper_body
-    assert "lastError_ = exc.what();" in helper_body
-    assert 'setBlockerUnlocked(sourceIndex, "blocked", exc.what());' in helper_body
+    assert "reportControlFailure(exc.what());" in helper_body
+    assert "catch (...)" in helper_body
+    failure_body = source.split("void NativeTeleopController::reportControlFailure", 1)[1].split(
+        "void NativeTeleopController::startGripperWorker", 1
+    )[0]
+    assert "motion_.emergencyStop();" in failure_body
+    assert "latchControlStop();" in failure_body
+    assert failure_body.index("latchControlStop();") < failure_body.index("motion_.emergencyStop();")
+    assert "lastError_ = message;" in failure_body
 
 
 def test_hal_native_zero_increment_hard_stops_active_target() -> None:
@@ -1753,7 +1783,7 @@ def test_ltdmc_native_teleop_accumulates_active_target_with_bounded_lead() -> No
         "const auto leadLimitedTargetPulse = clampTeleopTargetLead(actualPulse, targetPulse, targetLeadPulse);"
         in body
     )
-    assert "const auto launchDeltaPulse = static_cast<long>(std::llround(appliedTargetPulse - actualPulse));" in body
+    assert "const auto launchDeltaPulse = checkedMotionPulse(appliedTargetPulse - actualPulse);" in body
     assert body.index("const bool reversingTargetLead") < body.index("const auto unclippedTargetPulse")
 
 
@@ -1807,13 +1837,18 @@ def test_omega7_gripper_gap_uses_direct_encoder_and_angle_fallbacks() -> None:
 
 
 def test_settings_gripper_teleop_uses_hal_native_status_only() -> None:
-    source = (REPO_ROOT / "frontend" / "src" / "views" / "SettingsView.tsx").read_text(encoding="utf-8")
+    source = frontend_settings_source()
+    display_hook = (REPO_ROOT / "frontend" / "src" / "hooks" / "useGripperDisplay.ts").read_text(encoding="utf-8")
+    display = (REPO_ROOT / "frontend" / "src" / "gripperDisplay.ts").read_text(encoding="utf-8")
 
     assert "const handleTeleopToggle" not in source
     assert "startGripperTeleop" not in source
     assert "stopGripperTeleop" not in source
     assert "fetchGripperTeleopStatus" not in source
-    assert "主手连接后 HAL-native 会自动接管夹爪" in source
+    assert "useGripperDisplay" in source
+    assert "gripperFeedbackHealth(state.frame, state.telemetryLink, side)" in display_hook
+    assert "frame.gripperStatus" in display
+    assert "issueManualGripperMove" in source
 
 
 def test_hal_native_incremental_honors_continuous_increment_settings() -> None:
@@ -1979,12 +2014,13 @@ def test_hal_native_gripper_surfaces_command_status_and_retries_port_open() -> N
     assert "std::array<double, 2> gripperPositionsMm_" in controller_header
     assert '\\"grippers\\":{\\"left\\"' in controller_source
     assert (
-        "enqueueGripperCommand(targetIndex, targetSide, targetMm, config_.gripper.speed, config_.gripper.torque)"
+        "enqueueGripperCommand(targetIndex, targetSide, targetMm, config_.gripper.speed, config_.gripper.torque, motionEpoch)"
         in normalized_controller
     )
     assert "void NativeTeleopController::gripperLoop()" in controller_source
     assert "const bool ok = gripper_.commandTarget" in normalized_controller
-    assert "command.torque, &message, false);" in normalized_controller
+    assert "command.torque, &message, false," in normalized_controller
+    assert "motion_.commandEpochAllowed(command.motionEpoch)" in normalized_controller
     assert "gripperLastCommandOk_[command.targetIndex] = ok;" in normalized_controller
     assert "gripperLastMessage_[command.targetIndex] = message;" in normalized_controller
     assert "gripperPositionsMm_ = gripperPositions;" in normalized_controller
@@ -2034,7 +2070,7 @@ def test_hal_native_gripper_worker_samples_positions_without_commands() -> None:
 def test_hal_native_gripper_worker_starts_only_when_gripper_teleop_is_enabled() -> None:
     controller_source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
     start_body = controller_source.split(
-        "void NativeTeleopController::start(bool leftConnected, bool rightConnected)",
+        "void NativeTeleopController::start(",
         1,
     )[1].split("void NativeTeleopController::stop()", 1)[0]
     normalized = " ".join(start_body.split())
@@ -2250,3 +2286,202 @@ def test_hal_native_acceptance_script_no_longer_uses_direct_hal_http_control() -
     assert "/teleop/native/status" not in source
     assert "/motion/" not in source
     assert "/gripper/" not in source
+
+
+def test_hal_dds_discards_motion_requests_authored_before_the_latest_stop() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "HalDdsControlServer.cpp").read_text(encoding="utf-8")
+    body = source.split("void handleCommand(const HalCommandRequestSample& request)", 1)[1].split("void handleEmergencyStopCommand", 1)[0]
+    assert "request.stamp_unix_ms <= motion_.lastEmergencyStopUnixMs()" in body
+    assert body.index("const auto commandEpoch = motion_.commandEpoch();") < body.index("request.stamp_unix_ms")
+    assert body.index("request.stamp_unix_ms") < body.index("commandDispatcher_.handle(")
+    assert "request.payload_json, commandEpoch)" in body
+    for safe_command in ("motion.emergency_stop", "motion.disable_side", "teleop.native.stop", "omega7.zero_force_feedback"):
+        assert f'request.name == "{safe_command}"' in body
+
+
+def test_hal_motion_and_native_entries_preserve_the_incoming_stop_epoch() -> None:
+    motion = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
+    controller = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
+    dispatcher = (REPO_ROOT / "hal" / "src" / "HalCommandDispatcher.cpp").read_text(encoding="utf-8")
+    assert motion.count("expectedEpoch.value_or(commandEpoch())") == 6
+    assert controller.count("expectedEpoch.value_or(motion_.commandEpoch())") == 3
+    assert "motion_.acknowledgeEmergencyStop(expectedEpoch);" in dispatcher
+    assert "stopsInProgress_.load(std::memory_order_acquire) != 0" in motion
+    assert "clearEstopIfUnchanged" not in motion
+
+
+def test_hal_native_configuration_and_omega_force_share_the_emergency_gate() -> None:
+    controller = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
+    omega = (REPO_ROOT / "hal" / "src" / "Omega7Driver.cpp").read_text(encoding="utf-8")
+    dispatcher = (REPO_ROOT / "hal" / "src" / "HalCommandDispatcher.cpp").read_text(encoding="utf-8")
+    config_body = controller.split("void NativeTeleopController::configure(", 1)[1].split("void NativeTeleopController::configureGripper(", 1)[0]
+    assert "motion_.commandEpochAllowed(motionEpoch)" in config_body
+    assert "std::scoped_lock lifecycleLock(lifecycleMutex_);" in config_body
+    force_body = omega.split("void Omega7Driver::setGravityCompensation(", 1)[1].split("void Omega7Driver::requestEmergencyStop()", 1)[0]
+    assert "(leftEnabled || rightEnabled) && commandAllowed && !commandAllowed()" in force_body
+    assert force_body.count("applyForceOutputUnlocked(0, leftEnabled);") == 1
+    assert "omega_.requestEmergencyStop();" in dispatcher
+
+
+def test_hal_tare_rejects_stopped_requests_and_commits_after_force_safety() -> None:
+    dispatcher = (REPO_ROOT / "hal" / "src" / "HalCommandDispatcher.cpp").read_text(encoding="utf-8")
+    runtime = (REPO_ROOT / "hal" / "src" / "ForceControlRuntime.cpp").read_text(encoding="utf-8")
+    driver = (REPO_ROOT / "hal" / "src" / "HkvlForceDriver.cpp").read_text(encoding="utf-8")
+    branch = dispatcher.split('if (name == "force.tare")', 1)[1].split('if (name == "teleop.native.configure")', 1)[0]
+    assert branch.index("ensureCurrentMotionCommand();") < branch.index("forceRuntime_.tare(")
+    assert "motion->commandEpochAllowed(commandEpoch)" in branch
+    runtime_tare = runtime.split("void ForceControlRuntime::tare(", 1)[1].split("ForceComplianceResult ForceControlRuntime::complianceCorrection", 1)[0]
+    assert runtime_tare.index("safety_.latched()") < runtime_tare.index("driver_.tare(")
+    assert "tareEpoch_ != epoch || safety_.latched()" in runtime_tare
+    assert runtime_tare.index("tareEpoch_ != epoch") < runtime_tare.index("commit();")
+    frame = driver.split("void processFrame(", 1)[1].split("#ifdef _WIN32", 1)[0]
+    assert frame.index("callback(sample);") < frame.index("state.tareBias[axis] =")
+    assert "state.tareCancelled = !state.tareCommit(commit);" in frame
+    assert "HKVL tare cancelled by emergency stop" in driver
+    assert "now + std::chrono::milliseconds(10)" in driver
+
+
+def test_hal_native_workers_and_dds_mapping_share_a_noexcept_failure_exit() -> None:
+    native = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
+    mapping = (REPO_ROOT / "hal" / "src" / "TeleopMappingNode.cpp").read_text(encoding="utf-8")
+    leader = (REPO_ROOT / "hal" / "src" / "TeleopLeaderPublisher.cpp").read_text(encoding="utf-8")
+    assert "void NativeTeleopController::reportControlFailure(const char* message) noexcept" in native
+    assert "try { loop(); }" in native
+    assert "try { gripperLoop(); }" in native
+    assert "unknown C++ exception in native control worker" in native
+    assert "unknown C++ exception in native gripper worker" in native
+    listener = mapping.split("void TeleopMappingNode::Impl::LeaderListener::on_data_available", 1)[1].split(
+        "TeleopMappingNode::TeleopMappingNode", 1
+    )[0]
+    assert "catch (const std::exception& error)" in listener
+    assert "catch (...)" in listener
+    assert "reportControlFailure" in listener
+    assert "targetWriter_->write(&sample) != ReturnCode_t::RETCODE_OK" in mapping
+    assert "writer_->write(&sample) != ReturnCode_t::RETCODE_OK" in leader
+
+
+def test_hal_force_emergency_callback_failure_blocks_acknowledgement_and_is_visible() -> None:
+    runtime = (REPO_ROOT / "hal" / "src" / "ForceControlRuntime.cpp").read_text(encoding="utf-8")
+    callback = runtime.split("void ForceControlRuntime::invokeEmergencyStopIfNeeded", 1)[1].split(
+        "void ForceControlRuntime::recordEmergencyCallbackFailure", 1
+    )[0]
+    assert "noexcept" in callback
+    assert "catch (const std::exception& error)" in callback
+    assert "catch (...)" in callback
+    assert "recordEmergencyCallbackFailure" in callback
+    acknowledgement = runtime.split("void ForceControlRuntime::acknowledgeEmergencyStop", 1)[1].split(
+        "bool ForceControlRuntime::safetyLatched", 1
+    )[0]
+    assert acknowledgement.index("emergencyCallbackFailed_.load()") < acknowledgement.index("callback();")
+    assert "emergencyCallbackError" in runtime
+    assert "canAcknowledge = false;" in runtime
+
+
+def test_hal_http_diagnostics_bounds_workers_and_releases_failed_connections() -> None:
+    server = (REPO_ROOT / "hal" / "src" / "HalHttpServer.cpp").read_text(encoding="utf-8")
+    workers = (REPO_ROOT / "hal" / "include" / "HttpConnectionWorkers.h").read_text(encoding="utf-8")
+    assert "HttpConnectionWorkers<32> connections;" in server
+    assert ".detach()" not in server
+    assert "SO_RCVTIMEO" in server and "SO_SNDTIMEO" in server
+    assert "HTTP socket timeout configuration failed" in server
+    assert "~CloseClient() { closesocket(socket); }" in server
+    assert "if (!accepted) closesocket(client);" in server
+    accept_body = server.split("connections.tryStart", 1)[1]
+    assert "catch (...)" in accept_body and "closesocket(client);" in accept_body
+    assert "std::jthread worker;" in workers
+    assert "slot.busy.store(false);" in workers
+
+
+def test_hal_force_callback_attempts_all_stop_actions_before_reporting_failure() -> None:
+    server = (REPO_ROOT / "hal" / "src" / "HalServer.cpp").read_text(encoding="utf-8")
+    callback = server.split("ForceControlRuntime forceRuntime(", 1)[1].split("ForceRuntimeConfig forceConfig;", 1)[0]
+    for stop in ("motion.emergencyStop();", "nativeTeleop.requestEmergencyStop();", "omega.requestEmergencyStop();"):
+        assert f"attemptStop([&]() {{ {stop} }});" in callback
+    assert "std::current_exception()" in callback
+    assert "if (failure) std::rethrow_exception(failure);" in callback
+
+
+def test_hal_polling_and_serial_workers_have_fault_and_join_boundaries() -> None:
+    motion = (REPO_ROOT / "hal" / "src" / "MotionControlThread.cpp").read_text(encoding="utf-8")
+    serial = (REPO_ROOT / "hal" / "src" / "HkvlForceDriver.cpp").read_text(encoding="utf-8")
+    boundary = (REPO_ROOT / "hal" / "include" / "WorkerExceptionBoundary.h").read_text(encoding="utf-8")
+    assert "catch (const std::exception& error)" in boundary and "catch (...)" in boundary
+    assert "runWorkerBoundary" in motion and "reportFailure(error)" in motion
+    assert "driver_.latchEmergencyStop();" in motion
+    stop = motion.split("void MotionControlThread::stop()", 1)[1].split("bool MotionControlThread::running()", 1)[0]
+    assert "running_.store(false);" in stop and "worker_.join();" in stop
+    assert "return;" not in stop
+    assert "runWorkerBoundary" in serial and "impl_->reportFailure(side, error)" in serial
+    assert "~ClosePort() { CloseHandle(handle); }" in serial
+    failure = serial.split("void reportFailure(int side, const char* message) noexcept", 1)[1].split("void resetSide", 1)[0]
+    assert "requestStop();" in failure and "failureCallback(side, message)" in failure
+    assert "state.tareCancelled = true;" in failure
+    assert "HKVL reader stopped during tare" in serial
+
+
+def test_hal_force_monitor_fault_stops_serial_and_blocks_recovery() -> None:
+    runtime = (REPO_ROOT / "hal" / "src" / "ForceControlRuntime.cpp").read_text(encoding="utf-8")
+    assert "runWorkerBoundary([this]() { monitorLoop(); }" in runtime
+    fault = runtime.split("void ForceControlRuntime::reportWorkerFailure", 1)[1].split("void ForceControlRuntime::recordEmergencyCallbackFailure", 1)[0]
+    assert "workerFailed_.exchange(true)" in fault
+    assert "driver_.requestStop();" in fault
+    assert fault.index("emergencyStop_();") < fault.index("std::scoped_lock lock(mutex_)")
+    assert "force worker failure requires reconfiguration before restart" in runtime
+    assert "force worker failed; reconfigure before acknowledgement" in runtime
+    assert '\\"workerError\\"' in runtime
+
+
+def test_hal_dds_worker_failures_stop_control_and_do_not_continue_batches() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "HalDdsControlServer.cpp").read_text(encoding="utf-8")
+    assert "runWorkerBoundary([this]() { loop(); }" in source
+    assert "runWorkerBoundary([this]() { emergencyLoop(); }" in source
+    assert "joinWorkers();" in source
+    failure = source.split("void reportWorkerFailure(const char* message) noexcept", 1)[1].split("void loop()", 1)[0]
+    assert "running.store(false);" in failure
+    assert "nativeTeleop_.reportControlFailure(message);" in failure
+    assert "forceRuntime_.recordExternalEmergencyStop" in failure
+    assert source.count("if (!running.load()) break;") == 2
+    assert "replyWriter_->write(&reply) != ReturnCode_t::RETCODE_OK" in source
+
+
+def test_hal_dds_lease_uses_the_emergency_lane_and_regular_commands_expire() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "HalDdsControlServer.cpp").read_text(encoding="utf-8")
+    ordinary = source.split("void handleCommand(const HalCommandRequestSample& request)", 1)[1].split("void handleEmergencyStopCommand", 1)[0]
+    assert ordinary.index("ensureCommandNotExpired(") < ordinary.index("commandDispatcher_.handle(")
+    emergency = source.split("void handleEmergencyStopCommand", 1)[1].split("void writeReply", 1)[0]
+    assert 'request.name == "motion.emergency_stop"' in emergency
+    assert 'request.name == "control.lease"' in emergency
+    assert "commandDispatcher_.handle(request.name, request.payload_json)" in emergency
+    assert "command is not allowed on the emergency DDS topic" in emergency
+    assert "commandEpoch" not in emergency
+
+
+def test_hal_follower_contains_entire_callback_and_quiesces_on_stop() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "TeleopFollowerTargetSubscriber.cpp").read_text(encoding="utf-8")
+    callback = source.split("void TeleopFollowerTargetSubscriber::Impl::TargetListener::on_data_available", 1)[1].split("TeleopFollowerTargetSubscriber::TeleopFollowerTargetSubscriber", 1)[0]
+    assert "runWorkerBoundary" in callback
+    assert "owner_.listening.store(false);" in callback
+    assert "owner_.executor_.reportControlFailure(error);" in callback
+    stop = source.split("void stop()", 1)[1].split("void handleTargetData", 1)[0]
+    assert stop.index("listening = false;") < stop.index("set_listener(nullptr)") < stop.index("callbackLock(callbackMutex)")
+    executor = (REPO_ROOT / "hal" / "src" / "TeleopHardwareTargetExecutor.cpp").read_text(encoding="utf-8")
+    fault = executor.split("void TeleopHardwareTargetExecutor::reportControlFailure", 1)[1].split("void TeleopHardwareTargetExecutor::apply", 1)[0]
+    assert "motion_.latchEmergencyStop();" in fault
+    assert "motion_.emergencyStop();" in fault
+    assert "forceRuntime_.recordExternalEmergencyStop" in fault
+
+
+def test_hal_server_accepts_commands_after_assembly_and_unwinds_in_dependency_order() -> None:
+    server = (REPO_ROOT / "hal" / "src" / "HalServer.cpp").read_text(encoding="utf-8")
+    assert server.index("followerSubscriber.start();") < server.index("ddsControl.start();")
+    assert server.index("struct RuntimeShutdown") < server.index("ddsControl.start();")
+    shutdown = server.split("~RuntimeShutdown()", 1)[1].split("} shutdown", 1)[0]
+    assert shutdown.index("motion.failControlLease();") < shutdown.index("guardian.stop();")
+    assert shutdown.index("dds.stop();") < shutdown.index("native.stop();")
+    assert shutdown.index("native.stop();") < shutdown.index("mapping.stop();")
+    assert "native.setLeaderStatePublisher({});" in shutdown
+    assert "native.setHardwareTargetPublisher({});" in shutdown
+    assert "catch (...)" in shutdown
+    main = server.split("int main()", 1)[1]
+    assert "try { return runHalServer(); }" in main
+    assert "catch (const std::exception& error)" in main and "catch (...)" in main

@@ -1,6 +1,13 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：订阅主手状态，调用原生映射算法，再发布 HardwareTarget。
+ * 先看：JsonEnvelopeSample → TeleopHardwareTargetSample → TeleopTopicDataType → TeleopMappingNode。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "TeleopMappingNode.h"
 
 #include "HalJson.h"
+#include "WorkerExceptionBoundary.h"
 
 #include <fastcdr/Cdr.h>
 #include <fastcdr/FastBuffer.h>
@@ -24,6 +31,8 @@
 #include <fastrtps/types/TypesBase.h>
 
 #include <array>
+#include <atomic>
+#include <mutex>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -281,7 +290,9 @@ struct TeleopMappingNode::Impl {
   NativeTeleopController& nativeTeleop_;
   LeaderListener listener;
   bool enabled{false};
-  bool listening{false};
+  std::atomic_bool listening{false};
+  std::mutex lifecycleMutex;
+  std::mutex callbackMutex;
   DomainParticipant* participant{nullptr};
   Subscriber* subscriber{nullptr};
   Publisher* publisher{nullptr};
@@ -348,29 +359,38 @@ struct TeleopMappingNode::Impl {
   }
 
   void start() {
+    std::scoped_lock lifecycleLock(lifecycleMutex);
     if (!enabled || listening) return;
     listening = true;
     // listener 只负责唤醒读取，实际映射仍交给 NativeTeleopController。
-    (void)leaderReader->set_listener(&listener);
+    try { check(leaderReader->set_listener(&listener), "attach mapping listener"); }
+    catch (...) {
+      listening = false;
+      nativeTeleop_.reportControlFailure("DDS mapping listener could not be attached");
+      throw;
+    }
   }
 
   void stop() {
-    if (!listening) return;
+    std::scoped_lock lifecycleLock(lifecycleMutex);
     listening = false;
-    if (leaderReader) (void)leaderReader->set_listener(nullptr);
+    runWorkerBoundary([&]() {
+      if (leaderReader) check(leaderReader->set_listener(nullptr), "detach mapping listener");
+    }, [&](const char* error) { nativeTeleop_.reportControlFailure(error); });
+    std::scoped_lock callbackLock(callbackMutex);
   }
 
   void handleLeaderData(DataReader* reader) {
-    for (;;) {
+    while (listening.load()) {
       eprosima::fastdds::dds::LoanableSequence<JsonEnvelopeSample> samples(16);
       SampleInfoSeq infos(16);
       const auto result = reader->take(samples, infos, 16);
       if (result == ReturnCode_t::RETCODE_NO_DATA) return;
       if (result != ReturnCode_t::RETCODE_OK) {
-        std::cerr << "Fast-DDS teleop leader take failed\n";
-        return;
+        throw std::runtime_error("Fast-DDS teleop leader take failed");
       }
       for (int32_t i = 0; i < samples.length(); ++i) {
+        if (!listening.load()) return;
         if (!infos[i].valid_data) continue;
         const auto& sample = samples[i];
         // 用 Leader 的单调时间戳估算 dt，时间戳缺失或回退时给控制器一个保守默认值。
@@ -387,12 +407,19 @@ struct TeleopMappingNode::Impl {
     if (!enabled || !targetWriter_) return;
     // NativeTeleopController 生成的进程内目标在这里转换为 DDS 线格式。
     auto sample = toSample(target);
-    (void)targetWriter_->write(&sample);
+    if (targetWriter_->write(&sample) != ReturnCode_t::RETCODE_OK) {
+      throw std::runtime_error("Fast-DDS hardware target publication failed");
+    }
   }
 };
 
 void TeleopMappingNode::Impl::LeaderListener::on_data_available(DataReader* reader) {
-  owner_.handleLeaderData(reader);
+  runWorkerBoundary([&]() {
+    std::scoped_lock callbackLock(owner_.callbackMutex);
+    try { if (owner_.listening.load()) owner_.handleLeaderData(reader); }
+    catch (const std::exception& error) { owner_.nativeTeleop_.reportControlFailure(error.what()); }
+    catch (...) { owner_.nativeTeleop_.reportControlFailure("unknown C++ exception in DDS leader callback"); }
+  }, [&](const char* error) { owner_.nativeTeleop_.reportControlFailure(error); });
 }
 
 TeleopMappingNode::TeleopMappingNode(NativeTeleopController& nativeTeleop)

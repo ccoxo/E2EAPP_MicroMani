@@ -1,4 +1,10 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：集中完成 HAL 状态序列化和配置/命令 JSON 字段解析。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "HalJson.h"
+#include "HalVersion.h"
 
 #include <algorithm>
 #include <cctype>
@@ -57,7 +63,12 @@ std::string jsonHealth(const appstation::hal::HalHealth& motionHealth, bool omeg
       << ",\"omega7_ok\":" << (omegaOk ? "true" : "false")
       << ",\"version\":\"" << motionHealth.version << "\""
       << ",\"uptime_s\":" << motionHealth.uptimeS
-      << ",\"message\":\"" << jsonEscape(message) << "\"}";
+      << ",\"capabilities\":[";
+  for (size_t index = 0; index < kHalCapabilities.size(); ++index) {
+    if (index > 0) out << ",";
+    out << "\"" << jsonEscape(kHalCapabilities[index]) << "\"";
+  }
+  out << "],\"message\":\"" << jsonEscape(message) << "\"}";
   return out.str();
 }
 

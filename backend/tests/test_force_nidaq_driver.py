@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：NI-DAQ 标定矩阵、去皮、窗口采样和缓存回退。
+# 先看：test_force_driver_applies_reference_calibration_fallback → test_force_driver_tare_bias_is_subtracted_before_calibration → test_force_driver_loads_ati_xml_calibration_file → test_force_driver_latest_window_repeats_last_scalar_without_blocking。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from pathlib import Path

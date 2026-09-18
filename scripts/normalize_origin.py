@@ -1,3 +1,8 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：根据目标工作原点重算数据集运动 state/action；默认预演，显式 apply 才改写文件。
+# 先看：parse_args → normalize_frame_to_origin → normalize_dataset → main。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import argparse
@@ -12,7 +17,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from backend.core.defaults import default_config  # noqa: E402
-from backend.core.units import pulses_to_ui_state  # noqa: E402
+from backend.core.data_contract import (  # noqa: E402
+    hardware_to_dataset_motion,
+    validate_data_contract,
+)
+from backend.core.units import dataset_pulses_to_ui_state  # noqa: E402
 
 MOTION_STATE_INDICES = (0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12)
 
@@ -50,7 +59,7 @@ def normalize_frame_to_origin(
 
     conversion_config = config or default_config()
     relative_pulses = [float(pulses[index]) - origin_pulses[index] for index in range(12)]
-    motion_ui = pulses_to_ui_state(relative_pulses, conversion_config)
+    motion_ui = dataset_pulses_to_ui_state(relative_pulses, conversion_config)
     motion_state = _motion_ui_to_lerobot_state(motion_ui)
 
     next_state = list(state)
@@ -63,8 +72,14 @@ def normalize_frame_to_origin(
 
     return {
         "needs_manual_review": False,
+        "observation.pulses": pulses,
         "observation.state": next_state,
         "action": next_action,
+        **{
+            key: deepcopy(frame[key])
+            for key in ("observation.force_left", "observation.force_right")
+            if key in frame
+        },
         "changed": _different(state, next_state) or _different(action, next_action),
     }
 
@@ -76,6 +91,7 @@ def normalize_dataset(dataset_dir: Path, *, apply: bool = False, target_origin: 
 
     episodes = _read_episodes(dataset_dir)
     app_info = _read_json(dataset_dir / "meta" / "appstation_info.json")
+    _validate_dataset_metadata(app_info, _read_json(dataset_dir / "meta" / "info.json"))
     target = _target_origin(target_origin, episodes, app_info)
     config = _conversion_config(app_info)
     target_hash = _target_calibration_hash(target_origin, episodes, app_info)
@@ -222,7 +238,8 @@ def _origin_pulses(origin: dict[str, Any]) -> list[float] | None:
         return None
     if not bool(origin.get("rightValid", origin.get("valid", False))):
         return None
-    return left + right
+    # Origin metadata is explicitly hardware-side; dataset pulses are operator-side.
+    return hardware_to_dataset_motion(left + right)
 
 
 def _motion_ui_to_lerobot_state(motion_ui: list[float]) -> list[float]:
@@ -303,6 +320,14 @@ def _conversion_config(app_info: dict[str, Any]) -> dict[str, Any]:
     if isinstance(motion, dict) and isinstance(motion.get("kinematics"), dict):
         config["motion"]["kinematics"] = deepcopy(motion["kinematics"])
     return config
+
+
+def _validate_dataset_metadata(app_info: dict[str, Any], info: dict[str, Any]) -> None:
+    """Do not guess whether an unmarked dataset uses the old or new side order."""
+    try:
+        validate_data_contract(app_info.get("dataContract") or info.get("dataContract"))
+    except ValueError as exc:
+        raise RuntimeError(f"cannot normalize dataset: {exc}") from exc
 
 
 def _origin_groups(episodes: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -1,3 +1,8 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：加载本地 LeRobot 数据集并上传至指定 Hugging Face 仓库。
+# 先看：parse_args → push_dataset → main。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import argparse

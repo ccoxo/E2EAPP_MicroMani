@@ -1,6 +1,14 @@
-import { Button, Progress, Space, Tag, Typography } from 'antd'
-import { Database, Network, Settings, Wrench } from 'lucide-react'
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：汇总平台进程、相机及相关模块状态。
+ * 先看：processState → cameraByKey → PlatformOverview。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
+import { UiButton, UiProgress, UiSpace, UiTag, UiText } from '../ui'
+import { Network, Settings } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
+import { recordUiIsRecording } from '../../recordDisplay'
+import { useTelemetryStore } from '../../stores/telemetry'
 import { teleopPairState, teleopPairValue } from '../../teleopStatus'
 import type { CameraTelemetry, ConnectionState, DiagnosticItem, ProcessStatus, TelemetryFrame } from '../../types'
 import { ModuleStatusGrid, type ModuleStatus } from './ModuleStatusGrid'
@@ -26,6 +34,9 @@ export function PlatformOverview({
   diagnostics: DiagnosticItem[]
 }) {
   const navigate = useNavigate()
+  // 录制业务态以 phase 为准，不读 frame.recording。
+  const recordPhase = useTelemetryStore((state) => state.recordSession.phase)
+  const recordingUi = recordUiIsRecording(recordPhase)
   const globalCamera = cameraByKey(frame.cameras, 'global')
   const modules: ModuleStatus[] = [
     {
@@ -70,7 +81,7 @@ export function PlatformOverview({
       state: processState(frame.processStatus, 'recorder'),
       primary: `Episode #${frame.episodeCount} / Frame ${frame.frameCount}`,
       secondary: 'LeRobotDataset 写入链路',
-      metric: frame.recording ? 'REC' : 'STANDBY',
+      metric: recordingUi ? 'REC' : 'STANDBY',
       group: '数据',
     },
     {
@@ -115,24 +126,24 @@ export function PlatformOverview({
     <section className="panel-surface platform-overview">
       <div className="section-title">
         <span><Network size={17} />全局软硬件状态</span>
-        <Space size={8}>
-          <Button size="small" icon={<Settings size={14} />} onClick={() => navigate('/settings')}>
+        <UiSpace size={8} wrap>
+          <UiButton icon={<Settings size={14} />} onClick={() => navigate('/settings')}>
             配置
-          </Button>
-        </Space>
+          </UiButton>
+        </UiSpace>
       </div>
       <div className="platform-health-strip">
         <div>
-          <Typography.Text type="secondary">系统资源</Typography.Text>
-          <Progress percent={Math.round(frame.resource.cpuPct)} size="small" format={(v) => `CPU ${v}%`} />
+          <UiText secondary>系统资源</UiText>
+          <UiProgress percent={Math.round(frame.resource.cpuPct)} format={(v) => `CPU ${v}%`} />
         </div>
         <div>
-          <Typography.Text type="secondary">动作队列</Typography.Text>
-          <Progress percent={Math.max(frame.queueDepth.left, frame.queueDepth.right)} size="small" strokeColor="#d98400" format={() => `L ${frame.queueDepth.left}% / R ${frame.queueDepth.right}%`} />
+          <UiText secondary>动作队列</UiText>
+          <UiProgress percent={Math.max(frame.queueDepth.left, frame.queueDepth.right)} status="exception" format={() => `L ${frame.queueDepth.left}% / R ${frame.queueDepth.right}%`} />
         </div>
         <div className="platform-mode-tags">
-          <Tag color={frame.halOk ? 'processing' : 'error'} icon={<Wrench size={13} />}>{frame.halOk ? 'Real HAL' : 'HAL offline'}</Tag>
-          <Tag color="default" icon={<Database size={13} />}>Dataset local</Tag>
+          <UiTag tone={frame.halOk ? 'processing' : 'error'}>{frame.halOk ? 'Real HAL' : 'HAL offline'}</UiTag>
+          <UiTag tone="muted">Dataset local</UiTag>
         </div>
       </div>
       <ModuleStatusGrid modules={modules} />

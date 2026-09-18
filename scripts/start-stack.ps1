@@ -1,8 +1,12 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：按顺序启动 HAL、后端和前端，并管理同项目旧进程及日志。
+# 先看：Stop-ProcessTree → Stop-BackendProcessTrees。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 param(
   [int]$BackendPort = 18082,
   [int]$FrontendPort = 5174,
-  [int]$HalPort = 8091,
-  [switch]$SkipStartupHome
+  [int]$HalPort = 8091
 )
 
 $ErrorActionPreference = "Stop"
@@ -112,7 +116,6 @@ $env:APPSTATION_HAL_BASE_URL = "http://127.0.0.1:$activeHalPort"
 $env:APPSTATION_HAL_TRANSPORT = "dds"
 if (-not $env:APPSTATION_DDS_DOMAIN_ID) { $env:APPSTATION_DDS_DOMAIN_ID = "42" }
 if (-not $env:APPSTATION_DDS_LAN_DISCOVERY) { $env:APPSTATION_DDS_LAN_DISCOVERY = "0" }
-$env:APPSTATION_SKIP_STARTUP_HOME = if ($SkipStartupHome) { "true" } else { "false" }
 $backend = Start-Process `
   -FilePath (Join-Path $repo "backend\.venv\Scripts\python.exe") `
   -ArgumentList @("-m", "uvicorn", "backend.app:create_app", "--factory", "--host", "127.0.0.1", "--port", "$BackendPort") `
@@ -140,5 +143,4 @@ Start-Sleep -Seconds 3
   hal = "http://127.0.0.1:$activeHalPort"
   frontendOutLog = $frontendOutLog
   frontendErrLog = $frontendErrLog
-  skipStartupHome = [bool]$SkipStartupHome
 }

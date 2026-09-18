@@ -1,3 +1,8 @@
+# 阅读导航 03｜后端契约与配置
+# 职责：FastAPI 应用工厂、HTTP 路由与 WebSocket 入口；连接业务服务并管理资源生命周期。
+# 先看：create_app → make_hal_client → websocket_endpoint。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import asyncio
@@ -11,15 +16,22 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Annotated, Any, cast
 
-from fastapi import Body, FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.websockets import WebSocketState
 
 from backend.app_factory import create_services
 from backend.core.config import SettingsService
+from backend.core.data_contract import (
+    data_contract_metadata,
+    dataset_side_to_hardware_side,
+    hardware_to_dataset_motion,
+    validate_data_contract,
+)
 from backend.core.force_config import hal_force_config_payload
 from backend.core.logging import LOG_SCHEMA_VERSION, LogService, now_ms, stable_config_hash
+from backend.core.motion_safety import MotionSafetyToken
 from backend.core.operator_view import hardware_side_for_operator_side
 from backend.core.schemas import (
     ApiEnvelope,
@@ -31,7 +43,7 @@ from backend.core.schemas import (
     SnapshotScope,
 )
 from backend.core.units import motion_pulse_per_unit, pulses_to_ui_state
-from backend.hal_client.client import HalClient, TestHalClient
+from backend.hal_client.client import HalClient, HalHealth, TestHalClient
 from backend.hal_client.dds_client import DdsHalClient
 from backend.hal_client.dds_types import DEFAULT_DDS_DOMAIN_ID
 from backend.services.command_service import (
@@ -39,6 +51,7 @@ from backend.services.command_service import (
     normalize_motion_axis_enabled,
 )
 from backend.services.dataset_recorder import DatasetSaveError
+from backend.services.control_watchdog import ControlLeaseUnavailable, ControlWatchdog
 from backend.services.gripper_backend import native_teleop_enabled
 from backend.services.pico_network import PicoNetworkDetectionError, detect_pico_network
 from backend.services.policy_bridge import build_policy_action_plan, lerobot_state_from_ui
@@ -53,6 +66,25 @@ def envelope(data: dict[str, Any] | None = None) -> ApiEnvelope:
 AXIS_NAMES = ("X", "Y", "Z", "Roll", "Pitch", "Yaw")
 BACKEND_STARTED_AT = time.time()
 TELEOP_GRAVITY_SCALE_DEFAULTS = {"left": 0.45, "right": 1.0}
+REQUIRED_HAL_CAPABILITIES = ("force_calibration_state_v1",)
+
+
+def hal_capability_status(health: Any) -> dict[str, Any]:
+    """仅诊断自检能力；缺失字段或版本号不能被当作已经实现该能力。"""
+    reported = getattr(health, "capabilities", None)
+    capabilities = [item for item in reported if isinstance(item, str)] if isinstance(reported, list) else []
+    missing = [item for item in REQUIRED_HAL_CAPABILITIES if item not in capabilities]
+    return {
+        "compatible": not missing,
+        "required": list(REQUIRED_HAL_CAPABILITIES),
+        "reported": capabilities,
+        "missing": missing,
+        "message": (
+            "HAL capability check passed"
+            if not missing
+            else "HAL 未报告力校准状态能力；请核实对应实现与配套构建，版本号不能代替能力声明"
+        ),
+    }
 
 
 def teleop_gravity_scale(teleop: dict[str, Any], side: str) -> float:
@@ -379,6 +411,7 @@ def runtime_dir_from_env() -> Path:
     return Path(__file__).resolve().parent / "runtime"
 
 
+# 阅读起点：在工厂调用时创建运行服务；仅导入本模块不会打开硬件或创建服务实例。
 def create_app(runtime_dir: Path | None = None) -> FastAPI:
     app = FastAPI(title="AppStation Backend", version="0.1.0")
     app.add_middleware(
@@ -425,6 +458,29 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     app.state.teleop_background_tasks = set()
     stability.set_ws_client_count_provider(lambda: len(app.state.ws_clients))
 
+    def invalidate_control_session() -> None:
+        policy.invalidate_pending_actions()
+        commands.safety.interrupt(emergency=True)
+
+    control_watchdog = ControlWatchdog(hal, logs, invalidate_control_session, commands.emergency_stop)
+    app.state.control_watchdog = control_watchdog
+    commands.safety.readiness_check = control_watchdog.require_ready
+    from backend.services.control_watchdog import request_control_session
+
+    @app.exception_handler(ControlLeaseUnavailable)
+    async def control_lease_error(_request: Request, exc: ControlLeaseUnavailable):
+        return JSONResponse(status_code=409, content={"detail": {"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}})
+
+    @app.middleware("http")
+    async def bind_control_session(request: Request, call_next):
+        token = request_control_session.set(request.headers.get("X-Control-Session", ""))
+        try:
+            return await call_next(request)
+        finally:
+            request_control_session.reset(token)
+    if isinstance(hal, DdsHalClient):
+        hal.on_control_transport_fault = control_watchdog.trip
+
     def set_teleop_logical_connection(side: str, connected: bool) -> dict[str, Any]:
         # 逻辑连接状态写入配置，让页面刷新后仍能保留操作员显式选择。
         config = settings.get_config()
@@ -459,9 +515,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         if not bool(teleop.get("homeBeforeStart", True)):
             return
-        startup = config.get("motion", {}).get("homeOnStartup", {}) if isinstance(config.get("motion"), dict) else {}
-        if isinstance(startup, dict) and str(startup.get("mode", "work_origin")) != "work_origin":
-            return
         hardware_side = teleop_hardware_side_for_operator_source(side, config)
         origin = config.get("motion", {}).get("origin", {}) if isinstance(config.get("motion"), dict) else {}
         valid_key = "leftValid" if hardware_side == "left" else "rightValid"
@@ -494,11 +547,14 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         side: SideName,
         connected: bool,
         config: dict[str, Any] | None = None,
+        safety_token: MotionSafetyToken | None = None,
     ) -> None:
+        safety_token = safety_token if safety_token is not None else commands.safety.capture()
         config = config if config is not None else await get_config_async()
         teleop_config = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         hardware_side = teleop_hardware_side_for_operator_source(side, config)
         if connected:
+            commands.safety.check(safety_token)
             if isinstance(teleop_config, dict):
                 try:
                     await hal.command(
@@ -513,11 +569,13 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 except RuntimeError as exc:
                     logs.warning("[HAL]", f"Omega.7 force output apply failed: {exc}")
             try:
+                commands.safety.check(safety_token)
                 await commands.enable_motion_side(hardware_side)
             except RuntimeError as exc:
                 logs.error("[HAL]", f"teleop connect enable mapped {hardware_side} failed: {exc}")
             native_started = False
             try:
+                commands.safety.check(safety_token)
                 await teleop_mapper.start("teleop-connect", pre_home=False, home_side=hardware_side)
                 native_started = True
             except Exception:
@@ -536,6 +594,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
         try:
             await commands.stop_motion_side(hardware_side)
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             logs.error("[HAL]", f"teleop disconnect stop mapped {hardware_side} failed: {exc}")
         if not bool(teleop_config.get("leftConnected", False)) and not bool(teleop_config.get("rightConnected", False)):
@@ -543,6 +603,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             logs.info("[HAL]", f"{side} Omega.7 logical disconnect background stop completed")
             return
         if native_teleop_enabled(config):
+            # 本次断连已停止该侧；仅允许未被另一侧停止或全局急停打断的剩余来源恢复。
+            commands.safety.check(safety_token, ignore_side=hardware_side)
             await teleop_mapper.start("teleop-connect", pre_home=False)
         logs.info("[HAL]", f"{side} Omega.7 logical disconnect background refresh completed")
 
@@ -569,6 +631,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             }
         try:
             omega_state = await hal.omega_state()
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             return {
                 "ok": False,
@@ -665,6 +729,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 raise
 
     async def release_runtime_handles(reason: str) -> dict[str, Any]:
+        commands.safety.interrupt()
+        policy.invalidate_pending_actions()
         released_grippers: list[str] = []
         gripper_errors: dict[str, str] = {}
         teleop_errors: dict[str, str] = {}
@@ -680,9 +746,9 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         config["gripper"]["leftEnabled"] = False
         config["gripper"]["rightEnabled"] = False
         await asyncio.to_thread(settings.save_config, config, emit_log=False)
-        for source in ("teleop-connect", "recording"):
+        for source in ("teleop-connect", "recording", "manual-gripper"):
             try:
-                await teleop_mapper.stop(source)
+                await teleop_mapper.stop(source, restart_remaining=False)
             except RuntimeError as exc:
                 teleop_errors[source] = str(exc)
                 logs.error("[HAL]", f"teleop close-release failed source={source}: {exc}")
@@ -723,7 +789,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
     @app.on_event("startup")
     async def reconcile_startup_hal_state() -> None:
-        skip_startup_home = os.environ.get("APPSTATION_SKIP_STARTUP_HOME", "").strip().lower()
         config = await get_config_async()
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         if (
@@ -737,28 +802,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 logs.info("[HAL]", "startup cleared stale HAL-native teleop controller")
             except RuntimeError as exc:
                 logs.warning("[HAL]", f"startup stale HAL-native teleop cleanup skipped: {exc}")
-        if skip_startup_home in {"1", "true", "yes", "on"}:
-            logs.warning("[HAL]", "startup return-to-work-origin skipped by APPSTATION_SKIP_STARTUP_HOME")
-            return
-        startup_config = config.get("motion", {}).get("homeOnStartup", {})
-        if not isinstance(startup_config, dict) or not bool(startup_config.get("enabled", False)):
-            return
-        mode = str(startup_config.get("mode", "work_origin"))
-        if mode != "work_origin":
-            logs.warning("[HAL]", f"startup motion home skipped; unsupported mode={mode}")
-            return
-        hal_health = await hal.health()
-        if not hal_health.connected:
-            logs.warning("[HAL]", "startup return-to-work-origin skipped; HAL unavailable")
-            return
-        try:
-            await commands.home_all()
-            logs.info("[HAL]", "startup return-to-work-origin completed")
-        except RuntimeError as exc:
-            logs.error("[HAL]", f"startup return-to-work-origin failed: {exc}")
 
     @app.on_event("shutdown")
     async def shutdown_runtime_services() -> None:
+        await control_watchdog.close()
         try:
             record_status = await asyncio.to_thread(recorder.status)
             if record_status.get("active") or record_status.get("recording"):
@@ -770,11 +817,24 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         for task in tasks:
             task.cancel()
         for task in tasks:
-            with contextlib.suppress(asyncio.CancelledError):
+            try:
                 await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logs.error("[HAL]", f"shutdown background task cleanup failed: {exc}")
         app.state.teleop_background_tasks.clear()
-        await asyncio.to_thread(hardware.cameras.close_all)
-        await asyncio.to_thread(telemetry.shutdown)
+        # 单个模块释放失败不能跳过其余资源，尤其是遥测线程池。
+        for label, cleanup in (("camera", hardware.cameras.close_all), ("telemetry", telemetry.shutdown)):
+            try:
+                await asyncio.to_thread(cleanup)
+            except Exception as exc:
+                logs.error("[BACKEND]", f"shutdown {label} cleanup failed: {exc}")
+        if isinstance(hal, DdsHalClient):
+            try:
+                await hal.aclose()
+            except Exception as exc:
+                logs.error("[HAL]", f"shutdown DDS transport cleanup failed: {exc}")
 
     # 查询后端、HAL 与硬件健康状态。
     @app.get("/api/health")
@@ -792,7 +852,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             "ok": True,
             "backend": "running",
             "mode": hal_health.mode,
-            "hal": hal_health.__dict__,
+            "hal": {**hal_health.__dict__, "capabilityCheck": hal_capability_status(hal_health)},
             "hardware": hardware_status,
             "runtime": runtime_status,
             "ts": now_ms(),
@@ -816,20 +876,42 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def get_settings() -> dict[str, Any]:
         return await get_config_async()
 
+    @contextlib.asynccontextmanager
+    async def configuration_change(current, candidate, *, force_apply=False):
+        protected = force_apply or any(current.get(key) != candidate.get(key)
+                                       for key in ("motion", "force", "teleop", "gripper", "auto", "hal"))
+        if not protected:
+            yield
+            return
+        token = commands.safety.capture()
+        commands.safety.check(token)
+        with commands.safety.operation():
+            commands._ensure_origin_mutation_allowed()
+            state = await hal.motion_state()
+            commands.require_stationary_motion(state)
+            commands.safety.check(token)
+            yield token
+            commands.safety.check(token)
+
     # 保存新的应用配置。
     @app.put("/api/settings")
     async def put_settings(config: AppConfig) -> dict[str, Any]:
         try:
             current = await get_config_async()
             candidate = config.model_dump(mode="json")
-            if hal_force_config_payload(current) != hal_force_config_payload(candidate):
-                await hal.command("force.configure", hal_force_config_payload(candidate))
-            return await asyncio.to_thread(settings.save_config, candidate)
+            async with configuration_change(current, candidate) as config_token:
+                if hal_force_config_payload(current) != hal_force_config_payload(candidate):
+                    await hal.command("force.configure", hal_force_config_payload(candidate))
+                if config_token is not None:
+                    commands.safety.check(config_token)
+                return await asyncio.to_thread(settings.save_config, candidate)
         except ValueError as exc:
             raise HTTPException(
                 status_code=400,
                 detail={"code": "VALIDATION_ERROR", "message": str(exc)},
             ) from exc
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(
                 status_code=409,
@@ -846,16 +928,21 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 if config is not None
                 else current
             )
-            current_force_payload = hal_force_config_payload(current)
-            candidate_force_payload = hal_force_config_payload(candidate)
-            if config is None or current_force_payload != candidate_force_payload:
-                await hal.command("force.configure", candidate_force_payload)
-            active = await asyncio.to_thread(
-                settings.apply_config,
-                candidate,
-            )
+            async with configuration_change(current, candidate, force_apply=config is None) as config_token:
+                current_force_payload = hal_force_config_payload(current)
+                candidate_force_payload = hal_force_config_payload(candidate)
+                if config is None or current_force_payload != candidate_force_payload:
+                    await hal.command("force.configure", candidate_force_payload)
+                if config_token is not None:
+                    commands.safety.check(config_token)
+                active = await asyncio.to_thread(
+                    settings.apply_config,
+                    candidate,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": str(exc)}) from exc
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail={"code": "HAL_REJECTED", "message": str(exc)}) from exc
         return envelope({"config": active})
@@ -878,9 +965,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         try:
             current = await get_config_async()
             candidate = await asyncio.to_thread(settings.preview_snapshot, snapshot_id)
-            if hal_force_config_payload(current) != hal_force_config_payload(candidate):
-                await hal.command("force.configure", hal_force_config_payload(candidate))
-            config = await asyncio.to_thread(settings.apply_snapshot, snapshot_id)
+            async with configuration_change(current, candidate) as config_token:
+                if hal_force_config_payload(current) != hal_force_config_payload(candidate):
+                    await hal.command("force.configure", hal_force_config_payload(candidate))
+                if config_token is not None:
+                    commands.safety.check(config_token)
+                config = await asyncio.to_thread(settings.apply_snapshot, snapshot_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "snapshot not found"}) from exc
         except ValueError as exc:
@@ -888,6 +978,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 status_code=400,
                 detail={"code": "VALIDATION_ERROR", "message": str(exc)},
             ) from exc
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(
                 status_code=409,
@@ -915,6 +1007,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 安排运行时延迟关闭并释放资源。
     @app.post("/api/runtime/shutdown")
     async def runtime_shutdown(payload: dict[str, Any] | None = None) -> ApiEnvelope:
+        if not payload or payload.get("controlSessionId") != control_watchdog.last_browser_session or not control_watchdog.last_browser_session:
+            return envelope({"scheduled": False, "reason": "only the control owner may release runtime handles"})
         reason = str((payload or {}).get("reason", "browser-close"))
         release = await release_runtime_handles(reason)
         existing_task = app.state.shutdown_task
@@ -926,6 +1020,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 释放运行时持有的硬件句柄。
     @app.post("/api/runtime/release_handles")
     async def runtime_release_handles(payload: dict[str, Any] | None = None) -> ApiEnvelope:
+        if not payload or payload.get("controlSessionId") != control_watchdog.last_browser_session or not control_watchdog.last_browser_session:
+            return envelope({"released": False, "reason": "only the control owner may release runtime handles"})
         reason = str((payload or {}).get("reason", "browser-close"))
         return envelope(await release_runtime_handles(reason))
 
@@ -939,6 +1035,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def stability_start(payload: dict[str, Any] | None = None) -> ApiEnvelope:
         try:
             return envelope(await stability.start(payload))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail={"code": "STABILITY_RUNNING", "message": str(exc)}) from exc
 
@@ -998,6 +1096,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def auto_action(payload: dict[str, Any]) -> ApiEnvelope:
         try:
             return envelope(await policy.queue_action(payload))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail={"code": "ACTION_REJECTED", "message": str(exc)}) from exc
 
@@ -1006,6 +1106,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def auto_dispatch_next() -> ApiEnvelope:
         try:
             return envelope(await policy.dispatch_next())
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail={"code": "HAL_DISPATCH_FAILED", "message": str(exc)}) from exc
 
@@ -1030,19 +1132,21 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 触发运动急停。
     @app.post("/api/motion/emergency_stop")
     async def emergency_stop() -> ApiEnvelope:
+        policy.invalidate_pending_actions()
         auto_stop_task = asyncio.create_task(policy.auto_stop())
-        await asyncio.sleep(0)
-        result = await commands.emergency_stop()
-        if auto_stop_task.done():
-            await auto_stop_task
-        else:
-            def log_auto_stop_error(task: asyncio.Task[dict[str, Any]]) -> None:
-                try:
-                    task.result()
-                except Exception as exc:
-                    logs.error("[POLICY]", f"auto stop cleanup after emergency stop failed: {exc}")
 
-            auto_stop_task.add_done_callback(log_auto_stop_error)
+        def log_auto_stop_error(task: asyncio.Task[dict[str, Any]]) -> None:
+            if task.cancelled():
+                return
+            try:
+                task.result()
+            except Exception as exc:
+                logs.error("[POLICY]", f"auto stop cleanup after emergency stop failed: {exc}")
+
+        auto_stop_task.add_done_callback(log_auto_stop_error)
+        # 不先让出事件循环给清理；DDS 急停先发布，清理失败不改变急停应答。
+        result = await commands.emergency_stop()
+        control_watchdog.confirm_stop()
         return envelope(result)
 
     # 所有运动轴执行回零。
@@ -1052,6 +1156,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             result = await commands.home_all()
             recorder.mark_reset_origin_all_returned()
             return envelope(result)
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             logs.error("[HAL]", f"home_all failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1078,6 +1184,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     "drift": exc.drift,
                 },
             ) from exc
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             logs.error("[HAL]", f"capture_motion_origin failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1086,7 +1194,9 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/motion/origin/clear")
     async def clear_motion_origin_all() -> ApiEnvelope:
         try:
-            return envelope(await asyncio.to_thread(commands.clear_motion_origin))
+            return envelope(await commands.clear_motion_origin())
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             logs.error("[HAL]", f"clear_motion_origin failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1096,6 +1206,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def restore_previous_motion_origin() -> ApiEnvelope:
         try:
             return envelope(await commands.restore_previous_motion_origin())
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             logs.error("[HAL]", f"restore_previous_motion_origin failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1120,6 +1232,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     "drift": exc.drift,
                 },
             ) from exc
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             logs.error("[HAL]", f"capture_motion_origin failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1130,7 +1244,9 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         try:
-            return envelope(await asyncio.to_thread(commands.clear_motion_origin, side))
+            return envelope(await commands.clear_motion_origin(side))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             logs.error("[HAL]", f"clear_motion_origin failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1142,6 +1258,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         try:
             return envelope(await commands.enable_motion_side(side))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             logs.error("[HAL]", f"enable_motion_side failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1153,6 +1271,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         try:
             return envelope(await commands.disable_motion_side(side))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             logs.error("[HAL]", f"disable_motion_side failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1164,6 +1284,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         try:
             return envelope(await commands.stop_motion_side(side))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             logs.error("[HAL]", f"stop_motion_side failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1175,6 +1297,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         try:
             return envelope(await commands.home_motion_side(side))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             logs.error("[HAL]", f"home_motion_side failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1188,6 +1312,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             result = await commands.return_motion_origin_side(side)
             recorder.mark_reset_origin_returned(side)
             return envelope(result)
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             logs.error("[HAL]", f"return_motion_origin_side failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1197,6 +1323,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def manual_axis_move(request: ManualAxisMoveRequest) -> ApiEnvelope:
         try:
             return envelope(await commands.manual_axis_move(request))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             logs.error("[HAL]", f"manual_axis_move failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
@@ -1216,6 +1344,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 if isinstance(raw_pulses, list) and len(raw_pulses) == 12:
                     pulses = [float(value) for value in raw_pulses]
                     joint_positions = relative_motion_positions(config, joint_positions, pulses)
+                    pulses = hardware_to_dataset_motion(pulses)
                 telemetry.motion_positions = list(joint_positions)
             except RuntimeError as exc:
                 logs.error("[POLICY]", f"policy observation failed: {exc}")
@@ -1234,19 +1363,28 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             {
                 "state": lerobot_state_from_ui(joint_positions, grippers),
                 "pulses": pulses if pulses is not None else [0.0] * 12,
-                "force_left": [float(value) for value in force_left],
-                "force_right": [float(value) for value in force_right],
+                "force_left": [float(value) for value in force_right],
+                "force_right": [float(value) for value in force_left],
+                "dataContract": data_contract_metadata(),
             }
         )
 
     @app.post("/api/policy/action")
     async def policy_action(payload: Annotated[dict[str, Any], Body()]) -> ApiEnvelope:
+        safety_token = commands.safety.capture()
         action = payload.get("action")
         if not isinstance(action, list) or len(action) != 14:
             raise HTTPException(
                 status_code=400,
                 detail={"code": "BAD_POLICY_ACTION", "message": "action must be a 14-element list"},
             )
+        try:
+            validate_data_contract(payload.get("dataContract"))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "POLICY_DATA_CONTRACT_MISMATCH", "message": str(exc)},
+            ) from exc
         dry_run = bool(payload.get("dryRun", True))
         config = await get_config_async()
         current_state = lerobot_state_from_ui(list(telemetry.motion_positions), _policy_gripper_positions(config))
@@ -1259,10 +1397,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 max_rotation_deg=float(payload.get("maxRotationDeg", 0.2)),
                 max_gripper_mm=float(payload.get("maxGripperMm", 1.0)),
             )
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail={"code": "POLICY_ACTION_BLOCKED", "message": str(exc)}) from exc
         if dry_run:
-            return envelope({"dryRun": True, "sent": False, "plan": plan})
+            return envelope({"dryRun": True, "sent": False, "plan": plan, "dataContract": data_contract_metadata()})
         raw_controlled_sides = payload.get("controlledSides")
         controlled_sides = (
             [side for side in raw_controlled_sides if side in {"left", "right"}]
@@ -1276,32 +1416,46 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             )
         results: dict[str, Any] = {"motion": {}, "grippers": {}}
         try:
-            for side in controlled_sides:
-                motion_plan = plan["motion"][side]
-                await commands.enable_motion_side(side)
-                results["motion"][side] = await hal.command(
-                    "motion.teleop_target_update",
-                    _policy_motion_payload(side, motion_plan, config),
-                )
-            for side, target_key in (("left", "leftMm"), ("right", "rightMm")):
-                if side not in controlled_sides:
-                    continue
-                if not bool(config.get("gripper", {}).get(f"{side}Enabled", False)):
-                    continue
-                gripper_side = cast(SideName, side)
-                request = GripperCommandRequest(
-                    side=gripper_side,
-                    command="target",
-                    targetMm=plan["grippers"][target_key],
-                )
-                results["grippers"][gripper_side] = await commands.gripper_command(request)
+            with commands.safety.operation():
+                for side in controlled_sides:
+                    commands.safety.check(safety_token)
+                    motion_plan = plan["motion"][side]
+                    hardware_side = dataset_side_to_hardware_side(side)
+                    await commands.enable_motion_side(hardware_side)
+                    commands.safety.check(safety_token)
+                    results["motion"][side] = await hal.command(
+                        "motion.teleop_target_update",
+                        _policy_motion_payload(hardware_side, motion_plan, config),
+                    )
+                for side, target_key in (("left", "leftMm"), ("right", "rightMm")):
+                    if side not in controlled_sides:
+                        continue
+                    hardware_side = dataset_side_to_hardware_side(side)
+                    if not bool(config.get("gripper", {}).get(f"{hardware_side}Enabled", False)):
+                        continue
+                    gripper_side = cast(SideName, hardware_side)
+                    request = GripperCommandRequest(
+                        side=gripper_side,
+                        command="target",
+                        targetMm=plan["grippers"][target_key],
+                    )
+                    commands.safety.check(safety_token)
+                    results["grippers"][side] = await commands.gripper_command(request)
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             logs.error("[POLICY]", f"policy action send failed: {exc}")
             raise HTTPException(
                 status_code=503,
                 detail={"code": "POLICY_ACTION_UNAVAILABLE", "message": str(exc)},
             ) from exc
-        return envelope({"dryRun": False, "sent": True, "plan": plan, "results": results})
+        return envelope({
+            "dryRun": False,
+            "sent": True,
+            "plan": plan,
+            "results": results,
+            "dataContract": data_contract_metadata(),
+        })
 
     def _real_hardware_mode(config: dict[str, Any]) -> bool:
         mode = os.environ.get("APPSTATION_HAL_MODE") or config.get("hal", {}).get("mode", "real")
@@ -1339,13 +1493,19 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     # 确认并解除运动安全告警。
     @app.post("/api/motion/safety/acknowledge")
     async def acknowledge_safety() -> ApiEnvelope:
-        return envelope(await commands.acknowledge_safety())
+        policy.invalidate_pending_actions()
+        try:
+            return envelope(await commands.acknowledge_safety(readiness_check=control_watchdog.require_ack_ready))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_REQUIRED", "message": str(exc)}) from exc
 
     # 对所有力传感器执行去皮。
     @app.post("/api/sensors/tare")
     async def tare_sensors() -> ApiEnvelope:
         try:
             return envelope(await commands.tare_force())
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail={"code": "FORCE_UNAVAILABLE", "message": str(exc)}) from exc
 
@@ -1356,6 +1516,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         try:
             return envelope(await commands.tare_force(side))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail={"code": "FORCE_UNAVAILABLE", "message": str(exc)}) from exc
 
@@ -1370,6 +1532,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         try:
             result = envelope(await commands.gripper_command(request))
             return result
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail={"code": "GRIPPER_UNAVAILABLE", "message": str(exc)}) from exc
 
@@ -1419,12 +1583,15 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         side_name = cast(SideName, side)
+        safety_token = commands.safety.capture()
         pending_config = await get_config_async()
+        commands.safety.check(safety_token)
         validate_teleop_connect_ready(side_name, pending_config)
         config = await asyncio.to_thread(set_teleop_logical_connection, side_name, True)
+        commands.safety.check(safety_token)
         mapped_side = teleop_target_side_for_source(side_name, config)
         schedule_teleop_background(
-            sync_teleop_logical_connection(side_name, True, config),
+            sync_teleop_logical_connection(side_name, True, config, safety_token),
             f"teleop-{side}-connect-sync",
         )
         logs.info(
@@ -1463,6 +1630,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             omega_state = await hal.omega_state()
             config = await get_config_async()
             return envelope(mask_omega_state_for_logical_connection(omega_state, config))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail={"code": "OMEGA_UNAVAILABLE", "message": str(exc)}) from exc
 
@@ -1479,6 +1648,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         payload = payload or {}
         enabled = bool(payload.get("enabled", True))
+        safety_token = commands.safety.capture()
+        if enabled:
+            try:
+                commands.safety.check(safety_token)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=409, detail={"code": "TELEOP_FORCE_BLOCKED", "message": str(exc)}) from exc
         config = await get_config_async()
         current_scale = teleop_gravity_scale(config["teleop"], side)
         if "scale" in payload:
@@ -1494,14 +1669,23 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         config["teleop"][f"{side}GravityScale"] = scale
         saved = await asyncio.to_thread(settings.save_config, config, emit_log=False)
         saved_teleop = saved["teleop"]
+        force_payload = {
+            "leftEnabled": bool(saved_teleop.get("leftGravityCompensation", True)),
+            "rightEnabled": bool(saved_teleop.get("rightGravityCompensation", True)),
+            "leftScale": teleop_gravity_scale(saved_teleop, "left"),
+            "rightScale": teleop_gravity_scale(saved_teleop, "right"),
+        }
+        try:
+            commands.safety.check(safety_token)
+        except RuntimeError as exc:
+            if enabled:
+                raise HTTPException(status_code=409, detail={"code": "TELEOP_FORCE_BLOCKED", "message": str(exc)}) from exc
+            # 关闭仍可通过，但不能把配置中另一侧的旧启用值带回硬件。
+            force_payload["leftEnabled"] = False
+            force_payload["rightEnabled"] = False
         await hal.command(
             "omega7.gravity_compensation",
-            {
-                "leftEnabled": bool(saved_teleop.get("leftGravityCompensation", True)),
-                "rightEnabled": bool(saved_teleop.get("rightGravityCompensation", True)),
-                "leftScale": teleop_gravity_scale(saved_teleop, "left"),
-                "rightScale": teleop_gravity_scale(saved_teleop, "right"),
-            },
+            force_payload,
         )
         logs.info("[HAL]", f"{side} Omega.7 gravity compensation={enabled} scale={scale:.2f}")
         return envelope({"side": side, "enabled": enabled, "scale": scale, "config": saved})
@@ -1548,6 +1732,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         )
         try:
             result = await asyncio.to_thread(hardware.cameras.apply_tuning, active, camera)
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail={"code": "CAMERA_UNAVAILABLE", "message": str(exc)}) from exc
         logs.info("[CAMERA]", f"{camera} tuning applied: {result['profile']}")
@@ -1564,6 +1750,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         try:
             config = await get_config_async()
             jpeg = await asyncio.to_thread(hardware.cameras.snapshot, config, camera)
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail={"code": "CAMERA_UNAVAILABLE", "message": str(exc)}) from exc
         return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
@@ -1608,6 +1796,35 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             media_type="multipart/x-mixed-replace; boundary=frame",
             headers={"Cache-Control": "no-store"},
         )
+
+    @app.post("/api/cameras/wrists/identify")
+    async def identify_wrist_cameras() -> ApiEnvelope:
+        record_status = await asyncio.to_thread(recorder.status)
+        if recorder.camera_configuration_busy() or record_status.get("active") or record_status.get("recording"):
+            raise HTTPException(status_code=409, detail={"message": "请先结束录制会话，再识别相机"})
+        try:
+            config = await get_config_async()
+            devices = await asyncio.to_thread(hardware.cameras.identify_wrists, config)
+            return envelope({"devices": devices})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+
+    @app.post("/api/cameras/wrists/bind")
+    async def bind_wrist_cameras(payload: dict[str, str]) -> ApiEnvelope:
+        record_status = await asyncio.to_thread(recorder.status)
+        if recorder.camera_configuration_busy() or record_status.get("active") or record_status.get("recording"):
+            raise HTTPException(status_code=409, detail={"message": "请先结束录制会话，再更改相机绑定"})
+        try:
+            config = await get_config_async()
+            cameras = await asyncio.to_thread(
+                hardware.cameras.wrist_binding, config, payload.get("left", ""), payload.get("right", "")
+            )
+            config["cameras"] = cameras
+            saved = await asyncio.to_thread(settings.save_config, config)
+            probe = await asyncio.to_thread(hardware.cameras.reconnect, saved)
+            return envelope({"cameras": saved["cameras"], "connected": probe.ok, "message": probe.message})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
 
     # 枚举系统相机设备。
     @app.get("/api/cameras/enumerate")
@@ -1701,6 +1918,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 await stop_aux_native_teleop_sources("record session create")
             result = await recorder.start_session(str(dataset_name), str(task))
             return envelope(result)
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             if "native LeRobot dataset is required" in str(exc):
                 raise HTTPException(
@@ -1718,6 +1937,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             return envelope(result)
         except DatasetSaveError as exc:
             raise HTTPException(status_code=500, detail={"code": "RECORDING_SAVE_FAILED", "message": str(exc)}) from exc
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail={"code": "RECORDING_NOT_ACTIVE", "message": str(exc)}) from exc
 
@@ -1729,6 +1950,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 await stop_aux_native_teleop_sources("record episode discard")
             result = await recorder.discard_episode()
             return envelope(result)
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail={"code": "RECORDING_NOT_ACTIVE", "message": str(exc)}) from exc
 
@@ -1756,6 +1979,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 await stop_aux_native_teleop_sources("record reset skip")
             result = await recorder.skip_reset()
             return envelope(result)
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             message = str(exc)
             code = (
@@ -1781,6 +2006,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def create_dataset(payload: dict[str, Any]) -> ApiEnvelope:
         try:
             return envelope(await asyncio.to_thread(recorder.create_dataset, payload))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(
                 status_code=503,
@@ -1807,6 +2034,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             return envelope(await asyncio.to_thread(recorder.delete_dataset, dataset_id))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "DATASET_NOT_FOUND", "message": dataset_id}) from exc
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(
                 status_code=400,
@@ -1860,6 +2089,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             return envelope(await asyncio.to_thread(recorder.push_dataset, dataset_id, payload))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "DATASET_NOT_FOUND", "message": dataset_id}) from exc
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail={"code": "DATASET_PUSH_FAILED", "message": str(exc)}) from exc
 
@@ -1895,6 +2126,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             target = await asyncio.to_thread(recorder.resolve_file, dataset_id, path)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "FILE_NOT_FOUND", "message": path}) from exc
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail={"code": "BAD_FILE_PATH", "message": str(exc)}) from exc
         return FileResponse(target)
@@ -1912,6 +2145,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
     # 推送遥测、日志与运行状态的 WebSocket 通道。
+    # 遥测出口：将服务采样与日志推给界面。先看此循环如何刷新缓存，再回到 TelemetryHub 的组帧逻辑。
     @app.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket) -> None:
         await ws.accept()
@@ -1922,13 +2156,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             app.state.shutdown_task = None
             logs.info("[BACKEND]", "runtime shutdown cancelled; WebSocket client reconnected")
         client_token = id(ws)
-        app.state.ws_clients.add(client_token)
         last_log_id = 0
         last_loop_error = ""
         last_loop_error_at = 0.0
         # Cache HAL HTTP reads so the WS loop is not dominated by localhost round trips.
-        cached_health = await hal.health()
-        last_health_at = time.monotonic()
+        cached_health = HalHealth(
+            ltdmc_ok=False, omega7_ok=False, version="unknown", uptime_s=0,
+            connected=False,
+            mode=str(os.environ.get("APPSTATION_HAL_MODE") or startup_config.get("hal", {}).get("mode", "real")),
+        )
+        last_health_at = float("-inf")
         cached_motion_state: dict[str, Any] | None = None
         cached_omega_hands: list[dict[str, Any]] | None = None
         cached_force_state: dict[str, Any] | None = None
@@ -1940,6 +2177,25 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         ws_period = float(os.environ.get("APPSTATION_WS_PERIOD_SEC", "0.033"))
         health_period = float(os.environ.get("APPSTATION_HEALTH_PERIOD_SEC", "1.0"))
         state_period = float(os.environ.get("APPSTATION_HAL_STATE_PERIOD_SEC", "0.05"))
+        control_session_id: str | None = None
+        receive_task: asyncio.Task[None] | None = None
+        interruption_reported = False
+
+        async def receive_heartbeats() -> None:
+            try:
+                while True:
+                    message = await ws.receive_json()
+                    if isinstance(message, dict) and message.get("type") == "safety_heartbeat":
+                        data = message.get("data")
+                        if isinstance(data, dict) and control_session_id is not None:
+                            control_watchdog.respond(control_session_id, data)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if control_session_id is not None:
+                    control_watchdog.remove(control_session_id)
+
+        app.state.ws_clients.add(client_token)
         try:
             while True:
                 try:
@@ -1948,6 +2204,11 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         try:
                             cached_health = await hal.health()
                         except Exception as exc:  # noqa: BLE001
+                            # 读取失败即标记当前状态不可用，不能延用旧 connected=True。
+                            cached_health = HalHealth(
+                                ltdmc_ok=False, omega7_ok=False, version="unknown", uptime_s=0,
+                                connected=False, mode=cached_health.mode, message=str(exc),
+                            )
                             logs.error("[HAL]", f"health refresh failed: {exc}")
                         last_health_at = now
                     hal_health = cached_health
@@ -2031,7 +2292,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                                 logs.error("[HAL]", f"omega state failed: {exc}")
                         omega_hands = cached_omega_hands
                     force_state: dict[str, Any] | None = None
-                    force_source = str(active_config.get("force", {}).get("source", "nidaq")).lower()
+                    force_source = str(active_config.get("force", {}).get("source", "hkvl_serial")).lower()
                     if force_source == "hkvl_serial" and hal_health.connected:
                         if now - last_force_state_at >= min(state_period, 0.02):
                             last_force_state_at = now
@@ -2042,11 +2303,25 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                                 logs.error("[FORCE]", f"HAL force state failed: {exc}")
                         force_state = cached_force_state
                     hal_ok = hal_health.connected and (hal_health.mode != "real" or hal_health.ltdmc_ok)
-                    active_native_gripper_status = (
-                        await gripper_router.status(active_config)
-                        if gripper_router.is_native(active_config)
-                        else None
-                    )
+                    active_native_gripper_status = None
+                    if gripper_router.is_native(active_config):
+                        try:
+                            active_native_gripper_status = await gripper_router.status(active_config)
+                        except Exception as exc:
+                            # 夹爪状态失败只影响夹爪；运动、力状态与日志仍须送达。
+                            message = f"native gripper status unavailable: {exc}"
+                            active_native_gripper_status = {
+                                "ok": False, "message": message, "nativeManaged": True,
+                                "positionMm": {"left": -1.0, "right": -1.0},
+                                "sides": {
+                                    side: {"ok": False, "positionMm": -1.0, "message": message}
+                                    for side in ("left", "right")
+                                },
+                            }
+                            logs.event(
+                                "[GRIPPER]", "ERROR", "status_unavailable", component="GRIPPER",
+                                rate_key="ws_gripper_status_unavailable", rate_ms=2000, message=str(exc),
+                            )
                     frame = await asyncio.to_thread(
                         telemetry.next_frame,
                         motion_positions,
@@ -2060,13 +2335,27 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         config=active_config,
                     )
                     frame.halOk = frame.halOk and hal_ok
+                    if motion_estop_active:
+                        recorder.interrupt_for_safety()
                     frame.processStatus[0].label = "HalServer.exe" if hal_health.mode == "real" else "Test HAL boundary"
                     frame.processStatus[0].status = "running" if hal_health.connected else "error"
                     await ws.send_json({"type": "telemetry", "data": frame.model_dump(mode="json")})
+                    if recorder.safety_interrupted:
+                        if not interruption_reported:
+                            await ws.send_json({"type": "record_status", "data": await asyncio.to_thread(recorder.status)})
+                            interruption_reported = True
+                    else:
+                        interruption_reported = False
                     # 日志和遥测走同一条 WebSocket，前端不需要再轮询日志接口。
                     for entry in logs.entries_after(last_log_id):
                         await ws.send_json({"type": "log", "data": entry.model_dump(mode="json")})
                         last_log_id = max(last_log_id, entry.id)
+                    if control_session_id is None and getattr(ws, "query_params", {}).get("mode") != "observe":
+                        if control_watchdog.clients:
+                            await ws.close(code=1008, reason="another browser owns control; use ?mode=observe")
+                            return
+                        control_session_id = control_watchdog.register(ws.send_json)
+                        receive_task = asyncio.create_task(receive_heartbeats(), name="browser-control-heartbeat")
                     await asyncio.sleep(ws_period)
                 except WebSocketDisconnect:
                     return
@@ -2084,10 +2373,17 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             return
         finally:
             app.state.ws_clients.discard(client_token)
+            if control_session_id is not None:
+                control_watchdog.remove(control_session_id)
+            if receive_task is not None:
+                receive_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await receive_task
 
     return app
 
 
+# 传输选择集中在这里：test 使用替身；real 走 DDS。client.py 中仍存在的 HTTP 类不是当前默认链路。
 def make_hal_client(config: dict[str, Any], logs: LogService) -> HalClient:
     # HAL 模式优先读取环境变量，方便测试脚本覆盖持久化配置。
     env_mode = os.environ.get("APPSTATION_HAL_MODE")

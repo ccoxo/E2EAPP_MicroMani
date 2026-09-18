@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：声明ForceControlRuntime 的接口与状态结构；连接 HKVL 采样、安全锁存和柔顺控制，管理监控线程与急停/确认回调。
+ * 先看：ForceRuntimeConfig → ForceControlRuntime。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #pragma once
 
 #include "ForceComplianceController.h"
@@ -15,7 +21,7 @@
 namespace appstation::hal {
 
 struct ForceRuntimeConfig {
-  std::string source{"nidaq"};
+  std::string source{"hkvl_serial"};
   HkvlSerialConfig serial{};
   std::array<std::array<double, 6>, 2> axisSign{{
       {{-1.0, 1.0, -1.0, 1.0, -1.0, -1.0}},
@@ -32,7 +38,10 @@ class ForceControlRuntime {
 
   ForceControlRuntime(
       EmergencyStopCallback emergencyStop,
-      AcknowledgeCallback acknowledge);
+      AcknowledgeCallback acknowledge,
+      HkvlForceDriver::ReadLoop readLoop = {},
+      std::function<void()> monitorTick = {},
+      WorkerLauncher launcher = {});
   ~ForceControlRuntime();
 
   ForceControlRuntime(const ForceControlRuntime&) = delete;
@@ -53,10 +62,10 @@ class ForceControlRuntime {
       std::int64_t unixMs);
   void checkSafety(double nowMonotonicMs);
   void recordExternalEmergencyStop(const std::string& reason, double nowMonotonicMs);
-  void acknowledgeEmergencyStop(double nowMonotonicMs);
+  void acknowledgeEmergencyStop(double nowMonotonicMs, AcknowledgeCallback acknowledge = {});
   bool safetyLatched() const;
 
-  void tare(int side, int sampleCount);
+  void tare(int side, int sampleCount, std::function<bool()> commandAllowed = {});
   ForceComplianceResult complianceCorrection(
       int side,
       std::uint64_t targetMonotonicMs);
@@ -71,13 +80,23 @@ class ForceControlRuntime {
   static void validateConfig(const ForceRuntimeConfig& config);
   void monitorLoop();
   void invokeEmergencyStopIfNeeded(
-      const std::optional<ForceSafetyTrip>& trip);
+      const std::optional<ForceSafetyTrip>& trip) noexcept;
+  void recordEmergencyCallbackFailure(const char* message) noexcept;
+  void reportWorkerFailure(const char* message) noexcept;
 
   EmergencyStopCallback emergencyStop_;
   AcknowledgeCallback acknowledge_;
+  std::atomic_bool emergencyCallbackFailed_{false};
+  std::string emergencyCallbackError_;
+  std::atomic_bool workerFailed_{false};
+  std::string workerError_;
+  std::function<void()> monitorTick_;
+  WorkerLauncher launcher_;
+  std::recursive_mutex lifecycleMutex_;
   mutable std::mutex mutex_;
   ForceRuntimeConfig config_{};
   ForceSafetyLatch safety_{};
+  std::uint64_t tareEpoch_{0};
   ForceComplianceController compliance_;
   std::array<std::array<double, 6>, 2> latestTared_{};
   std::array<std::array<double, 6>, 2> latestFiltered_{};

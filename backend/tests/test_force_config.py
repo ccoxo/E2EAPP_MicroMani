@@ -1,11 +1,48 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：HKVL 端口绑定、方向校准、阈值和柔顺参数校验。
+# 先看：hkvl_config → test_hkvl_force_config_payload_matches_hal_flat_contract → test_hkvl_force_config_payload_uses_pnp_bound_runtime_ports → test_hkvl_force_config_payload_rejects_duplicate_pnp_bound_ports。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
+import json
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
+from backend.core.config import SettingsService
 from backend.core.defaults import default_config
 from backend.core.force_config import hal_force_config_payload, validate_force_config
+from backend.core.logging import LogService
+
+
+@pytest.mark.parametrize("source", ["hkvl_serial", "nidaq"])
+def test_force_source_selection_survives_settings_reload(tmp_path: Path, source: str) -> None:
+    settings = SettingsService(tmp_path, LogService(emit_startup=False))
+    config = settings.get_config()
+    assert config["force"]["source"] == "hkvl_serial"
+    config["force"]["source"] = source
+    config["force"]["leftIp"] = "DevBackup/ai0:5"
+
+    settings.save_config(config, emit_log=False)
+    restored = SettingsService(tmp_path, LogService(emit_startup=False)).get_config()
+
+    assert restored["force"]["source"] == source
+    assert restored["force"]["leftIp"] == "DevBackup/ai0:5"
+    assert hal_force_config_payload(restored)["source"] == source
+
+
+def test_legacy_config_without_force_source_defaults_to_hkvl(tmp_path: Path) -> None:
+    config = default_config()
+    config["force"].pop("source")
+    config["force"]["leftIp"] = "DevBackup/ai0:5"
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    restored = SettingsService(tmp_path, LogService(emit_startup=False)).get_config()
+
+    assert restored["force"]["source"] == "hkvl_serial"
+    assert restored["force"]["leftIp"] == "DevBackup/ai0:5"
 
 
 def hkvl_config() -> dict:

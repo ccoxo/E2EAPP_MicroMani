@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：Jodell 开口换算、最小夹缝保护、端口释放和使能条件。
+# 先看：test_jodell_gripper_target_position_mapping → test_gripper_close_respects_icf_min_gap_protection → test_jodell_gripper_default_config_matches_reference_project → test_gripper_selects_and_closes_configured_port_per_command。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from pytest import MonkeyPatch

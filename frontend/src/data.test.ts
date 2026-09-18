@@ -1,3 +1,8 @@
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：验证前端运动标定、主手重力及 HKVL 默认值与项目约定一致。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { describe, expect, it } from 'vitest'
 import { axisHardwareSpecs, defaultConfig, defaultKinematics } from './data'
 
@@ -44,6 +49,7 @@ describe('HKVL-36A force safety defaults', () => {
 
 describe('HKVL-36A hardware-side binding', () => {
   it('binds hardware left to COM15/Card1 and hardware right to COM14/Card0', () => {
+    expect(defaultConfig.force.source).toBe('hkvl_serial')
     expect(defaultConfig.force.serial.leftPort).toBe('COM15')
     expect(defaultConfig.force.serial.rightPort).toBe('COM14')
     expect(defaultConfig.motion.leftCardNo).toBe(1)

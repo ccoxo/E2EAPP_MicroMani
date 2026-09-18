@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：管理 HAL-native 遥操作启停、来源共享、回原点安全门控和状态镜像；实时映射在 HAL。
+# 先看：TeleopMappingService。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 """Coordinate HAL-native Omega.7 teleop modes and guard live motion handoffs.
 
 Python owns native start/stop, work-origin safety gates, status mirroring and
@@ -11,11 +16,13 @@ import math
 import os
 import time
 from collections import deque
+from contextvars import ContextVar
 from typing import Any, Literal
 
 from backend.core.config import SettingsService
 from backend.core.defaults import ICF_KINEMATICS_DEFAULTS, ICF_TELEOP_DEFAULTS
 from backend.core.logging import LogService, now_ms
+from backend.core.motion_safety import MotionSafetyGate, MotionSafetyToken, motion_operation
 from backend.core.motion_limits import (
     WorkOriginMissing,
     effective_limit_arrays,
@@ -46,12 +53,16 @@ PRE_HOME_ROTATION_LIMIT_TOLERANCE_DEG = 1e-6
 class TeleopMappingService:
     """HAL-native teleop lifecycle and status bridge used during recording."""
 
+    # 同一个原生控制器可能同时被连接界面和录制会话使用；来源集合决定停止一个入口后是否仍需运行。
     _NATIVE_ARM_SOURCES = {"teleop-connect", "recording"}
 
-    def __init__(self, settings: SettingsService, hal: HalClient, logs: LogService) -> None:
+    def __init__(self, settings: SettingsService, hal: HalClient, logs: LogService, *, safety: MotionSafetyGate | None = None) -> None:
         self.settings = settings
         self.hal = hal
         self.logs = logs
+        self.safety = safety if safety is not None else MotionSafetyGate()
+        self._source_stop_generation: dict[str, int] = {}
+        self._transition_token: ContextVar[tuple[MotionSafetyToken, str, int] | None] = ContextVar("teleop_transition_token", default=None)
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
         self._last_action: dict[str, Any] | None = None
@@ -74,6 +85,7 @@ class TeleopMappingService:
             return {}
         return await asyncio.to_thread(self.settings.get_config)
 
+    @motion_operation()
     async def start(
         self,
         source: str = "recording",
@@ -81,13 +93,48 @@ class TeleopMappingService:
         *,
         pre_home: bool = True,
     ) -> dict[str, Any]:
+        token = self._transition_token.set((self.safety.capture(), source, self._source_stop_generation.get(source, 0)))
+        try:
+            self._check_transition_current()
+            return await self._start_current(source, home_side, pre_home=pre_home)
+        finally:
+            self._transition_token.reset(token)
+
+    def _check_transition_current(self) -> None:
+        token = self._transition_token.get()
+        if token is None:
+            self.safety.check(self.safety.capture())
+            return
+        safety_token, source, generation = token
+        self.safety.check(safety_token)
+        if self._source_stop_generation.get(source, 0) != generation:
+            raise RuntimeError(f"teleop {source} start cancelled by a newer stop")
+
+    async def _native_command(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        # configure/pre-home/start 之间的 await 不能跨过停止或急停后继续发下一条。
+        if name != "teleop.native.stop":
+            self._check_transition_current()
+        result = await self.hal.command(name, payload)
+        if name != "teleop.native.stop":
+            self._check_transition_current()
+        return result
+
+    async def _start_current(
+        self,
+        source: str = "recording",
+        home_side: SideName | None = None,
+        *,
+        pre_home: bool = True,
+    ) -> dict[str, Any]:
         config = await self._get_config_async()
+        self._check_transition_current()
         op_id = self.logs.new_op_id("teleop") if self.logs is not None else None
         mode = self._hal_mode(config)
         if mode == "real":
             # Native teleop reconfiguration can stop/re-home/start hardware, so
             # serialize it even when UI connect and recording start race.
             async with self._native_transition_lock:
+                self._check_transition_current()
                 return await self._start_native_locked(config, op_id, source, home_side, pre_home)
         if self._task is not None and not self._task.done():
             self._arm_sources.add(source)
@@ -101,6 +148,7 @@ class TeleopMappingService:
         self.logs.info("[HAL]", "HAL-native teleop armed in test mode; no hardware motion will be sent")
         return self.status(config)
 
+    # 启动切换涉及停止、回原点和配置重发，必须串行，防止录制按钮与连接按钮并发改变硬件状态。
     async def _start_native_locked(
         self,
         config: dict[str, Any],
@@ -191,18 +239,11 @@ class TeleopMappingService:
         teleop_config = config.get("teleop", {})
         if not force and isinstance(teleop_config, dict) and not bool(teleop_config.get("homeBeforeStart", True)):
             return
-        startup_config = config.get("motion", {}).get("homeOnStartup", {})
-        if (
-            not force
-            and isinstance(startup_config, dict)
-            and str(startup_config.get("mode", "work_origin")) != "work_origin"
-        ):
-            return
         origin = self._normalized_motion_origin(config)
         if side is None and not bool(origin["valid"]):
             raise RuntimeError("motion work origin is not captured")
         if side is None:
-            await self.hal.command(
+            await self._native_command(
                 "motion.home_all",
                 {
                     "leftPulse": origin["leftPulse"],
@@ -217,7 +258,7 @@ class TeleopMappingService:
         pulse_key = "leftPulse" if side == "left" else "rightPulse"
         if not bool(origin[valid_key]):
             raise RuntimeError(f"{side} motion work origin is not captured")
-        await self.hal.command(
+        await self._native_command(
             "motion.home_origin_side",
             {
                 "side": side,
@@ -302,11 +343,7 @@ class TeleopMappingService:
         teleop_config = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         if isinstance(teleop_config, dict) and not bool(teleop_config.get("homeBeforeStart", True)):
             return False
-        startup_config = config.get("motion", {}).get("homeOnStartup", {})
-        return not (
-            isinstance(startup_config, dict)
-            and str(startup_config.get("mode", "work_origin")) != "work_origin"
-        )
+        return True
 
     def _native_startup_blockers(self, config: dict[str, Any]) -> dict[str, dict[str, Any]]:
         if not self._native_prehome_enabled(config):
@@ -443,6 +480,14 @@ class TeleopMappingService:
         )
 
     async def stop(self, source: str = "recording", *, restart_remaining: bool = True) -> dict[str, Any]:
+        self._source_stop_generation[source] = self._source_stop_generation.get(source, 0) + 1
+        token = self._transition_token.set((self.safety.capture(), source, self._source_stop_generation[source]))
+        try:
+            return await self._stop_current(source, restart_remaining=restart_remaining)
+        finally:
+            self._transition_token.reset(token)
+
+    async def _stop_current(self, source: str, *, restart_remaining: bool) -> dict[str, Any]:
         config = await self._get_config_async()
         if self._hal_mode(config) == "real":
             async with self._native_transition_lock:
@@ -599,12 +644,12 @@ class TeleopMappingService:
         await self._configure_and_start_native_payload(payload)
 
     async def _configure_and_start_native_payload(self, payload: dict[str, Any]) -> None:
-        await self.hal.command("teleop.native.configure", payload)
-        await self.hal.command("teleop.native.start", payload)
+        await self._native_command("teleop.native.configure", payload)
+        await self._native_command("teleop.native.start", payload)
         self._last_native_payload = dict(payload)
 
     async def _start_native_payload(self, payload: dict[str, Any]) -> None:
-        await self.hal.command("teleop.native.start", payload)
+        await self._native_command("teleop.native.start", payload)
         self._last_native_payload = dict(payload)
 
     async def _refresh_native_status(self) -> None:

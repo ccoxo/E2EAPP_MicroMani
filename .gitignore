@@ -26,8 +26,18 @@ frontend/output/playwright/
 __MACOSX/
 
 # Local tool config
-.claude/
-.agents/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/micromani-frontend/
+!.claude/skills/micromani-backend/
+!.claude/skills/micromani-hal/
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/micromani-frontend/
+!.agents/skills/micromani-backend/
+!.agents/skills/micromani-hal/
 .agents/skills/speckit-git-*/
 
 # C++ build output
@@ -66,3 +76,27 @@ hal/vendor/
 
 # Nested project checkout
 cc_data_collection/
+
+# Source-only upload: keep local investigations and personal projects on disk.
+/output/
+/paper/
+/codex-provider-sync/
+/app-main-*.js
+/tmp_debug_connect/
+/tmp_debug_connect_ctx/
+
+# Keep the reviewed design and change record, not generated frontend artifacts.
+/frontend/output/*
+!/frontend/output/ui-redesign/
+/frontend/output/ui-redesign/*
+!/frontend/output/ui-redesign/DESIGN.md
+!/frontend/output/ui-redesign/SESSION_SUMMARY.md
+/frontend/scripts/find-lines.py
+/frontend/scripts/fix-dash-antd*.py
+/frontend/scripts/patch-*.py
+
+# Native compiler intermediate files.
+*.obj
+*.pdb
+*.ilk
+*.lib

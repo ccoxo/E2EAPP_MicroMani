@@ -1,12 +1,21 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：声明LTDMCDriver 的接口与状态结构；封装运动卡访问、脉冲换算、回原点、目标续推、软限位及急停状态。
+ * 先看：LTDMCDriver。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #pragma once
 
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #include "HalTypes.h"
+#include "EmergencyStopState.h"
+#include "ControlLeaseState.h"
 
 namespace appstation::hal {
 
@@ -19,27 +28,42 @@ class LTDMCDriver {
   HalHealth health(double uptimeS) const;
   // 读取 12 个语义轴的运动快照。读锁竞争时返回最近缓存，避免周期线程阻塞。
   MotionState readState();
-  // 立即急停所有轴并尽力关闭伺服，随后需要由回零/使能流程清除急停状态。
+  // 立即急停所有轴并尽力关闭伺服；只有显式安全确认可以清除锁存。
   void emergencyStop();
+  void latchEmergencyStop() noexcept;
+  void requireControlLease();
+  void failControlLease() noexcept;
+  void renewControlLease(const std::string& session, std::uint64_t sequence);
+  bool controlLeaseFresh() const;
+  std::uint64_t pollControlLease();
+  void completeControlLeaseStop(std::uint64_t sequence);
   // Clears only the software latch. It never enables axes or restores prior state.
   void acknowledgeEmergencyStop();
+  void acknowledgeEmergencyStop(std::uint64_t expectedEpoch);
   bool estopActive() const;
+  std::uint64_t commandEpoch() const;
+  bool commandEpochAllowed(std::uint64_t epoch) const;
+  std::int64_t lastEmergencyStopUnixMs() const;
   // 回工作原点前的安全检查，急停未清除时直接拒绝运动。
   void ensureMotionReturnAllowed() const;
   // 按侧打开/关闭伺服；enabledAxes 允许只作用于部分语义轴。
   std::string enableSide(Side side, bool enabled = true);
-  std::string enableSide(Side side, bool enabled, const std::array<bool, 6>& enabledAxes);
+  std::string enableSide(Side side, bool enabled, const std::array<bool, 6>& enabledAxes,
+      std::optional<std::uint64_t> expectedEpoch = std::nullopt);
   // 使用控制卡原点回零模式回单侧机械原点。
-  void homeSide(Side side, const std::array<bool, 6>& enabledAxes);
+  void homeSide(Side side, const std::array<bool, 6>& enabledAxes,
+      std::optional<std::uint64_t> expectedEpoch = std::nullopt);
   // 两侧回工作原点。workOriginPulse 是 12 轴目标脉冲，顺序与 MotionState::axes 一致。
   void homeAll(
       const std::array<double, 12>& workOriginPulse,
-      const std::array<std::array<bool, 6>, 2>& enabledAxes);
+      const std::array<std::array<bool, 6>, 2>& enabledAxes,
+      std::optional<std::uint64_t> expectedEpoch = std::nullopt);
   // 单侧回工作原点。入参只包含该侧 6 个语义轴的目标脉冲。
   void homeOriginSide(
       Side side,
       const std::array<double, 6>& workOriginPulse,
-      const std::array<bool, 6>& enabledAxes);
+      const std::array<bool, 6>& enabledAxes,
+      std::optional<std::uint64_t> expectedEpoch = std::nullopt);
   // maxVelocityUiPerSec/startVelocityUiPerSec 使用语义 UI 单位：
   // 平移轴是 um/s，旋转轴是 deg/s；传入 <=0 时使用内置保守默认值。
   void moveRelativeUi(
@@ -49,7 +73,8 @@ class LTDMCDriver {
       double maxVelocityUiPerSec,
       double startVelocityUiPerSec = 0.0,
       double accTimeSec = 0.0,
-      double decTimeSec = 0.0);
+      double decTimeSec = 0.0,
+      std::optional<std::uint64_t> expectedEpoch = std::nullopt);
   // 原生 teleop 的高频目标更新入口。函数会做死区、单步限幅、软限位裁剪、
   // 目标窗口刷新/重发，并返回完整诊断数据给上层记录。
   TeleopTargetUpdateResult updateTeleopTargetUi(
@@ -67,7 +92,8 @@ class LTDMCDriver {
       double translationStartVelocityUiPerSec = 0.0,
       double rotationStartVelocityUiPerSec = 0.0,
       double accTimeSec = 0.0,
-      double decTimeSec = 0.0);
+      double decTimeSec = 0.0,
+      std::optional<std::uint64_t> expectedEpoch = std::nullopt);
   // 停止某一侧 teleop 相关运动，并清空该侧目标缓存。
   void stopTeleopSide(Side side);
 
@@ -86,15 +112,17 @@ class LTDMCDriver {
   // best-effort 方法用于急停路径，不能抛异常，也不能依赖完整初始化状态。
   void stopAllAxesBestEffort() noexcept;
   void disableAllAxesBestEffort() noexcept;
-  void clearEstopIfUnchanged(std::uint64_t sequenceAtStart);
+  void checkMotionCommand(std::uint64_t epoch);
 
   // mutex_ 保护 vendor SDK 调用和内部状态；snapshotMutex_ 只保护对外快照缓存。
   mutable std::mutex mutex_;
   mutable std::mutex snapshotMutex_;
   bool initialized_{false};
-  // estopSequence_ 用来区分不同急停事件，避免旧操作在结束时误清新急停。
-  std::atomic_bool estopActive_{false};
-  std::atomic_uint64_t estopSequence_{0};
+  // 原子代际同时记录锁存，急停/确认后旧命令仍保持失效。
+  EmergencyStopState estop_;
+  ControlLeaseState controlLease_;
+  std::atomic_uint32_t stopsInProgress_{0};
+  std::atomic_int64_t lastEmergencyStopUnixMs_{0};
   std::string lastError_;
   // pulse_/enabled_ 是 12 轴内部状态，索引由 stateIndex(side, axis) 计算。
   std::array<double, 12> pulse_{};

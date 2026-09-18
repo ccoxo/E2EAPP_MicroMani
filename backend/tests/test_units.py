@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：脉冲到微米/角度的换算，以及运行标定值的使用。
+# 先看：test_rotation_ui_uses_degrees_not_millidegrees → test_translation_ui_uses_micrometers → test_motion_pulse_per_unit_uses_runtime_kinematics_config。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from backend.core.defaults import default_config

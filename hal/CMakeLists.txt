@@ -1,3 +1,7 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：声明 HAL 核心库、服务和夹爪 worker 构建目标，以及 SDK、Fast-DDS 链接配置。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 cmake_minimum_required(VERSION 3.24)
 project(AppStationHal LANGUAGES CXX)
 
@@ -9,6 +13,7 @@ option(APPSTATION_ENABLE_VENDOR_SDKS "Compile LTDMC and Omega.7 vendor SDK calls
 
 # 核心库只包含硬件访问、单位换算、teleop 映射和夹爪控制，不包含 HTTP 传输层。
 add_library(appstation_hal_core
+  include/HalVersion.h
   src/ForceComplianceController.cpp
   src/ForceControlRuntime.cpp
   src/ForceSafetyLatch.cpp
@@ -34,6 +39,7 @@ endif()
 
 # HalServer 串起 HTTP 控制、主手 DDS 发布、HAL 映射和 follower 目标执行。
 add_executable(HalServer
+  include/HalVersion.h
   include/HalCommandDispatcher.h
   include/HalDdsControlServer.h
   include/HalHttpServer.h

@@ -1,3 +1,8 @@
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：验证页面隐藏时只发送一次运行资源释放请求。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 afterEach(() => {

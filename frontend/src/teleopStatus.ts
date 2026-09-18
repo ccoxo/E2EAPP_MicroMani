@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 02｜前端契约与状态
+ * 职责：综合诊断与逻辑连接状态，生成单手或双手遥操作的显示状态。
+ * 先看：omegaDiagnosticState → handForSide → logicalDisconnected → teleopHandState。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import type { ConnectionState, DiagnosticItem, Omega7Telemetry, TelemetryFrame } from './types'
 
 const sides = ['left', 'right'] as const

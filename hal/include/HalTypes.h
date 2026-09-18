@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：定义 HAL 共用侧别、轴、状态、限位和运动结果结构。
+ * 先看：Side → SemanticAxis → AxisLimit → MotionProfile。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #pragma once
 
 #include <array>

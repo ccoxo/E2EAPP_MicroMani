@@ -6,22 +6,55 @@ import { formatApiErrorMessage, stopMotionSide } from './api'
 import App from './App'
 import { ActionCompareModal } from './components/ActionCompareModal'
 import { LogPanel } from './components/LogPanel'
+import EpisodeControlPanel from './components/record/EpisodeControlPanel'
 import { defaultConfig, defaultDiagnostics } from './data'
 import { telemetryStaleAfterMs } from './hardwareStatus'
+import { initialMotionCommand } from './stores/motionCommands'
+import { initialControlLease } from './stores/controlLease'
 import { chartHistoryIntervalMs, uiFrameIntervalMs, useTelemetryStore } from './stores/telemetry'
 import type { TelemetryFrame } from './types'
+import { initialControlSafety } from './utils/controlSafety'
 import { DatasetView } from './views/DatasetView'
 import { SettingsView } from './views/SettingsView'
 
+const initialFrame = structuredClone(useTelemetryStore.getState().frame)
+
+/** Render the app and wait for the lazy route chunk to finish. */
+async function renderApp() {
+  render(<App />)
+  await waitFor(
+    () => {
+      expect(document.querySelector('.app-shell')).toBeTruthy()
+    },
+    { timeout: 10000 },
+  )
+  await waitFor(
+    () => {
+      expect(
+        document.querySelector(
+          '.main-content .view-stack, .main-content .record-page, .main-content .hardware-settings-view, .main-content .hardware-dashboard-page',
+        ),
+      ).toBeTruthy()
+    },
+    { timeout: 10000 },
+  )
+}
+
 afterEach(() => {
+  cleanup()
   useTelemetryStore.getState().parameterSnapshots.forEach((snapshot) => useTelemetryStore.getState().deleteParameterSnapshot(snapshot.id))
   useTelemetryStore.getState().setDangerOverride(null)
   useTelemetryStore.getState().stopMock()
   useTelemetryStore.getState().stopBackend()
   useTelemetryStore.getState().clearRecordSession()
-  useTelemetryStore.setState((state) => ({
+  useTelemetryStore.setState({
     config: structuredClone(defaultConfig),
+    motionCommand: { left: initialMotionCommand(), right: initialMotionCommand() },
+    controlSafety: initialControlSafety(),
+    controlLease: initialControlLease(false),
+    telemetryLink: { state: 'connecting', lastFrameReceivedAt: null },
     diagnostics: structuredClone(defaultDiagnostics),
+    history: [],
     picoConnection: { state: 'pending', message: '尚未检查 PICO ADB', checkedAt: null },
     picoNetworkInfo: null,
     manualControl: {
@@ -39,8 +72,8 @@ afterEach(() => {
       axisOffsets: {},
     },
     frame: {
-      ...state.frame,
-      teleopHands: state.frame.teleopHands.map((hand) => ({
+      ...structuredClone(initialFrame),
+      teleopHands: initialFrame.teleopHands.map((hand) => ({
         ...hand,
         connected: false,
         calibrated: false,
@@ -54,18 +87,16 @@ afterEach(() => {
         message: 'logical teleop hand disconnected',
       })),
     },
-  }))
-  cleanup()
+  })
   window.localStorage.clear()
   window.history.pushState({}, '', '/')
   vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
-  ;(globalThis as { __captureEchartOptions?: boolean }).__captureEchartOptions = false
 })
 
 describe('AppStation M0 frontend', () => {
-  it('renders a before and after comparison before confirming a high-risk action', () => {
+  it('renders a before and after comparison before confirming a high-risk action', async () => {
     const onConfirm = vi.fn()
     const onCancel = vi.fn()
 
@@ -100,8 +131,8 @@ describe('AppStation M0 frontend', () => {
     expect(onConfirm).toHaveBeenCalledTimes(1)
   })
 
-  it('renders the dashboard workbench', () => {
-    render(<App />)
+  it('renders the dashboard workbench', async () => {
+    await renderApp()
     expect(screen.getByText('AppStation')).toBeInTheDocument()
     expect(screen.getByText('全局硬件状态')).toBeInTheDocument()
     expect(screen.getByText('左机械臂')).toBeInTheDocument()
@@ -109,7 +140,7 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getByText('Backend 30Hz')).toBeInTheDocument()
   })
 
-  it('labels dashboard arm panels by their wrist camera side', () => {
+  it('labels dashboard arm panels by their wrist camera side', async () => {
     const frame = structuredClone(useTelemetryStore.getState().frame)
     useTelemetryStore.setState({
       frame: {
@@ -122,7 +153,7 @@ describe('AppStation M0 frontend', () => {
       },
     })
 
-    render(<App />)
+    await renderApp()
 
     const armPanels = [...document.querySelectorAll<HTMLElement>('.arm-hardware-panel')]
     expect(armPanels).toHaveLength(2)
@@ -142,6 +173,10 @@ describe('AppStation M0 frontend', () => {
     vi.useFakeTimers()
 
     class MockWebSocket {
+      static OPEN = 1
+      readyState = 1
+      private challengeSeq = 0
+      private challengeTimer: ReturnType<typeof setInterval>
       static instances: MockWebSocket[] = []
       readonly url: string
       onopen: ((event: Event) => void) | null = null
@@ -152,10 +187,19 @@ describe('AppStation M0 frontend', () => {
         this.url = url
         MockWebSocket.instances.push(this)
         window.setTimeout(() => this.onopen?.(new Event('open')), 0)
+        this.challengeTimer = setInterval(() => {
+          this.onmessage?.({ data: JSON.stringify({ type: 'safety_challenge', data: { sessionId: 'frame-test', challengeId: `n${++this.challengeSeq}`, ttlMs: 2000 } }) } as MessageEvent)
+        }, 500)
       }
 
       close() {
+        clearInterval(this.challengeTimer)
         this.onclose?.({ code: 1000 } as CloseEvent)
+      }
+
+      send(message: string) {
+        const { data } = JSON.parse(message)
+        this.onmessage?.({ data: JSON.stringify({ type: 'control_lease', data: { ...data, status: 'active', ttlMs: 2500 } }) } as MessageEvent)
       }
 
       emitTelemetry(frame: TelemetryFrame) {
@@ -212,32 +256,53 @@ describe('AppStation M0 frontend', () => {
     expect(useTelemetryStore.getState().frame.wsOk).toBe(false)
   })
 
-  it('renders the operator navigation in the requested order', () => {
-    render(<App />)
+  it('renders the operator navigation in the requested order', async () => {
+    await renderApp()
     const nav = screen.getByLabelText('主导航')
     const labels = within(nav).getAllByRole('link').map((link) => link.textContent)
     expect(labels).toEqual(['主页', '录制', '数据集', '模型', '微调', '自动', '设置'])
   })
 
   it('keeps the global emergency stop available across pages', async () => {
-    render(<App />)
+    let resolveEmergency!: (value: unknown) => void
+    vi.spyOn(api, 'emergencyStop').mockImplementationOnce(() => new Promise((resolve) => {
+      resolveEmergency = resolve
+    }))
+    const acknowledgeSpy = vi.spyOn(api, 'acknowledgeSafety')
+    await renderApp()
     fireEvent.click(screen.getByRole('link', { name: '数据集' }))
 
     const emergencyButton = screen.getByRole('button', { name: '全局急停' })
     expect(emergencyButton).toBeInTheDocument()
+    const dangerBeforeStop = useTelemetryStore.getState().frame.dangerIndex
     fireEvent.click(emergencyButton)
 
-    expect(useTelemetryStore.getState().frame.dangerIndex).toBe(1.1)
+    expect(useTelemetryStore.getState().frame.dangerIndex).toBe(dangerBeforeStop)
+    expect(useTelemetryStore.getState().controlSafety).toMatchObject({ emergencyRequested: true, emergencyPending: true })
     const resetButton = screen.getByRole('button', { name: '确认安全态' })
-    expect(resetButton).toBeInTheDocument()
-    expect(resetButton).toHaveTextContent('确认安全态')
+    expect(resetButton).toBeDisabled()
+    fireEvent.click(resetButton)
+    expect(acknowledgeSpy).not.toHaveBeenCalled()
+
+    await act(async () => resolveEmergency({ ok: true }))
+    await waitFor(() => expect(resetButton).toBeEnabled())
+    expect(emergencyButton).toHaveTextContent('安全锁定')
     fireEvent.click(resetButton)
 
-    await waitFor(() => expect(useTelemetryStore.getState().frame.dangerIndex).toBe(0))
+    expect(resetButton).toBeDisabled()
+    expect(useTelemetryStore.getState().controlSafety.emergencyRequested).toBe(true)
+    await waitFor(() => expect(useTelemetryStore.getState().controlSafety.emergencyRequested).toBe(false))
+    expect(acknowledgeSpy).toHaveBeenCalledTimes(1)
+    expect(useTelemetryStore.getState().frame.forceStatus?.safety?.latched).toBe(false)
+    expect(screen.queryByRole('button', { name: '确认安全态' })).not.toBeInTheDocument()
   })
 
-  it('keeps the safety acknowledgement visible after a latched force trip is unloaded', () => {
-    useTelemetryStore.setState((state) => ({
+  it('keeps the safety acknowledgement visible after a latched force trip is unloaded', async () => {
+    await renderApp()
+    // 固定反馈，避免 33ms 模拟帧在路由加载期间覆盖本用例的锁存事件。
+    act(() => {
+      useTelemetryStore.getState().stopMock()
+      useTelemetryStore.setState((state) => ({
       frame: {
         ...state.frame,
         dangerIndex: 0.2,
@@ -250,30 +315,30 @@ describe('AppStation M0 frontend', () => {
           },
         },
       },
-    }))
-
-    render(<App />)
+      }))
+    })
 
     expect(screen.getByRole('button', { name: '确认安全态' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '全局急停' })).toHaveTextContent('已急停')
+    expect(screen.getByRole('button', { name: '全局急停' })).toHaveTextContent('安全锁定')
   })
 
   it('keeps the safety latch visible when acknowledgement is rejected', async () => {
-    vi.spyOn(api, 'acknowledgeSafety').mockRejectedValueOnce(
+    const acknowledgeSpy = vi.spyOn(api, 'acknowledgeSafety').mockRejectedValueOnce(
       new Error('双侧健康稳定时间不足 500 ms'),
     )
     useTelemetryStore.setState((state) => ({
-      dangerOverride: 1.1,
+      telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
       frame: {
         ...state.frame,
+        wsOk: true,
+        halOk: true,
         dangerIndex: 1.1,
         forceStatus: {
           source: 'hkvl_serial',
           safety: {
             latched: true,
             reason: 'left Fz stop threshold',
-            canAcknowledge: false,
-            acknowledgeBlocker: '双侧健康稳定时间不足 500 ms',
+            canAcknowledge: true,
           },
         },
       },
@@ -282,7 +347,10 @@ describe('AppStation M0 frontend', () => {
     useTelemetryStore.getState().acknowledgeSafety()
 
     await waitFor(() => {
+      expect(acknowledgeSpy).toHaveBeenCalledTimes(1)
       expect(useTelemetryStore.getState().frame.dangerIndex).toBe(1.1)
+      expect(useTelemetryStore.getState().frame.forceStatus?.safety?.latched).toBe(true)
+      expect(useTelemetryStore.getState().controlSafety.acknowledging).toBe(false)
       expect(useTelemetryStore.getState().logs.at(-1)?.msg).toContain('500 ms')
     })
   })
@@ -347,11 +415,11 @@ describe('AppStation M0 frontend', () => {
     expect(operatorLeftCard?.querySelector('.force-settings-column .force-control-workbench')).toBeTruthy()
     expect(document.body).toHaveTextContent('CRC 3')
     expect(screen.getByText('left Fz stop threshold')).toBeInTheDocument()
-    expect(screen.getByText(/不会恢复伺服/)).toBeInTheDocument()
-    expect(screen.getAllByRole('switch', { name: '启用 X/Z 顺应' })[0]).toBeDisabled()
+    expect(screen.getByText(/超限后不会恢复伺服，需人工确认安全态/)).toBeInTheDocument()
+    expect(screen.getAllByRole('checkbox', { name: '启用 X/Z 顺应' })[0]).toBeDisabled()
   }, 60000)
 
-  it('opens the operator-side six-axis force direction calibration', () => {
+  it('opens the operator-side six-axis force direction calibration', async () => {
     window.history.pushState({}, '', '/settings#force-left')
     useTelemetryStore.setState((state) => ({
       config: {
@@ -389,7 +457,6 @@ describe('AppStation M0 frontend', () => {
   })
 
   it("plots force history from the card's mapped hardware side", () => {
-    ;(globalThis as { __captureEchartOptions?: boolean }).__captureEchartOptions = true
     useTelemetryStore.setState((state) => ({
       config: {
         ...state.config,
@@ -420,7 +487,7 @@ describe('AppStation M0 frontend', () => {
     }))
 
     render(
-      <MemoryRouter initialEntries={['/settings']}>
+      <MemoryRouter initialEntries={['/settings#force-left']}>
         <SettingsView />
       </MemoryRouter>,
     )
@@ -429,21 +496,21 @@ describe('AppStation M0 frontend', () => {
     const operatorRightCard = document.getElementById('force-right')
     expect(operatorLeftCard).toBeTruthy()
     expect(operatorRightCard).toBeTruthy()
-    const operatorLeftOption = JSON.parse(
-      within(operatorLeftCard!).getByTestId('echart-mock').getAttribute('data-chart-option') ?? '{}',
+    const operatorLeftFx = JSON.parse(
+      within(operatorLeftCard!).getByTestId('live-chart').getAttribute('data-fx') ?? '[]',
     )
-    const operatorRightOption = JSON.parse(
-      within(operatorRightCard!).getByTestId('echart-mock').getAttribute('data-chart-option') ?? '{}',
+    const operatorRightFx = JSON.parse(
+      within(operatorRightCard!).getByTestId('live-chart').getAttribute('data-fx') ?? '[]',
     )
 
-    expect(operatorLeftOption.series[0].data).toEqual([1527])
-    expect(operatorRightOption.series[0].data).toEqual([14])
+    expect(operatorLeftFx).toEqual([1527])
+    expect(operatorRightFx).toEqual([14])
   })
 
-  it('navigates to the record workflow', () => {
-    render(<App />)
+  it('navigates to the record workflow', async () => {
+    await renderApp()
     fireEvent.click(screen.getByRole('link', { name: '录制' }))
-    expect(screen.getByText('相机预览')).toBeInTheDocument()
+    expect(await screen.findByText('相机预览', {}, { timeout: 5000 })).toBeInTheDocument()
     expect(screen.getByText('运动与力觉监看')).toBeInTheDocument()
     expect(screen.getByText('录制控制')).toBeInTheDocument()
     expect(screen.getByText('开始采集会话')).toBeInTheDocument()
@@ -452,9 +519,9 @@ describe('AppStation M0 frontend', () => {
     expect(document.querySelector('.record-camera-placeholder-wrist_right')).toBeTruthy()
   })
 
-  it('exposes Kalman filter controls on the record page', () => {
+  it('exposes Kalman filter controls on the record page', async () => {
     window.history.pushState({}, '', '/record')
-    render(<App />)
+    await renderApp()
 
     expect(screen.getByText('卡尔曼滤波')).toBeInTheDocument()
     expect(screen.getByText('遗忘因子 beta')).toBeInTheDocument()
@@ -471,7 +538,7 @@ describe('AppStation M0 frontend', () => {
       recordSidebar?.textContent?.indexOf('卡尔曼滤波') ?? -1,
     )
 
-    const toggle = screen.getByRole('switch', { name: '卡尔曼滤波开关' })
+    const toggle = screen.getByRole('checkbox', { name: '卡尔曼滤波开关' })
     expect(toggle).not.toBeChecked()
     fireEvent.click(toggle)
 
@@ -497,7 +564,7 @@ describe('AppStation M0 frontend', () => {
         ],
       },
     }))
-    render(<App />)
+    await renderApp()
 
     expect(screen.getByText('#007')).toBeInTheDocument()
     expect(screen.getByText('321 帧 / 10.7s')).toBeInTheDocument()
@@ -525,22 +592,27 @@ describe('AppStation M0 frontend', () => {
         motionEnabled: { left: true, right: true },
         motionAxisEnabled: {
           left: [true, true, true, true, true, true],
-          right: [true, true, true, true, true, false],
+          right: [true, true, true, true, true, true],
         },
       },
     }))
-    render(<App />)
-    useTelemetryStore.getState().stopMock()
-    useTelemetryStore.setState((state) => ({
-      frame: {
-        ...state.frame,
-        motionEnabled: { left: true, right: true },
-        motionAxisEnabled: {
-          left: [true, true, true, true, true, true],
-          right: [true, true, true, true, true, false],
+    await renderApp()
+    act(() => {
+      useTelemetryStore.getState().stopMock()
+      useTelemetryStore.setState((state) => ({
+        telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
+        frame: {
+          ...state.frame,
+          wsOk: true,
+          halOk: true,
+          motionEnabled: { left: true, right: true },
+          motionAxisEnabled: {
+            left: [true, true, true, true, true, true],
+            right: [true, true, true, true, true, true],
+          },
         },
-      },
-    }))
+      }))
+    })
 
     const leftButton = () => screen.getByText('左从臂回工作原点').closest('button')!
     const rightButton = () => screen.getByText('右从臂回工作原点').closest('button')!
@@ -556,7 +628,7 @@ describe('AppStation M0 frontend', () => {
         motionEnabled: { left: true, right: true },
         motionAxisEnabled: {
           left: [true, true, true, true, true, true],
-          right: [true, true, true, true, true, false],
+          right: [true, true, true, true, true, true],
         },
       },
     }))
@@ -567,7 +639,7 @@ describe('AppStation M0 frontend', () => {
         motionEnabled: { left: true, right: true },
         motionAxisEnabled: {
           left: [true, true, true, true, true, true],
-          right: [true, true, true, true, true, false],
+          right: [true, true, true, true, true, true],
         },
       },
     }))
@@ -576,7 +648,7 @@ describe('AppStation M0 frontend', () => {
     expect(returnOriginSpy.mock.calls).toEqual([['right'], ['left']])
   })
 
-  it('disables record return-to-origin buttons when the motion side is not enabled', () => {
+  it('disables record return-to-origin buttons when the motion side is not enabled', async () => {
     window.history.pushState({}, '', '/record')
     useTelemetryStore.setState((state) => ({
       frame: {
@@ -584,12 +656,12 @@ describe('AppStation M0 frontend', () => {
         motionEnabled: { left: false, right: true },
         motionAxisEnabled: {
           left: [false, false, false, false, false, false],
-          right: [true, true, true, true, true, false],
+          right: [true, true, true, true, true, true],
         },
       },
     }))
 
-    render(<App />)
+    await renderApp()
     useTelemetryStore.getState().stopMock()
     useTelemetryStore.setState((state) => ({
       frame: {
@@ -597,7 +669,7 @@ describe('AppStation M0 frontend', () => {
         motionEnabled: { left: false, right: true },
         motionAxisEnabled: {
           left: [false, false, false, false, false, false],
-          right: [true, true, true, true, true, false],
+          right: [true, true, true, true, true, true],
         },
       },
     }))
@@ -606,9 +678,9 @@ describe('AppStation M0 frontend', () => {
     expect(screen.getByText('右从臂回工作原点').closest('button')).toBeDisabled()
   })
 
-  it('shows teleop connection, gripper teleop ports, and camera tuning controls in compact status rows', () => {
-    window.history.pushState({}, '', '/settings')
-    render(<App />)
+  it('shows teleop connection, gripper teleop ports, and camera tuning controls in compact status rows', async () => {
+    window.history.pushState({}, '', '/settings#teleop-left')
+    await renderApp()
 
     const teleopStrips = document.querySelectorAll('.teleop-connection-strip')
     expect(teleopStrips.length).toBeGreaterThanOrEqual(2)
@@ -620,11 +692,12 @@ describe('AppStation M0 frontend', () => {
     expect(gripperTeleopStrips[0].textContent).toContain('COM9')
     expect(gripperTeleopStrips[0].textContent).toContain('slave 9')
 
+    fireEvent.click(screen.getByRole('tab', { name: '视觉' }))
     const cameraRows = document.querySelectorAll('.camera-tuning-control-row')
     expect(cameraRows.length).toBeGreaterThanOrEqual(6)
   })
 
-  it('marks a logically connected but physically offline teleop hand as an error state', () => {
+  it('marks a logically connected but physically offline teleop hand as an error state', async () => {
     window.history.pushState({}, '', '/settings#teleop-left')
     useTelemetryStore.setState((state) => ({
       config: {
@@ -641,14 +714,18 @@ describe('AppStation M0 frontend', () => {
       },
     }))
 
-    render(<App />)
+    render(
+      <MemoryRouter initialEntries={['/settings#teleop-left']}>
+        <SettingsView />
+      </MemoryRouter>,
+    )
 
     const teleopConnection = document.querySelector<HTMLElement>('#teleop-left .teleop-connection-strip > div:first-child')
     expect(teleopConnection).toHaveClass('teleop-status-error')
     expect(teleopConnection).toHaveTextContent('物理离线')
   })
 
-  it('makes a physically offline teleop hand obvious even before logical connection', () => {
+  it('makes a physically offline teleop hand obvious even before logical connection', async () => {
     window.history.pushState({}, '', '/settings#teleop-left')
     useTelemetryStore.setState((state) => ({
       config: {
@@ -665,7 +742,11 @@ describe('AppStation M0 frontend', () => {
       },
     }))
 
-    render(<App />)
+    render(
+      <MemoryRouter initialEntries={['/settings#teleop-left']}>
+        <SettingsView />
+      </MemoryRouter>,
+    )
 
     const teleopCard = document.querySelector<HTMLElement>('#teleop-left')
     const teleopAlert = document.querySelector<HTMLElement>('#teleop-left .teleop-error-callout')
@@ -677,7 +758,7 @@ describe('AppStation M0 frontend', () => {
     expect(teleopConnection).toHaveTextContent('物理离线')
   })
 
-  it('uses live Omega telemetry for the displayed OpenID instead of the configured OpenID', () => {
+  it('uses live Omega telemetry for the displayed OpenID instead of the configured OpenID', async () => {
     window.history.pushState({}, '', '/settings#teleop-left')
     useTelemetryStore.setState((state) => ({
       config: {
@@ -702,7 +783,11 @@ describe('AppStation M0 frontend', () => {
       },
     }))
 
-    render(<App />)
+    render(
+      <MemoryRouter initialEntries={['/settings#teleop-left']}>
+        <SettingsView />
+      </MemoryRouter>,
+    )
 
     const teleopCard = document.querySelector<HTMLElement>('#teleop-left')
     expect(teleopCard).toHaveTextContent('配置 dhdOpenID(0)')
@@ -710,10 +795,10 @@ describe('AppStation M0 frontend', () => {
     expect(teleopCard).not.toHaveTextContent('OpenID 0 / device 1')
   })
 
-  it('shows the operator-view target arm for each Omega teleop source hand', () => {
-    window.history.pushState({}, '', '/settings')
+  it('shows the operator-view target arm for each Omega teleop source hand', async () => {
+    window.history.pushState({}, '', '/settings#teleop-left')
 
-    render(<App />)
+    await renderApp()
 
     const leftTeleopCard = document.querySelector<HTMLElement>('#teleop-left')
     const rightTeleopCard = document.querySelector<HTMLElement>('#teleop-right')
@@ -737,7 +822,7 @@ describe('AppStation M0 frontend', () => {
     expect(rightMetrics).not.toHaveTextContent('目标臂')
   })
 
-  it('blocks Omega teleop connect when the mapped work origin is missing', () => {
+  it('blocks Omega teleop connect when the mapped work origin is missing', async () => {
     const connectSpy = vi.spyOn(api, 'connectTeleopHand')
     window.history.pushState({}, '', '/settings#teleop-left')
     useTelemetryStore.setState((state) => ({
@@ -762,7 +847,11 @@ describe('AppStation M0 frontend', () => {
       },
     }))
 
-    render(<App />)
+    render(
+      <MemoryRouter initialEntries={['/settings#teleop-left']}>
+        <SettingsView />
+      </MemoryRouter>,
+    )
 
     const teleopCard = document.querySelector<HTMLElement>('#teleop-left')
     expect(teleopCard).toBeTruthy()
@@ -790,29 +879,34 @@ describe('AppStation M0 frontend', () => {
     const homeAllSpy = vi.spyOn(api, 'homeAll').mockResolvedValue({ ok: true })
     const captureOriginSpy = vi.spyOn(api, 'captureMotionOrigin').mockResolvedValue({ ok: true })
 
-    window.history.pushState({}, '', '/settings')
+    window.history.pushState({}, '', '/settings#teleop-left')
     useTelemetryStore.setState((state) => ({
       frame: {
         ...state.frame,
         motionEnabled: { left: true, right: true },
         motionAxisEnabled: {
           left: [true, true, true, true, true, true],
-          right: [true, true, true, true, true, false],
+          right: [true, true, true, true, true, true],
         },
       },
     }))
-    render(<App />)
-    useTelemetryStore.getState().stopMock()
-    useTelemetryStore.setState((state) => ({
-      frame: {
-        ...state.frame,
-        motionEnabled: { left: true, right: true },
-        motionAxisEnabled: {
-          left: [true, true, true, true, true, true],
-          right: [true, true, true, true, true, false],
+    await renderApp()
+    act(() => {
+      useTelemetryStore.getState().stopMock()
+      useTelemetryStore.setState((state) => ({
+        telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
+        frame: {
+          ...state.frame,
+          wsOk: true,
+          halOk: true,
+          motionEnabled: { left: true, right: true },
+          motionAxisEnabled: {
+            left: [true, true, true, true, true, true],
+            right: [true, true, true, true, true, true],
+          },
         },
-      },
-    }))
+      }))
+    })
 
     const getTeleopCard = (side: 'left' | 'right') => {
       const card = document.querySelector<HTMLElement>(`#teleop-${side}`)
@@ -836,7 +930,7 @@ describe('AppStation M0 frontend', () => {
         motionEnabled: { left: true, right: true },
         motionAxisEnabled: {
           left: [true, true, true, true, true, true],
-          right: [true, true, true, true, true, false],
+          right: [true, true, true, true, true, true],
         },
       },
     }))
@@ -847,7 +941,7 @@ describe('AppStation M0 frontend', () => {
         motionEnabled: { left: true, right: true },
         motionAxisEnabled: {
           left: [true, true, true, true, true, true],
-          right: [true, true, true, true, true, false],
+          right: [true, true, true, true, true, true],
         },
       },
     }))
@@ -861,7 +955,7 @@ describe('AppStation M0 frontend', () => {
   it('returns the same-side work origin from Omega cards when teleop channel swap is disabled', async () => {
     const returnOriginSpy = vi.spyOn(api, 'returnMotionOriginSide').mockResolvedValue({ ok: true })
 
-    window.history.pushState({}, '', '/settings')
+    window.history.pushState({}, '', '/settings#teleop-left')
     useTelemetryStore.setState((state) => ({
       config: {
         ...state.config,
@@ -875,22 +969,27 @@ describe('AppStation M0 frontend', () => {
         motionEnabled: { left: true, right: true },
         motionAxisEnabled: {
           left: [true, true, true, true, true, true],
-          right: [true, true, true, true, true, false],
+          right: [true, true, true, true, true, true],
         },
       },
     }))
-    render(<App />)
-    useTelemetryStore.getState().stopMock()
-    useTelemetryStore.setState((state) => ({
-      frame: {
-        ...state.frame,
-        motionEnabled: { left: true, right: true },
-        motionAxisEnabled: {
-          left: [true, true, true, true, true, true],
-          right: [true, true, true, true, true, false],
+    await renderApp()
+    act(() => {
+      useTelemetryStore.getState().stopMock()
+      useTelemetryStore.setState((state) => ({
+        telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
+        frame: {
+          ...state.frame,
+          wsOk: true,
+          halOk: true,
+          motionEnabled: { left: true, right: true },
+          motionAxisEnabled: {
+            left: [true, true, true, true, true, true],
+            right: [true, true, true, true, true, true],
+          },
         },
-      },
-    }))
+      }))
+    })
 
     const teleopLeft = document.querySelector<HTMLElement>('#teleop-left')
     expect(teleopLeft).toBeTruthy()
@@ -903,31 +1002,36 @@ describe('AppStation M0 frontend', () => {
     expect(returnOriginSpy).not.toHaveBeenCalledWith('right')
   })
 
-  it('disables Omega return-to-origin buttons when the motion side is not enabled', () => {
-    window.history.pushState({}, '', '/settings')
+  it('disables Omega return-to-origin buttons when the motion side is not enabled', async () => {
+    window.history.pushState({}, '', '/settings#teleop-left')
     useTelemetryStore.setState((state) => ({
       frame: {
         ...state.frame,
         motionEnabled: { left: false, right: true },
         motionAxisEnabled: {
           left: [false, false, false, false, false, false],
-          right: [true, true, true, true, true, false],
+          right: [true, true, true, true, true, true],
         },
       },
     }))
 
-    render(<App />)
-    useTelemetryStore.getState().stopMock()
-    useTelemetryStore.setState((state) => ({
-      frame: {
-        ...state.frame,
-        motionEnabled: { left: false, right: true },
-        motionAxisEnabled: {
-          left: [false, false, false, false, false, false],
-          right: [true, true, true, true, true, false],
+    await renderApp()
+    act(() => {
+      useTelemetryStore.getState().stopMock()
+      useTelemetryStore.setState((state) => ({
+        telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
+        frame: {
+          ...state.frame,
+          wsOk: true,
+          halOk: true,
+          motionEnabled: { left: false, right: true },
+          motionAxisEnabled: {
+            left: [false, false, false, false, false, false],
+            right: [true, true, true, true, true, true],
+          },
         },
-      },
-    }))
+      }))
+    })
 
     const getTeleopCard = (side: 'left' | 'right') => {
       const card = document.querySelector<HTMLElement>(`#teleop-${side}`)
@@ -944,7 +1048,7 @@ describe('AppStation M0 frontend', () => {
     expect(getReturnButton('right')).toBeDisabled()
   })
 
-  it('does not show stale Omega pose values after the latest read failed', () => {
+  it('does not show stale Omega pose values after the latest read failed', async () => {
     window.history.pushState({}, '', '/settings#teleop-left')
     useTelemetryStore.setState((state) => ({
       config: {
@@ -967,7 +1071,11 @@ describe('AppStation M0 frontend', () => {
       },
     }))
 
-    render(<App />)
+    render(
+      <MemoryRouter initialEntries={['/settings#teleop-left']}>
+        <SettingsView />
+      </MemoryRouter>,
+    )
 
     const teleopCard = document.querySelector<HTMLElement>('#teleop-left')
     expect(teleopCard).toHaveTextContent('读数待恢复')
@@ -975,7 +1083,7 @@ describe('AppStation M0 frontend', () => {
     expect(teleopCard).not.toHaveTextContent('4.00, 5.00, 6.00°')
   })
 
-  it('marks dashboard Omega hand status from per-hand telemetry reads', () => {
+  it('marks dashboard Omega hand status from per-hand telemetry reads', async () => {
     useTelemetryStore.setState((state) => ({
       diagnostics: state.diagnostics.map((item) => (item.key === 'omega7' ? { ...item, status: 'ok' } : item)),
       config: {
@@ -992,7 +1100,7 @@ describe('AppStation M0 frontend', () => {
       },
     }))
 
-    render(<App />)
+    await renderApp()
 
     const leftPanel = screen.getByText('左机械臂').closest('section')
     const teleopChip = leftPanel?.querySelector<HTMLElement>('.device-chip-row button:last-child')
@@ -1000,7 +1108,7 @@ describe('AppStation M0 frontend', () => {
     expect(teleopChip).toHaveTextContent('读数待恢复')
   })
 
-  it('demotes gripper enable controls when HAL-native teleop owns the gripper', () => {
+  it('demotes gripper enable controls when HAL-native teleop owns the gripper', async () => {
     window.history.pushState({}, '', '/settings#gripper-left')
     useTelemetryStore.setState((state) => ({
       config: {
@@ -1009,7 +1117,7 @@ describe('AppStation M0 frontend', () => {
         teleop: { ...state.config.teleop, leftConnected: true },
       },
     }))
-    render(<App />)
+    await renderApp()
 
     const leftGripperCard = document.querySelector<HTMLElement>('#gripper-left')
     expect(leftGripperCard).toBeTruthy()
@@ -1043,8 +1151,11 @@ describe('AppStation M0 frontend', () => {
         item.key === 'omega7' || item.key === 'gripper' ? { ...item, status: 'ok' } : item,
       ),
     }))
-    render(<App />)
+    await renderApp()
     fireEvent.click(screen.getByRole('link', { name: '录制' }))
+    await waitFor(() => {
+      expect(screen.getByText('开始采集会话')).toBeInTheDocument()
+    })
     fireEvent.click(screen.getByText('开始采集会话').closest('button')!)
 
     expect(screen.getByText('采集会话开始前硬件检查')).toBeInTheDocument()
@@ -1052,6 +1163,7 @@ describe('AppStation M0 frontend', () => {
 
     const confirmButton = screen.getByText('确认开始').closest('button')!
     expect(confirmButton).toBeDisabled()
+    act(() => useTelemetryStore.setState((state) => ({ recordSession: { ...state.recordSession, resetReturnedSides: ['left', 'right'] } })))
     fireEvent.click(screen.getByRole('checkbox', { name: '已完成' }))
     await waitFor(() => expect(confirmButton).not.toBeDisabled())
     fireEvent.click(confirmButton)
@@ -1158,7 +1270,7 @@ describe('AppStation M0 frontend', () => {
         motionEnabled: { ...state.frame.motionEnabled, right: true },
         motionAxisEnabled: {
           ...state.frame.motionAxisEnabled,
-          right: [true, true, true, true, true, false],
+          right: [true, true, true, true, true, true],
         },
       },
     }))
@@ -1202,7 +1314,7 @@ describe('AppStation M0 frontend', () => {
     expect(captureOriginSpy).not.toHaveBeenCalled()
   })
 
-  it('does not expose origin capture from the record workflow store', () => {
+  it('does not expose origin capture from the record workflow store', async () => {
     expect(useTelemetryStore.getState()).not.toHaveProperty('captureRecordMotionOrigin')
   })
 
@@ -1271,10 +1383,7 @@ describe('AppStation M0 frontend', () => {
     expect(Date.now() - (session.phaseStartedAt ?? 0)).toBeGreaterThanOrEqual(550)
   })
 
-  it('keeps the recording progress bar visible when backend status omits the total duration', () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-05-22T00:00:05.000Z'))
-    window.history.pushState({}, '', '/record')
+  it('keeps the recording progress bar visible when backend status omits the total duration', async () => {
     useTelemetryStore.setState((state) => ({
       recording: true,
       recordSession: {
@@ -1287,7 +1396,7 @@ describe('AppStation M0 frontend', () => {
       },
     }))
 
-    render(<App />)
+    render(<EpisodeControlPanel onStartSession={vi.fn()} />)
 
     expect(
       screen.getAllByRole('progressbar').some((bar) => bar.getAttribute('aria-valuenow') === '25'),
@@ -1303,24 +1412,30 @@ describe('AppStation M0 frontend', () => {
       ),
     }))
 
-    render(<App />)
+    await renderApp()
     fireEvent.click(document.querySelector<HTMLButtonElement>('.record-action-stack button')!)
 
-    const confirmButton = document.querySelector<HTMLButtonElement>('.ant-modal-footer .ant-btn-primary')!
+    const confirmButton = screen.getByRole('button', { name: '确认开始' })
     expect(confirmButton).toBeDisabled()
-    const precheckDoneCheckbox = screen.getAllByRole('checkbox').at(-1)!
+    act(() => useTelemetryStore.setState((state) => ({ recordSession: { ...state.recordSession, resetReturnedSides: ['left', 'right'] } })))
+    const precheckDoneCheckbox = screen.getByRole('checkbox', { name: '已完成' })
     fireEvent.click(precheckDoneCheckbox)
     await new Promise((resolve) => window.setTimeout(resolve, 0))
     expect(confirmButton).toBeDisabled()
 
     act(() => {
+      useTelemetryStore.getState().stopMock()
       useTelemetryStore.setState((state) => ({
+        telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
         config: {
           ...state.config,
           teleop: { ...state.config.teleop, leftConnected: true, rightConnected: true },
         },
         frame: {
           ...state.frame,
+          halOk: true,
+          wsOk: true,
+          cameras: state.frame.cameras.map((camera) => ({ ...camera, health: 'ok' as const })),
           teleopHands: state.frame.teleopHands.map((hand) => ({
             ...hand,
             connected: true,
@@ -1359,10 +1474,10 @@ describe('AppStation M0 frontend', () => {
       ),
     }))
 
-    render(<App />)
+    await renderApp()
     fireEvent.click(document.querySelector<HTMLButtonElement>('.record-action-stack button')!)
 
-    const confirmButton = document.querySelector<HTMLButtonElement>('.ant-modal-footer .ant-btn-primary')!
+    const confirmButton = screen.getByRole('button', { name: '确认开始' })
     const precheckDoneCheckbox = screen.getAllByRole('checkbox').at(-1)!
     fireEvent.click(precheckDoneCheckbox)
     await new Promise((resolve) => window.setTimeout(resolve, 500))
@@ -1421,7 +1536,7 @@ describe('AppStation M0 frontend', () => {
     expect(useTelemetryStore.getState().recordSession.latestQualityReport).toBeNull()
   })
 
-  it('ignores reset skip unless the record workflow is resetting', () => {
+  it('ignores reset skip unless the record workflow is resetting', async () => {
     useTelemetryStore.setState((state) => ({
       recording: false,
       recordSession: {
@@ -1466,7 +1581,7 @@ describe('AppStation M0 frontend', () => {
     expect(useTelemetryStore.getState().recording).toBe(false)
   })
 
-  it('does not call reset skip while required work origin is not returned', () => {
+  it('does not call reset skip while required work origin is not returned', async () => {
     const skipSpy = vi.spyOn(api, 'skipReset').mockResolvedValue({ ok: true })
     useTelemetryStore.setState((state) => ({
       recording: false,
@@ -1518,7 +1633,7 @@ describe('AppStation M0 frontend', () => {
     await waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('recording'))
   })
 
-  it('pauses for reset after discarding an active record episode', () => {
+  it('pauses for reset after discarding an active record episode', async () => {
     const discardSpy = vi.spyOn(api, 'discardEpisode').mockResolvedValue({ ok: true, data: {}, ts: Date.now() })
     useTelemetryStore.setState((state) => ({
       recording: true,
@@ -1542,7 +1657,7 @@ describe('AppStation M0 frontend', () => {
     expect(state.recordSession.recorderTotalS).toBe(state.recordSession.resetTimeS)
   })
 
-  it('ignores quality report acceptance when no report is pending', () => {
+  it('ignores quality report acceptance when no report is pending', async () => {
     useTelemetryStore.setState((state) => ({
       recording: false,
       recordSession: {
@@ -1560,9 +1675,9 @@ describe('AppStation M0 frontend', () => {
     expect(useTelemetryStore.getState().recordSession.latestQualityReport).toBeNull()
   })
 
-  it('does not skip reset from a repeated Space shortcut after saving', () => {
+  it('does not skip reset from a repeated Space shortcut after saving', async () => {
     window.history.pushState({}, '', '/record')
-    render(<App />)
+    await renderApp()
     useTelemetryStore.setState((state) => ({
       recording: false,
       recordSession: {
@@ -1579,17 +1694,19 @@ describe('AppStation M0 frontend', () => {
     expect(useTelemetryStore.getState().recording).toBe(false)
   })
 
-  it('does not bind F12 to emergency stop', () => {
-    render(<App />)
+  it('does not bind F12 to emergency stop', async () => {
+    await renderApp()
     fireEvent.keyDown(window, { key: 'F12' })
     expect(screen.queryByText('安全恢复确认')).not.toBeInTheDocument()
     expect(useTelemetryStore.getState().frame.dangerIndex).not.toBe(1.1)
   })
 
-  it('renders the dataset quality review workbench', () => {
-    render(<App />)
+  it('renders the dataset quality review workbench', async () => {
+    await renderApp()
     fireEvent.click(screen.getByRole('link', { name: '数据集' }))
-    expect(screen.getByText('数据集质检 Dataset')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByText('数据集质检 Dataset')).toBeInTheDocument()
+    })
     expect(screen.getByText('同步视频检查')).toBeInTheDocument()
     expect(screen.getByText('左机械臂轨迹')).toBeInTheDocument()
     expect(screen.getByText('右机械臂轨迹')).toBeInTheDocument()
@@ -1604,7 +1721,7 @@ describe('AppStation M0 frontend', () => {
     useTelemetryStore.setState({ config: structuredClone(defaultConfig) })
     render(<DatasetView />)
     fireEvent.click(screen.getByRole('button', { name: /Hub 上传/ }))
-    fireEvent.click(screen.getByRole('switch', { name: 'Hub 上传开关' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Hub 上传开关' }))
     fireEvent.change(screen.getByPlaceholderText('org/dataset-name'), { target: { value: 'lab/micro_assembly_v1' } })
     fireEvent.change(screen.getByLabelText('Local path'), { target: { value: 'E:\\data group\\micro_assembly_v1' } })
     fireEvent.change(screen.getByPlaceholderText('hf_xxx'), { target: { value: 'hf_transient_secret' } })
@@ -1624,14 +1741,16 @@ describe('AppStation M0 frontend', () => {
     expect(screen.queryByDisplayValue('hf_transient_secret')).not.toBeInTheDocument()
   }, 30000)
 
-  it('opens focused hardware settings from dashboard module buttons', () => {
-    render(<App />)
+  it('opens focused hardware settings from dashboard module buttons', async () => {
+    await renderApp()
     const motionButton = document.querySelector<HTMLButtonElement>('.arm-hardware-panel .device-chip-row button')
     expect(motionButton).toBeTruthy()
     fireEvent.click(motionButton!)
     expect(window.location.pathname).toBe('/settings')
     expect(window.location.hash).toBe('#motion-right')
-    expect(screen.getByText('\u53f3\u81c2\u8fd0\u52a8\u63a7\u5236\u5361 \u00b7 Card 1')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByText('\u53f3\u81c2\u8fd0\u52a8\u63a7\u5236\u5361 \u00b7 Card 1')).toBeInTheDocument()
+    })
     expect(screen.getByText('\u786c\u4ef6\u5de6\u4fa7\u901a\u9053')).toBeInTheDocument()
   })
 
@@ -1639,7 +1758,7 @@ describe('AppStation M0 frontend', () => {
     await expect(stopMotionSide('left')).resolves.toMatchObject({ path: '/motion/left/stop' })
   })
 
-  it('formats backend command errors with detail codes and messages', () => {
+  it('formats backend command errors with detail codes and messages', async () => {
     expect(formatApiErrorMessage(409, { detail: { code: 'RECORDING_BUSY', message: 'record session already active' } })).toBe(
       '录制会话已在运行，请先结束当前会话后再开始新的录制。（409 RECORDING_BUSY）',
     )
@@ -1655,9 +1774,9 @@ describe('AppStation M0 frontend', () => {
     await expect(api.stopPicoVision()).resolves.toMatchObject({ path: '/pico/vision/stop' })
   })
 
-  it('renders visual PICO status and current IMX335 camera hardware', () => {
+  it('renders visual PICO status and current IMX335 camera hardware', async () => {
     window.history.pushState({}, '', '/settings#teleop')
-    render(<App />)
+    await renderApp()
 
     const picoCard = document.querySelector<HTMLElement>('#teleop')
     const picoStrip = picoCard?.querySelector<HTMLElement>('.pico-status-strip')
@@ -1685,7 +1804,7 @@ describe('AppStation M0 frontend', () => {
     window.history.pushState({}, '', '/settings#teleop')
     vi.spyOn(api, 'checkPicoStatus').mockResolvedValue({ ok: true, data: { ok: false, message: 'device offline' } })
 
-    render(<App />)
+    await renderApp()
 
     const statusBar = document.querySelector<HTMLElement>('.status-bar')
     expect(statusBar).toBeTruthy()
@@ -1694,26 +1813,50 @@ describe('AppStation M0 frontend', () => {
 
     fireEvent.click((await screen.findByText('检查状态')).closest('button')!)
 
-    await waitFor(() => expect(statusBar).toHaveTextContent('PICO 离线'))
+    await waitFor(() => expect(statusBar).toHaveTextContent('PICO 错误'))
+    expect(useTelemetryStore.getState().picoConnection.message).toBe('device offline')
     expect(statusBar).toHaveTextContent('10.90.129.166')
   })
 
-  it('renders hardware-specific settings from the reference manual', () => {
+  it('renders hardware-specific settings from the reference manual', async () => {
     window.history.pushState({}, '', '/settings#motion-left')
     useTelemetryStore.setState((state) => ({
       config: {
         ...state.config,
         teleop: { ...state.config.teleop, leftConnected: false, rightConnected: false },
       },
+      // P0：使能入口在 live 遥测未建立时禁用；本用例需先模拟可用链路。
+      telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
+      frame: {
+        ...state.frame,
+        halOk: true,
+        wsOk: true,
+        motionAxisEnabled: {
+          left: Array.from({ length: 6 }, () => false),
+          right: Array.from({ length: 6 }, () => false),
+        },
+      },
+      motionCommand: { left: initialMotionCommand(), right: initialMotionCommand() },
     }))
-    render(<App />)
-    expect(screen.getByText('左臂运动控制卡 · Card 0')).toBeInTheDocument()
+    render(
+      <MemoryRouter initialEntries={['/settings#motion-left']}>
+        <SettingsView />
+      </MemoryRouter>,
+    )
+    await waitFor(() => {
+      expect(screen.getByText('左臂运动控制卡 · Card 0')).toBeInTheDocument()
+    })
     expect(screen.getByText('右臂运动控制卡 · Card 1')).toBeInTheDocument()
     expect(screen.getByText('0,1,3,5,4,2')).toBeInTheDocument()
     expect(screen.getByText('2,0,5,8,1,7')).toBeInTheDocument()
-    expect(screen.getAllByText(/640x480/).length).toBeGreaterThan(0)
-    expect(screen.getAllByText(/mN·m/).length).toBeGreaterThan(0)
-    expect(screen.getByDisplayValue('COM8')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: '安全与力觉' }))
+    await waitFor(() => {
+      expect(screen.getAllByText(/mN·m/).length).toBeGreaterThan(0)
+    })
+    fireEvent.click(screen.getByRole('tab', { name: '遥操作' }))
+    await waitFor(() => {
+      expect(screen.getByDisplayValue('COM8')).toBeInTheDocument()
+    })
     expect(screen.getByDisplayValue('COM9')).toBeInTheDocument()
     const leftGripperCard = document.querySelector<HTMLElement>('#gripper-left')
     const rightGripperCard = document.querySelector<HTMLElement>('#gripper-right')
@@ -1722,24 +1865,32 @@ describe('AppStation M0 frontend', () => {
     expect(rightGripperCard).toHaveTextContent('COM8')
     expect(rightGripperCard).toHaveTextContent('从站 10')
     expect(screen.getAllByText('0-26 mm').length).toBeGreaterThan(0)
-    expect(screen.getAllByText('初始速度').length).toBeGreaterThan(0)
+    fireEvent.click(screen.getByRole('tab', { name: '运动控制' }))
+    await waitFor(() => {
+      expect(screen.getAllByText('初始速度').length).toBeGreaterThan(0)
+    })
     expect(screen.queryByText('最大加速度')).not.toBeInTheDocument()
     expect(screen.getAllByText('加速时间').length).toBeGreaterThan(0)
     expect(screen.getAllByText('减速时间').length).toBeGreaterThan(0)
     expect(screen.getAllByText('相对工作原点位置').length).toBeGreaterThan(0)
     expect(screen.getAllByText('绝对软限位下限').length).toBeGreaterThan(0)
     expect(screen.getAllByText('命令力限制 N').length).toBeGreaterThan(0)
-    expect(screen.getByText('HAL API 地址')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: '系统连接' }))
+    await waitFor(() => {
+      expect(screen.getByText('HAL API 地址')).toBeInTheDocument()
+    })
     expect(screen.queryByText(/\?\?\?\?/)).not.toBeInTheDocument()
-    expect(screen.getAllByText('手册未给出').length).toBeGreaterThan(0)
-    expect(screen.getByText('PICO-4 视觉推流')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: '遥操作' }))
+    await waitFor(() => {
+      expect(screen.getAllByText('手册未给出').length).toBeGreaterThan(0)
+    })
+    fireEvent.click(screen.getByRole('tab', { name: '视觉' }))
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: 'PICO-4 视觉推流' })).toBeInTheDocument()
+    })
     expect(screen.getByText('连接无线 ADB')).toBeInTheDocument()
     expect(screen.getByText('重新识别网口')).toBeInTheDocument()
     expect(screen.getByText('启动视觉')).toBeInTheDocument()
-    expect(screen.getAllByText('相机采集目标 FPS').length).toBeGreaterThan(0)
-    expect(screen.getAllByText('录制 FPS').length).toBeGreaterThan(0)
-    expect(screen.queryByText('目标 FPS')).not.toBeInTheDocument()
-    expect(screen.queryByText('HAL API 已验证')).not.toBeInTheDocument()
     const globalCameraCard = document.querySelector<HTMLElement>('#camera-global')
     const leftCameraCard = document.querySelector<HTMLElement>('#camera-left')
     const rightCameraCard = document.querySelector<HTMLElement>('#camera-right')
@@ -1757,11 +1908,17 @@ describe('AppStation M0 frontend', () => {
     expect(within(globalCameraCard!).queryByRole('button', { name: '重连' })).not.toBeInTheDocument()
     expect(screen.getByText('选择硬件快照')).toBeInTheDocument()
     expect(screen.getByText('保存硬件快照')).toBeInTheDocument()
-    expect(screen.getAllByText('选择运动参数')).toHaveLength(2)
+    fireEvent.click(screen.getByRole('tab', { name: '运动控制' }))
+    await waitFor(() => {
+      expect(screen.getAllByText('选择运动参数')).toHaveLength(2)
+    })
     expect(screen.getAllByText('保存运动参数')).toHaveLength(2)
     expect(screen.getAllByText('使能全部')[0].closest('button')).toBeEnabled()
     expect(screen.getAllByText('记录工作原点')[0].closest('button')).toBeEnabled()
-    expect(screen.getAllByText('连接主手').length).toBeGreaterThan(0)
+    fireEvent.click(screen.getByRole('tab', { name: '遥操作' }))
+    await waitFor(() => {
+      expect(screen.getAllByText('连接主手').length).toBeGreaterThan(0)
+    })
     expect(screen.getAllByText('回工作原点').length).toBeGreaterThan(0)
     expect(screen.getAllByText('平移比例').length).toBeGreaterThan(0)
     expect(screen.getAllByText('旋转比例').length).toBeGreaterThan(0)
@@ -1831,7 +1988,7 @@ describe('AppStation M0 frontend', () => {
     const startSpy = vi.spyOn(api, 'startPicoVision').mockResolvedValue({ ok: true })
     const stopSpy = vi.spyOn(api, 'stopPicoVision').mockResolvedValue({ ok: true })
 
-    render(<App />)
+    await renderApp()
 
     fireEvent.click((await screen.findByText('连接无线 ADB')).closest('button')!)
     await waitFor(() => expect(connectSpy).toHaveBeenCalledTimes(1))
@@ -1847,8 +2004,8 @@ describe('AppStation M0 frontend', () => {
     expect(stopSpy).toHaveBeenCalledTimes(1)
   })
 
-  it('only keeps camera grid overlays on the global preview', () => {
-    render(<App />)
+  it('only keeps camera grid overlays on the global preview', async () => {
+    await renderApp()
     const globalFrame = document.querySelector<HTMLElement>('.camera-frame-global')
     const leftWristFrame = document.querySelector<HTMLElement>('.camera-frame-wrist_left')
     const rightWristFrame = document.querySelector<HTMLElement>('.camera-frame-wrist_right')
@@ -1861,9 +2018,9 @@ describe('AppStation M0 frontend', () => {
     expect(rightWristFrame?.querySelector('.camera-reticle')).toBeNull()
   })
 
-  it('places camera parameter actions inside the tuning panel', () => {
+  it('places camera parameter actions inside the tuning panel', async () => {
     window.history.pushState({}, '', '/settings#camera-global')
-    render(<App />)
+    await renderApp()
     const globalCameraCard = document.querySelector<HTMLElement>('#camera-global')
     expect(globalCameraCard).toBeTruthy()
     const headerActions = globalCameraCard!.querySelector<HTMLElement>('.hardware-config-actions')
@@ -1876,16 +2033,17 @@ describe('AppStation M0 frontend', () => {
     expect(headerActions?.textContent ?? '').not.toContain('应用参数')
   })
 
-  it('uses a single force certificate confirmation control', () => {
+  it('uses a single force certificate confirmation control for the NI-DAQ backup', async () => {
     window.history.pushState({}, '', '/settings#force-left')
-    render(<App />)
+    await renderApp()
     const forceCard = document.querySelector<HTMLElement>('#force-left')
     expect(forceCard).toBeTruthy()
+    fireEvent.change(within(forceCard!).getByLabelText('数据源'), { target: { value: 'nidaq' } })
     expect(within(forceCard!).queryByText('标定证书待确认')).not.toBeInTheDocument()
     expect(within(forceCard!).getByText('标定证书')).toBeInTheDocument()
     expect(within(forceCard!).getByText('待确认')).toBeInTheDocument()
 
-    const switches = within(forceCard!).getAllByRole('switch')
+    const switches = within(forceCard!).getAllByRole('checkbox')
     fireEvent.click(switches.at(-1)!)
 
     expect(within(forceCard!).getByText('已确认')).toBeInTheDocument()
@@ -1893,25 +2051,25 @@ describe('AppStation M0 frontend', () => {
 
   it('saves and applies a motion parameter snapshot from settings', async () => {
     window.history.pushState({}, '', '/settings#motion-left')
-    render(<App />)
+    await renderApp()
     fireEvent.click(screen.getAllByText('保存运动参数')[0].closest('button')!)
     const dialog = (await screen.findByText('保存左臂运动控制卡参数')).closest('[role="dialog"]') as HTMLElement
     fireEvent.change(within(dialog).getByRole('textbox'), { target: { value: '微装配运动默认' } })
-    fireEvent.click(within(dialog).getByText('保 存').closest('button')!)
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
     await waitFor(() => expect(useTelemetryStore.getState().parameterSnapshots.some((snapshot) => snapshot.name === '微装配运动默认')).toBe(true))
 
-    fireEvent.click(screen.getAllByText('选择运动参数')[0].closest('button')!)
+    fireEvent.click(screen.getAllByText('选择运动参数')[0].closest('summary')!)
     fireEvent.click(await screen.findByText('微装配运动默认'))
     expect(useTelemetryStore.getState().logs.at(-1)?.msg).toContain('左臂运动控制卡快照已应用')
 
-    fireEvent.click(screen.getAllByText('选择运动参数')[0].closest('button')!)
+    fireEvent.click(screen.getAllByText('选择运动参数')[0].closest('summary')!)
     fireEvent.click(await screen.findByLabelText('删除 微装配运动默认'))
     await waitFor(() => expect(useTelemetryStore.getState().parameterSnapshots.some((snapshot) => snapshot.name === '微装配运动默认')).toBe(false))
   }, 20000)
 
   it('shows before and after values before applying camera parameters', async () => {
     window.history.pushState({}, '', '/settings#camera-global')
-    render(<App />)
+    await renderApp()
     const globalCameraCard = document.querySelector<HTMLElement>('#camera-global')
     expect(globalCameraCard).toBeTruthy()
 
@@ -1928,7 +2086,7 @@ describe('AppStation M0 frontend', () => {
 
   it('shows before and after state before recording the work origin', async () => {
     window.history.pushState({}, '', '/settings#motion-left')
-    render(<App />)
+    await renderApp()
     const leftCard = document.querySelector<HTMLElement>('#motion-left')
     expect(leftCard).toBeTruthy()
 
@@ -1946,10 +2104,11 @@ describe('AppStation M0 frontend', () => {
     const homeSpy = vi.spyOn(api, 'homeMotionSide').mockResolvedValue({ ok: true })
     const captureSpy = vi.spyOn(api, 'captureMotionOrigin').mockResolvedValue({ ok: true })
 
-    render(<App />)
+    await renderApp()
     const leftCard = document.querySelector<HTMLElement>('#motion-left')
     expect(leftCard).toBeTruthy()
 
+    await waitFor(() => expect(within(leftCard!).getByText('回硬件零点').closest('button')).toBeEnabled())
     fireEvent.click(within(leftCard!).getByText('回硬件零点').closest('button')!)
     const dialog = (await screen.findByText('左臂回硬件零点')).closest('[role="dialog"]') as HTMLElement
     fireEvent.click(within(dialog).getByText('确认回硬件零点').closest('button')!)
@@ -1958,21 +2117,21 @@ describe('AppStation M0 frontend', () => {
     expect(captureSpy).not.toHaveBeenCalled()
   }, 10000)
 
-  it('executes settings gripper targets through operator-view side mapping', async () => {
+  it('executes settings gripper targets through operator-view side mapping even when cached enable flags are false', async () => {
     window.history.pushState({}, '', '/settings#gripper-left')
     useTelemetryStore.setState((state) => ({
       config: {
         ...state.config,
         gripper: {
           ...state.config.gripper,
-          leftEnabled: true,
-          rightEnabled: true,
+          leftEnabled: false,
+          rightEnabled: false,
           targetLeftMm: 7,
           targetRightMm: 17,
         },
       },
     }))
-    render(<App />)
+    await renderApp()
     const leftGripperCard = document.querySelector<HTMLElement>('#gripper-left')
     const rightGripperCard = document.querySelector<HTMLElement>('#gripper-right')
     expect(leftGripperCard).toBeTruthy()
@@ -2003,21 +2162,21 @@ describe('AppStation M0 frontend', () => {
     expect(useTelemetryStore.getState().config.gripper.targetRightMm).toBe(17)
   }, 10000)
 
-  it('records manual gripper targets with hardware sides mapped from operator controls', async () => {
+  it('records manual gripper targets with hardware sides mapped from operator controls even when cached enable flags are false', async () => {
     window.history.pushState({}, '', '/settings#manual')
     useTelemetryStore.setState((state) => ({
       config: {
         ...state.config,
         gripper: {
           ...state.config.gripper,
-          leftEnabled: true,
-          rightEnabled: true,
+          leftEnabled: false,
+          rightEnabled: false,
           targetLeftMm: 7,
           targetRightMm: 17,
         },
       },
     }))
-    render(<App />)
+    await renderApp()
     fireEvent.click(screen.getByText('开始记录').closest('button')!)
     const leftGripperCard = screen.getByText('左臂夹爪手动控制').closest('article')
     const rightGripperCard = screen.getByText('右臂夹爪手动控制').closest('article')
@@ -2059,9 +2218,9 @@ describe('AppStation M0 frontend', () => {
     expect(useTelemetryStore.getState().logs.some((log) => log.msg.includes('右夹爪 目标 7.0mm'))).toBe(true)
   }, 10000)
 
-  it('renders manual control instead of old jog/developer pages', () => {
+  it('renders manual control instead of old jog/developer pages', async () => {
     window.history.pushState({}, '', '/settings#manual')
-    render(<App />)
+    await renderApp()
     expect(screen.getAllByText('手动控制').length).toBeGreaterThan(0)
     expect(screen.getByText('左臂手动控制')).toBeInTheDocument()
     expect(screen.getByText('右臂手动控制')).toBeInTheDocument()
@@ -2074,29 +2233,29 @@ describe('AppStation M0 frontend', () => {
     expect(screen.queryByText('开发者模式')).not.toBeInTheDocument()
   })
 
-  it('enables Card 0 Yaw in manual controls', () => {
+  it('enables Card 0 Yaw in manual controls', async () => {
     window.history.pushState({}, '', '/settings#manual')
-    render(<App />)
+    await renderApp()
 
     const operatorLeftCard = screen.getByText('左臂手动控制').closest('article')
     expect(operatorLeftCard).toBeTruthy()
     expect(within(operatorLeftCard!).getByRole('button', { name: 'Yaw' })).toBeEnabled()
   })
 
-  it('allows the Card 0 Yaw teleop axis mask to be controlled', () => {
+  it('allows the Card 0 Yaw teleop axis mask to be controlled', async () => {
     window.history.pushState({}, '', '/settings#teleop-right')
-    render(<App />)
+    await renderApp()
 
     const teleopCard = document.getElementById('teleop-right')
     expect(teleopCard).toBeTruthy()
     const yawRow = within(teleopCard!).getByText('Yaw').parentElement
     expect(yawRow).toBeTruthy()
-    const yawSwitch = within(yawRow!).getByRole('switch')
+    const yawSwitch = within(yawRow!).getByRole('checkbox')
     expect(yawSwitch).toBeEnabled()
     expect(yawSwitch).toBeChecked()
   })
 
-  it('records arm and gripper manual actions into replay memory', () => {
+  it('records arm and gripper manual actions into replay memory', async () => {
     window.history.pushState({}, '', '/settings#manual')
     useTelemetryStore.setState((state) => ({
       config: {
@@ -2104,7 +2263,7 @@ describe('AppStation M0 frontend', () => {
         gripper: { ...state.config.gripper, leftEnabled: true },
       },
     }))
-    render(<App />)
+    await renderApp()
     fireEvent.click(screen.getByText('开始记录').closest('button')!)
     const leftArmCard = screen.getByText('左臂手动控制').closest('article')
     const leftGripperCard = screen.getByText('左臂夹爪手动控制').closest('article')
@@ -2125,18 +2284,21 @@ describe('AppStation M0 frontend', () => {
     expect(useTelemetryStore.getState().logs.at(-1)?.msg).toContain('Manual memory replay queued')
   })
 
-  it('runs test fixture hardware commands without backend calls', () => {
+  it('runs test fixture hardware commands without backend calls', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('fixture 禁止真实网络'))
     window.history.pushState({}, '', '/settings#force-left')
-    render(<App />)
+    await renderApp()
     const before = useTelemetryStore.getState().logs.length
     const tareButton = document.querySelector<HTMLButtonElement>('#force-left .hardware-config-actions button')
     expect(tareButton).toBeTruthy()
     fireEvent.click(tareButton!)
-    expect(useTelemetryStore.getState().logs.length).toBeGreaterThan(before)
-    expect(useTelemetryStore.getState().logs.at(-1)?.msg).toContain('test fixture')
+    await waitFor(() => expect(useTelemetryStore.getState().logs.slice(before).some((log) =>
+      log.msg.includes('Tare 请求已接受') && log.msg.includes('test fixture'),
+    )).toBe(true))
+    expect(fetchSpy).not.toHaveBeenCalled()
   })
 
-  it('shows millisecond timestamps and full native diagnostic messages in the log panel', () => {
+  it('shows millisecond timestamps and full native diagnostic messages in the log panel', async () => {
     useTelemetryStore.setState({
       logPanelOpen: true,
       logs: [
@@ -2159,7 +2321,7 @@ describe('AppStation M0 frontend', () => {
     )
   })
 
-  it('filters teleop Roll diagnostics from quick log panel presets', () => {
+  it('filters teleop Roll diagnostics from quick log panel presets', async () => {
     useTelemetryStore.setState({
       logPanelOpen: true,
       logs: [
@@ -2193,11 +2355,12 @@ describe('AppStation M0 frontend', () => {
 
   it('toggles teleop hands with one logical connect button', async () => {
     window.history.pushState({}, '', '/settings#teleop-left')
-    render(<App />)
+    await renderApp()
     const teleopCard = document.querySelector<HTMLElement>('#teleop-left')
     expect(teleopCard).toBeTruthy()
     const teleopButton = teleopCard!.querySelectorAll<HTMLButtonElement>('.hardware-config-actions button')[1]
     expect(teleopButton).toBeTruthy()
+    await waitFor(() => expect(teleopButton).toBeEnabled())
 
     fireEvent.click(teleopButton!)
     await waitFor(() => expect(useTelemetryStore.getState().config.teleop.leftConnected).toBe(true))
@@ -2217,7 +2380,19 @@ describe('AppStation M0 frontend', () => {
     })
     const disconnectSpy = vi.spyOn(api, 'disconnectTeleopHand')
     window.history.pushState({}, '', '/settings#teleop-left')
-    render(<App />)
+    await renderApp()
+    act(() => {
+      useTelemetryStore.getState().stopMock()
+      useTelemetryStore.setState((state) => ({
+        telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
+        frame: {
+          ...state.frame,
+          wsOk: true,
+          halOk: true,
+          teleopHands: state.frame.teleopHands.map((hand) => ({ ...hand, connected: false, lastReadOk: false })),
+        },
+      }))
+    })
     const teleopCard = document.querySelector<HTMLElement>('#teleop-left')
     expect(teleopCard).toBeTruthy()
     const connectButton = teleopCard!.querySelectorAll<HTMLButtonElement>('.hardware-config-actions button')[1]
@@ -2233,19 +2408,20 @@ describe('AppStation M0 frontend', () => {
     expect(disconnectSpy).not.toHaveBeenCalled()
   })
 
-  it('renders work origin controls and the startup return switch', () => {
+  it('renders work origin controls and the startup return switch', async () => {
     window.history.pushState({}, '', '/settings#motion-left')
-    render(<App />)
+    await renderApp()
     expect(screen.getAllByText('记录工作原点')).toHaveLength(2)
     expect(screen.getAllByText('回硬件零点')).toHaveLength(2)
     expect(screen.getByText('恢复上个工作原点')).toBeInTheDocument()
-    expect(screen.getByText('开机回工作原点')).toBeInTheDocument()
     expect(screen.queryByText('设为采集零点')).not.toBeInTheDocument()
     expect(screen.queryByText('清除零点')).not.toBeInTheDocument()
     expect(screen.getAllByText('Roll -5~95° / Pitch ±30° · Yaw ±7°').length).toBeGreaterThan(0)
     expect(screen.getAllByText('Roll -95~5° / Pitch ±30° · Yaw ±7°').length).toBeGreaterThan(0)
     expect(screen.queryByText(/Yaw disabled/)).not.toBeInTheDocument()
     expect(screen.queryByText('Card 0 Yaw disabled')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: '系统连接' }))
+    expect(screen.queryByText('开机回工作原点')).not.toBeInTheDocument()
   })
 
   it('disables restoring the previous work origin when the backup is outside effective limits', async () => {
@@ -2266,7 +2442,7 @@ describe('AppStation M0 frontend', () => {
     })
     const restoreSpy = vi.spyOn(api, 'restorePreviousMotionOrigin')
 
-    render(<App />)
+    await renderApp()
 
     const hardwareLeftCard = document.querySelector<HTMLElement>('#motion-right')
     expect(hardwareLeftCard).toBeTruthy()
@@ -2282,7 +2458,7 @@ describe('AppStation M0 frontend', () => {
 
   it('updates the work origin state when the side controls are used', async () => {
     window.history.pushState({}, '', '/settings#motion-left')
-    render(<App />)
+    await renderApp()
     const leftCard = document.querySelector<HTMLElement>('#motion-left')
     expect(leftCard).toBeTruthy()
 
@@ -2339,7 +2515,7 @@ describe('AppStation M0 frontend', () => {
         },
       })
 
-    render(<App />)
+    await renderApp()
     const leftCard = document.querySelector<HTMLElement>('#motion-left')
     expect(leftCard).toBeTruthy()
 

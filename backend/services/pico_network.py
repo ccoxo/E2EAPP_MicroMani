@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：解析 Windows 网卡与路由信息，为 PICO 选择合适的物理网络与网关。
+# 先看：PicoNetworkDetectionError → IPv4Adapter → IPv4Route → select_pico_network。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import os

@@ -1,9 +1,32 @@
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：验证配置默认值迁移、相机绑定和候选 HAL 二进制诊断提示。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
 import { defaultConfig, defaultDiagnostics } from '../data'
 import { diagnosticsFromHardwareStatus, normalizeConfig, useTelemetryStore } from './telemetry'
 
 describe('telemetry config normalization', () => {
+  it('保留用户显式选择的 NI-DAQ 备用数据源及通道', () => {
+    const config = structuredClone(defaultConfig)
+    config.force.source = 'nidaq'
+    config.force.leftIp = 'Dev7/ai0:5'
+
+    expect(normalizeConfig(config).force).toMatchObject({ source: 'nidaq', leftIp: 'Dev7/ai0:5' })
+  })
+
+  it('丢弃旧开机回原点配置并保留工作原点及遥操作准备配置', () => {
+    const legacy = structuredClone(defaultConfig)
+    Object.assign(legacy.motion, { homeOnStartup: { enabled: true, mode: 'work_origin' } })
+    const normalized = normalizeConfig(legacy)
+    expect(normalized.motion).not.toHaveProperty('homeOnStartup')
+    expect(normalized.motion.origin).toEqual(legacy.motion.origin)
+    expect(normalized.teleop.homeBeforeStart).toBe(legacy.teleop.homeBeforeStart)
+    expect(legacy.motion).toHaveProperty('homeOnStartup')
+  })
+
   it('migrates stale PICO and camera hardware defaults', () => {
     const staleConfig = structuredClone(defaultConfig)
     staleConfig.picoVision.ip = '10.90.132.51'

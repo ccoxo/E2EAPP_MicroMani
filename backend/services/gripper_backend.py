@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：定义夹爪后端协议及原生适配器；转换配置、HAL 状态与夹爪命令载荷。
+# 先看：GripperBackend → native_teleop_enabled → gripper_serial_ports → native_gripper_payload。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import asyncio

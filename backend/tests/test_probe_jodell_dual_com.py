@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：双串口探测脚本的参数解析、统计与运动检查开关。
+# 先看：load_probe_module → test_probe_script_parses_com_ports_and_latency_percentiles → test_probe_stats_report_success_rate_and_raw_range → test_probe_command_check_requires_explicit_unsafe_flag。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import importlib.util

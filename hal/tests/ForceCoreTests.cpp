@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：验证 HKVL 帧解析、力安全锁存、柔顺修正及力运行时的边界行为。
+ * 先看：main。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "ForceComplianceController.h"
 #include "ForceControlRuntime.h"
 #include "ForceSafetyLatch.h"
@@ -254,7 +260,7 @@ void testCompliance() {
   require(controller.cumulativeOffset(0) == std::array<double, 2>{0.0, 0.0}, "reset must clear session offset");
 }
 
-void testForceRuntime() {
+void testDefaultHkvlForceRuntime() {
   int emergencyStops = 0;
   int acknowledgements = 0;
   ForceControlRuntime runtime(
@@ -262,7 +268,6 @@ void testForceRuntime() {
       [&acknowledgements]() { ++acknowledgements; });
 
   ForceRuntimeConfig config;
-  config.source = "hkvl_serial";
   config.serial.protocol = "hkvl_active_v1";
   config.serial.leftPort = "COM15";
   config.serial.rightPort = "COM14";
@@ -271,6 +276,7 @@ void testForceRuntime() {
   config.safety = safetyConfig();
   config.safety.watchdogMs = 1000.0;
   runtime.configure(config, 0.0);
+  require(runtime.usesHkvl(), "default runtime must select HKVL");
   require(runtime.safetyLatched(), "HKVL configuration must begin in a safety latch");
   require(emergencyStops == 1, "HKVL configuration must invoke the global emergency stop");
 
@@ -394,9 +400,9 @@ void testForceRuntimeAlignsAllSixChannelsBeforeStandardConsumption() {
 
 void testNidaqRuntimeDoesNotLatchForceSafetyForManualEstop() {
   ForceControlRuntime runtime([]() {}, []() {});
-  ForceRuntimeConfig config;
-  config.source = "nidaq";
+  const auto config = appstation::hal::jsonForceRuntimeConfig(R"({"source":"nidaq"})");
   runtime.configure(config, 0.0);
+  require(!runtime.usesHkvl(), "explicit NI-DAQ selection must override the HKVL default");
 
   runtime.recordExternalEmergencyStop("manual emergency stop", 1.0);
 
@@ -414,6 +420,9 @@ void testMotionAcknowledge() {
 }
 
 void testForceConfigJson() {
+  require(
+      appstation::hal::jsonForceRuntimeConfig("{}").source == "hkvl_serial",
+      "force config without a source must default to HKVL");
   ForceRuntimeConfig fallback;
   const auto config = appstation::hal::jsonForceRuntimeConfig(
       R"({
@@ -457,7 +466,7 @@ int main() {
     testOfficialHkvlMotionAlignedAxisSigns();
     testSafetyLatch();
     testCompliance();
-    testForceRuntime();
+    testDefaultHkvlForceRuntime();
     testForceRuntimeAlignsAllSixChannelsBeforeStandardConsumption();
     testNidaqRuntimeDoesNotLatchForceSafetyForManualEstop();
     testMotionAcknowledge();

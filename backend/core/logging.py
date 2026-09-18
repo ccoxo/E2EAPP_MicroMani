@@ -1,3 +1,8 @@
+# 阅读导航 03｜后端契约与配置
+# 职责：生成结构化事件、操作编号与配置哈希；维护内存日志和会话日志文件。
+# 先看：now_ms → monotonic_ms → default_session_id → stable_config_hash。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import hashlib

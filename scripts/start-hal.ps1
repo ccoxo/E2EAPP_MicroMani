@@ -1,3 +1,8 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：部署候选 HAL 二进制和依赖 DLL，绑定 HKVL 端口、注入力配置并启动健康检查。
+# 先看：Stop-ProcessTree → Stop-HalRuntimeProcessTrees → Promote-HalCandidate → Copy-RuntimeDllIfNewer。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 param(
   [int]$Port = 8091,
   [switch]$Restart
@@ -212,7 +217,7 @@ $omegaSwapHands = $false
 $hkvlLeftInstanceId = "USB\VID_1A86&PID_55D3\5C7B023865"
 $hkvlRightInstanceId = "USB\VID_1A86&PID_55D3\5C7B030018"
 $forceRuntimeConfig = [ordered]@{
-  source = "nidaq"
+  source = "hkvl_serial"
   protocol = "hkvl_active_v1"
   leftPort = "COM15"
   rightPort = "COM14"

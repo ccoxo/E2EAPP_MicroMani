@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：解析 HKVL 字节帧与 CRC，维护帧同步和错误统计。
+ * 先看：HkvlForceParser::feed → HkvlForceParser::reset → HkvlForceParser::stats。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "HkvlForceProtocol.h"
 
 #include <cmath>

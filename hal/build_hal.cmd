@@ -1,4 +1,8 @@
 @echo off
+rem 阅读导航 08｜启动、部署与工具
+rem 职责：使用 Windows C++ 工具链构建 HAL 和夹爪 worker，并处理候选二进制产物。
+rem 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 setlocal
 rem Enter the MSVC x64 environment before invoking cl/link directly.
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul

@@ -1,19 +1,28 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：管理模型、自动执行状态和微调任务；具体能力与返回值需结合方法实现阅读。
+# 先看：PolicyService。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import asyncio
+import math
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from backend.core.config import SettingsService
 from backend.core.logging import LogService, now_ms
+from backend.core.motion_safety import MotionSafetyGate
 from backend.hal_client.client import HalClient
 
 
 class PolicyService:
-    def __init__(self, settings: SettingsService, hal: HalClient, logs: LogService) -> None:
+    def __init__(self, settings: SettingsService, hal: HalClient, logs: LogService, safety: MotionSafetyGate | None = None) -> None:
         self.settings = settings
         self.hal = hal
         self.logs = logs
+        self.safety = safety if safety is not None else MotionSafetyGate()
         self._lock = asyncio.Lock()
         self._models: dict[str, dict[str, Any]] = {
             "act": self._model("act", "ACT", "ready", "local baseline policy", 32),
@@ -22,9 +31,11 @@ class PolicyService:
         }
         self._active_model_id = ""
         self._auto_running = False
+        self._stop_generation = 0
         self._action_queue: list[dict[str, Any]] = []
         self._fine_tune_jobs: list[dict[str, Any]] = []
         self._last_dispatch: dict[str, Any] | None = None
+        self.validate_hardware_action: Callable[[dict[str, Any]], Awaitable[None]] | None = None
 
     def list_models(self) -> dict[str, Any]:
         return {"models": list(self._models.values()), "activeModelId": self._active_model_id}
@@ -81,9 +92,15 @@ class PolicyService:
         }
 
     async def auto_start(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        safety_token = self.safety.capture()
+        self.safety.check(safety_token)
+        generation = self._stop_generation
         request = payload or {}
         model_id = str(request.get("modelId") or self._active_model_id or "act")
         async with self._lock:
+            if generation != self._stop_generation:
+                raise RuntimeError("auto start cancelled by a newer stop")
+            self.safety.check(safety_token)
             if model_id not in self._models:
                 raise FileNotFoundError(model_id)
             self._active_model_id = model_id
@@ -92,23 +109,35 @@ class PolicyService:
         self.logs.info("[POLICY]", f"auto execution started with model={model_id}")
         return self.auto_status(await self._get_config_async())
 
+    def invalidate_pending_actions(self) -> None:
+        # 在任何 await / 清理之前使已取出和仍在准备的动作失效。
+        self._stop_generation += 1
+        self._auto_running = False
+        self._action_queue.clear()
+
     async def auto_stop(self) -> dict[str, Any]:
-        async with self._lock:
-            self._auto_running = False
-            self._action_queue.clear()
+        self.invalidate_pending_actions()
         self.logs.warning("[POLICY]", "auto execution stopped; action queue cleared")
         return self.auto_status(await self._get_config_async())
 
     async def queue_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+        safety_token = self.safety.capture()
+        self.safety.check(safety_token)
+        generation = self._stop_generation
         config = await self._get_config_async()
         action = self._validated_action(payload, config)
         async with self._lock:
+            if generation != self._stop_generation:
+                raise RuntimeError("action cancelled by a newer stop")
+            self.safety.check(safety_token)
             self._action_queue.append(action)
             self._action_queue = self._action_queue[-200:]
         self.logs.info("[POLICY]", f"action queued: {action['id']}")
         return {"action": action, "status": self.auto_status(config)}
 
     async def dispatch_next(self) -> dict[str, Any]:
+        safety_token = self.safety.capture()
+        generation = self._stop_generation
         async with self._lock:
             auto_running = self._auto_running
             if not auto_running:
@@ -126,6 +155,8 @@ class PolicyService:
             config = await self._get_config_async()
             return {"dispatched": False, "reason": "action queue is empty", "status": self.auto_status(config)}
         config = await self._get_config_async()
+        if generation != self._stop_generation or not self._auto_running:
+            return {"dispatched": False, "reason": "action cancelled by a newer stop", "status": self.auto_status(config)}
         dispatch_enabled = bool(config.get("auto", {}).get("allowHardwareDispatch", False))
         if not dispatch_enabled:
             self._last_dispatch = {"action": action, "mode": "dry-run", "ts": now_ms()}
@@ -135,7 +166,18 @@ class PolicyService:
                 "action": action,
                 "status": self.auto_status(config),
             }
-        result = await self._dispatch_action_to_hal(action)
+        self.safety.check(safety_token)
+        try:
+            result = await self._dispatch_action_to_hal(action)
+        except (RuntimeError, asyncio.CancelledError) as exc:
+            # 派发边界会记录是否进入 HAL；不能把已发布但无应答标成未执行。
+            if self._last_dispatch and self._last_dispatch.get("action") is action:
+                self._last_dispatch.update(outcome="unknown", error=str(exc))
+            raise
+        if generation != self._stop_generation:
+            self._last_dispatch = {"action": action, "mode": "hal", "result": result, "outcome": "interrupted", "ts": now_ms()}
+            return {"dispatched": True, "outcome": "interrupted", "action": action, "hal": result,
+                    "reason": "dispatch interrupted by a newer stop; motion may have occurred", "status": self.auto_status(config)}
         self._last_dispatch = {"action": action, "mode": "hal", "result": result, "ts": now_ms()}
         return {"dispatched": True, "action": action, "hal": result, "status": self.auto_status(config)}
 
@@ -184,14 +226,35 @@ class PolicyService:
             "speedMode": action["speedMode"],
             "maxVelocityUiPerSec": action["maxVelocityUiPerSec"],
         }
-        return await self.hal.command("motion.manual_axis_move", payload)
+        token = self.safety.capture(action["side"])
+        generation = self._stop_generation
+        with self.safety.operation(action["side"]):
+            self.safety.check(token)
+            config = await self._get_config_async()
+            self._validated_action(action, config)
+            if self.validate_hardware_action is None:
+                raise RuntimeError("hardware action validator is not configured")
+            await self.validate_hardware_action(action)
+            self.safety.check(token)
+            if generation != self._stop_generation or not self._auto_running:
+                raise RuntimeError("action cancelled by a newer stop before HAL dispatch")
+            self._last_dispatch = {"action": action, "mode": "hal", "outcome": "pending", "ts": now_ms()}
+            return await self.hal.command("motion.manual_axis_move", payload)
 
     def _validated_action(self, payload: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
         action_type = str(payload.get("type") or "manual_axis_move")
         side = str(payload.get("side") or "left")
         axis = str(payload.get("axis") or "X")
-        direction = int(payload.get("direction") or 1)
-        step = float(payload.get("step") or 0.0)
+        raw_direction = payload.get("direction", 1)
+        if type(raw_direction) not in (int, float) or raw_direction not in {-1, 1}:
+            raise RuntimeError("direction must be -1 or 1")
+        direction = int(raw_direction)
+        try:
+            step = float(payload.get("step", 0.0))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("step must be a finite number") from exc
+        if not math.isfinite(step) or step < 0:
+            raise RuntimeError("step must be finite and non-negative")
         speed_mode = str(payload.get("speedMode") or "fine")
         if action_type != "manual_axis_move":
             raise RuntimeError("only manual_axis_move actions are accepted")
@@ -204,10 +267,17 @@ class PolicyService:
         caps = self._safety_caps(config)
         is_translation = axis in {"X", "Y", "Z"}
         max_step = caps["translationStepUm"] if is_translation else caps["rotationStepDeg"]
+        if not math.isfinite(max_step) or max_step <= 0:
+            raise RuntimeError("step cap must be finite and positive")
         if abs(step) > max_step:
             raise RuntimeError(f"step exceeds auto safety cap: {max_step}")
-        velocity = float(payload.get("maxVelocityUiPerSec") or (50.0 if is_translation else 0.05))
+        try:
+            velocity = float(payload.get("maxVelocityUiPerSec", 50.0 if is_translation else 0.05))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("velocity must be a finite number") from exc
         max_velocity = caps["translationVelocityUmS"] if is_translation else caps["rotationVelocityDegS"]
+        if not math.isfinite(velocity) or velocity <= 0 or not math.isfinite(max_velocity) or max_velocity <= 0:
+            raise RuntimeError("velocity and velocity cap must be finite and positive")
         if velocity > max_velocity:
             raise RuntimeError(f"velocity exceeds auto safety cap: {max_velocity}")
         return {

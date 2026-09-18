@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 02｜前端契约与状态
+ * 职责：提供前端默认配置、诊断初值与显示标签；包含操作者侧和硬件侧的转换函数。
+ * 先看：RobotSide → hardwareSideForOperatorSide → operatorSideForHardwareSide → operatorSideLabel。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import type { AppConfig, DiagnosticItem, LogChannel } from './types'
 
 export const axisNames = [
@@ -31,6 +37,16 @@ export function operatorSideForHardwareSide(side: RobotSide): RobotSide {
 
 export function operatorSideLabel(side: RobotSide) {
   return side === 'left' ? '左臂' : '右臂'
+}
+
+/** 力觉数据源对应的显示型号，随 config.force.source 实时切换。 */
+export function forceSensorModelLabel(source?: string) {
+  return source === 'hkvl_serial' ? 'HKVL-36A' : 'Nano-17'
+}
+
+/** 力觉主通道显示单位：HKVL 用 N，Nano-17 用 mN。 */
+export function forceSensorUnitLabel(source?: string) {
+  return source === 'hkvl_serial' ? 'N / Nm' : 'mN'
 }
 
 export function hardwareChannelLabel(side: RobotSide) {
@@ -424,7 +440,7 @@ export const defaultConfig: AppConfig = {
     },
   },
   force: {
-    source: 'nidaq',
+    source: 'hkvl_serial',
     leftIp: 'Dev5/ai0:5',
     rightIp: 'Dev3/ai0:5',
     port: 49152,
@@ -511,10 +527,6 @@ export const defaultConfig: AppConfig = {
       updatedAt: 1778586070000,
     },
     relativeSoftLimits: structuredClone(defaultRelativeSoftLimits),
-    homeOnStartup: {
-      enabled: false,
-      mode: 'work_origin',
-    },
     leftProfile: structuredClone(defaultMotionProfile),
     rightProfile: structuredClone(defaultMotionProfile),
     leftSoftLimits: structuredClone(defaultLeftSoftLimits),

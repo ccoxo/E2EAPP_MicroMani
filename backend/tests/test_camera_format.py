@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：相机驱动与 worker 设置 YUYV 格式及采集尺寸的顺序。
+# 先看：test_camera_driver_requests_yuyv_fourcc_before_capture_dimensions → test_camera_worker_requests_yuyv_fourcc_before_capture_dimensions。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from typing import Any

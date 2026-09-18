@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：管理相机身份绑定、OpenCV 采集、编码与最新帧缓存；可使用子进程隔离阻塞驱动。
+# 先看：CameraProbeResult → CameraFrameSnapshot → OpenCVCameraDriver。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 """OpenCV camera access with process isolation for fragile capture backends.
 
 Several Windows camera drivers can block or crash inside OpenCV. The driver
@@ -162,6 +167,112 @@ public static class AppstationDirectShowCameraEnum
         return sb.ToString();
     }
 
+    [ComImport, Guid("28F54685-06FD-11D2-B27A-00A0C9223196"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IKsControl
+    {
+        [PreserveSig]
+        int KsProperty(IntPtr property, int propertySize, IntPtr data, int dataSize, out int returned);
+        [PreserveSig]
+        int KsMethod(IntPtr property, int propertySize, IntPtr data, int dataSize, out int returned);
+        [PreserveSig]
+        int KsEvent(IntPtr property, int propertySize, IntPtr data, int dataSize, out int returned);
+    }
+
+    public static string SetFixedFrameRate(string devicePath)
+    {
+        var type = Type.GetTypeFromCLSID(new Guid("62BE5D10-60EB-11D0-BD3B-00A0C911CE86"));
+        var devEnum = (ICreateDevEnum)Activator.CreateInstance(type);
+        IEnumMoniker enumerator = null;
+        try
+        {
+            Guid category = new Guid("860BB310-5D01-11D0-BD3B-00A0C911CE86");
+            if (devEnum.CreateClassEnumerator(ref category, out enumerator, 0) != 0)
+                throw new InvalidOperationException("Camera enumeration failed");
+            var monikers = new IMoniker[1];
+            while (enumerator.Next(1, monikers, IntPtr.Zero) == 0)
+            {
+                try
+                {
+                    if (!String.Equals(ReadBag(monikers[0], "DevicePath"), devicePath,
+                                       StringComparison.OrdinalIgnoreCase)) continue;
+                    object filter;
+                    Guid iid = new Guid("56A86895-0AD4-11CE-B03A-0020AF0BA770");
+                    monikers[0].BindToObject(null, null, ref iid, out filter);
+                    try
+                    {
+                        var control = (IKsControl)filter;
+                        EnableAutoExposure(control);
+                        return DisableLowLightCompensation(control);
+                    }
+                    finally { Marshal.ReleaseComObject(filter); }
+                }
+                finally { Marshal.ReleaseComObject(monikers[0]); }
+            }
+            throw new InvalidOperationException("Camera device path not found");
+        }
+        finally
+        {
+            if (enumerator != null) Marshal.ReleaseComObject(enumerator);
+            Marshal.ReleaseComObject(devEnum);
+        }
+    }
+
+    static void EnableAutoExposure(IKsControl control)
+    {
+        // 自动曝光优先级属性仅在曝光已为 Auto 时有效。
+        IntPtr data = Marshal.AllocCoTaskMem(40);
+        try
+        {
+            for (int i = 0; i < 40; i += 4) Marshal.WriteInt32(data, i, 0);
+            ControlHeader(data, 4, 1); // KSPROPERTY_CAMERACONTROL_EXPOSURE, GET
+            int returned;
+            Marshal.ThrowExceptionForHR(control.KsProperty(data, 40, data, 40, out returned));
+            if ((Marshal.ReadInt32(data, 28) & 1) == 0)
+            {
+                ControlHeader(data, 4, 2);
+                Marshal.WriteInt32(data, 28, 1); // KSPROPERTY_CAMERACONTROL_FLAGS_AUTO
+                Marshal.ThrowExceptionForHR(control.KsProperty(data, 40, data, 40, out returned));
+            }
+        }
+        finally { Marshal.FreeCoTaskMem(data); }
+    }
+
+    static string DisableLowLightCompensation(IKsControl control)
+    {
+        // KSPROPERTY_CAMERACONTROL_S is 40 bytes with 8-byte alignment on Windows.
+        IntPtr data = Marshal.AllocCoTaskMem(40);
+        try
+        {
+            for (int i = 0; i < 40; i += 4) Marshal.WriteInt32(data, i, 0);
+            ControlHeader(data, 19, 1);
+            int returned;
+            Marshal.ThrowExceptionForHR(control.KsProperty(data, 40, data, 40, out returned));
+            int before = Marshal.ReadInt32(data, 24);
+            if (before != 0)
+            {
+                ControlHeader(data, 19, 2);
+                Marshal.WriteInt32(data, 24, 0);
+                Marshal.WriteInt32(data, 28, 2); // KSPROPERTY_CAMERACONTROL_FLAGS_MANUAL
+                Marshal.ThrowExceptionForHR(control.KsProperty(data, 40, data, 40, out returned));
+            }
+            // Get may overwrite the property header, so rebuild it for each call.
+            ControlHeader(data, 19, 1);
+            Marshal.ThrowExceptionForHR(control.KsProperty(data, 40, data, 40, out returned));
+            if (Marshal.ReadInt32(data, 24) != 0)
+                throw new InvalidOperationException("Low-light compensation remained enabled");
+            return "fixed_frame_rate=1 previous_priority=" + before;
+        }
+        finally { Marshal.FreeCoTaskMem(data); }
+    }
+
+    static void ControlHeader(IntPtr data, int property, int operation)
+    {
+        Marshal.StructureToPtr(new Guid("C6E13370-30AC-11D0-A18C-00A0C9118956"), data, false);
+        Marshal.WriteInt32(data, 16, property);
+        Marshal.WriteInt32(data, 20, operation);
+    }
+
     static string ReadBag(IMoniker moniker, string name)
     {
         object bagObj;
@@ -184,7 +295,31 @@ public static class AppstationDirectShowCameraEnum
 }
 '@
 Add-Type -TypeDefinition $code -Language CSharp
-[AppstationDirectShowCameraEnum]::List()
+$listing = [AppstationDirectShowCameraEnum]::List()
+foreach ($line in ($listing -split "\r?\n")) {
+    Write-Output $line
+    if (-not $line.StartsWith("DevicePath=")) { continue }
+    $devicePath = $line.Substring("DevicePath=".Length)
+    if ([string]::IsNullOrWhiteSpace($devicePath)) { continue }
+    try {
+        $instanceId = if ($devicePath.StartsWith('\\?\')) { $devicePath.Substring(4) } else { $devicePath }
+        $instanceId = ($instanceId -split '#\{', 2)[0]
+        $instanceId = $instanceId -replace '#', '\'
+        $parentProperty = Get-PnpDeviceProperty `
+            -InstanceId $instanceId `
+            -KeyName 'DEVPKEY_Device_Parent' `
+            -ErrorAction Stop
+        $parentId = $parentProperty.Data
+        Write-Output ("ParentId=" + $parentId)
+        $locationProperty = Get-PnpDeviceProperty `
+            -InstanceId $parentId `
+            -KeyName 'DEVPKEY_Device_LocationPaths' `
+            -ErrorAction Stop
+        $locationPath = $locationProperty.Data | Select-Object -First 1
+        Write-Output ("LocationPath=" + $locationPath)
+    }
+    catch { }
+}
 """
 
 
@@ -202,6 +337,8 @@ def _identity_matches(expected: str, identity: dict[str, str]) -> bool:
                 identity.get("name", ""),
                 identity.get("devicePath", ""),
                 identity.get("displayName", ""),
+                identity.get("parentId", ""),
+                identity.get("locationPath", ""),
             ]
         )
     )
@@ -611,6 +748,9 @@ class OpenCVCameraDriver:
                 }
             else:
                 actual = self._apply_tuning(cv2, capture, profile)
+                if capture is current and camera in {"wrist_left", "wrist_right"} and profile["autoExposure"]:
+                    # 已打开的 direct capture 不经过重开分支，也需同步关闭低光降帧。
+                    self._disable_low_light_compensation(index)
             self._clear_probe_cache()
         self._log("info", f"{camera} tuning applied on index {index}: {profile}")
         return {
@@ -648,6 +788,68 @@ class OpenCVCameraDriver:
             for index in list(indices):
                 self._drop_capture(index)
             self._clear_probe_cache()
+
+    def wrist_candidates(self, config: dict[str, Any]) -> list[dict[str, Any]]:
+        self._identity_cache = None
+        identities = self._camera_identities_by_index()
+        global_identity = str(config["cameras"].get("globalIdentity", "")).strip()
+        if not global_identity:
+            raise ValueError("请先设置全局相机身份，再识别腕部相机")
+        global_matches = [
+            device for device in identities.values()
+            if not self._is_directshow_software_source(device) and _identity_matches(global_identity, device)
+        ]
+        if len(global_matches) != 1:
+            raise ValueError("无法唯一确认全局相机，请检查全局相机连接和身份配置后重新扫描")
+        devices = []
+        for index, device in identities.items():
+            if self._is_directshow_software_source(device) or not device.get("devicePath"):
+                continue
+            if _identity_matches(global_identity, device):
+                continue
+            parent = device.get("parentId", "")
+            serial = parent.rsplit("\\", 1)[-1]
+            identity = parent if parent and serial and "&" not in serial else device.get("locationPath", "")
+            if not identity:
+                continue
+            devices.append({
+                "index": index, "devicePath": device["devicePath"], "identity": identity,
+                "name": device.get("name", "USB Camera"),
+            })
+        return devices
+
+    def identify_wrists(self, config: dict[str, Any]) -> list[dict[str, Any]]:
+        devices = self.wrist_candidates(config)
+        for device in devices:
+            with self._capture_lock:
+                already_open = device["index"] in self._captures
+            preview_config = {**config, "cameras": {
+                **config["cameras"], "wristLeftIdentity": device["devicePath"], "wristRightIdentity": "",
+                "wristRight": "index -1",
+            }}
+            try:
+                jpeg = self.snapshot(preview_config, "wrist_left")
+                device["preview"] = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
+            except RuntimeError as exc:
+                device["error"] = str(exc)
+            finally:
+                if not already_open:
+                    with self._capture_lock:
+                        self._drop_capture(device["index"])
+        return devices
+
+    def wrist_binding(self, config: dict[str, Any], left: str, right: str) -> dict[str, Any]:
+        devices = {device["devicePath"]: device for device in self.wrist_candidates(config)}
+        if (
+            left == right or left not in devices or right not in devices
+            or devices[left]["identity"] == devices[right]["identity"]
+        ):
+            raise ValueError("请选择两台不同且仍在线的相机；设备变化后请重新扫描")
+        cameras = dict(config["cameras"])
+        for key, path in (("wristLeft", left), ("wristRight", right)):
+            cameras[key] = f"IMX335 / index {devices[path]['index']}"
+            cameras[f"{key}Identity"] = devices[path]["identity"]
+        return cameras
 
     def enumerate_devices(self, config: dict[str, Any], max_index: int = 3) -> list[dict[str, Any]]:
         try:
@@ -795,10 +997,14 @@ class OpenCVCameraDriver:
             )
             for role, config_key in CAMERA_DESCRIPTOR_KEYS.items()
         }
-        resolved.update(self._resolve_indices_by_identity(cameras))
+        identity_resolved = self._resolve_indices_by_identity(cameras)
+        for role, identity_key in CAMERA_IDENTITY_KEYS.items():
+            if str(cameras.get(identity_key, "")).strip():
+                resolved[role] = identity_resolved.get(role, -1)
         resolved = self._remap_software_sources(resolved, max_index)
         wrist_indices = {resolved["wrist_left"], resolved["wrist_right"]}
-        if resolved["global"] < 0 or resolved["global"] in wrist_indices:
+        global_has_identity = bool(str(cameras.get(CAMERA_IDENTITY_KEYS["global"], "")).strip())
+        if not global_has_identity and (resolved["global"] < 0 or resolved["global"] in wrist_indices):
             readable = self._discover_readable_indices(cv2, *CAMERA_CAPTURE_SIZES["global"], fps, max_index)
             remaining = [index for index in readable if index not in wrist_indices]
             if remaining:
@@ -913,6 +1119,8 @@ class OpenCVCameraDriver:
                 "name": current.get("FriendlyName", ""),
                 "devicePath": current.get("DevicePath", ""),
                 "displayName": current.get("DisplayName", ""),
+                "parentId": current.get("ParentId", ""),
+                "locationPath": current.get("LocationPath", ""),
             }
 
         for line in output.splitlines():
@@ -971,6 +1179,8 @@ class OpenCVCameraDriver:
         backend_label = ""
         worker_fallback = False
         profile = self._camera_tuning(config, camera) if config is not None and camera is not None else None
+        if camera in {"wrist_left", "wrist_right"} and profile and profile["autoExposure"]:
+            self._disable_low_light_compensation(index)
         backend_candidates = _backend_candidates(cv2)
         if self._process_capture_enabled(cv2, backend_candidates):
             capture = self._start_process_capture(cv2, index, width, height, fps, camera, profile, backend_candidates)
@@ -1095,6 +1305,28 @@ class OpenCVCameraDriver:
         self._start_encoder(cv2, index)
         self._log("info", f"{camera or 'camera'} opened index {index} via {backend_label} {width}x{height}@{fps:g}")
         return capture
+
+    def _disable_low_light_compensation(self, index: int) -> None:
+        if sys.platform != "win32":
+            return
+        device_path = self._camera_identities_by_index().get(index, {}).get("devicePath", "")
+        if not device_path:
+            return
+        # Reapply on every open: USB power cycles can restore variable frame rate.
+        script = DIRECTSHOW_CAMERA_ENUM_SCRIPT.split("$listing =", 1)[0]
+        script += "\n$ErrorActionPreference = 'Stop'\n"
+        script += "[AppstationDirectShowCameraEnum]::SetFixedFrameRate('" + device_path.replace("'", "''") + "')"
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True, text=True, timeout=8, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode != 0 or "fixed_frame_rate=1" not in result.stdout:
+                self._log("warning", f"camera index {index}: low-light compensation could not be disabled")
+            else:
+                self._log("info", f"camera index {index}: low-light compensation disabled; verify measured frame rate")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._log("warning", f"camera index {index}: fixed frame rate setup failed: {exc}")
 
     def _process_capture_enabled(self, cv2: Any, backend_candidates: list[tuple[int, str]]) -> bool:
         mode = os.environ.get("APPSTATION_CAMERA_CAPTURE_MODE", "").strip().lower()

@@ -1,9 +1,15 @@
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：显示 MJPEG 相机流，处理加载、错误占位和手动刷新。
+ * 先看：CameraPreviewProps → CameraPreview。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { useEffect } from 'react'
-import { Tag, Typography } from 'antd'
 import { Camera, Clock3 } from 'lucide-react'
 import { useLiveCameraSnapshot } from '../hooks/useLiveCameraSnapshot'
 import type { CameraTelemetry } from '../types'
 import { MetricPill } from './MetricPill'
+import { UiTag, UiText } from './ui'
 
 interface CameraPreviewProps {
   camera: CameraTelemetry
@@ -80,12 +86,13 @@ export function CameraPreview({
         <div className="camera-meta-grid">
           <MetricPill state={previewHealth} label={`${camera.fps.toFixed(1)} FPS`} />
           <MetricPill state={skewState} label={`${camera.timestampSkewMs.toFixed(1)} ms`} tip="Clock skew" />
-          <Tag className="camera-resolution-tag">{displayResolution}</Tag>
-          <Tag className="compact-tag camera-age-tag" icon={<Clock3 size={13} />}>
+          <UiTag className="camera-resolution-tag">{displayResolution}</UiTag>
+          <UiTag className="compact-tag camera-age-tag">
+            <Clock3 size={13} />
             age {Math.max(0, camera.frameAgeMs).toFixed(0)} ms
-          </Tag>
+          </UiTag>
         </div>
-        {!compact && <Typography.Text type="secondary">Preview frames keep the original aspect ratio.</Typography.Text>}
+        {!compact && <UiText secondary>Preview frames keep the original aspect ratio.</UiText>}
       </div>
     </section>
   )

@@ -1,3 +1,8 @@
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：验证粗、中、细速度倍率与最大速度限幅。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { describe, expect, it } from 'vitest'
 
 import { manualMaxVelocity, manualSpeedScale } from './manualSpeed'

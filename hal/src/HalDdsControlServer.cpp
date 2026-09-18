@@ -1,6 +1,14 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：提供后端 DDS 控制面：发布状态、接收命令并按请求编号返回应答。
+ * 先看：JsonEnvelopeSample → HalCommandRequestSample → HalCommandReplySample → HalTopicDataType。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "HalDdsControlServer.h"
 
 #include "HalJson.h"
+#include "WorkerExceptionBoundary.h"
+#include "CommandDeadline.h"
 
 #include <fastcdr/Cdr.h>
 #include <fastcdr/FastBuffer.h>
@@ -315,6 +323,8 @@ struct HalDdsControlServer::Impl {
   std::thread worker;
   std::thread emergencyWorker;
   std::mutex replyMutex_;
+  std::mutex lifecycleMutex_;
+  std::atomic_bool workerFailed_{false};
 
   Impl(
       HalCommandDispatcher& commandDispatcher,
@@ -410,23 +420,57 @@ struct HalDdsControlServer::Impl {
   }
 
   void start() {
-    if (!enabled || worker.joinable()) {
+    std::scoped_lock lifecycleLock(lifecycleMutex_);
+    if (!enabled || running.load()) {
       return;
     }
+    joinWorkers();
+    if (workerFailed_.load() && motion_.estopActive()) {
+      throw std::runtime_error("DDS worker failure requires emergency-stop acknowledgement before restart");
+    }
+    workerFailed_.store(false);
     running = true;
     // 普通命令和遥测共用 5 ms 级轮询；急停单独线程缩短响应路径。
-    worker = std::thread([this]() { loop(); });
-    emergencyWorker = std::thread([this]() { emergencyLoop(); });
+    try {
+      worker = std::thread([this]() {
+        runWorkerBoundary([this]() { loop(); }, [this](const char* error) { reportWorkerFailure(error); });
+      });
+      emergencyWorker = std::thread([this]() {
+        runWorkerBoundary([this]() { emergencyLoop(); }, [this](const char* error) { reportWorkerFailure(error); });
+      });
+    } catch (...) {
+      reportWorkerFailure("DDS control worker could not be created");
+      joinWorkers();
+      throw;
+    }
   }
 
   void stop() {
+    std::scoped_lock lifecycleLock(lifecycleMutex_);
     running = false;
+    joinWorkers();
+  }
+
+  void joinWorkers() {
     if (emergencyWorker.joinable()) {
       emergencyWorker.join();
     }
     if (worker.joinable()) {
       worker.join();
     }
+  }
+
+  void reportWorkerFailure(const char* message) noexcept {
+    running.store(false);
+    if (workerFailed_.exchange(true)) return;
+    motion_.failControlLease();
+    motion_.latchEmergencyStop();
+    nativeTeleop_.latchControlStop();
+    omega_.latchForceStop();
+    nativeTeleop_.reportControlFailure(message);
+    try { forceRuntime_.recordExternalEmergencyStop("dds_worker_failed", forceMonotonicMilliseconds()); }
+    catch (...) { std::fputs("DDS worker fault: force latch update failed\n", stderr); }
+    std::fprintf(stderr, "HAL DDS workers stopped: %s\n", message);
   }
 
   void loop() {
@@ -467,11 +511,11 @@ struct HalDdsControlServer::Impl {
       return false;
     }
     if (result != ReturnCode_t::RETCODE_OK) {
-      std::cerr << "Fast-DDS HAL command request take failed\n";
-      return false;
+      throw std::runtime_error("Fast-DDS HAL command request take failed");
     }
     bool handled = false;
     for (int32_t i = 0; i < samples.length(); ++i) {
+      if (!running.load()) break;
       if (!infos[i].valid_data) {
         continue;
       }
@@ -490,11 +534,11 @@ struct HalDdsControlServer::Impl {
       return false;
     }
     if (result != ReturnCode_t::RETCODE_OK) {
-      std::cerr << "Fast-DDS HAL emergency stop take failed\n";
-      return false;
+      throw std::runtime_error("Fast-DDS HAL emergency stop take failed");
     }
     bool handled = false;
     for (int32_t i = 0; i < samples.length(); ++i) {
+      if (!running.load()) break;
       if (!infos[i].valid_data) {
         continue;
       }
@@ -505,12 +549,27 @@ struct HalDdsControlServer::Impl {
   }
 
   void handleCommand(const HalCommandRequestSample& request) {
+    const auto commandEpoch = motion_.commandEpoch();
     HalCommandReplySample reply;
     reply.request_id = request.request_id;
     try {
+      const bool stopOrRead = request.name == "motion.emergency_stop"
+          || request.name == "motion.disable_side"
+          || request.name == "motion.teleop_stop_side"
+          || request.name == "teleop.native.stop"
+          || request.name == "teleop.native.status"
+          || request.name == "force.state"
+          || request.name == "omega7.zero_force_feedback"
+          || (request.name == "omega7.gravity_compensation"
+              && !jsonBoolValue(request.payload_json, "leftEnabled", true)
+              && !jsonBoolValue(request.payload_json, "rightEnabled", true));
+      if (!stopOrRead && request.stamp_unix_ms <= motion_.lastEmergencyStopUnixMs()) {
+        throw std::runtime_error("HAL command predates emergency stop; submit a new request after acknowledgement");
+      }
+      if (!stopOrRead) ensureCommandNotExpired(request.payload_json, static_cast<double>(unixMs()));
       reply.result_json = commandDispatcher_.handle(
           request.name,
-          request.payload_json.empty() ? std::string("{}") : request.payload_json);
+          request.payload_json.empty() ? std::string("{}") : request.payload_json, commandEpoch);
       reply.ok = true;
       reply.error.clear();
     } catch (const std::exception& exc) {
@@ -525,7 +584,14 @@ struct HalDdsControlServer::Impl {
     HalCommandReplySample reply;
     reply.request_id = request.request_id;
     try {
-      reply.result_json = commandDispatcher_.handleEmergencyStop();
+      if (request.name == "motion.emergency_stop") {
+        reply.result_json = commandDispatcher_.handleEmergencyStop();
+      } else if (request.name == "control.lease") {
+        // 租约续期必须独立于可能正在回原点的普通命令线程；有效期由 dispatcher 检查。
+        reply.result_json = commandDispatcher_.handle(request.name, request.payload_json);
+      } else {
+        throw std::invalid_argument("command is not allowed on the emergency DDS topic");
+      }
       reply.ok = true;
       reply.error.clear();
     } catch (const std::exception& exc) {
@@ -538,11 +604,12 @@ struct HalDdsControlServer::Impl {
 
   void writeReply(HalCommandReplySample& reply) {
     std::scoped_lock lock(replyMutex_);
-    (void)replyWriter_->write(&reply);
+    if (replyWriter_->write(&reply) != ReturnCode_t::RETCODE_OK) {
+      throw std::runtime_error("Fast-DDS HAL command reply publication failed");
+    }
   }
 
   void publishTelemetry() {
-    try {
       // DDS 遥测仍使用现有 JSON 序列化结果，避免 HTTP 和 DDS 两边字段定义漂移。
       const double uptime =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
@@ -550,19 +617,12 @@ struct HalDdsControlServer::Impl {
       publishJson(motionWriter_, jsonMotionState(motion_.readState()));
       publishJson(omegaWriter_, jsonOmegaState(omega_.readState()));
       publishJson(nativeTeleopWriter_, nativeTeleop_.statusJson());
-    } catch (const std::exception& exc) {
-      std::cerr << "Fast-DDS HAL telemetry publish failed: " << exc.what() << "\n";
-    }
   }
 
   void publishForceState() {
-    try {
       publishJson(
           forceWriter_,
           forceRuntime_.forceStateJson(forceMonotonicMilliseconds()));
-    } catch (const std::exception& exc) {
-      std::cerr << "Fast-DDS HAL force telemetry publish failed: " << exc.what() << "\n";
-    }
   }
 
   void publishJson(DataWriter* writer, const std::string& payloadJson) {
@@ -574,7 +634,9 @@ struct HalDdsControlServer::Impl {
     sample.stamp_monotonic_ms = monotonicMs();
     sample.source = "hal-cpp";
     sample.payload_json = payloadJson;
-    (void)writer->write(&sample);
+    if (writer->write(&sample) != ReturnCode_t::RETCODE_OK) {
+      throw std::runtime_error("Fast-DDS HAL telemetry publication failed");
+    }
   }
 };
 

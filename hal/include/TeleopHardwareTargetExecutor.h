@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：声明TeleopHardwareTargetExecutor 的接口与状态结构；接收硬件目标，叠加柔顺修正后交给运动驱动，并回写实际修正量。
+ * 先看：TeleopHardwareTargetExecutor。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #pragma once
 
 #include "ForceControlRuntime.h"
@@ -12,13 +18,16 @@ class TeleopHardwareTargetExecutor {
  public:
   TeleopHardwareTargetExecutor(
       LTDMCDriver& motion,
-      ForceControlRuntime& forceRuntime);
+      ForceControlRuntime& forceRuntime,
+      std::function<void(const char*)> failureCallback = {});
 
   void apply(const TeleopHardwareTarget& target);
+  void reportControlFailure(const char* message) noexcept;
 
  private:
   LTDMCDriver& motion_;
   ForceControlRuntime& forceRuntime_;
+  std::function<void(const char*)> failureCallback_;
 };
 
 }  // namespace appstation::hal

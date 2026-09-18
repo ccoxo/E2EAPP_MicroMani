@@ -1,3 +1,8 @@
+# 阅读导航 03｜后端契约与配置
+# 职责：组合机械软限位、工作原点和旋转工作范围，计算各侧实际可用运动区间。
+# 先看：AxisLimit → WorkOriginMissing → side_offset → config_limit_to_ui。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from dataclasses import dataclass

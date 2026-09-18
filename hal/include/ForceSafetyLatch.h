@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：声明ForceSafetyLatch 的接口与状态结构；根据超限次数、严重超限和数据超时锁存故障；恢复需双侧健康并满足稳定窗口。
+ * 先看：ForceSafetyConfig → ForceSafetyTrip → ForceSafetyLatch。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #pragma once
 
 #include <array>

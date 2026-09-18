@@ -1,8 +1,16 @@
-﻿#include "HalCommandDispatcher.h"
+﻿/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：统一解析并分派 HAL 命令，调用运动、主手、遥操作和力运行时。
+ * 先看：HalCommandDispatcher::handleEmergencyStop → HalCommandDispatcher::handle。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
+#include "HalCommandDispatcher.h"
 
 #include "HalJson.h"
 
 #include <stdexcept>
+#include <cmath>
+#include <exception>
 
 namespace appstation::hal {
 
@@ -19,15 +27,51 @@ HalCommandDispatcher::HalCommandDispatcher(
       started_(started) {}
 
 std::string HalCommandDispatcher::handleEmergencyStop() {
-  forceRuntime_.recordExternalEmergencyStop(
-      "manual_emergency_stop",
-      forceMonotonicMilliseconds());
-  motion_.emergencyStop();
-  nativeTeleop_.requestEmergencyStop();
+  emergencyStopsInProgress_.fetch_add(1);
+  struct StopCompletion {
+    std::atomic_uint32_t& count;
+    ~StopCompletion() { count.fetch_sub(1); }
+  } completion{emergencyStopsInProgress_};
+  // 先撤销软件运动权限；任何停止动作报错也必须继续其余动作。
+  motion_.latchEmergencyStop();
+  nativeTeleop_.latchControlStop();
+  omega_.latchForceStop();
+  std::exception_ptr failure;
+  const auto attempt = [&failure](auto&& action) {
+    try { action(); }
+    catch (...) { if (!failure) failure = std::current_exception(); }
+  };
+  attempt([&]() { motion_.emergencyStop(); });
+  attempt([&]() { nativeTeleop_.requestEmergencyStop(); });
+  attempt([&]() { omega_.requestEmergencyStop(); });
+  attempt([&]() { forceRuntime_.recordExternalEmergencyStop(
+      "manual_emergency_stop", forceMonotonicMilliseconds()); });
+  if (failure) std::rethrow_exception(failure);
   return "{\"ok\":true}";
 }
 
-std::string HalCommandDispatcher::handle(const std::string& name, const std::string& bodyText) {
+std::string HalCommandDispatcher::handle(const std::string& name, const std::string& bodyText,
+    std::optional<std::uint64_t> expectedEpoch) {
+  if (name == "control.lease") {
+    const auto sequence = jsonNumberValue(bodyText, "sequence", 0);
+    const auto issuedAt = jsonNumberValue(bodyText, "issuedAtUnixMs", 0);
+    const auto timeout = jsonNumberValue(bodyText, "timeoutMs", 0);
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (!std::isfinite(sequence) || sequence < 1 || sequence > 9007199254740991.0
+        || std::floor(sequence) != sequence || !std::isfinite(issuedAt)
+        || std::abs(static_cast<double>(now) - issuedAt) > 1000
+        || timeout != ControlLeaseState::kTimeoutMs)
+      throw std::runtime_error("invalid or stale control lease request");
+    motion_.renewControlLease(jsonStringValue(bodyText, "sessionId"), static_cast<std::uint64_t>(sequence));
+    return "{\"ok\":true,\"leaseFresh\":true,\"timeoutMs\":2500}";
+  }
+  const auto commandEpoch = expectedEpoch.value_or(motion_.commandEpoch());
+  const auto ensureCurrentMotionCommand = [&]() {
+    if (!motion_.commandEpochAllowed(commandEpoch)) {
+      throw std::runtime_error("HAL command cancelled by emergency stop");
+    }
+  };
   // DDS command request 使用和 Python backend 相同的 command name；
   // 这里复用既有 HTTP 路由语义，避免两套控制面出现行为分叉。
   if (name == "hal.reconnect") {
@@ -41,7 +85,8 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
         jsonBoolValue(bodyText, "leftEnabled", true),
         jsonBoolValue(bodyText, "rightEnabled", true),
         jsonNumberValue(bodyText, "leftScale", 0.45),
-        jsonNumberValue(bodyText, "rightScale", 1.0));
+        jsonNumberValue(bodyText, "rightScale", 1.0),
+        [&]() { return motion_.commandEpochAllowed(commandEpoch); });
     return "{\"ok\":true}";
   }
   if (name == "omega7.zero_force_feedback") {
@@ -68,6 +113,7 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     return "{\"ok\":true}";
   }
   if (name == "force.tare") {
+    ensureCurrentMotionCommand();
     const auto sideValue = lowercase(jsonStringValueOr(bodyText, "side", "all"));
     int side = -1;
     if (sideValue == "left") {
@@ -79,20 +125,23 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     }
     forceRuntime_.tare(
         side,
-        static_cast<int>(jsonNumberValue(bodyText, "samples", 200)));
+        static_cast<int>(jsonNumberValue(bodyText, "samples", 200)),
+        [motion = &motion_, commandEpoch]() { return motion->commandEpochAllowed(commandEpoch); });
     return "{\"ok\":true}";
   }
   if (name == "teleop.native.configure") {
-    nativeTeleop_.configure(jsonNativeTeleopConfig(bodyText));
+    nativeTeleop_.configure(jsonNativeTeleopConfig(bodyText), commandEpoch);
     return "{\"ok\":true}";
   }
   if (name == "teleop.native.start") {
+    ensureCurrentMotionCommand();
     forceRuntime_.resetCompliance();
-    nativeTeleop_.configure(jsonNativeTeleopConfig(bodyText));
+    nativeTeleop_.configure(jsonNativeTeleopConfig(bodyText), commandEpoch);
     omega_.ensureReady();
+    ensureCurrentMotionCommand();
     nativeTeleop_.start(
         jsonBoolValue(bodyText, "leftConnected", false),
-        jsonBoolValue(bodyText, "rightConnected", false));
+        jsonBoolValue(bodyText, "rightConnected", false), commandEpoch);
     return "{\"ok\":true}";
   }
   if (name == "teleop.native.stop") {
@@ -104,6 +153,7 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     return nativeTeleop_.statusJson();
   }
   if (name == "teleop.native.gripper_command" || name == "gripper.command") {
+    ensureCurrentMotionCommand();
     const auto config = jsonNativeTeleopConfig(bodyText);
     nativeTeleop_.configureGripper(config.gripper);
     nativeTeleop_.configureGripperProtection(
@@ -115,7 +165,8 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     const auto speed = static_cast<int>(jsonNumberValue(bodyText, "gripSpeed", config.gripper.speed));
     const auto torque = static_cast<int>(jsonNumberValue(bodyText, "gripTorque", config.gripper.torque));
     std::string message;
-    if (!nativeTeleop_.commandGripperTarget(side, targetMm, speed, torque, &message)) {
+    ensureCurrentMotionCommand();
+    if (!nativeTeleop_.commandGripperTarget(side, targetMm, speed, torque, &message, commandEpoch)) {
       throw std::runtime_error(message);
     }
     return "{\"ok\":true,\"message\":\"" + jsonEscape(message) + "\",\"targetMm\":"
@@ -125,14 +176,21 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     return handleEmergencyStop();
   }
   if (name == "motion.acknowledge_estop") {
-    forceRuntime_.acknowledgeEmergencyStop(forceMonotonicMilliseconds());
+    if (emergencyStopsInProgress_.load() != 0) {
+      throw std::runtime_error("emergency stop is still being applied; acknowledge again after it completes");
+    }
+    const auto expectedEpoch = commandEpoch;
+    forceRuntime_.acknowledgeEmergencyStop(forceMonotonicMilliseconds(), [&]() {
+      motion_.acknowledgeEmergencyStop(expectedEpoch);
+    });
     return "{\"ok\":true,\"servoRestored\":false}";
   }
   if (name == "motion.home_all") {
     motion_.ensureMotionReturnAllowed();
     const auto enabledAxes = jsonHomeAllEnabledAxes(bodyText);
     nativeTeleop_.stop();
-    motion_.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes);
+    ensureCurrentMotionCommand();
+    motion_.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes, commandEpoch);
     return "{\"ok\":true}";
   }
   if (name == "motion.home_origin_side") {
@@ -140,12 +198,13 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     const auto side = parseSide(jsonStringValue(bodyText, "side"));
     const auto enabledAxes = jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled);
     nativeTeleop_.stop();
-    motion_.homeOriginSide(side, jsonSideWorkOriginPulse(bodyText), enabledAxes);
+    ensureCurrentMotionCommand();
+    motion_.homeOriginSide(side, jsonSideWorkOriginPulse(bodyText), enabledAxes, commandEpoch);
     return "{\"ok\":true}";
   }
   if (name == "motion.enable_side") {
     const auto side = parseSide(jsonStringValue(bodyText, "side"));
-    const auto message = motion_.enableSide(side, true, jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled));
+    const auto message = motion_.enableSide(side, true, jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled), commandEpoch);
     return "{\"ok\":true,\"message\":\"" + jsonEscape(message) + "\"}";
   }
   if (name == "motion.disable_side") {
@@ -155,7 +214,7 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
   }
   if (name == "motion.home_side") {
     const auto side = parseSide(jsonStringValue(bodyText, "side"));
-    motion_.homeSide(side, jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled));
+    motion_.homeSide(side, jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled), commandEpoch);
     return "{\"ok\":true}";
   }
   if (name == "motion.manual_axis_move") {
@@ -174,7 +233,7 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
         maxVelocity,
         startVelocity,
         accTime,
-        decTime);
+        decTime, commandEpoch);
     return "{\"ok\":true}";
   }
   if (name == "motion.teleop_target_update") {
@@ -201,7 +260,7 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
         jsonNumberValue(bodyText, "translationStartVelocityUiPerSec", 0.0),
         jsonNumberValue(bodyText, "rotationStartVelocityUiPerSec", 0.0),
         jsonNumberValue(bodyText, "accTimeSec", 0.0),
-        jsonNumberValue(bodyText, "decTimeSec", 0.0));
+        jsonNumberValue(bodyText, "decTimeSec", 0.0), commandEpoch);
     return jsonTeleopTargetUpdateResult(side, result);
   }
   if (name == "motion.teleop_stop_side") {

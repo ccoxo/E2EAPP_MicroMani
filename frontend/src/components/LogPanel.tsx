@@ -1,10 +1,16 @@
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：按通道、级别和搜索词筛选日志，并使用虚拟列表控制渲染开销。
+ * 先看：formatLogTime → matchesSearch → LogPanel。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { Button, Checkbox, Input, Select, Space, Typography } from 'antd'
 import { Activity, ChevronDown, ChevronUp, Download, RotateCw, Search, TriangleAlert } from 'lucide-react'
 import { useMemo, useRef, useState } from 'react'
 import { channelColor, logChannels } from '../data'
 import { useTelemetryStore } from '../stores/telemetry'
 import type { LogLevel } from '../types'
+import { UiButton, UiSpace, UiText } from './ui'
 
 const levelOptions: Array<LogLevel | 'ALL'> = ['ALL', 'DEBUG', 'INFO', 'WARNING', 'ERROR']
 const quickFilters = [
@@ -86,8 +92,8 @@ export function LogPanel() {
     URL.revokeObjectURL(url)
   }
 
- /** 处理对应的用户交互。 */
- function jumpNextError() {
+  /** 处理对应的用户交互。 */
+  function jumpNextError() {
     const index = filtered.findIndex((entry) => entry.level === 'ERROR')
     if (index >= 0) virtualizer.scrollToIndex(index, { align: 'center' })
   }
@@ -95,41 +101,66 @@ export function LogPanel() {
   return (
     <section className={`log-panel ${open ? 'log-panel-open' : 'log-panel-closed'}`}>
       <header className="log-toolbar">
-        <Space size={8} wrap>
-          <Button size="small" icon={open ? <ChevronDown size={14} /> : <ChevronUp size={14} />} onClick={() => setOpen(!open)}>
+        <UiSpace size={8} wrap>
+          <UiButton icon={open ? <ChevronDown size={14} /> : <ChevronUp size={14} />} onClick={() => setOpen(!open)}>
             Log Panel
-          </Button>
+          </UiButton>
           {open && (
             <>
-              <Checkbox.Group options={logChannels} value={selectedChannels} onChange={(value) => setSelectedChannels(value.map(String))} />
-              <Select size="small" value={level} options={levelOptions.map((item) => ({ value: item, label: item }))} onChange={setLevel} />
-              <Space size={4} className="log-quick-filters">
+              <span className="log-channel-filters">
+                {logChannels.map((channel) => (
+                  <label key={channel}>
+                    <input
+                      type="checkbox"
+                      checked={selectedChannels.includes(channel)}
+                      onChange={(event) => {
+                        setSelectedChannels((current) =>
+                          event.target.checked ? [...current, channel] : current.filter((item) => item !== channel),
+                        )
+                      }}
+                    />
+                    {channel}
+                  </label>
+                ))}
+              </span>
+              <select
+                className="ui-select"
+                value={level}
+                onChange={(event) => setLevel(event.target.value as LogLevel | 'ALL')}
+              >
+                {levelOptions.map((item) => (
+                  <option key={item} value={item}>{item}</option>
+                ))}
+              </select>
+              <UiSpace size={4} className="log-quick-filters">
                 {quickFilters.map((item) => (
-                  <Button
+                  <UiButton
                     key={item.label}
-                    size="small"
-                    type={search === item.query ? 'primary' : 'default'}
+                    variant={search === item.query ? 'primary' : 'default'}
                     icon={item.icon}
                     onClick={() => setSearch(item.query)}
                   >
                     {item.label}
-                  </Button>
+                  </UiButton>
                 ))}
-              </Space>
-              <Input size="small" prefix={<Search size={14} />} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="regex / keyword" />
+              </UiSpace>
+              <span className="log-search">
+                <Search size={14} />
+                <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="regex / keyword" />
+              </span>
             </>
           )}
-        </Space>
+        </UiSpace>
         {open && (
-          <Space>
-            <Button size="small" icon={<TriangleAlert size={14} />} onClick={jumpNextError}>
+          <UiSpace>
+            <UiButton icon={<TriangleAlert size={14} />} onClick={jumpNextError}>
               下一个错误
-            </Button>
-            <Button size="small" icon={<Download size={14} />} onClick={exportLogs}>
+            </UiButton>
+            <UiButton icon={<Download size={14} />} onClick={exportLogs}>
               导出
-            </Button>
-            <Typography.Text type="secondary">{filtered.length} / {logs.length}</Typography.Text>
-          </Space>
+            </UiButton>
+            <UiText secondary>{filtered.length} / {logs.length}</UiText>
+          </UiSpace>
         )}
       </header>
       {open && (

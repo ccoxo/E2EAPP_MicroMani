@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 08｜启动、部署与工具
+ * 职责：启动预览并用 Playwright 检查页面与截图；用于人工界面核对。
+ * 先看：wait → waitForServer。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'

@@ -1,3 +1,8 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：离线校验已有遥操作验收 JSON，检查轴诊断、零停、主手和夹爪等证据。
+# 先看：Add-Failure → As-Array → Has-Value → Number-Value。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 param(
   [string]$ReportPath = "",
   [string]$AcceptanceDir = ""

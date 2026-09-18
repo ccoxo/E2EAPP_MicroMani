@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：启动脚本的进程顺序、DLL 部署、DDS 和 HKVL 配置注入。
+# 先看：test_start_stack_cleans_backend_process_tree_even_without_listening_port → test_start_stack_stops_backend_before_restarting_hal → test_start_hal_passes_configured_port_to_hal_process_and_health_check → test_start_hal_injects_force_runtime_config_from_backend_config。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import re

@@ -1,3 +1,8 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：测量 Jodell 端口读取方式的耗时和成功率；直接使用夹爪驱动。
+# 先看：BenchResult → percentile → mean → parse_port。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import argparse

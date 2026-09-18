@@ -1,3 +1,8 @@
+# 阅读导航 03｜后端契约与配置
+# 职责：集中定义硬件标定、轴映射、相机和遥操作默认值，并生成独立的默认配置副本。
+# 先看：anchored_mechanical_soft_limits → rotation_work_limits_from_soft_limits → stable_mechanical_soft_limits → default_config。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -326,7 +331,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "cameras": deepcopy(ICF_CAMERA_DEFAULTS),
     "force": {
-        "source": "nidaq",
+        "source": "hkvl_serial",
         "leftIp": "Dev5/ai0:5",
         "rightIp": "Dev3/ai0:5",
         "port": 49152,
@@ -388,10 +393,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "homeReference": deepcopy(ICF_HOME_REFERENCE_DEFAULTS),
         "workOriginOffset": deepcopy(ICF_WORK_ORIGIN_OFFSET_DEFAULTS),
         "relativeSoftLimits": deepcopy(ICF_RELATIVE_SOFT_LIMIT_DEFAULTS),
-        "homeOnStartup": {
-            "enabled": False,
-            "mode": "work_origin",
-        },
         "leftProfile": deepcopy(DEFAULT_MOTION_PROFILE),
         "rightProfile": deepcopy(DEFAULT_MOTION_PROFILE),
         "leftSoftLimits": deepcopy(ICF_LEFT_MOTION_MECHANICAL_LIMITS),

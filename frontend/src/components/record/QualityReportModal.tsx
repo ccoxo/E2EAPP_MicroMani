@@ -1,5 +1,11 @@
-import { Alert, Button, Descriptions, Modal } from 'antd'
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：展示录制 episode 的质量结果与相关统计。
+ * 先看：QualityReportModalProps → QualityReportModal。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import type { RecordQualityReport } from '../../types'
+import { UiButton, UiText } from '../ui'
 
 interface QualityReportModalProps {
   open: boolean
@@ -14,58 +20,50 @@ export default function QualityReportModal({
   onReRecord,
   onAccept,
 }: QualityReportModalProps) {
+  if (!open || !report) return null
   return (
-    <Modal
-      title={report ? `Episode #${String(report.index).padStart(3, '0')} 质量报告` : '质量报告'}
-      open={open}
-      closable={false}
-      maskClosable={false}
-      footer={[
-        <Button key="rerecord" onClick={onReRecord}>
-          重录本条
-        </Button>,
-        <Button key="accept" type="primary" onClick={onAccept}>
-          接受并继续
-        </Button>,
-      ]}
-    >
-      {report && (
-        <>
-          <Descriptions size="small" column={2} bordered>
-            <Descriptions.Item label="帧数">{report.frameCount}</Descriptions.Item>
-            <Descriptions.Item label="时长">{report.durationS.toFixed(1)}s</Descriptions.Item>
-            <Descriptions.Item label="迟帧">{report.lateFrames}</Descriptions.Item>
-            <Descriptions.Item label="相机掉帧">
-              全局 {report.cameraDrops.global} / 左腕 {report.cameraDrops.wristLeft} / 右腕 {report.cameraDrops.wristRight}
-            </Descriptions.Item>
-            <Descriptions.Item label="左臂峰值力">
-              {report.maxForceLeft.toFixed(2)}N
-            </Descriptions.Item>
-            <Descriptions.Item label="右臂峰值力">
-              {report.maxForceRight.toFixed(2)}N
-            </Descriptions.Item>
-          </Descriptions>
+    <div className="ui-modal-mask" role="presentation">
+      <div
+        className="ui-modal"
+        role="dialog"
+        aria-label={`Episode #${String(report.index).padStart(3, '0')} 质量报告`}
+      >
+        <header className="ui-modal-head">
+          <strong>Episode #{String(report.index).padStart(3, '0')} 质量报告</strong>
+        </header>
+        <div className="ui-modal-body">
+          <table className="ui-table">
+            <tbody>
+              <tr><th>帧数</th><td>{report.frameCount}</td><th>时长</th><td>{report.durationS.toFixed(1)}s</td></tr>
+              <tr><th>迟帧</th><td>{report.lateFrames}</td>
+                <th>相机掉帧</th>
+                <td>全局 {report.cameraDrops.global} / 左腕 {report.cameraDrops.wristLeft} / 右腕 {report.cameraDrops.wristRight}</td></tr>
+              <tr><th>左臂峰值力</th><td>{report.maxForceLeft.toFixed(2)}N</td>
+                <th>右臂峰值力</th><td>{report.maxForceRight.toFixed(2)}N</td></tr>
+            </tbody>
+          </table>
 
           {report.warnings.length > 0 && (
-            <Alert
-              type="warning"
-              message="检测到以下问题"
-              description={
-                <ul style={{ margin: 0, paddingLeft: 16 }}>
-                  {report.warnings.map((w, i) => (
-                    <li key={i}>{w}</li>
-                  ))}
-                </ul>
-              }
-              style={{ marginTop: 12 }}
-            />
+            <div className="ui-alert ui-alert-warning">
+              <strong>检测到以下问题</strong>
+              <ul style={{ margin: '6px 0 0', paddingLeft: 16 }}>
+                {report.warnings.map((w, i) => (
+                  <li key={i}>{w}</li>
+                ))}
+              </ul>
+            </div>
           )}
 
           {report.warnings.length === 0 && report.passed && (
-            <Alert type="success" message="数据质量良好，可以继续。" style={{ marginTop: 12 }} />
+            <div className="ui-alert ui-alert-success">数据质量良好，可以继续。</div>
           )}
-        </>
-      )}
-    </Modal>
+          <UiText secondary style={{ fontSize: 11 }}>选择「接受并继续」进入下一条，或「重录本条」丢弃本次采集。</UiText>
+        </div>
+        <div className="ui-modal-actions">
+          <UiButton onClick={onReRecord}>重录本条</UiButton>
+          <UiButton variant="primary" onClick={onAccept}>接受并继续</UiButton>
+        </div>
+      </div>
+    </div>
   )
 }

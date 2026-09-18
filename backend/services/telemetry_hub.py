@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：聚合运动、主手、相机、夹爪和力状态，生成供 WebSocket 与界面使用的遥测帧。
+# 先看：TelemetryHub。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import math
@@ -88,7 +93,7 @@ class TelemetryHub:
         self._last_frame_at = now
         config = config if config is not None else self.settings.get_config()
         real_mode = self._real_hardware_mode(config)
-        force_source = str(config.get("force", {}).get("source", "nidaq")).lower()
+        force_source = str(config.get("force", {}).get("source", "hkvl_serial")).lower()
         if real_mode:
             if motion_positions is not None and len(motion_positions) == 12:
                 # 真机位置以 HAL 返回值为准，本地 offset 只服务于测试模式。
@@ -575,7 +580,7 @@ class TelemetryHub:
     def _refresh_force_values(self, config: dict[str, Any], now: float) -> None:
         if self.hardware is None or getattr(self, "_shutdown", False):
             return
-        if str(config.get("force", {}).get("source", "nidaq")).lower() != "nidaq":
+        if str(config.get("force", {}).get("source", "hkvl_serial")).lower() != "nidaq":
             return
         if self._force_future is not None and self._force_future.done():
             try:

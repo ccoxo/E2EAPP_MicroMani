@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：把夹爪操作统一路由到 HAL-native 适配器；当前 select 始终返回原生后端。
+# 先看：GripperRouter。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 """Route gripper commands through the HAL-native backend."""
 
 from __future__ import annotations

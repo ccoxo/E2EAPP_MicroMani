@@ -1,3 +1,8 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：只读采集双侧 HKVL 串口原始数据，并验证候选帧格式与 CRC。
+# 先看：New-ReadOnlySerialPort → Get-ModbusCrc16 → Test-HkvlCandidateFrames。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 param(
   [string]$LeftPort = "COM15",
   [string]$RightPort = "COM14",

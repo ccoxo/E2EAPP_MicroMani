@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：DDS 状态缓存、命令应答、急停发布、超时和重试。
+# 先看：FakeDdsTransport → test_dds_hal_client_reads_health_from_topic_cache → test_dds_hal_client_reads_motion_state_from_topic_cache → test_dds_hal_client_reads_force_state_from_topic_cache。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import asyncio
@@ -323,3 +328,16 @@ def test_dds_hal_client_default_runtime_reports_missing_fastdds_binding(
     monkeypatch.setenv("APPSTATION_FASTDDS_BINDING_DLL", str(tmp_path / "missing-fastdds.dll"))
     with pytest.raises(RuntimeError, match="Fast-DDS Python bindings are required"):
         DdsHalClient(LogService(emit_startup=False))
+
+
+@pytest.mark.parametrize("name", [
+    "motion.manual_axis_move", "motion.enable_side", "motion.acknowledge_estop",
+    "teleop.native.start", "gripper.command", "teleop.native.gripper_command",
+])
+def test_dds_lost_reply_does_not_reissue_mutating_command(name: str) -> None:
+    transport = FakeDdsTransport()
+    # 此用例模拟已发布后丢失应答，不能让线程调度的 1ms 抖动先触发发布前过期。
+    client = DdsHalClient(LogService(emit_startup=False), transport=transport, reply_timeout_s=0.1)
+    with pytest.raises(RuntimeError, match="timed out"):
+        asyncio.run(client.command(name, {"side": "left", "step": 5}))
+    assert len(transport.requests) == 1

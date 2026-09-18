@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：结构化事件、限频、会话日志保存、清理和配置变更记录。
+# 先看：test_event_log_formats_stable_key_value_message → test_event_log_uses_generated_operation_id → test_rate_limited_event_keeps_first_and_suppresses_repeat → test_log_service_persists_each_entry_to_session_file。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import json

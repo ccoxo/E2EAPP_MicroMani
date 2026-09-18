@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：枚举和读取 Omega.7 主手，处理左右设备绑定、重力补偿及力输出。
+ * 先看：Omega7Driver::initialize → Omega7Driver::ensureReady → Omega7Driver::ok → Omega7Driver::lastError。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "Omega7Driver.h"
 
 #ifdef _WIN32
@@ -9,6 +15,7 @@
 #include <cstddef>
 #include <cmath>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -300,6 +307,10 @@ std::string Omega7Driver::lastError() const {
 
 std::array<Omega7State, 2> Omega7Driver::readState() {
   std::scoped_lock lock(mutex_);
+  if (forceStopRequested_.load()) {
+    applyForceOutputUnlocked(0, false);
+    applyForceOutputUnlocked(1, false);
+  }
   const auto readTimestampMs = unixTimeMs();
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   // 逐台读取已打开设备的实时状态。这里不重新打开设备，只复用 initialize
@@ -364,7 +375,9 @@ std::array<Omega7State, 2> Omega7Driver::readState() {
     }
     item.gripperGap = selectedGapMm / 1000.0;
     item.gripperGapAvailable = haveGap;
-    if (forceOutputEnabled_[index]) {
+    if (forceStopRequested_.load()) {
+      applyForceOutputUnlocked(index, false);
+    } else if (forceOutputEnabled_[index]) {
       writeZeroForceUnlocked(item);
     }
   }
@@ -377,14 +390,43 @@ std::array<Omega7State, 2> Omega7Driver::readState() {
   return state_;
 }
 
-void Omega7Driver::setGravityCompensation(bool leftEnabled, bool rightEnabled, double leftScale, double rightScale) {
+void Omega7Driver::setGravityCompensation(bool leftEnabled, bool rightEnabled, double leftScale, double rightScale,
+    const std::function<bool()>& commandAllowed) {
   std::scoped_lock lock(mutex_);
-  gravityScale_[0] = normalizeGravityScale(leftScale, gravityScale_[0]);
-  gravityScale_[1] = normalizeGravityScale(rightScale, gravityScale_[1]);
+  const auto checkEnable = [&]() {
+    if ((leftEnabled || rightEnabled) && commandAllowed && !commandAllowed()) {
+      forceStopRequested_.store(true);
+      applyForceOutputUnlocked(0, false);
+      applyForceOutputUnlocked(1, false);
+      throw std::runtime_error("Omega force output cancelled by emergency stop");
+    }
+  };
+  checkEnable();
+  // 解除停止后必须显式新开力；全关请求在锁存期间只关力，不热改比例。
+  if (!commandAllowed || commandAllowed()) {
+    gravityScale_[0] = normalizeGravityScale(leftScale, gravityScale_[0]);
+    gravityScale_[1] = normalizeGravityScale(rightScale, gravityScale_[1]);
+    if (leftEnabled || rightEnabled) forceStopRequested_.store(false);
+  }
   // 两侧独立控制，允许只给已连接或需要的主手开启力输出。
+  checkEnable();
   applyForceOutputUnlocked(0, leftEnabled);
-  applyForceOutputUnlocked(0, leftEnabled);
+  checkEnable();
   applyForceOutputUnlocked(1, rightEnabled);
+  checkEnable();
+}
+
+void Omega7Driver::latchForceStop() noexcept {
+  forceStopRequested_.store(true);
+}
+
+void Omega7Driver::requestEmergencyStop() {
+  latchForceStop();
+  // 不等待读取 SDK 的锁；持锁中的采样/命令也会观察停止请求并关力。
+  std::unique_lock lock(mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) return;
+  applyForceOutputUnlocked(0, false);
+  applyForceOutputUnlocked(1, false);
 }
 
 std::array<bool, 2> Omega7Driver::forceOutputEnabled() const {
@@ -406,6 +448,7 @@ void Omega7Driver::applyForceOutputUnlocked(std::size_t index, bool enabled) {
   if (index >= state_.size()) {
     return;
   }
+  enabled = enabled && !forceStopRequested_.load();
   forceOutputEnabled_[index] = enabled;
   const auto& item = state_[index];
   if (!item.connected || item.deviceId < 0) {

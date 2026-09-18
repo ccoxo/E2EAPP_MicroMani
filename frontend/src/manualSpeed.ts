@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 02｜前端契约与状态
+ * 职责：定义手动粗、中、细速度倍率，并将实际速度限制在配置上限内。
+ * 先看：manualSpeedScale → manualMaxVelocity。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import type { ManualSpeedMode } from './types'
 
 /** Scale operator jog speed by the selected precision mode. */

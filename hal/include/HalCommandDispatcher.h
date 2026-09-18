@@ -1,6 +1,13 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：声明HalCommandDispatcher 的接口与状态结构；统一解析并分派 HAL 命令，调用运动、主手、遥操作和力运行时。
+ * 先看：HalCommandDispatcher。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #pragma once
 
 #include <chrono>
+#include <atomic>
 #include <string>
 
 #include "ForceControlRuntime.h"
@@ -22,7 +29,8 @@ class HalCommandDispatcher {
       const std::chrono::steady_clock::time_point& started);
 
   // bodyText 是上层传入的 JSON 字符串；返回值保持 JSON 字符串，便于传输层原样转发。
-  std::string handle(const std::string& name, const std::string& bodyText);
+  std::string handle(const std::string& name, const std::string& bodyText,
+      std::optional<std::uint64_t> expectedEpoch = std::nullopt);
   std::string handleEmergencyStop();
 
  private:
@@ -31,6 +39,7 @@ class HalCommandDispatcher {
   NativeTeleopController& nativeTeleop_;
   ForceControlRuntime& forceRuntime_;
   const std::chrono::steady_clock::time_point& started_;
+  std::atomic_uint32_t emergencyStopsInProgress_{0};
 };
 
 }  // namespace appstation::hal

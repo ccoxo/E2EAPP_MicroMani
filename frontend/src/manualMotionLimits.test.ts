@@ -1,3 +1,8 @@
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：验证手动平移/旋转步长与脉冲约束及 HAL 上限一致。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { describe, expect, it } from 'vitest'
 
 import { manualAxisStepLimitFromPulse } from './manualMotionLimits'

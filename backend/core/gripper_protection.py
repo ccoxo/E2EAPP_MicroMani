@@ -1,3 +1,8 @@
+# 阅读导航 03｜后端契约与配置
+# 职责：限制夹爪目标开口范围，保留配置要求的最小夹缝。
+# 先看：gripper_stroke_mm → icf_target_protection_enabled → icf_target_min_gap_mm → protected_gripper_target_mm。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from typing import Any

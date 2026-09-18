@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 05｜DDS 传输
+ * 职责：向 Python 暴露 Fast-DDS 的 C ABI；维护主题缓存、命令发布与应答同步。
+ * 先看：JsonEnvelopeSample → HalCommandRequestSample → HalCommandReplySample → AppStationTopicDataType。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include <fastcdr/Cdr.h>
 #include <fastcdr/FastBuffer.h>
 #include <fastdds/dds/core/LoanableSequence.hpp>

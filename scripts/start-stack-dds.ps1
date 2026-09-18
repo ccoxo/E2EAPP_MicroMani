@@ -1,9 +1,13 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：设置 DDS 域和发现范围，重启本项目 HAL 与后端服务。
+# 先看：Stop-RepoProcessByPattern。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 param(
   [int]$BackendPort = 18082,
   [int]$HalPort = 8091,
   [int]$DomainId = 42,
-  [switch]$LanDiscovery,
-  [switch]$SkipStartupHome
+  [switch]$LanDiscovery
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,7 +43,6 @@ $env:APPSTATION_DDS_LAN_DISCOVERY = if ($LanDiscovery) { "1" } else { "0" }
 $env:APPSTATION_HAL_MODE = "real"
 $env:APPSTATION_HAL_BASE_URL = "http://127.0.0.1:$HalPort"
 $env:APPSTATION_HAL_TRANSPORT = "dds"
-$env:APPSTATION_SKIP_STARTUP_HOME = if ($SkipStartupHome) { "true" } else { "false" }
 
 Start-Sleep -Seconds 1
 

@@ -1,3 +1,7 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：装配 ACT 模型部署参数并调用外部策略工程；Send 控制是否发送真实动作。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 param(
   [string]$CheckpointDir = "D:\ACT_TEXT\act_text\checkpoints\003000",
   [string]$Checkpoint = "pretrained_model",
@@ -21,7 +25,6 @@ param(
   [double]$TranslationDeadbandUm = 0.0,
   [int]$PolicyUpdateInterval = 1,
   [switch]$Send,
-  [switch]$SkipStartupHome,
   [switch]$WithFrontend
 )
 
@@ -57,9 +60,6 @@ if ($WithFrontend) {
     "-BackendPort", "$BackendPort",
     "-FrontendPort", "$FrontendPort"
   )
-  if ($SkipStartupHome) {
-    $stackArgs += "-SkipStartupHome"
-  }
 
   Write-Host "Starting AppStation stack with frontend..."
   & powershell @stackArgs | Out-Host
@@ -83,7 +83,6 @@ if ($WithFrontend) {
   Write-Host "Launching backend on $backendUrl..."
   $env:APPSTATION_HAL_MODE = "real"
   $env:APPSTATION_HAL_BASE_URL = "http://127.0.0.1:8091"
-  $env:APPSTATION_SKIP_STARTUP_HOME = if ($SkipStartupHome) { "true" } else { "false" }
   $env:APPSTATION_DISABLE_CAMERA_PROBE = "true"
   $backend = Start-Process `
     -FilePath (Join-Path $repo "backend\.venv\Scripts\python.exe") `
@@ -98,7 +97,6 @@ if ($WithFrontend) {
     hal = "http://127.0.0.1:8091"
     frontend = "disabled"
     cameraProbe = "disabled"
-    skipStartupHome = [bool]$SkipStartupHome
   } | Format-List | Out-Host
 }
 

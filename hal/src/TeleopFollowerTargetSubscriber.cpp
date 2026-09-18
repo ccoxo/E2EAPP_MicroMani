@@ -1,6 +1,13 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：订阅 DDS 硬件目标并交给最终执行器，隔离传输与设备访问。
+ * 先看：TeleopHardwareTargetSample → HardwareTargetTopicDataType → TeleopFollowerTargetSubscriber → TargetListener。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "TeleopFollowerTargetSubscriber.h"
 
 #include "HalJson.h"
+#include "WorkerExceptionBoundary.h"
 
 #include <fastcdr/Cdr.h>
 #include <fastcdr/FastBuffer.h>
@@ -21,6 +28,8 @@
 #include <fastrtps/types/TypesBase.h>
 
 #include <array>
+#include <atomic>
+#include <mutex>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -232,7 +241,9 @@ struct TeleopFollowerTargetSubscriber::Impl {
   TeleopHardwareTargetExecutor& executor_;
   TargetListener listener;
   bool enabled{false};
-  bool listening{false};
+  std::atomic_bool listening{false};
+  std::mutex lifecycleMutex;
+  std::mutex callbackMutex;
   DomainParticipant* participant{nullptr};
   Subscriber* subscriber{nullptr};
   TypeSupport targetType;
@@ -277,29 +288,39 @@ struct TeleopFollowerTargetSubscriber::Impl {
   }
 
   void start() {
+    std::scoped_lock lifecycleLock(lifecycleMutex);
     if (!enabled || listening) return;
     listening = true;
     // DataReaderListener 触发后立即 drain 当前批次，减少目标堆积造成的滞后。
-    (void)reader->set_listener(&listener);
+    try { check(reader->set_listener(&listener), "attach follower listener"); }
+    catch (...) {
+      listening = false;
+      executor_.reportControlFailure("DDS follower listener could not be attached");
+      throw;
+    }
   }
 
   void stop() {
-    if (!listening) return;
+    std::scoped_lock lifecycleLock(lifecycleMutex);
     listening = false;
-    if (reader) (void)reader->set_listener(nullptr);
+    // 先撤销回调，再等待正在执行的回调退出；不持 callbackMutex 调 SDK。
+    runWorkerBoundary([&]() {
+      if (reader) check(reader->set_listener(nullptr), "detach follower listener");
+    }, [&](const char* error) { executor_.reportControlFailure(error); });
+    std::scoped_lock callbackLock(callbackMutex);
   }
 
   void handleTargetData(DataReader* dataReader) {
-    for (;;) {
+    while (listening.load()) {
       eprosima::fastdds::dds::LoanableSequence<TeleopHardwareTargetSample> samples(16);
       SampleInfoSeq infos(16);
       const auto result = dataReader->take(samples, infos, 16);
       if (result == ReturnCode_t::RETCODE_NO_DATA) return;
       if (result != ReturnCode_t::RETCODE_OK) {
-        std::cerr << "Fast-DDS teleop hardware target take failed\n";
-        return;
+        throw std::runtime_error("Fast-DDS teleop hardware target take failed");
       }
       for (int32_t i = 0; i < samples.length(); ++i) {
+        if (!listening.load()) return;
         if (!infos[i].valid_data) continue;
         // 执行前先回到进程内结构，安全检查和 LTDMC 调用都集中在 executor。
         const auto target = toTarget(samples[i]);
@@ -310,7 +331,17 @@ struct TeleopFollowerTargetSubscriber::Impl {
 };
 
 void TeleopFollowerTargetSubscriber::Impl::TargetListener::on_data_available(DataReader* reader) {
-  owner_.handleTargetData(reader);
+  const auto failed = [&](const char* error) {
+    owner_.listening.store(false);
+    owner_.executor_.reportControlFailure(error);
+  };
+  runWorkerBoundary([&]() {
+    std::scoped_lock callbackLock(owner_.callbackMutex);
+    // 停止等待也覆盖失败处理本身，防止诊断/关断仍使用 owner 时外层开始析构。
+    runWorkerBoundary([&]() {
+      if (owner_.listening.load()) owner_.handleTargetData(reader);
+    }, failed);
+  }, failed);
 }
 
 TeleopFollowerTargetSubscriber::TeleopFollowerTargetSubscriber(TeleopHardwareTargetExecutor& executor)

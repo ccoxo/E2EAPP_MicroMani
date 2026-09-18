@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：原生遥操作启停、来源共享、原点门控、并发切换及失败回滚。
+# 先看：FakeHal → FakeSettings → GuardedSettings → FailingNativeStopHal。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import asyncio
@@ -618,10 +623,15 @@ def test_native_teleop_start_and_stop_transitions_are_serialized(monkeypatch: py
         config = start_config(home_before_start=False)
         mapper = TeleopMappingService(settings=FakeSettings(config), hal=hal, logs=LogService())
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             mapper.start("teleop-connect", pre_home=False),
             mapper.start("manual-gripper", pre_home=False),
+            return_exceptions=True,
         )
+        assert isinstance(results[1], RuntimeError)
+        assert "already in progress" in str(results[1])
+        # 冲突启动不排队；操作者重新发起后正常增加来源。
+        await mapper.start("manual-gripper", pre_home=False)
         await asyncio.gather(
             mapper.stop("teleop-connect", restart_remaining=False),
             mapper.stop("manual-gripper"),
@@ -1867,7 +1877,7 @@ def test_settings_save_atomically_backs_up_current_work_origin(tmp_path: Any) ->
     settings.save_config(config, emit_log=False)
 
     next_config = settings.get_config()
-    next_config["motion"]["homeOnStartup"]["enabled"] = not bool(next_config["motion"]["homeOnStartup"]["enabled"])
+    next_config["motion"]["motionThreadHz"] = 2000
     settings.save_config(next_config, emit_log=False)
 
     backups = sorted((runtime_dir / "_work_origin_backups").glob("*.json"))

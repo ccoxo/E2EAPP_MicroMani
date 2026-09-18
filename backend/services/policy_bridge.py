@@ -1,8 +1,15 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：在界面状态和 14 维 LeRobot 状态/动作之间转换，生成限幅后的分侧执行计划。
+# 先看：lerobot_state_from_ui → build_policy_action_plan。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from typing import Any
 
+from backend.core.data_contract import hardware_to_dataset_grippers, hardware_to_dataset_motion
 from backend.core.motion_limits import effective_limit_arrays
+from backend.core.operator_view import hardware_side_for_operator_side
 from backend.core.units import ui_to_lerobot_state
 
 AXES = ("X", "Y", "Z", "Roll", "Pitch", "Yaw")
@@ -13,8 +20,8 @@ MOTION_INDICES = {
 
 
 def lerobot_state_from_ui(joint_positions: list[float], gripper_positions: list[float]) -> list[float]:
-    motion = ui_to_lerobot_state((list(joint_positions) + [0.0] * 12)[:12])
-    grippers = (list(gripper_positions) + [0.0] * 2)[:2]
+    motion = ui_to_lerobot_state(hardware_to_dataset_motion(joint_positions))
+    grippers = hardware_to_dataset_grippers(gripper_positions)
     return motion[:6] + [float(grippers[0])] + motion[6:12] + [float(grippers[1])]
 
 
@@ -60,13 +67,14 @@ def _side_motion_plan(
             deltas[AXES[axis_index]] = _clamp(raw_delta, max_translation_um)
         else:
             deltas[AXES[axis_index]] = _clamp(raw_delta / 1000.0, max_rotation_deg)
-    soft_limit_min, soft_limit_max = effective_limit_arrays(config, side)
+    hardware_side = hardware_side_for_operator_side(side)  # policy side is dataset/operator side
+    soft_limit_min, soft_limit_max = effective_limit_arrays(config, hardware_side)
     teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
     return {
         "deltas": deltas,
         "softLimitMin": soft_limit_min,
         "softLimitMax": soft_limit_max,
-        "enabledAxes": _axis_array(teleop.get(f"{side}EnabledAxes"), True),
+        "enabledAxes": _axis_array(teleop.get(f"{hardware_side}EnabledAxes"), True),
     }
 
 

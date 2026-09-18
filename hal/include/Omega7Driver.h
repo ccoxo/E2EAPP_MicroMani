@@ -1,8 +1,16 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：声明Omega7Driver 的接口与状态结构；枚举和读取 Omega.7 主手，处理左右设备绑定、重力补偿及力输出。
+ * 先看：Omega7State → Omega7Driver。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 
@@ -50,7 +58,10 @@ class Omega7Driver {
   std::array<Omega7State, 2> readState();
   std::array<bool, 2> forceOutputEnabled() const;
   // 控制 SDK 力输出/重力补偿。关闭力输出时会写零力，避免残留力反馈。
-  void setGravityCompensation(bool leftEnabled, bool rightEnabled, double leftScale, double rightScale);
+  void setGravityCompensation(bool leftEnabled, bool rightEnabled, double leftScale, double rightScale,
+      const std::function<bool()>& commandAllowed = {});
+  void requestEmergencyStop();
+  void latchForceStop() noexcept;
   void zeroForceFeedback(int openId);
 
  private:
@@ -69,6 +80,7 @@ class Omega7Driver {
   std::array<Omega7State, 2> state_{};
   // 每侧是否保持 Force Dimension 力输出/重力补偿开启；关闭时会尽量写零力。
   std::array<bool, 2> forceOutputEnabled_{{true, true}};
+  std::atomic_bool forceStopRequested_{false};
   std::array<double, 2> gravityScale_{{0.45, 1.0}};
 };
 

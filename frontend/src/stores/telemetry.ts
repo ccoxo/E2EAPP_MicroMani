@@ -1,5 +1,13 @@
+/*
+ * 阅读导航 02｜前端契约与状态
+ * 职责：Zustand 全局状态中枢；处理配置保存队列、WebSocket、遥测节流、手动控制与录制状态。
+ * 先看：useTelemetryStore → queueConfigSave。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { create } from 'zustand'
 import {
+  installControlCommandTimeoutHandler,
+  installControlSessionProvider,
   acknowledgeSafety as acknowledgeSafetyApi,
   autoConfigurePicoNetwork as autoConfigurePicoNetworkApi,
   applyParameterSnapshotApi,
@@ -7,13 +15,16 @@ import {
   createSession as createRecordSessionApi,
   deleteParameterSnapshotApi,
   discardEpisode as discardRecordEpisodeApi,
+  disableMotionSide,
   emergencyStop as emergencyStopApi,
+  enableMotionSide,
   fetchConfig,
   fetchHardwareStatus,
   fetchParameterSnapshots,
   fetchRecordStatus,
   finishSession as finishRecordSessionApi,
   gripperCommand as gripperCommandApi,
+  installControlCommandGuard,
   manualAxisMove as manualAxisMoveApi,
   mockMode,
   returnMotionOriginSide as returnMotionOriginSideApi,
@@ -36,6 +47,11 @@ import { telemetryStaleAfterMs } from '../hardwareStatus'
 import { manualAxisStepLimitFromPulse } from '../manualMotionLimits'
 import { manualMaxVelocity } from '../manualSpeed'
 import { motionSideReturnOriginReady } from '../motionReturnReady'
+import { initialGripperCommandProgress, type GripperCommandProgress } from '../gripperDisplay'
+import { createMotionCommandController, initialMotionCommand, type MotionCommands } from './motionCommands'
+import { isWireRecord, parseLogEntry, parseTelemetryFrame, wireFrameIsLatched } from './telemetryIngress'
+import { canAcknowledgeControlSafety, controlSafetyBlockReason, initialControlSafety, type ControlSafetyState } from '../utils/controlSafety'
+import { createControlLeaseSession, initialControlLease, type ControlLeaseState } from './controlLease'
 import type {
   AppConfig,
   ConnectionState,
@@ -62,11 +78,35 @@ import type {
 
 const maxLogEntries = 5000
 export const uiFrameIntervalMs = 66
+// 页面不可见时降低 UI 提交频率，避免后台标签页持续整树重渲染。
+export const uiFrameIntervalHiddenMs = 400
 export const chartHistoryIntervalMs = 100
 export const mockTelemetryIntervalMs = 33
 // Keep mock history short enough for smooth chart rendering during long demos.
 const maxHistorySamples = 120
 const parameterSnapshotStorageKey = 'appstation.parameterSnapshots.v1'
+const emergencyIntentStorageKey = 'appstation.emergencyRequested.v1'
+
+function persistEmergencyIntent(requested: boolean) {
+  if (mockMode) return
+  try {
+    if (requested) window.sessionStorage.setItem(emergencyIntentStorageKey, '1')
+    else window.sessionStorage.removeItem(emergencyIntentStorageKey)
+  } catch {
+    // 存储不可用不能阻断急停发送；当前页面的内存门闩仍保持生效。
+  }
+}
+
+function initialSessionControlSafety(): ControlSafetyState {
+  const safety = initialControlSafety()
+  if (mockMode) return safety
+  try {
+    safety.emergencyRequested = window.sessionStorage.getItem(emergencyIntentStorageKey) === '1'
+  } catch {
+    // 沙箱或隐私模式可能禁止持久化，继续使用内存门闩。
+  }
+  return safety
+}
 const cameraLabels = {
   global: '全局相机',
   wrist_left: '左腕相机',
@@ -88,6 +128,7 @@ function returnedRecordResetState(session: RecordSessionState, side: RecordReset
     resetReady: required.every((requiredSide) => returned.includes(requiredSide)),
   }
 }
+// 配置请求共用保存队列；追踪录制启动时，应同时检查它是否等待最近一次配置落盘。
 let configSaveQueue: Promise<unknown> = Promise.resolve()
 const manualAxisOrder: ManualControlAxis[] = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']
 const manualAxisKeys = ['x', 'y', 'z', 'roll', 'pitch', 'yaw'] as const
@@ -330,11 +371,16 @@ interface TelemetryStore {
   episodeCount: number
   frameCount: number
   logPanelOpen: boolean
-  selectedMode: 'Record' | 'Auto' | 'Manual'
   dangerOverride: number | null
+  controlSafety: ControlSafetyState
+  controlLease: ControlLeaseState
+  revokeControlLease: (reason: string) => void
   qualityReport: QualityReport | null
   recordSession: RecordSessionState
   manualControl: ManualControlState
+  motionCommand: MotionCommands
+  setMotionEnabled: (side: ManualControlState['selectedSide'], enabled: boolean) => void
+  gripperCommand: Record<ManualControlState['selectedSide'], GripperCommandProgress>
   parameterSnapshots: ParameterSnapshot[]
   mockTimer: number | null
   backendWs: WebSocket | null
@@ -346,7 +392,6 @@ interface TelemetryStore {
   startBackend: () => void
   stopBackend: () => void
   setLogPanelOpen: (open: boolean) => void
-  setMode: (mode: 'Record' | 'Auto' | 'Manual') => void
   startRecording: () => void
   pauseRecording: () => void
   saveEpisode: () => void
@@ -407,7 +452,7 @@ const emptyFrame: TelemetryFrame = {
   forceLeft: [0, 0, 0, 0, 0, 0],
   forceRight: [0, 0, 0, 0, 0, 0],
   forceStatus: {
-    source: 'nidaq',
+    source: defaultConfig.force.source,
     sides: {
       left: { connected: false, healthy: false },
       right: { connected: false, healthy: false },
@@ -695,6 +740,7 @@ function buildFrame(state: TelemetryStore): TelemetryFrame {
 
 let _logIdSeq = 0
 let _manualActionIdSeq = 0
+let _gripperCommandIdSeq = 0
 let _manualMemoryIdSeq = 0
 /** Create a bounded in-memory log entry for UI-only events. */
 function makeLog(level: LogLevel, msg: string, channel?: LogEntry['channel']): LogEntry {
@@ -712,10 +758,6 @@ function appendLog(logs: LogEntry[], entry: LogEntry) {
   return [...logs, entry].slice(-maxLogEntries)
 }
 
-type BackendWsMessage =
-  | { type: 'telemetry'; data: TelemetryFrame }
-  | { type: 'log'; data: LogEntry }
-  | { type: 'config'; data: AppConfig }
 /** Strip a backend telemetry frame down to the fields rendered in charts. */
 function telemetrySampleFromFrame(frame: TelemetryFrame): TelemetrySample {
   // 图表只保留绘制需要的字段，避免历史缓冲持有整帧对象造成渲染压力。
@@ -753,6 +795,27 @@ let backendStaleWatchdogTimer: number | null = null
 let lastBackendFrameReceivedAt: number | null = null
 let lastBackendFrameCommitAt = 0
 let lastBackendHistoryCommitAt = 0
+let backendVisibilityHandler: (() => void) | null = null
+let backendConnectionGeneration = 0
+let backendObserverMode = false
+/** 页面重新可见时立即提交积压 frame，避免切回后仍按隐藏节流。 */
+function installBackendVisibilityFlush(set: TelemetryStoreSet, get: TelemetryStoreGet) {
+  if (backendVisibilityHandler || typeof document === 'undefined') return
+  backendVisibilityHandler = () => {
+    if (document.hidden) return
+    lastBackendFrameCommitAt = 0
+    lastBackendHistoryCommitAt = 0
+    if (pendingBackendFrame) {
+      flushPendingBackendFrame(set, get, true)
+    }
+  }
+  document.addEventListener('visibilitychange', backendVisibilityHandler)
+}
+function removeBackendVisibilityFlush() {
+  if (!backendVisibilityHandler || typeof document === 'undefined') return
+  document.removeEventListener('visibilitychange', backendVisibilityHandler)
+  backendVisibilityHandler = null
+}
 /** Finalize the backend session after the quality-report review flow closes. */
 function finishRecordSessionNow(set: TelemetryStoreSet) {
   void finishRecordSessionApi().finally(() => {
@@ -796,19 +859,19 @@ function recordSessionFromStatus(
   task: string,
   now = Date.now(),
 ): RecordSessionState {
-  const backendElapsedS = typeof status.elapsedS === 'number' ? Math.max(0, status.elapsedS) : 0
-  const backendFrameCount = typeof status.frameCount === 'number' ? Math.max(0, status.frameCount) : 0
-  const backendFps = typeof status.fps === 'number' ? Math.max(0, status.fps) : 30
+  const backendElapsedS = typeof status.elapsedS === 'number' && Number.isFinite(status.elapsedS) ? Math.max(0, status.elapsedS) : 0
+  const backendFrameCount = typeof status.frameCount === 'number' && Number.isFinite(status.frameCount) ? Math.max(0, status.frameCount) : 0
+  const backendFps = typeof status.fps === 'number' && Number.isFinite(status.fps) ? Math.max(0, status.fps) : 30
   const resetRequiredSides = normalizedRecordResetSides(status.resetRequiredSides, defaultRecordResetRequiredSides)
   const resetReturnedSides = normalizedRecordResetSides(status.resetReturnedSides, [])
   const resetPending = Boolean(status.resetPending)
   return {
     ...state.recordSession,
-    datasetName: status.datasetName ?? datasetName,
-    task: status.task ?? task,
+    datasetName: typeof status.datasetName === 'string' ? status.datasetName : datasetName,
+    task: typeof status.task === 'string' ? status.task : task,
     latestQualityReport: null,
-    phase: 'recording',
-    phaseStartedAt: now - backendElapsedS * 1000,
+    phase: status.safetyInterrupted ? 'interrupted' : 'recording',
+    phaseStartedAt: status.safetyInterrupted ? null : now - backendElapsedS * 1000,
     recorderFps: backendFps,
     recorderFrameCount: backendFrameCount,
     recorderLateFrames: 0,
@@ -822,6 +885,8 @@ function recordSessionFromStatus(
 }
 function backendFrameCommitIsUrgent(previous: TelemetryFrame, next: TelemetryFrame) {
   return previous.wsOk !== next.wsOk
+    || previous.forceStatus?.safety?.latched !== next.forceStatus?.safety?.latched
+    || previous.forceStatus?.safety?.canAcknowledge !== next.forceStatus?.safety?.canAcknowledge
     || previous.halOk !== next.halOk
     || previous.recording !== next.recording
     || previous.episodeCount !== next.episodeCount
@@ -831,9 +896,17 @@ function backendFrameCommitIsUrgent(previous: TelemetryFrame, next: TelemetryFra
     || previous.motionAxisEnabled.right.some((value, index) => value !== next.motionAxisEnabled.right[index])
     || (previous.dangerIndex < 1 && next.dangerIndex >= 1)
 }
+/** 当前 UI 提交节流间隔：隐藏页降频，可见页约 15Hz。 */
+function currentUiFrameIntervalMs() {
+  if (typeof document !== 'undefined' && document.hidden) return uiFrameIntervalHiddenMs
+  return uiFrameIntervalMs
+}
 /** 构建当前流程需要的数据结构。 */
 function nextRecordSessionFromBackend(state: TelemetryStore, frame: TelemetryFrame): RecordSessionState {
   if (state.recordSession.phase !== 'recording') return state.recordSession
+  if (!frame.recording && (frame.forceStatus?.safety?.latched || state.controlSafety.emergencyRequested)) {
+    return { ...state.recordSession, phase: 'interrupted', phaseStartedAt: null, recorderFps: 0 }
+  }
   return {
     ...state.recordSession,
     recorderFrameCount: Math.max(state.recordSession.recorderFrameCount, frame.frameCount),
@@ -854,16 +927,21 @@ function commitBackendFrame(set: TelemetryStoreSet, frame: TelemetryFrame, force
       || state.history.length === 0
       || lastBackendHistoryCommitAt === 0
       || now - lastBackendHistoryCommitAt >= chartHistoryIntervalMs
-    const nextFrame = state.dangerOverride === null ? frame : { ...frame, dangerIndex: state.dangerOverride }
+    const nextFrame = !mockMode || state.dangerOverride === null ? frame : { ...frame, dangerIndex: state.dangerOverride }
+    const acknowledged = state.controlSafety.acknowledgeAfterFrame !== null
+      && backendSafetyFrameSequence > state.controlSafety.acknowledgeAfterFrame
+      && frame.halOk && frame.wsOk && frame.forceStatus?.safety?.latched === false
+    if (acknowledged) persistEmergencyIntent(false)
     historyCommitted = shouldCommitHistory
     return {
       tick: state.tick + 1,
       frame: nextFrame,
+      ...(acknowledged ? { controlSafety: { ...initialControlSafety(), generation: state.controlSafety.generation } } : {}),
       telemetryLink: {
         state: 'live',
         lastFrameReceivedAt: lastBackendFrameReceivedAt ?? now,
       },
-      recording: nextFrame.recording,
+      recording: !controlSafetyBlockReason(state, false) && nextFrame.recording,
       episodeCount: nextFrame.episodeCount,
       frameCount: nextFrame.frameCount,
       recordSession: nextRecordSessionFromBackend(state, nextFrame),
@@ -878,7 +956,8 @@ function flushPendingBackendFrame(set: TelemetryStoreSet, get: TelemetryStoreGet
   const frame = pendingBackendFrame
   if (!frame) return
   const now = Date.now()
-  if (!force && lastBackendFrameCommitAt > 0 && now - lastBackendFrameCommitAt < uiFrameIntervalMs) {
+  const intervalMs = currentUiFrameIntervalMs()
+  if (!force && lastBackendFrameCommitAt > 0 && now - lastBackendFrameCommitAt < intervalMs) {
     schedulePendingBackendFrame(set, get)
     return
   }
@@ -888,8 +967,9 @@ function flushPendingBackendFrame(set: TelemetryStoreSet, get: TelemetryStoreGet
 /** 描述当前方法的功能边界。 */
 function schedulePendingBackendFrame(set: TelemetryStoreSet, get: TelemetryStoreGet) {
   if (backendFrameDelayTimer !== null || backendFrameRaf !== null) return
-  const elapsed = lastBackendFrameCommitAt > 0 ? Date.now() - lastBackendFrameCommitAt : uiFrameIntervalMs
-  const delayMs = Math.max(0, uiFrameIntervalMs - elapsed)
+  const intervalMs = currentUiFrameIntervalMs()
+  const elapsed = lastBackendFrameCommitAt > 0 ? Date.now() - lastBackendFrameCommitAt : intervalMs
+  const delayMs = Math.max(0, intervalMs - elapsed)
   backendFrameDelayTimer = window.setTimeout(() => {
     backendFrameDelayTimer = null
    /** 描述当前方法的功能边界。 */
@@ -929,7 +1009,9 @@ function startBackendStaleWatchdog(set: TelemetryStoreSet, get: TelemetryStoreGe
       set((state) => ({
         telemetryLink: { state: 'stale', lastFrameReceivedAt: receivedAt },
         frame: { ...state.frame, wsOk: false },
+        controlSafety: interruptedControlSafety(state.controlSafety),
       }))
+      motionCommands.invalidate('遥测停滞，未获得执行确认')
     }
   }, 250)
 }
@@ -972,6 +1054,11 @@ function mergeConfig(current: AppConfig, patch: Partial<AppConfig>): AppConfig {
 
 /** 应用当前现场硬件的前端配置迁移。 */
 export function normalizeConfig(config: AppConfig): AppConfig {
+  if ('homeOnStartup' in config.motion) {
+    const motion = { ...config.motion }
+    delete motion.homeOnStartup
+    config = { ...config, motion }
+  }
   const hasPreviousImx258CameraDefaults =
     config.cameras.global === 'AR0234 / index 1'
     && config.cameras.wristLeft === 'IMX258 / index 2'
@@ -1226,6 +1313,41 @@ function advanceRecordSession(session: RecordSessionState): RecordSessionState {
   }
 }
 
+let backendSafetyFrameSequence = 0
+let autoRequestId = 0
+let backendLeaseSession: ReturnType<typeof createControlLeaseSession> | null = null
+
+/** 网络成功只说明请求返回；超时后仍保留急停门闩，允许再次发送急停。 */
+async function safetyRequestWithDeadline(request: Promise<unknown>) {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([request, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('安全请求超时，未确认硬件状态')), 5_000)
+    })])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+function rejectUnsafeControl(get: TelemetryStoreGet, set: TelemetryStoreSet): boolean {
+  const reason = controlSafetyBlockReason(get(), !mockMode)
+  if (!reason) return false
+  set((state) => ({ logs: appendLog(state.logs, makeLog('WARNING', reason, '[SAFETY]')) }))
+  return true
+}
+
+function assertControlGeneration(get: TelemetryStoreGet, generation: number) {
+  if (get().controlSafety.generation !== generation) throw new Error('控制流程已被安全事件取消，请重新操作')
+  const reason = controlSafetyBlockReason(get(), !mockMode)
+  if (reason) throw new Error(reason)
+}
+
+function interruptedControlSafety(safety: ControlSafetyState): ControlSafetyState {
+  return { ...safety, generation: safety.generation + 1, emergencyPending: false,
+    acknowledging: false, acknowledgeAfterFrame: null,
+    emergencyError: safety.emergencyRequested ? '遥测中断，未确认硬件状态' : safety.emergencyError }
+}
+
 export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   tick: 0,
   frame: emptyFrame,
@@ -1241,11 +1363,20 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   episodeCount: 42,
   frameCount: 0,
   logPanelOpen: false,
-  selectedMode: 'Record',
+  controlSafety: initialSessionControlSafety(),
+  controlLease: initialControlLease(!mockMode),
+  revokeControlLease: (reason) => {
+    const required = get().controlLease.required
+    get().stopBackend()
+    set({ controlLease: { ...initialControlLease(required), status: 'expired', reason } })
+  },
   dangerOverride: null,
   qualityReport: null,
   recordSession: initialRecordSession,
   manualControl: initialManualState,
+  motionCommand: { left: initialMotionCommand(), right: initialMotionCommand() },
+  setMotionEnabled: (side, enabled) => motionCommands.setEnabled(side, enabled),
+  gripperCommand: { left: initialGripperCommandProgress(), right: initialGripperCommandProgress() },
   parameterSnapshots: readParameterSnapshots(),
   mockTimer: null,
   backendWs: null,
@@ -1257,6 +1388,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
 startMock: () => {
     if (get().mockTimer) return
     const timer = window.setInterval(() => {
+      backendSafetyFrameSequence += 1
       set((state) => {
         const recordSession = advanceRecordSession(state.recordSession)
         const frame = buildFrame({ ...state, recordSession })
@@ -1283,6 +1415,10 @@ startMock: () => {
         return {
           tick,
           frame,
+          ...(state.controlSafety.acknowledgeAfterFrame !== null
+            && backendSafetyFrameSequence > state.controlSafety.acknowledgeAfterFrame
+            && frame.forceStatus?.safety?.latched === false
+            ? { controlSafety: { ...initialControlSafety(), generation: state.controlSafety.generation } } : {}),
           telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
           recordSession,
           frameCount: frame.frameCount,
@@ -1292,6 +1428,7 @@ startMock: () => {
           logs,
         }
       })
+      motionCommands.receiveFrame(get().frame)
     }, mockTelemetryIntervalMs)
     set({ mockTimer: timer })
   },
@@ -1300,14 +1437,28 @@ startMock: () => {
 stopMock: () => {
     const timer = get().mockTimer
     if (timer) window.clearInterval(timer)
-    set({ mockTimer: null })
+    set((state) => ({
+      mockTimer: null,
+      ...(timer ? {
+        frame: { ...state.frame, wsOk: false },
+        telemetryLink: { state: 'offline' as const, lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
+      } : {}),
+    }))
+    if (timer) motionCommands.invalidate('遥测已停止，未获得执行确认')
   },
 
 /** 启动对应流程。 */
 startBackend: () => {
     if (get().backendWs) return
+    backendObserverMode ||= new URL(wsUrl).searchParams.get('mode') === 'observe'
+      || new URLSearchParams(window.location.search).get('mode') === 'observe'
+    const connectionGeneration = ++backendConnectionGeneration
+    const connectionIsCurrent = () => backendConnectionGeneration === connectionGeneration
+    motionCommands.invalidate('遥测连接中，未获得执行确认')
     startBackendStaleWatchdog(set, get)
+    installBackendVisibilityFlush(set, get)
     set((state) => ({
+      controlLease: initialControlLease(),
       telemetryLink: { state: 'connecting', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
     }))
     clearPendingBackendFrameFlush()
@@ -1319,27 +1470,32 @@ startBackend: () => {
     // 网页套接字建立前先拉一次静态配置和硬件概况，首屏不会等到下一帧遥测才有数据。
     void fetchConfig()
       .then((config) => {
+        if (!connectionIsCurrent()) return
         set({ config: normalizeConfig(config) })
         void get().autoConfigurePicoNetwork().catch((error) => {
+          if (!connectionIsCurrent()) return
           set((state) => ({
             logs: appendLog(state.logs, makeLog('WARNING', `PICO network detection failed: ${String(error)}`, '[CAMERA]')),
           }))
         })
       })
       .catch((error) => {
+        if (!connectionIsCurrent()) return
         set((state) => ({
           logs: appendLog(state.logs, makeLog('ERROR', `settings fetch failed: ${String(error)}`, '[BACKEND]')),
         }))
       })
     void fetchParameterSnapshots()
-      .then((snapshots) => set({ parameterSnapshots: snapshots }))
+      .then((snapshots) => { if (connectionIsCurrent()) set({ parameterSnapshots: snapshots }) })
       .catch((error) => {
+        if (!connectionIsCurrent()) return
         set((state) => ({
           logs: appendLog(state.logs, makeLog('WARNING', `snapshots fetch failed: ${String(error)}`, '[BACKEND]')),
         }))
       })
     void fetchHardwareStatus()
       .then((status) => {
+        if (!connectionIsCurrent()) return
         set((state) => ({
           diagnostics: diagnosticsFromHardwareStatus(state.diagnostics, status),
           picoConnection: picoConnectionFromHardwareStatus(status) ?? state.picoConnection,
@@ -1347,12 +1503,52 @@ startBackend: () => {
         }))
       })
       .catch((error) => {
+        if (!connectionIsCurrent()) return
         set((state) => ({
           logs: appendLog(state.logs, makeLog('ERROR', `hardware status fetch failed: ${String(error)}`, '[BACKEND]')),
         }))
       })
-    const ws = new WebSocket(wsUrl)
+    let ws: WebSocket
+    try {
+      const target = new URL(wsUrl)
+      if (backendObserverMode) target.searchParams.set('mode', 'observe')
+      ws = new WebSocket(target.toString())
+    } catch (error) {
+      backendConnectionGeneration += 1
+      stopBackendStaleWatchdog()
+      removeBackendVisibilityFlush()
+      set((state) => ({
+        frame: { ...state.frame, wsOk: false },
+        telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
+        logs: appendLog(state.logs, makeLog('ERROR', `Backend WebSocket 创建失败：${String(error)}`, '[BACKEND]')),
+      }))
+      return
+    }
+    backendLeaseSession?.dispose()
+    const leaseSession = createControlLeaseSession({
+      isCurrent: () => connectionIsCurrent() && get().backendWs === ws,
+      send: (message) => {
+        if (!connectionIsCurrent() || get().backendWs !== ws || ws.readyState !== WebSocket.OPEN) throw new Error('控制会话已经断开')
+        ws.send(message)
+      },
+      close: () => ws.close(),
+      publish: (controlLease) => {
+        if (!connectionIsCurrent() || get().backendWs !== ws) return
+        const invalidated = get().controlLease.status === 'active' && controlLease.status !== 'active'
+        set((state) => ({ controlLease,
+          ...(invalidated ? { controlSafety: interruptedControlSafety(state.controlSafety), autoRunning: false,
+            clutchActive: false, manualControl: { ...state.manualControl, replayingMemoryId: null, recording: false } } : {}),
+        }))
+        if (invalidated) motionCommands.invalidate('执行侧安全租约失效，未获得执行确认')
+      },
+    })
+    backendLeaseSession = leaseSession
+    if (backendObserverMode) {
+      leaseSession.dispose()
+      set({ controlLease: { ...initialControlLease(), reason: '只读观察模式，未申请控制权' } })
+    }
     ws.onopen = () => {
+      if (get().backendWs !== ws) return
       set((state) => ({
         backendReconnectAttempts: 0,
         telemetryLink: { state: 'connecting', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
@@ -1360,44 +1556,99 @@ startBackend: () => {
       }))
     }
     ws.onmessage = (event) => {
+      if (get().backendWs !== ws || !connectionIsCurrent()) return
+      let telemetryMessage = false
       try {
-        const message = JSON.parse(String(event.data)) as BackendWsMessage
+        const message: unknown = JSON.parse(String(event.data))
+        if (!isWireRecord(message)) throw new Error('WebSocket 消息格式无效')
+        if (leaseSession.receive(message)) return
+        if (message.type === 'record_status' && isWireRecord(message.data)
+          && message.data.active === true && message.data.recording === false && message.data.safetyInterrupted === true) {
+          const status = message.data as RecordStatusApi
+          set((state) => ['idle', 'recording', 'interrupted'].includes(state.recordSession.phase) ? {
+            recording: false,
+            recordSession: recordSessionFromStatus(state, status, state.recordSession.datasetName, state.recordSession.task),
+          } : {})
+          return
+        }
         if (message.type === 'telemetry') {
-          lastBackendFrameReceivedAt = Date.now()
-          const frame = {
-            ...message.data,
-            motionEnabled: message.data.motionEnabled ?? { left: null, right: null },
-            motionAxisEnabled: message.data.motionAxisEnabled ?? {
-              left: Array.from({ length: 6 }, () => null),
-              right: Array.from({ length: 6 }, () => null),
-            },
+          telemetryMessage = true
+          if (wireFrameIsLatched(message.data) && !get().controlSafety.emergencyRequested) {
+            persistEmergencyIntent(true)
+            set((state) => ({
+              controlSafety: { ...initialControlSafety(), generation: state.controlSafety.generation + 1, emergencyRequested: true },
+              autoRunning: false,
+              clutchActive: false,
+              manualControl: { ...state.manualControl, replayingMemoryId: null, recording: false },
+              gripperCommand: {
+                left: { ...initialGripperCommandProgress(), requestId: ++_gripperCommandIdSeq },
+                right: { ...initialGripperCommandProgress(), requestId: ++_gripperCommandIdSeq },
+              },
+            }))
           }
+          const frame = parseTelemetryFrame(message.data)
+          backendSafetyFrameSequence += 1
+          lastBackendFrameReceivedAt = Date.now()
+          motionCommands.receiveFrame(frame)
           enqueueBackendFrame(set, get, frame)
           // 说明当前代码块的功能用途。
           return
         }
         if (message.type === 'log') {
-          set((state) => ({ logs: appendLog(state.logs, message.data) }))
+          const entry = parseLogEntry(message.data)
+          set((state) => ({ logs: appendLog(state.logs, entry) }))
           return
         }
         if (message.type === 'config') {
-          set({ config: normalizeConfig(message.data) })
+          set({ config: normalizeConfig(message.data as AppConfig) })
         }
       } catch (error) {
+        if (telemetryMessage) {
+          leaseSession.revoke('遥测数据无效，控制租约已撤销')
+          clearPendingBackendFrameFlush()
+          set((state) => ({
+            frame: { ...state.frame, wsOk: false },
+            telemetryLink: { state: 'stale', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
+            controlSafety: interruptedControlSafety(state.controlSafety),
+          }))
+          motionCommands.invalidate('遥测数据无效，未获得执行确认')
+        }
         set((state) => ({
           logs: appendLog(state.logs, makeLog('WARNING', `backend ws message ignored: ${String(error)}`, '[BACKEND]')),
         }))
       }
     }
     ws.onerror = () => {
+      if (get().backendWs !== ws) return
+      leaseSession.dispose()
+      backendConnectionGeneration += 1
+      clearPendingBackendFrameFlush()
       set((state) => ({
         frame: { ...state.frame, wsOk: false },
         telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
         logs: appendLog(state.logs, makeLog('ERROR', 'Backend WebSocket error', '[BACKEND]')),
+        controlSafety: interruptedControlSafety(state.controlSafety),
+        controlLease: { ...initialControlLease(), status: 'expired', reason: '连接错误，控制租约已撤销' },
       }))
+      motionCommands.invalidate('遥测断连，未获得执行确认')
     }
     ws.onclose = (event) => {
       if (get().backendWs !== ws) {
+        return
+      }
+      leaseSession.dispose()
+      backendConnectionGeneration += 1
+      clearPendingBackendFrameFlush()
+      motionCommands.invalidate('遥测断连，未获得执行确认')
+      if (event.code === 1008) {
+        set((state) => ({
+          backendWs: null,
+          backendReconnectTimer: null,
+          controlSafety: interruptedControlSafety(state.controlSafety),
+          controlLease: { ...initialControlLease(), status: 'expired', reason: '另一页面持有控制权；可用 ?mode=observe 打开观察页，或稍后显式重连' },
+          frame: { ...state.frame, wsOk: false },
+          telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
+        }))
         return
       }
       const attempts = get().backendReconnectAttempts + 1
@@ -1411,6 +1662,8 @@ startBackend: () => {
         backendWs: null,
         backendReconnectTimer: reconnectTimer,
         backendReconnectAttempts: attempts,
+        controlSafety: interruptedControlSafety(state.controlSafety),
+        controlLease: { ...initialControlLease(), status: 'expired', reason: '连接断开，控制租约已撤销' },
         frame: { ...state.frame, wsOk: false },
         telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
         logs: appendLog(
@@ -1428,24 +1681,36 @@ startBackend: () => {
 
 /** 停止对应流程。 */
 stopBackend: () => {
+    backendLeaseSession?.dispose()
+    backendLeaseSession = null
+    backendConnectionGeneration += 1
     const ws = get().backendWs
+    // 先停止传输，再通知显示订阅；显示层抛错也不能保持旧租约续租。
+    if (ws) {
+      ws.onopen = null
+      ws.onmessage = null
+      ws.onerror = null
+      ws.onclose = null
+      ws.close()
+    }
     const timer = get().backendReconnectTimer
     if (timer) window.clearTimeout(timer)
     stopBackendStaleWatchdog()
+    removeBackendVisibilityFlush()
     clearPendingBackendFrameFlush()
     set((state) => ({
       backendWs: null,
       backendReconnectTimer: null,
       backendReconnectAttempts: 0,
       telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
+      controlSafety: interruptedControlSafety(state.controlSafety),
+      controlLease: { ...initialControlLease(get().controlLease.required), status: 'expired', reason: '连接已停止，控制租约已撤销' },
     }))
-    if (ws) ws.close()
+    motionCommands.invalidate('遥测已停止，未获得执行确认')
   },
 
 /** 设置当前流程的对应状态。 */
 setLogPanelOpen: (open) => set({ logPanelOpen: open }),
- /** 设置当前流程的对应状态。 */
- setMode: (mode) => set({ selectedMode: mode }),
 
 /** 启动对应流程。 */
 startRecording: () =>
@@ -1522,6 +1787,8 @@ setRecordEpisodeTimes: (episodeS, resetS) =>
 
 /** 启动对应流程。 */
 startRecordSession: (datasetName, task) => {
+    if (rejectUnsafeControl(get, set)) return
+    const generation = get().controlSafety.generation
     if (recordSessionStartInFlight || get().recordSession.phase !== 'idle') {
       set((state) => ({
         logs: appendLog(state.logs, makeLog('WARNING', 'record session start ignored: start is already pending', '[LEROBOT]')),
@@ -1555,6 +1822,15 @@ startRecordSession: (datasetName, task) => {
     }))
     void (async () => {
       const status = await fetchRecordStatus().catch(() => null)
+      assertControlGeneration(get, generation)
+      if (status?.active && status.safetyInterrupted) {
+        set((state) => ({
+          recording: false,
+          recordSession: recordSessionFromStatus(state, status, nextDatasetName, task),
+          logs: appendLog(state.logs, makeLog('WARNING', '存在中断片段，请先保存或丢弃；未自动结束旧会话', '[LEROBOT]')),
+        }))
+        return
+      }
       if (status?.active) {
         set((state) => ({
           logs: appendLog(
@@ -1565,7 +1841,9 @@ startRecordSession: (datasetName, task) => {
         await finishRecordSessionApi()
       }
       await queueConfigSave(get().config)
+      assertControlGeneration(get, generation)
       const createResponse = await createRecordSessionApi(nextDatasetName, task)
+      assertControlGeneration(get, generation)
       set((state) => {
         const now = Date.now()
         const backendStatus = createResponse.data ?? {}
@@ -1579,7 +1857,12 @@ startRecordSession: (datasetName, task) => {
       })
     })()
       .catch(async (error) => {
+        if (get().controlSafety.generation !== generation || controlSafetyBlockReason(get(), !mockMode)) {
+          set((state) => ({ recording: false, recordSession: { ...state.recordSession, phase: 'idle' } }))
+          return
+        }
         const backendStatus = await fetchRecordStatus().catch(() => null)
+        if (get().controlSafety.generation !== generation || controlSafetyBlockReason(get(), !mockMode)) return
         if (backendStatus?.recording) {
           set((state) => {
             const nextSession = recordSessionFromStatus(state, backendStatus, nextDatasetName, task)
@@ -1619,7 +1902,7 @@ startRecordSession: (datasetName, task) => {
 saveRecordEpisode: () => {
     let pendingReport: RecordQualityReport | null = null
     set((state) => {
-      if (state.recordSession.phase !== 'recording') return state
+      if (state.recordSession.phase !== 'recording' && state.recordSession.phase !== 'interrupted') return state
       pendingReport = makeRecordQualityReport(state)
       const report = pendingReport
       return {
@@ -1832,6 +2115,8 @@ finishRecordSession: () => {
 
 /** 描述当前方法的功能边界。 */
 skipRecordReset: () => {
+    if (rejectUnsafeControl(get, set)) return
+    const generation = get().controlSafety.generation
     if (recordResetSkipInFlight) {
       set((state) => ({
         logs: appendLog(state.logs, makeLog('WARNING', 'record reset skip ignored: request is already pending', '[LEROBOT]')),
@@ -1854,6 +2139,7 @@ skipRecordReset: () => {
     recordResetSkipInFlight = true
     void skipRecordResetApi()
       .then((payload) => {
+        assertControlGeneration(get, generation)
         const status = payload && typeof payload === 'object' && 'data' in payload ? payload.data as RecordStatusApi : {}
         set((state) => ({
           recording: true,
@@ -1886,35 +2172,36 @@ skipRecordReset: () => {
 
 /** 发送或封装对应的后端命令。 */
 tareRecordForceSensors: () => {
-    void tareForceSensorsApi()
-    set((state) => ({
-      dangerOverride: 0,
-      frame: {
-        ...state.frame,
-        dangerIndex: 0,
-        forceLeft: [0, 0, 0, 0, 0, 0],
-        forceRight: [0, 0, 0, 0, 0, 0],
-      },
-      recordSession: {
-        ...state.recordSession,
-        forceTareActive: true,
-      },
-      logs: appendLog(state.logs, makeLog('INFO', '力觉 Tare 已执行', '[FORCE]')),
-    }))
+    void tareForceSensorsApi().then(() => {
+      set((state) => ({
+        recordSession: { ...state.recordSession, forceTareActive: true },
+        logs: appendLog(state.logs, makeLog('INFO', '力觉 Tare 请求已接受，等待传感器反馈', '[FORCE]')),
+      }))
+    }).catch((error) => {
+      set((state) => ({ logs: appendLog(state.logs, makeLog('ERROR', `力觉 Tare 失败：${String(error)}`, '[FORCE]')) }))
+    })
   },
 
 /** 发送或封装对应的后端命令。 */
 toggleRecordClutch: () => {
-    void toggleClutchApi()
-    set((state) => ({
-      clutchActive: !state.clutchActive,
-      logs: appendLog(state.logs, makeLog('INFO', `离合器${state.clutchActive ? '释放' : '切换'}`, '[HAL]')),
-    }))
+    if (rejectUnsafeControl(get, set)) return
+    const generation = get().controlSafety.generation
+    void toggleClutchApi().then(() => {
+      assertControlGeneration(get, generation)
+      set((state) => ({
+        clutchActive: !state.clutchActive,
+        logs: appendLog(state.logs, makeLog('INFO', `离合器${state.clutchActive ? '释放' : '切换'}`, '[HAL]')),
+      }))
+    }).catch((error) => {
+      set((state) => ({ logs: appendLog(state.logs, makeLog('ERROR', `离合请求失败：${String(error)}`, '[HAL]')) }))
+    })
   },
 
 /** 设置当前流程的对应状态。 */
 setRecordSpeedMode: (mode) => {
-    void setRecordSpeedModeApi(mode)
+    void setRecordSpeedModeApi(mode).catch((error) => {
+      set((state) => ({ logs: appendLog(state.logs, makeLog('ERROR', `速度请求失败：${String(error)}`, '[HAL]')) }))
+    })
     set((state) => ({
       manualControl: {
         ...state.manualControl,
@@ -1930,6 +2217,8 @@ setRecordSpeedMode: (mode) => {
 
 /** 发送或封装对应的后端命令。 */
 homeRecordArms: () => {
+    if (rejectUnsafeControl(get, set)) return
+    const generation = get().controlSafety.generation
     if (recordMotionOriginInFlight) {
       set((state) => ({
         logs: appendLog(state.logs, makeLog('WARNING', 'record arms return-to-work-origin ignored: request is already pending', '[HAL]')),
@@ -1960,8 +2249,10 @@ homeRecordArms: () => {
     void (async () => {
       try {
         for (const side of requiredSides) {
+          assertControlGeneration(get, generation)
           await returnMotionOriginSideApi(side)
         }
+        assertControlGeneration(get, generation)
         set((state) => ({
           manualControl: {
             ...state.manualControl,
@@ -1994,6 +2285,8 @@ homeRecordArms: () => {
 
 /** 描述当前方法的功能边界。 */
 returnRecordMotionOrigin: async (side) => {
+    if (rejectUnsafeControl(get, set)) return
+    const generation = get().controlSafety.generation
     const operatorLabel = operatorSideLabel(operatorSideForHardwareSide(side))
     if (recordMotionOriginInFlight) {
       set((state) => ({
@@ -2017,6 +2310,7 @@ returnRecordMotionOrigin: async (side) => {
     }))
     try {
       await returnMotionOriginSideApi(side)
+      assertControlGeneration(get, generation)
       set((state) => ({
         recordSession: {
           ...state.recordSession,
@@ -2041,31 +2335,48 @@ returnRecordMotionOrigin: async (side) => {
 
 /** 鎻忚堪褰撳墠鏂规硶鐨勫姛鑳借竟鐣屻€?*/
 triggerEmergencyStop: () => {
-    void emergencyStopApi()
+    const generation = get().controlSafety.generation + 1
+    // 先发急停并接住失败；显示订阅或存储异常不能使硬件请求根本没有发送。
+    void safetyRequestWithDeadline(emergencyStopApi()).then(() => {
+      if (get().controlSafety.generation !== generation) return
+      set((state) => ({
+        controlSafety: { ...state.controlSafety, emergencyPending: false },
+        logs: appendLog(state.logs, makeLog('WARNING', '急停请求已返回；保持保护，核查硬件反馈后再确认安全态', '[SAFETY]')),
+      }))
+    }).catch((error) => {
+      if (get().controlSafety.generation !== generation) return
+      set((state) => ({
+        controlSafety: { ...state.controlSafety, emergencyPending: false, emergencyError: String(error) },
+        logs: appendLog(state.logs, makeLog('ERROR', `急停未确认：${String(error)}；请使用实体急停并检查设备`, '[SAFETY]')),
+      }))
+    })
+    persistEmergencyIntent(true)
     set((state) => ({
+      controlSafety: { ...initialControlSafety(), generation, emergencyRequested: true, emergencyPending: true },
       recording: false,
       autoRunning: false,
-      dangerOverride: 1.1,
-      logPanelOpen: true,
-      frame: {
-        ...state.frame,
-        dangerIndex: 1.1,
-        recording: false,
+      clutchActive: false,
+      manualControl: { ...state.manualControl, replayingMemoryId: null, recording: false },
+      gripperCommand: {
+        left: { ...initialGripperCommandProgress(), requestId: ++_gripperCommandIdSeq },
+        right: { ...initialGripperCommandProgress(), requestId: ++_gripperCommandIdSeq },
       },
+      logPanelOpen: true,
       recordSession: {
         ...state.recordSession,
-        phase: 'idle',
+        phase: state.recordSession.phase === 'recording' || state.recordSession.phase === 'interrupted' ? 'interrupted' : state.recordSession.phase === 'starting' ? 'idle' : state.recordSession.phase,
         phaseStartedAt: null,
         recorderFps: 0,
-        recorderElapsedS: 0,
+        recorderElapsedS: state.recordSession.recorderElapsedS,
         recorderTotalS: -1,
         resetPending: false,
         resetReturnedSides: [],
         resetReady: false,
         returnOriginInFlight: false,
       },
-      logs: appendLog(state.logs, makeLog('ERROR', '操作员触发硬件急停', '[SAFETY]')),
+      logs: appendLog(state.logs, makeLog('ERROR', '操作员请求急停，禁止新运动；尚未确认硬件停止', '[SAFETY]')),
     }))
+    motionCommands.blockEnabling('操作员请求急停，使能请求已取消')
   },
 
 /** 删除对应数据并同步界面状态。 */
@@ -2093,53 +2404,62 @@ setClutchActive: (active) =>
 
 /** 设置当前流程的对应状态。 */
 setAutoRunning: (running) => {
-    if (!mockMode) {
-      void (running ? startAutoExecution() : stopAutoExecution()).catch((error) => {
-        set((state) => ({
-          logs: appendLog(state.logs, makeLog('ERROR', `auto command failed: ${String(error)}`, '[POLICY]')),
-        }))
-      })
-    }
-    set((state) => ({
-      autoRunning: running,
-      logs: appendLog(state.logs, makeLog(running ? 'INFO' : 'WARNING', running ? 'Auto policy loop started' : 'Auto policy loop stopped', '[POLICY]')),
-    }))
+    if (running && rejectUnsafeControl(get, set)) return
+    const requestId = ++autoRequestId
+    const generation = get().controlSafety.generation
+    if (!running) set({ autoRunning: false })
+    void (running ? startAutoExecution() : stopAutoExecution()).then(() => {
+      if (requestId !== autoRequestId) return
+      if (running) assertControlGeneration(get, generation)
+      set((state) => ({
+        autoRunning: running,
+        logs: appendLog(state.logs, makeLog(running ? 'INFO' : 'WARNING', running ? 'Auto policy loop started' : 'Auto policy loop stopped', '[POLICY]')),
+      }))
+    }).catch((error) => {
+      if (requestId !== autoRequestId) return
+      set((state) => ({
+        autoRunning: false,
+        logs: appendLog(state.logs, makeLog('ERROR', `auto command failed: ${String(error)}`, '[POLICY]')),
+      }))
+    })
   },
 
 /** 设置当前流程的对应状态。 */
-setDangerOverride: (danger) =>
+setDangerOverride: (danger) => {
+    if (!mockMode) return
     set((state) => ({
       dangerOverride: danger,
       frame: {
         ...state.frame,
         dangerIndex: danger ?? state.frame.dangerIndex,
       },
-    })),
+    }))
+  },
 
 /** 应用对应配置或状态。 */
 acknowledgeSafety: () => {
-    void acknowledgeSafetyApi()
+    if (!canAcknowledgeControlSafety(get())) return
+    const generation = get().controlSafety.generation
+    set((state) => ({ controlSafety: { ...state.controlSafety, acknowledging: true, emergencyError: null } }))
+    void safetyRequestWithDeadline(acknowledgeSafetyApi())
       .then(() => {
+        if (get().controlSafety.generation !== generation) return
+        const acknowledgeAfterFrame = backendSafetyFrameSequence
         set((state) => ({
-          dangerOverride: null,
-          frame: {
-            ...state.frame,
-            dangerIndex: 0,
-            forceStatus: {
-              ...state.frame.forceStatus,
-              safety: {
-                ...state.frame.forceStatus?.safety,
-                latched: false,
-                reason: '',
-                acknowledgeBlocker: '',
-              },
-            },
-          },
-          logs: appendLog(state.logs, makeLog('INFO', '操作员确认安全态（伺服保持关闭）', '[SAFETY]')),
+          controlSafety: { ...state.controlSafety, acknowledgeAfterFrame },
+          logs: appendLog(state.logs, makeLog('INFO', '安全确认请求已返回，等待新的未锁存反馈；不会自动恢复运动', '[SAFETY]')),
         }))
+        setTimeout(() => {
+          const safety = get().controlSafety
+          if (safety.generation !== generation || !safety.acknowledging || safety.acknowledgeAfterFrame !== acknowledgeAfterFrame) return
+          set((state) => ({ controlSafety: { ...state.controlSafety, acknowledging: false, acknowledgeAfterFrame: null,
+            emergencyError: '未获得安全解除反馈，请检查硬件后重试确认' } }))
+        }, 5_000)
       })
       .catch((error) => {
+        if (get().controlSafety.generation !== generation) return
         set((state) => ({
+          controlSafety: { ...state.controlSafety, acknowledging: false, acknowledgeAfterFrame: null, emergencyError: String(error) },
           logs: appendLog(state.logs, makeLog('ERROR', `safety acknowledge failed: ${String(error)}`, '[SAFETY]')),
         }))
       })
@@ -2204,12 +2524,16 @@ sendBackendCommandLog: (level, msg, channel) => {
 
 /** Detect the active PC network path and accept the config already persisted by the backend. */
 autoConfigurePicoNetwork: async (picoIp) => {
+    const connectionGeneration = backendConnectionGeneration
+    const requestedPicoConfig = get().config.picoVision
     const response = await autoConfigurePicoNetworkApi(picoIp)
     const network = response.data?.network
     const config = response.data?.config
     if (!network || !config) throw new Error('PICO network detection returned an incomplete response')
+    if (connectionGeneration !== backendConnectionGeneration || get().config.picoVision !== requestedPicoConfig) return network
     set((state) => ({
-      config: normalizeConfig(config),
+      // 网络检测仅拥有 PICO 配置，不能回写旧响应中的运动、相机或存储参数。
+      config: { ...state.config, picoVision: normalizeConfig(config).picoVision },
       picoNetworkInfo: network,
       logs: appendLog(
         state.logs,
@@ -2360,11 +2684,12 @@ setManualSpeedMode: (mode) =>
 
 /** 计算或执行手动控制的对应逻辑。 */
 issueManualAxisMove: (side, axis, direction) => {
+    if (rejectUnsafeControl(get, set)) return
     const operatorLabel = operatorSideLabel(operatorSideForHardwareSide(side))
     if (!mockMode) {
       const state = get()
       const axisIndex = manualAxisOrder.indexOf(axis)
-      if (state.frame.motionAxisEnabled?.[side]?.[axisIndex] === false) {
+      if (state.frame.motionAxisEnabled?.[side]?.[axisIndex] !== true) {
         set((current) => ({
           logs: appendLog(current.logs, makeLog('WARNING', `${operatorLabel} ${axis} jog skipped: motion axis is disabled`, '[HAL]')),
         }))
@@ -2474,17 +2799,27 @@ issueManualAxisMove: (side, axis, direction) => {
 
 /** 计算或执行手动控制的对应逻辑。 */
 issueManualGripperMove: (side, command, targetMm) => {
+    if (command !== 'stop' && command !== 'disable' && rejectUnsafeControl(get, set)) return
     const operatorSide = operatorSideForHardwareSide(side)
     const operatorLabel = operatorSideLabel(operatorSide)
     const operatorGripperLabel = operatorSide === 'left' ? '左夹爪' : '右夹爪'
+    const gripperRequestId = ++_gripperCommandIdSeq
+    const setGripperProgress = (
+      phase: GripperCommandProgress['phase'],
+      message = '',
+      patchCommand: ManualGripperCommand | null = command,
+    ) => {
+      set((current) => ({
+        gripperCommand: {
+          ...current.gripperCommand,
+          [side]: { phase, command: patchCommand, requestId: gripperRequestId, message },
+        },
+      }))
+    }
     if (!mockMode) {
       const enabledKey = side === 'left' ? 'leftEnabled' : 'rightEnabled'
       const previousEnabled = Boolean(get().config.gripper[enabledKey])
-      // 夹爪启停先乐观更新界面，再由后端持久化和回读校准最终状态。
-      // 说明当前代码块的功能用途。
-      // 说明当前代码块的功能用途。
-      // 说明当前代码块的功能用途。
-      // 说明当前代码块的功能用途。
+      // 请求启停写入配置标志；命令进度单独跟踪，不把 API 接受写成设备已使能。
       if (command === 'enable' || command === 'disable') {
         set((current) => ({
           config: {
@@ -2496,21 +2831,28 @@ issueManualGripperMove: (side, command, targetMm) => {
           },
         }))
       }
+      setGripperProgress('sending')
       void gripperCommandApi(side, command, targetMm, get().config.gripper.commandForceLimitN)
         .then(() => {
+          if (get().gripperCommand[side].requestId !== gripperRequestId) return
+          setGripperProgress('accepted', `${operatorLabel}夹爪${command === 'enable' ? '使能' : command === 'disable' ? '断使能' : command === 'open' ? '打开' : command === 'close' ? '闭合' : command === 'home' ? '回零' : command === 'target' ? '目标' : command === 'stop' ? '停止' : ''}命令已接受`)
           set((current) => ({
             logs: appendLog(current.logs, makeLog('INFO', `${operatorLabel} gripper ${command} accepted by backend`, '[GRIPPER]')),
           }))
-          // 说明当前代码块的功能用途。
-          // 说明当前代码块的功能用途。
-          // 说明当前代码块的功能用途。
           if (command === 'enable' || command === 'disable') {
+            const configAtRefresh = get().config
             void fetchConfig()
-              .then((config) => set({ config: normalizeConfig(config) }))
+              .then((config) => {
+                // 全量回读只归属当前请求，不能覆盖期间另一侧命令或配置更新。
+                if (get().gripperCommand[side].requestId !== gripperRequestId || get().config !== configAtRefresh) return
+                set({ config: normalizeConfig(config) })
+              })
               .catch(() => undefined)
           }
         })
         .catch((error) => {
+          if (get().gripperCommand[side].requestId !== gripperRequestId) return
+          setGripperProgress('failed', `命令失败：${error instanceof Error ? error.message : String(error)}`)
           set((current) => ({
             config: command === 'enable' || command === 'disable'
               ? {
@@ -2526,6 +2868,8 @@ issueManualGripperMove: (side, command, targetMm) => {
         })
       return
     }
+    // 模拟路径也经过 sending，避免 UI 把本地 fixture 直接当成已接受。
+    setGripperProgress('sending')
     set((state) => {
       const enabledKey = side === 'left' ? 'leftEnabled' : 'rightEnabled'
       const targetKey = side === 'left' ? 'targetLeftMm' : 'targetRightMm'
@@ -2573,6 +2917,11 @@ issueManualGripperMove: (side, command, targetMm) => {
         logs: appendLog(state.logs, makeLog('INFO', `${operatorGripperLabel} ${commandText[command]} · gripper test fixture`, '[GRIPPER]')),
       }
     })
+    setTimeout(() => {
+      if (get().gripperCommand[side].requestId === gripperRequestId) {
+        setGripperProgress('accepted', '模拟命令已接受')
+      }
+    }, 0)
   },
 
 /** 启动对应流程。 */
@@ -2629,7 +2978,8 @@ saveManualMemory: (name) =>
     }),
 
 /** 描述当前方法的功能边界。 */
-replayManualMemory: (id) =>
+replayManualMemory: (id) => {
+    if (rejectUnsafeControl(get, set)) return
     set((state) => {
       const memory = state.manualControl.memories.find((item) => item.id === id)
       if (!memory) return state
@@ -2640,7 +2990,8 @@ replayManualMemory: (id) =>
         },
         logs: appendLog(state.logs, makeLog('INFO', `Manual memory replay queued: ${memory.name} (${memory.actions.length} actions)`, '[HAL]')),
       }
-    }),
+    })
+  },
 
 /** 停止对应流程。 */
 pauseManualReplay: () =>
@@ -2666,3 +3017,23 @@ deleteManualMemory: (id) =>
 /** 描述当前方法的功能边界。 */
 closeQualityReport: () => set({ qualityReport: null }),
 }))
+
+const motionCommands = createMotionCommandController(
+  useTelemetryStore.getState,
+  (side, command) => useTelemetryStore.setState((state) => ({
+    motionCommand: { ...state.motionCommand, [side]: command },
+    ...(state.motionCommand[side].phase !== command.phase && command.phase !== 'idle' ? {
+      logs: appendLog(state.logs, makeLog(
+        command.phase === 'failed' ? 'ERROR' : command.phase === 'timeout' ? 'WARNING' : 'INFO',
+        `${operatorSideLabel(operatorSideForHardwareSide(side))}：${command.message}`,
+        '[HAL]',
+      )),
+    } : {}),
+  })),
+  (side, enabled) => enabled ? enableMotionSide(side) : disableMotionSide(side),
+  () => controlSafetyBlockReason(useTelemetryStore.getState(), false),
+)
+
+installControlCommandGuard(() => controlSafetyBlockReason(useTelemetryStore.getState(), !mockMode))
+installControlSessionProvider(() => useTelemetryStore.getState().controlLease.sessionId)
+installControlCommandTimeoutHandler((reason) => useTelemetryStore.getState().revokeControlLease(reason))

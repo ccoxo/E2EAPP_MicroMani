@@ -1,9 +1,24 @@
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：验证录制前主手连接、必需原点侧和相机警告的判定。
+ * 先看：makeReadyForRecordPrecheck。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { MemoryRouter } from 'react-router-dom'
 import * as api from '../../api'
 import { defaultConfig, defaultDiagnostics } from '../../data'
 import { useTelemetryStore } from '../../stores/telemetry'
 import PreCheckModal from './PreCheckModal'
+
+function renderPreCheck(onConfirm = vi.fn(), onCancel = vi.fn()) {
+  return render(
+    <MemoryRouter>
+      <PreCheckModal open onConfirm={onConfirm} onCancel={onCancel} />
+    </MemoryRouter>,
+  )
+}
 
 function makeReadyForRecordPrecheck() {
   useTelemetryStore.setState((state) => ({
@@ -79,8 +94,9 @@ describe('PreCheckModal', () => {
   it('allows a single logically connected Omega hand to satisfy the record hardware check', () => {
     const onConfirm = vi.fn()
     makeReadyForRecordPrecheck()
+    useTelemetryStore.setState((state) => ({ recordSession: { ...state.recordSession, resetReturnedSides: ['left'] } }))
 
-    render(<PreCheckModal open onConfirm={onConfirm} onCancel={vi.fn()} />)
+    renderPreCheck(onConfirm)
 
     const confirmButton = screen.getByRole('button', { name: '确认开始' })
     expect(confirmButton).toBeDisabled()
@@ -99,7 +115,7 @@ describe('PreCheckModal', () => {
     const captureOriginSpy = vi.spyOn(api, 'captureMotionOrigin').mockResolvedValue({ ok: true })
     const homeMotionSideSpy = vi.spyOn(api, 'homeMotionSide').mockResolvedValue({ ok: true })
 
-    render(<PreCheckModal open onConfirm={vi.fn()} onCancel={vi.fn()} />)
+    renderPreCheck()
 
     fireEvent.click(screen.getByRole('button', { name: '自动回工作原点' }))
 
@@ -113,6 +129,7 @@ describe('PreCheckModal', () => {
   it('allows low camera fps as a warning-only precheck condition', () => {
     const onConfirm = vi.fn()
     makeReadyForRecordPrecheck()
+    useTelemetryStore.setState((state) => ({ recordSession: { ...state.recordSession, resetReturnedSides: ['left'] } }))
     useTelemetryStore.setState((state) => ({
       frame: {
         ...state.frame,
@@ -120,11 +137,11 @@ describe('PreCheckModal', () => {
       },
     }))
 
-    render(<PreCheckModal open onConfirm={onConfirm} onCancel={vi.fn()} />)
+    renderPreCheck(onConfirm)
 
     fireEvent.click(screen.getByRole('checkbox'))
 
-    const confirmButton = screen.getAllByRole('button').find((button) => button.className.includes('ant-btn-primary'))
+    const confirmButton = screen.getAllByRole('button').find((button) => button.className.includes('ui-btn-primary'))
     if (!confirmButton) throw new Error('confirm button not found')
     expect(confirmButton).toBeEnabled()
     fireEvent.click(confirmButton)
@@ -146,7 +163,7 @@ describe('PreCheckModal', () => {
       },
     }))
 
-    render(<PreCheckModal open onConfirm={vi.fn()} onCancel={vi.fn()} />)
+    renderPreCheck()
 
     expect(screen.queryByText(/fallback/)).not.toBeInTheDocument()
   })
@@ -160,7 +177,7 @@ describe('PreCheckModal', () => {
       },
     }))
 
-    render(<PreCheckModal open onConfirm={vi.fn()} onCancel={vi.fn()} />)
+    renderPreCheck()
 
     const returnButton = screen.getAllByRole('button').find((button) => button.style.marginTop === '6px')
     if (!returnButton) throw new Error('return-origin button not found')
@@ -180,7 +197,7 @@ describe('PreCheckModal', () => {
       },
     }))
 
-    render(<PreCheckModal open onConfirm={vi.fn()} onCancel={vi.fn()} />)
+    renderPreCheck()
 
     expect(screen.getByRole('button', { name: '自动回工作原点' })).toBeDisabled()
   })
@@ -198,7 +215,7 @@ describe('PreCheckModal', () => {
       },
     }))
 
-    render(<PreCheckModal open onConfirm={vi.fn()} onCancel={vi.fn()} />)
+    renderPreCheck()
 
     const returnButton = screen.getAllByRole('button').find((button) => button.style.marginTop === '6px')
     if (!returnButton) throw new Error('return-origin button not found')

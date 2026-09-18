@@ -1,9 +1,17 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：封装运动卡访问、脉冲换算、回原点、目标续推、软限位及急停状态。
+ * 先看：AxisHoldResult → LTDMCDriver::initialize → LTDMCDriver::health → LTDMCDriver::ensureMotionReturnAllowed。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "LTDMCDriver.h"
+#include "HalVersion.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -16,6 +24,20 @@
 namespace appstation::hal {
 
 namespace {
+void requireFiniteMotionParameter(double value) {
+  if (!std::isfinite(value)) throw std::runtime_error("motion parameters must be finite");
+}
+
+long checkedMotionPulse(double value) {
+  requireFiniteMotionParameter(value);
+  // 保留一个负端脉冲，避免后续 abs(LONG_MIN) 溢出。
+  if (value < static_cast<double>((std::numeric_limits<long>::min)()) + 1.0
+      || value > static_cast<double>((std::numeric_limits<long>::max)())) {
+    throw std::runtime_error("motion pulse parameter is outside the controller integer range");
+  }
+  return static_cast<long>(std::llround(value));
+}
+
 // 这些默认掩码只表示“本次请求覆盖全部 6 个语义轴”，不代表硬件实际都已使能。
 constexpr std::array<bool, 6> kAllAxesEnabled{true, true, true, true, true, true};
 constexpr unsigned short kHomeDirection = 0;
@@ -118,21 +140,25 @@ std::string dmcAbsoluteFailureMessage(
 // 回工作原点时允许 100 pulse 以内视为已经到位，避免微小误差导致无意义运动。
 constexpr long kWorkOriginSettledPulseTolerance = 100;
 
+template <typename CheckCurrent>
 void startWorkOriginMoveOrThrow(
     unsigned short card,
     unsigned short axisNo,
     long targetPulse,
     long deltaPulse,
-    long currentPulse) {
+    long currentPulse,
+    CheckCurrent checkCurrent) {
   // 目标足够接近时直接跳过，让回原点流程对已经到位的轴保持幂等。
   if (std::abs(deltaPulse) <= kWorkOriginSettledPulseTolerance) {
     return;
   }
   // 优先用绝对运动到目标脉冲；部分现场配置不支持时再退回相对运动。
+  checkCurrent();
   const auto absoluteRet = dmcPMove(card, axisNo, targetPulse, 1);
   if (absoluteRet == 0) {
     return;
   }
+  checkCurrent();
   const auto relativeRet = dmcPMove(card, axisNo, deltaPulse, 0);
   if (relativeRet == 0) {
     return;
@@ -295,12 +321,14 @@ double velocityToPulsePerSec(Side side, SemanticAxis axis, double velocityUiPerS
   // 平移 UI 单位是 um/s，而 pulsePerUnit 是 pulse/mm；旋转 UI 单位直接是 deg/s。
   const auto pulseScale = std::abs(pulsePerUnit(side, axis));
   const auto velocityScale = isRotation(axis) ? pulseScale : pulseScale / 1000.0;
-  return (std::max)(1.0, velocityUiPerSec * velocityScale);
+  const auto pulseVelocity = velocityUiPerSec * velocityScale;
+  requireFiniteMotionParameter(pulseVelocity);
+  return (std::max)(1.0, pulseVelocity);
 }
 
 long clampPulseStep(long deltaPulse, double stepLimitPulse) {
   // 单帧限幅保护 teleop 高频环路，防止主手突跳生成过大的目标窗口。
-  const auto limit = static_cast<long>(std::llround(stepLimitPulse));
+  const auto limit = checkedMotionPulse(stepLimitPulse);
   if (limit <= 0 || std::abs(deltaPulse) <= limit) {
     return deltaPulse;
   }
@@ -328,8 +356,8 @@ long maxTeleopTargetLeadPulse(
   const double leadTimeSec = (std::max)(0.01, (std::max)(accTimeSec, decTimeSec));
   const auto velocityLead = (std::max)(
       1L,
-      static_cast<long>(std::llround((std::max)(1.0, maxVelocityPulse) * leadTimeSec)));
-  const auto stepLimit = static_cast<long>(std::llround(stepLimitPulse));
+      checkedMotionPulse((std::max)(1.0, maxVelocityPulse) * leadTimeSec));
+  const auto stepLimit = checkedMotionPulse(stepLimitPulse);
   const auto boundedVelocityLead = stepLimit > 0 ? (std::min)(velocityLead, stepLimit) : velocityLead;
   return (std::max)(1L, (std::max)(requested, boundedVelocityLead));
 }
@@ -377,26 +405,31 @@ struct AxisHoldResult {
   int updateReturn{0};
 };
 
-AxisHoldResult stopTeleopAxisAtCurrentBestEffort(unsigned short card, unsigned short axisNo) {
+template <typename CheckCurrent>
+AxisHoldResult stopTeleopAxisAtCurrentBestEffort(unsigned short card, unsigned short axisNo, CheckCurrent checkCurrent) {
   // 停轴后立即把目标更新到当前位置，避免控制卡仍保留旧目标造成下一帧突跳。
   const auto retStop = dmcStop(card, axisNo, 0);
   if (retStop != 0) {
     throw std::runtime_error(dmcAxisFailureMessage("dmc_stop", retStop, card, axisNo));
   }
   const auto currentPulse = dmcGetPosition(card, axisNo);
+  checkCurrent();
   const auto retUpdate = updateTeleopTargetBestEffort(card, axisNo, currentPulse);
+  checkCurrent();
   return {static_cast<double>(currentPulse), retUpdate};
 }
 
-template <size_t N>
+template <size_t N, typename CheckCurrent>
 void waitForAxesDone(
     const std::array<std::pair<unsigned short, unsigned short>, N>& axes,
     size_t count,
     const char* operation,
-    int timeoutMs) {
+    int timeoutMs,
+    CheckCurrent checkCurrent) {
   // 回原点需要等待多轴完成；统一超时避免某个轴异常时接口永久阻塞。
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
   while (true) {
+    checkCurrent();
     bool allDone = true;
     for (size_t i = 0; i < count; ++i) {
       if (dmcCheckDone(axes[i].first, axes[i].second) == 0) {
@@ -492,7 +525,7 @@ HalHealth LTDMCDriver::health(double uptimeS) const {
   if (!lock.owns_lock()) {
     return cachedHealth(uptimeS);
   }
-  HalHealth health{initialized_, false, "hal-real/0.1", uptimeS};
+  HalHealth health{initialized_, false, kHalVersion, uptimeS};
   if (!lastError_.empty()) {
     health.version += " " + lastError_;
   }
@@ -506,7 +539,7 @@ void LTDMCDriver::ensureMotionReturnAllowed() const {
 }
 
 bool LTDMCDriver::estopActive() const {
-  return estopActive_.load(std::memory_order_acquire);
+  return estop_.active();
 }
 
 MotionState LTDMCDriver::readState() {
@@ -518,7 +551,7 @@ MotionState LTDMCDriver::readState() {
   ensureInitialized();
   MotionState state;
   state.readTimestampMs = unixTimeMs();
-  state.estopActive = estopActive_.load(std::memory_order_acquire);
+  state.estopActive = estop_.active();
   for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
     const auto card = cardForSide(side);
@@ -551,13 +584,13 @@ MotionState LTDMCDriver::cachedStateSnapshot() const {
   std::scoped_lock snapshotLock(snapshotMutex_);
   auto state = cachedState_;
   state.readTimestampMs = unixTimeMs();
-  state.estopActive = estopActive_.load(std::memory_order_acquire);
+  state.estopActive = estop_.active();
   return state;
 }
 
 HalHealth LTDMCDriver::cachedHealth(double uptimeS) const {
   std::scoped_lock snapshotLock(snapshotMutex_);
-  HalHealth health{cachedInitialized_, false, "hal-real/0.1", uptimeS};
+  HalHealth health{cachedInitialized_, false, kHalVersion, uptimeS};
   if (!cachedLastError_.empty()) {
     health.version += " " + cachedLastError_;
   }
@@ -568,7 +601,7 @@ void LTDMCDriver::publishStateSnapshotLocked() {
   // 调用方已持有 mutex_；这里把内部 pulse/enabled 状态转换成对外 MotionState。
   MotionState state;
   state.readTimestampMs = unixTimeMs();
-  state.estopActive = estopActive_.load(std::memory_order_acquire);
+  state.estopActive = estop_.active();
   for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
@@ -591,9 +624,13 @@ void LTDMCDriver::publishStateSnapshotLocked(const MotionState& state) {
 }
 
 void LTDMCDriver::emergencyStop() {
+  stopsInProgress_.fetch_add(1, std::memory_order_acq_rel);
+  struct StopCompletion {
+    std::atomic_uint32_t& count;
+    ~StopCompletion() { count.fetch_sub(1, std::memory_order_acq_rel); }
+  } completion{stopsInProgress_};
   // sequence 用于区分多次急停/解除路径，避免旧操作完成后误清新急停。
-  estopSequence_.fetch_add(1, std::memory_order_acq_rel);
-  estopActive_.store(true, std::memory_order_release);
+  latchEmergencyStop();
   stopAllAxesBestEffort();
   disableAllAxesBestEffort();
 
@@ -614,14 +651,44 @@ void LTDMCDriver::emergencyStop() {
   publishStateSnapshotLocked();
 }
 
+void LTDMCDriver::latchEmergencyStop() noexcept {
+  estop_.trip();
+  const auto stopTime = unixTimeMs();
+  auto previousTime = lastEmergencyStopUnixMs_.load(std::memory_order_acquire);
+  while (previousTime < stopTime && !lastEmergencyStopUnixMs_.compare_exchange_weak(
+      previousTime, stopTime, std::memory_order_acq_rel)) {}
+}
+
+void LTDMCDriver::requireControlLease() { controlLease_.require(estop_); }
+void LTDMCDriver::failControlLease() noexcept { controlLease_.fail(estop_); }
+void LTDMCDriver::renewControlLease(const std::string& session, std::uint64_t sequence) {
+  controlLease_.renew(estop_, session, sequence, ControlLeaseState::nowMs());
+}
+bool LTDMCDriver::controlLeaseFresh() const { return controlLease_.fresh(); }
+std::uint64_t LTDMCDriver::pollControlLease() { return controlLease_.poll(estop_); }
+void LTDMCDriver::completeControlLeaseStop(std::uint64_t sequence) { controlLease_.completeStop(sequence); }
+
 void LTDMCDriver::acknowledgeEmergencyStop() {
-  // Invalidate older in-flight operations before clearing the current latch.
-  estopSequence_.fetch_add(1, std::memory_order_acq_rel);
-  estopActive_.store(false, std::memory_order_release);
+  acknowledgeEmergencyStop(commandEpoch());
+}
+
+void LTDMCDriver::acknowledgeEmergencyStop(std::uint64_t expectedEpoch) {
+  if (stopsInProgress_.load(std::memory_order_acquire) != 0) {
+    throw std::runtime_error("emergency stop is still being applied; acknowledge again after it completes");
+  }
+  controlLease_.acknowledge(estop_, expectedEpoch);
   std::unique_lock<std::mutex> stateLock(mutex_, std::try_to_lock);
   if (stateLock.owns_lock()) {
     publishStateSnapshotLocked();
   }
+}
+
+std::uint64_t LTDMCDriver::commandEpoch() const { return estop_.epoch(); }
+bool LTDMCDriver::commandEpochAllowed(std::uint64_t epoch) const {
+  return estop_.permits(epoch) && controlLeaseFresh();
+}
+std::int64_t LTDMCDriver::lastEmergencyStopUnixMs() const {
+  return lastEmergencyStopUnixMs_.load(std::memory_order_acquire);
 }
 
 void LTDMCDriver::stopAllAxesBestEffort() noexcept {
@@ -658,22 +725,31 @@ void LTDMCDriver::disableAllAxesBestEffort() noexcept {
 #endif
 }
 
-void LTDMCDriver::clearEstopIfUnchanged(std::uint64_t sequenceAtStart) {
-  // 只有同一轮恢复动作可以清急停；期间如果又触发急停，sequence 会变化。
-  if (estopSequence_.load(std::memory_order_acquire) == sequenceAtStart) {
-    estopActive_.store(false, std::memory_order_release);
-  }
+void LTDMCDriver::checkMotionCommand(std::uint64_t epoch) {
+  controlLease_.poll(estop_);
+  if (commandEpochAllowed(epoch)) return;
+  // SDK 调用可能在急停发生后才返回；再次停车/断使能，禁止继续下一轴或恢复旧缓存。
+  stopAllAxesBestEffort();
+  disableAllAxesBestEffort();
+  teleopTargetActive_.fill(false);
+  enabled_.fill(false);
+  commandedEnabled_.fill(false);
+  publishStateSnapshotLocked();
+  throw std::runtime_error("motion command cancelled by emergency stop; submit a new command after acknowledgement");
 }
 
 std::string LTDMCDriver::enableSide(Side side, bool enabled) {
   return enableSide(side, enabled, kAllAxesEnabled);
 }
 
-std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bool, 6>& enabledAxes) {
+std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bool, 6>& enabledAxes,
+    std::optional<std::uint64_t> expectedEpoch) {
+  const auto estopSequenceAtStart = expectedEpoch.value_or(commandEpoch());
   std::scoped_lock lock(mutex_);
   ensureInitialized();
   if (enabled) {
     throwIfEstopActive();
+    checkMotionCommand(estopSequenceAtStart);
   }
   int succeeded = 0;
   int failed = 0;
@@ -684,6 +760,7 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bo
   }
   const auto card = cardForSide(side);
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    if (enabled) checkMotionCommand(estopSequenceAtStart);
     const auto axis = static_cast<SemanticAxis>(axisIndex);
     const auto axisEnabled = enabled && enabledAxes[axisIndex];
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
@@ -707,7 +784,9 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bo
       ++succeeded;
       continue;
     }
+    if (enabled) checkMotionCommand(estopSequenceAtStart);
     const auto ret = dmcWriteSevonPin(card, axisNo, axisEnabled ? 1 : 0);
+    if (enabled) checkMotionCommand(estopSequenceAtStart);
     if (ignoreUnsupportedSevonWriteFailure(side, axis, ret)) {
       // 现场右侧返回“不支持写入”时仍保留软件期望状态，后续运动使能按该状态判断。
       const auto index = stateIndex(side, axis);
@@ -734,6 +813,7 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bo
   }
 #else
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    if (enabled) checkMotionCommand(estopSequenceAtStart);
     const auto axis = static_cast<SemanticAxis>(axisIndex);
     const auto axisEnabled = enabled && enabledAxes[axisIndex];
     const auto index = stateIndex(side, axis);
@@ -744,8 +824,10 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bo
 #endif
   // 伺服状态变化后旧 teleop 目标不再可信，下一帧必须重新建立目标。
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    if (enabled) checkMotionCommand(estopSequenceAtStart);
     teleopTargetActive_[stateIndex(side, static_cast<SemanticAxis>(axisIndex))] = false;
   }
+  if (enabled) checkMotionCommand(estopSequenceAtStart);
   publishStateSnapshotLocked();
   if (failed > 0) {
     throw std::runtime_error(failures.str());
@@ -760,11 +842,13 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bo
   return message.str();
 }
 
-void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes) {
+void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes,
+    std::optional<std::uint64_t> expectedEpoch) {
+  const auto estopSequenceAtStart = expectedEpoch.value_or(commandEpoch());
   std::scoped_lock lock(mutex_);
   ensureInitialized();
   throwIfEstopActive();
-  const auto estopSequenceAtStart = estopSequence_.load(std::memory_order_acquire);
+  checkMotionCommand(estopSequenceAtStart);
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   if (!dmcHomeMove || !dmcSetPulseOutmode || !dmcSetElMode || !dmcSetHomeMode || !dmcSetHomePinLogic) {
     throw std::runtime_error("required LTDMC home exports missing");
@@ -773,6 +857,7 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes) {
   configureStageAxes(side);
   const auto card = cardForSide(side);
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    checkMotionCommand(estopSequenceAtStart);
     const auto axis = static_cast<SemanticAxis>(axisIndex);
     if (!enabledAxes[axisIndex]) {
       continue;
@@ -784,6 +869,7 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes) {
     }
   }
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    checkMotionCommand(estopSequenceAtStart);
     const auto axis = static_cast<SemanticAxis>(axisIndex);
     if (!enabledAxes[axisIndex]) {
       continue;
@@ -804,7 +890,9 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes) {
         beforePulse,
         beforeUi,
         0);
+    checkMotionCommand(estopSequenceAtStart);
     const auto ret = dmcHomeMove(card, axisNo);
+    checkMotionCommand(estopSequenceAtStart);
     const auto afterPulse = dmcGetPosition ? dmcGetPosition(card, axisNo) : static_cast<long>(pulse_[stateIndex(side, axis)]);
     const auto afterUi = pulseToUi(static_cast<double>(afterPulse), side, axis);
     logHardwareHomeDiagnostic(
@@ -825,7 +913,7 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes) {
     }
   }
 #endif
-  clearEstopIfUnchanged(estopSequenceAtStart);
+  checkMotionCommand(estopSequenceAtStart);
   // 机械回零会改变坐标参考，全部 teleop 目标都必须失效。
   for (auto& active : teleopTargetActive_) {
     active = false;
@@ -835,12 +923,15 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes) {
 
 void LTDMCDriver::homeAll(
     const std::array<double, 12>& workOriginPulse,
-    const std::array<std::array<bool, 6>, 2>& enabledAxes) {
+    const std::array<std::array<bool, 6>, 2>& enabledAxes,
+    std::optional<std::uint64_t> expectedEpoch) {
+  for (const auto pulse : workOriginPulse) checkedMotionPulse(pulse);
+  const auto estopSequenceAtStart = expectedEpoch.value_or(commandEpoch());
   std::scoped_lock lock(mutex_);
   ensureInitialized();
   ensureMotionReturnAllowed();
   throwIfEstopActive();
-  const auto estopSequenceAtStart = estopSequence_.load(std::memory_order_acquire);
+  checkMotionCommand(estopSequenceAtStart);
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   if (!dmcSetProfile || !dmcPMove || !dmcCheckDone || !dmcGetPosition) {
     throw std::runtime_error("required LTDMC motion exports missing");
@@ -857,6 +948,7 @@ void LTDMCDriver::homeAll(
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
     const auto card = cardForSide(side);
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+      checkMotionCommand(estopSequenceAtStart);
       const auto axis = static_cast<SemanticAxis>(axisIndex);
       if (!enabledAxes[sideIndex][axisIndex]) {
         continue;
@@ -868,21 +960,22 @@ void LTDMCDriver::homeAll(
       homeAxes[homeAxisCount++] = {card, axisNo};
     }
   }
-  waitForAxesDone(homeAxes, homeAxisCount, "home_all pre-move", 3000);
+  waitForAxesDone(homeAxes, homeAxisCount, "home_all pre-move", 3000, [&]() { checkMotionCommand(estopSequenceAtStart); });
   // 每轴使用相同保守 profile，按目标脉冲绝对移动到工作原点。
   for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
     const auto card = cardForSide(side);
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+      checkMotionCommand(estopSequenceAtStart);
       const auto axis = static_cast<SemanticAxis>(axisIndex);
       if (!enabledAxes[sideIndex][axisIndex]) {
         continue;
       }
       const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
       const auto index = stateIndex(side, axis);
-      const auto targetPulse = static_cast<long>(std::llround(workOriginPulse[index]));
+      const auto targetPulse = checkedMotionPulse(workOriginPulse[index]);
       const auto currentPulse = dmcGetPosition(card, axisNo);
-      const auto deltaPulse = targetPulse - currentPulse;
+      const auto deltaPulse = checkedMotionPulse(static_cast<double>(targetPulse) - currentPulse);
       // 平移轴和旋转轴的 UI 速度单位不同，velocityToPulsePerSec 负责换算到 pulse/s。
       const auto rotation = isRotation(axis);
       const auto maxVelocityPulse =
@@ -897,20 +990,23 @@ void LTDMCDriver::homeAll(
       if (dmcSetSProfile) {
         dmcSetSProfile(card, axisNo, 0, 0.0);
       }
-      startWorkOriginMoveOrThrow(card, axisNo, targetPulse, deltaPulse, currentPulse);
+      checkMotionCommand(estopSequenceAtStart);
+      startWorkOriginMoveOrThrow(card, axisNo, targetPulse, deltaPulse, currentPulse, [&]() { checkMotionCommand(estopSequenceAtStart); });
+      checkMotionCommand(estopSequenceAtStart);
       pulse_[index] = static_cast<double>(targetPulse);
       teleopTargetPulse_[index] = pulse_[index];
       teleopTargetActive_[index] = false;
     }
   }
   publishStateSnapshotLocked();
-  waitForAxesDone(homeAxes, homeAxisCount, "home_all", 60000);
+  waitForAxesDone(homeAxes, homeAxisCount, "home_all", 60000, [&]() { checkMotionCommand(estopSequenceAtStart); });
   // 运动完成后重新读取真实位置，避免缓存只停留在理论目标值。
   if (dmcGetPosition) {
     for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
       const auto side = sideIndex == 0 ? Side::Left : Side::Right;
       const auto card = cardForSide(side);
       for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+        checkMotionCommand(estopSequenceAtStart);
         const auto axis = static_cast<SemanticAxis>(axisIndex);
         const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
         const auto index = stateIndex(side, axis);
@@ -924,6 +1020,7 @@ void LTDMCDriver::homeAll(
   for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+      checkMotionCommand(estopSequenceAtStart);
       const auto axis = static_cast<SemanticAxis>(axisIndex);
       if (!enabledAxes[sideIndex][axisIndex]) {
         continue;
@@ -936,19 +1033,22 @@ void LTDMCDriver::homeAll(
     }
   }
 #endif
-  clearEstopIfUnchanged(estopSequenceAtStart);
+  checkMotionCommand(estopSequenceAtStart);
   publishStateSnapshotLocked();
 }
 
 void LTDMCDriver::homeOriginSide(
     Side side,
     const std::array<double, 6>& workOriginPulse,
-    const std::array<bool, 6>& enabledAxes) {
+    const std::array<bool, 6>& enabledAxes,
+    std::optional<std::uint64_t> expectedEpoch) {
+  for (const auto pulse : workOriginPulse) checkedMotionPulse(pulse);
+  const auto estopSequenceAtStart = expectedEpoch.value_or(commandEpoch());
   std::scoped_lock lock(mutex_);
   ensureInitialized();
   ensureMotionReturnAllowed();
   throwIfEstopActive();
-  const auto estopSequenceAtStart = estopSequence_.load(std::memory_order_acquire);
+  checkMotionCommand(estopSequenceAtStart);
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   if (!dmcSetProfile || !dmcPMove || !dmcCheckDone || !dmcGetPosition) {
     throw std::runtime_error("required LTDMC motion exports missing");
@@ -963,6 +1063,7 @@ void LTDMCDriver::homeOriginSide(
   size_t homeAxisCount = 0;
   // 单侧回工作原点与 homeAll 逻辑一致，但只处理调用方指定侧。
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    checkMotionCommand(estopSequenceAtStart);
     const auto axis = static_cast<SemanticAxis>(axisIndex);
     if (!enabledAxes[axisIndex]) {
       continue;
@@ -973,17 +1074,18 @@ void LTDMCDriver::homeOriginSide(
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
     homeAxes[homeAxisCount++] = {card, axisNo};
   }
-  waitForAxesDone(homeAxes, homeAxisCount, "home_origin_side pre-move", 3000);
+  waitForAxesDone(homeAxes, homeAxisCount, "home_origin_side pre-move", 3000, [&]() { checkMotionCommand(estopSequenceAtStart); });
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    checkMotionCommand(estopSequenceAtStart);
     const auto axis = static_cast<SemanticAxis>(axisIndex);
     if (!enabledAxes[axisIndex]) {
       continue;
     }
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
     const auto index = stateIndex(side, axis);
-    const auto targetPulse = static_cast<long>(std::llround(workOriginPulse[axisIndex]));
+    const auto targetPulse = checkedMotionPulse(workOriginPulse[axisIndex]);
     const auto currentPulse = dmcGetPosition(card, axisNo);
-    const auto deltaPulse = targetPulse - currentPulse;
+    const auto deltaPulse = checkedMotionPulse(static_cast<double>(targetPulse) - currentPulse);
     const auto rotation = isRotation(axis);
     const auto maxVelocityPulse =
         velocityToPulsePerSec(side, axis, rotation ? kRotationMaxVelocityUi : kTranslationMaxVelocityUi);
@@ -997,14 +1099,17 @@ void LTDMCDriver::homeOriginSide(
     if (dmcSetSProfile) {
       dmcSetSProfile(card, axisNo, 0, 0.0);
     }
-    startWorkOriginMoveOrThrow(card, axisNo, targetPulse, deltaPulse, currentPulse);
+    checkMotionCommand(estopSequenceAtStart);
+    startWorkOriginMoveOrThrow(card, axisNo, targetPulse, deltaPulse, currentPulse, [&]() { checkMotionCommand(estopSequenceAtStart); });
+    checkMotionCommand(estopSequenceAtStart);
     pulse_[index] = static_cast<double>(targetPulse);
     teleopTargetActive_[index] = false;
   }
   publishStateSnapshotLocked();
-  waitForAxesDone(homeAxes, homeAxisCount, "home_origin_side", 60000);
+  waitForAxesDone(homeAxes, homeAxisCount, "home_origin_side", 60000, [&]() { checkMotionCommand(estopSequenceAtStart); });
   if (dmcGetPosition) {
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+      checkMotionCommand(estopSequenceAtStart);
       const auto axis = static_cast<SemanticAxis>(axisIndex);
       const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
       const auto index = stateIndex(side, axis);
@@ -1015,6 +1120,7 @@ void LTDMCDriver::homeOriginSide(
   }
 #else
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    checkMotionCommand(estopSequenceAtStart);
     const auto axis = static_cast<SemanticAxis>(axisIndex);
     if (!enabledAxes[axisIndex]) {
       continue;
@@ -1027,7 +1133,7 @@ void LTDMCDriver::homeOriginSide(
     teleopTargetActive_[index] = false;
   }
 #endif
-  clearEstopIfUnchanged(estopSequenceAtStart);
+  checkMotionCommand(estopSequenceAtStart);
   publishStateSnapshotLocked();
 }
 
@@ -1038,11 +1144,16 @@ void LTDMCDriver::moveRelativeUi(
     double maxVelocityUiPerSec,
     double startVelocityUiPerSec,
     double accTimeSec,
-    double decTimeSec) {
+    double decTimeSec,
+    std::optional<std::uint64_t> expectedEpoch) {
+  for (const auto value : {deltaUi, maxVelocityUiPerSec, startVelocityUiPerSec, accTimeSec, decTimeSec}) {
+    requireFiniteMotionParameter(value);
+  }
+  const auto estopSequenceAtStart = expectedEpoch.value_or(commandEpoch());
   std::scoped_lock lock(mutex_);
   ensureInitialized();
   throwIfEstopActive();
-  const auto estopSequenceAtStart = estopSequence_.load(std::memory_order_acquire);
+  checkMotionCommand(estopSequenceAtStart);
   const auto rotation = isRotation(axis);
   // 硬件测试安全边界：避免相对 jog 误把轴带出工作台范围。
   // 上层调用方仍需按任务继续施加软限位。
@@ -1054,7 +1165,7 @@ void LTDMCDriver::moveRelativeUi(
     throw std::runtime_error("max velocity must be positive");
   }
   const auto index = stateIndex(side, axis);
-  const auto deltaPulse = static_cast<long>(std::llround(uiToPulse(deltaUi, side, axis)));
+  const auto deltaPulse = checkedMotionPulse(uiToPulse(deltaUi, side, axis));
   if (deltaPulse == 0) {
     // 真实控制卡无法执行 0 pulse jog，把它作为调用方输入过小的错误暴露出来。
     throw std::runtime_error("jog delta rounds to zero pulses");
@@ -1095,7 +1206,9 @@ void LTDMCDriver::moveRelativeUi(
   if (dmcSetSProfile) {
     dmcSetSProfile(card, axisNo, 0, 0.0);
   }
+  checkMotionCommand(estopSequenceAtStart);
   const auto retMove = dmcPMove(card, axisNo, deltaPulse, 0);
+  checkMotionCommand(estopSequenceAtStart);
   if (retMove != 0) {
     throw std::runtime_error(dmcFailureMessage("dmc_pmove", retMove, card, axisNo, deltaPulse));
   }
@@ -1109,7 +1222,7 @@ void LTDMCDriver::moveRelativeUi(
 #endif
   pulse_[index] += static_cast<double>(deltaPulse);
   teleopTargetActive_[index] = false;
-  clearEstopIfUnchanged(estopSequenceAtStart);
+  checkMotionCommand(estopSequenceAtStart);
 }
 
 TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
@@ -1127,11 +1240,27 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
     double translationStartVelocityUiPerSec,
     double rotationStartVelocityUiPerSec,
     double accTimeSec,
-    double decTimeSec) {
+    double decTimeSec,
+    std::optional<std::uint64_t> expectedEpoch) {
+  for (const auto value : {translationStepPulse, rotationStepPulse, translationPulseDeadband,
+      rotationPulseDeadband, translationVelocityUiPerSec, rotationVelocityUiPerSec,
+      translationStartVelocityUiPerSec, rotationStartVelocityUiPerSec, accTimeSec, decTimeSec}) {
+    requireFiniteMotionParameter(value);
+  }
+  for (std::size_t axis = 0; axis < deltaUi.size(); ++axis) {
+    checkedMotionPulse(uiToPulse(deltaUi[axis], side, static_cast<SemanticAxis>(axis)));
+    requireFiniteMotionParameter(limits[axis].min);
+    requireFiniteMotionParameter(limits[axis].max);
+  }
+  checkedMotionPulse(translationStepPulse);
+  checkedMotionPulse(rotationStepPulse);
+  checkedMotionPulse(translationPulseDeadband);
+  checkedMotionPulse(rotationPulseDeadband);
+  const auto estopSequenceAtStart = expectedEpoch.value_or(commandEpoch());
   std::scoped_lock lock(mutex_);
   ensureInitialized();
   throwIfEstopActive();
-  const auto estopSequenceAtStart = estopSequence_.load(std::memory_order_acquire);
+  checkMotionCommand(estopSequenceAtStart);
   if (translationVelocityUiPerSec <= 0 || rotationVelocityUiPerSec <= 0) {
     throw std::runtime_error("teleop velocity must be positive");
   }
@@ -1150,6 +1279,7 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
   }
 #endif
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    checkMotionCommand(estopSequenceAtStart);
     const auto axis = static_cast<SemanticAxis>(axisIndex);
     const auto delta = deltaUi[axisIndex];
     const auto rotation = isRotation(axis);
@@ -1166,9 +1296,9 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
     }
     const auto stepLimitPulse = rotation ? rotationStepPulse : translationStepPulse;
     const auto pulseDeadband = rotation ? rotationPulseDeadband : translationPulseDeadband;
-    const auto requestedDeltaPulse = static_cast<long>(std::llround(uiToPulse(delta, side, axis)));
+    const auto requestedDeltaPulse = checkedMotionPulse(uiToPulse(delta, side, axis));
     const auto deadbandedDeltaPulse =
-        std::abs(requestedDeltaPulse) <= static_cast<long>(std::llround(pulseDeadband)) ? 0 : requestedDeltaPulse;
+        std::abs(requestedDeltaPulse) <= checkedMotionPulse(pulseDeadband) ? 0 : requestedDeltaPulse;
     // deadband 后再做单帧限幅，先去抖再保护步长。
     const auto deltaPulse = clampPulseStep(deadbandedDeltaPulse, stepLimitPulse);
     result.requestedDeltaPulse[axisIndex] = static_cast<double>(requestedDeltaPulse);
@@ -1208,14 +1338,16 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
         // 主手回到死区时，把运动目标同步到当前位置，相当于“松手即保持”。
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
         if (moving) {
-          const auto hold = stopTeleopAxisAtCurrentBestEffort(card, axisNo);
+          const auto hold = stopTeleopAxisAtCurrentBestEffort(card, axisNo, [&]() { checkMotionCommand(estopSequenceAtStart); });
           actualPulse = hold.pulse;
           result.updateReturn[axisIndex] = static_cast<double>(hold.updateReturn);
         } else {
           actualPulse = static_cast<double>(dmcGetPosition(card, axisNo));
-          const auto updateTargetPulse = static_cast<long>(std::llround(actualPulse));
+          const auto updateTargetPulse = checkedMotionPulse(actualPulse);
+          checkMotionCommand(estopSequenceAtStart);
           result.updateReturn[axisIndex] = static_cast<double>(
               updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse));
+          checkMotionCommand(estopSequenceAtStart);
         }
         pulse_[index] = actualPulse;
         result.currentPulse[axisIndex] = actualPulse;
@@ -1260,7 +1392,7 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
     const auto targetPulse = uiToPulse(targetUi, side, axis);
     const auto leadLimitedTargetPulse = clampTeleopTargetLead(actualPulse, targetPulse, targetLeadPulse);
     // 控制卡目标使用整数脉冲；applied* 记录取整后的实际目标。
-    const auto updateTargetPulse = static_cast<long>(std::llround(leadLimitedTargetPulse));
+    const auto updateTargetPulse = checkedMotionPulse(leadLimitedTargetPulse);
     const auto appliedTargetPulse = static_cast<double>(updateTargetPulse);
     const auto appliedTargetUi = pulseToUi(appliedTargetPulse, side, axis);
     const bool targetHeldAtBase = std::abs(appliedTargetPulse - basePulse) <= 0.5;
@@ -1280,7 +1412,7 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
     if (targetHeldAtBase && moving) {
       // 目标被压回当前位置但轴仍在动，需要主动 stop 并更新保持目标。
-      const auto hold = stopTeleopAxisAtCurrentBestEffort(card, axisNo);
+      const auto hold = stopTeleopAxisAtCurrentBestEffort(card, axisNo, [&]() { checkMotionCommand(estopSequenceAtStart); });
       actualPulse = hold.pulse;
       pulse_[index] = actualPulse;
       const auto actualUi = pulseToUi(actualPulse, side, axis);
@@ -1296,27 +1428,34 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
     }
 #endif
     const bool shouldLaunchMove = !moving;
-    const auto launchDeltaPulse = static_cast<long>(std::llround(appliedTargetPulse - actualPulse));
+    const auto launchDeltaPulse = checkedMotionPulse(appliedTargetPulse - actualPulse);
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
     result.moveStarted[axisIndex] = shouldLaunchMove;
     result.launchDeltaPulse[axisIndex] = shouldLaunchMove ? static_cast<double>(launchDeltaPulse) : 0.0;
     if (shouldLaunchMove) {
       // 轴空闲时必须先设置 profile，再启动/刷新目标。
+      checkMotionCommand(estopSequenceAtStart);
       applyMotionProfile(card, axisNo, startVelocityPulse, maxVelocityPulse, tacc, tdec, launchDeltaPulse);
+      checkMotionCommand(estopSequenceAtStart);
     }
+    checkMotionCommand(estopSequenceAtStart);
     const auto updateReturn = updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse);
+    checkMotionCommand(estopSequenceAtStart);
     result.updateReturn[axisIndex] = static_cast<double>(updateReturn);
     if (moving && teleopTargetUpdateMissedWindow(updateReturn)) {
       // 如果刷新窗口错过，读取当前位置后重新启动一个相对运动段追向目标。
       const auto relaunchCurrentPulse = static_cast<double>(dmcGetPosition(card, axisNo));
       const auto relaunchDeltaPulse =
-          static_cast<long>(std::llround(appliedTargetPulse - relaunchCurrentPulse));
+          checkedMotionPulse(appliedTargetPulse - relaunchCurrentPulse);
       if (relaunchDeltaPulse != 0) {
+        checkMotionCommand(estopSequenceAtStart);
         applyMotionProfile(card, axisNo, startVelocityPulse, maxVelocityPulse, tacc, tdec, relaunchDeltaPulse);
+        checkMotionCommand(estopSequenceAtStart);
         result.moveStarted[axisIndex] = true;
         result.launchDeltaPulse[axisIndex] = static_cast<double>(relaunchDeltaPulse);
         result.updateReturn[axisIndex] =
             static_cast<double>(updateTeleopTargetBestEffort(card, axisNo, updateTargetPulse));
+        checkMotionCommand(estopSequenceAtStart);
       }
       actualPulse = relaunchCurrentPulse;
       pulse_[index] = actualPulse;
@@ -1344,11 +1483,12 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
     pulse_[index] = appliedTargetPulse;
 #endif
   }
-  clearEstopIfUnchanged(estopSequenceAtStart);
+  checkMotionCommand(estopSequenceAtStart);
   return result;
 }
 
 void LTDMCDriver::stopTeleopSide(Side side) {
+  const auto stopEpoch = commandEpoch();
   std::scoped_lock lock(mutex_);
   ensureInitialized();
   const auto card = cardForSide(side);
@@ -1366,9 +1506,10 @@ void LTDMCDriver::stopTeleopSide(Side side) {
       if (dmcGetPosition) {
         pulse_[index] = static_cast<double>(dmcGetPosition(card, axisNo));
       }
-      if (dmcUpdateTargetPosition) {
-        const auto currentPulse = static_cast<long>(std::llround(pulse_[index]));
+      if (dmcUpdateTargetPosition && commandEpochAllowed(stopEpoch)) {
+        const auto currentPulse = checkedMotionPulse(pulse_[index]);
         updateTeleopTargetBestEffort(card, axisNo, currentPulse);
+        checkMotionCommand(stopEpoch);
       }
     }
 #else

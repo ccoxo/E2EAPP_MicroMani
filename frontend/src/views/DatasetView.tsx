@@ -1,4 +1,10 @@
-import { Button, Card, Checkbox, Empty, Form, Input, Modal, Popconfirm, Progress, Segmented, Slider, Space, Switch, Tag, Typography } from 'antd'
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：管理数据集、episode 审阅和图像回放；列表与详情分别请求，避免一次加载全部样本。
+ * 先看：CameraKey → EpisodeStatus → EpisodeSample → ReviewCamera。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
+import { UiButton, UiCard, UiProgress, UiSegmented, UiSpace, UiTag, UiText, UiTitle } from '../components/ui'
 import {
   CheckCircle2,
   Database,
@@ -33,6 +39,7 @@ import {
   type DatasetEpisodeStatusApi,
   type DatasetFeatureSummaryApi,
 } from '../api'
+import { camerasEqual, useFrameField } from '../stores/frameSelectors'
 import { useTelemetryStore } from '../stores/telemetry'
 import type { EpisodeRecord } from '../types'
 
@@ -260,19 +267,12 @@ const baseDatasets: ReviewDataset[] = [
 
 /** 格式化对应数值用于界面展示。 */
 function statusTag(status: EpisodeStatus) {
-  if (status === 'valid') return <Tag color="success">有效</Tag>
-  if (status === 'invalid') return <Tag color="error">无效</Tag>
-  return <Tag color="warning">待复核</Tag>
+  if (status === 'valid') return <UiTag tone="success">有效</UiTag>
+  if (status === 'invalid') return <UiTag tone="error">无效</UiTag>
+  return <UiTag tone="warning">待复核</UiTag>
 }
 
-/** 格式化对应数值用于界面展示。 */
-function qualityTone(quality: number) {
-  if (quality >= 90) return '#12a06f'
-  if (quality >= 80) return '#d98400'
-  return '#d83a52'
-}
-
-/** 格式化对应数值用于界面展示。 */
+/** 计算对应的业务值或展示值。 */
 function clampFrame(value: number, frames: number) {
   return Math.max(0, Math.min(frames - 1, Math.round(value)))
 }
@@ -334,7 +334,7 @@ function DatasetVideoPane({
     <article className={`dataset-video-pane dataset-video-${camera.key}`}>
       <div className="dataset-video-head">
         <span>{camera.label}</span>
-        <Tag>{camera.resolution}</Tag>
+        <UiTag>{camera.resolution}</UiTag>
       </div>
       <div className="dataset-video-frame" style={{ aspectRatio: camera.aspectRatio }}>
         {imageUrl ? (
@@ -373,7 +373,7 @@ function TrajectoryPanel({
   const currentX = (frameIndex / Math.max(1, episode.frames - 1)) * width
 
   return (
-    <Card size="small" title={title}>
+    <UiCard title={title}>
       <svg className="dataset-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title}>
         <line x1="0" y1={height / 2} x2={width} y2={height / 2} className="dataset-chart-axis" />
         <polyline points={linePoints(episode.samples, side, 0, width, height)} className="dataset-line dataset-line-x" />
@@ -393,7 +393,7 @@ function TrajectoryPanel({
           </span>
         ))}
       </div>
-    </Card>
+    </UiCard>
   )
 }
 
@@ -416,7 +416,7 @@ function ForcePanel({
   const currentX = (frameIndex / Math.max(1, episode.frames - 1)) * width
 
   return (
-    <Card size="small" title={title}>
+    <UiCard title={title}>
       <svg className="dataset-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title}>
         <line x1="0" y1={height / 2} x2={width} y2={height / 2} className="dataset-chart-axis" />
         <polyline points={forcePoints(episode.samples, side, 0, width, height)} className="dataset-line dataset-line-x" />
@@ -431,16 +431,21 @@ function ForcePanel({
           </span>
         ))}
       </div>
-    </Card>
+    </UiCard>
   )
 }
 
 /** 构建当前流程需要的数据结构。 */
-function applyEpisodeOverrides(episode: ReviewEpisode, nameOverrides: Record<string, string>, statusOverrides: Record<string, EpisodeStatus>) {
+function episodeKey(datasetId: string, episodeId: string) {
+  return JSON.stringify([datasetId, episodeId])
+}
+
+function applyEpisodeOverrides(datasetId: string, episode: ReviewEpisode, nameOverrides: Record<string, string>, statusOverrides: Record<string, EpisodeStatus>) {
+  const key = episodeKey(datasetId, episode.id)
   return {
     ...episode,
-    name: nameOverrides[episode.id] ?? episode.name,
-    status: statusOverrides[episode.id] ?? episode.status,
+    name: nameOverrides[key] ?? episode.name,
+    status: statusOverrides[key] ?? episode.status,
   }
 }
 
@@ -455,7 +460,8 @@ function applyEpisodeOverrides(episode: ReviewEpisode, nameOverrides: Record<str
 export function DatasetView() {
   const recordSession = useTelemetryStore((state) => state.recordSession)
   const config = useTelemetryStore((state) => state.config)
-  const frame = useTelemetryStore((state) => state.frame)
+  // 复核页只读相机健康，不订整帧，避免 15Hz 关节刷新拖垮长页面。
+  const liveCameras = useFrameField((frame) => frame.cameras, camerasEqual)
   const [selectedDatasetId, setSelectedDatasetId] = useState('micro_assembly_v1')
   const [selectedEpisodeId, setSelectedEpisodeId] = useState<string | null>(null)
   const [frameIndex, setFrameIndex] = useState(0)
@@ -469,7 +475,10 @@ export function DatasetView() {
   const [datasetNameOverrides, setDatasetNameOverrides] = useState<Record<string, string>>({})
   const [episodeNameOverrides, setEpisodeNameOverrides] = useState<Record<string, string>>({})
   const [episodeStatusOverrides, setEpisodeStatusOverrides] = useState<Record<string, EpisodeStatus>>({})
-  const [renameTarget, setRenameTarget] = useState<{ type: 'dataset' | 'episode'; id: string; value: string } | null>(null)
+  const [renameTarget, setRenameTarget] = useState<{ type: 'dataset' | 'episode'; id: string; datasetId?: string; value: string } | null>(null)
+  const [mutationPending, setMutationPending] = useState(false)
+  const mutationPendingRef = useRef(false)
+  const mountedRef = useRef(false)
   const [hubUploadOpen, setHubUploadOpen] = useState(false)
   const [hubPushToHub, setHubPushToHub] = useState(Boolean(config.storage.pushToHub))
   const [hubRepoId, setHubRepoId] = useState('')
@@ -479,8 +488,12 @@ export function DatasetView() {
   const [hubDryRun, setHubDryRun] = useState(true)
   const [hubUploading, setHubUploading] = useState(false)
   const [hubMessage, setHubMessage] = useState('')
-  const episodeDetailLoadingKeyRef = useRef('')
   const episodeDetailRequestedKeysRef = useRef(new Set<string>())
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
 
   useEffect(() => {
     if (mockMode) return
@@ -517,8 +530,8 @@ export function DatasetView() {
         ...dataset,
         name: datasetNameOverrides[dataset.id] ?? dataset.name,
         episodes: dataset.episodes
-          .filter((episode) => !deletedEpisodeIds.includes(episode.id))
-          .map((episode) => applyEpisodeOverrides(episode, episodeNameOverrides, episodeStatusOverrides)),
+          .filter((episode) => !deletedEpisodeIds.includes(episodeKey(dataset.id, episode.id)))
+          .map((episode) => applyEpisodeOverrides(dataset.id, episode, episodeNameOverrides, episodeStatusOverrides)),
       }))
   }, [datasetNameOverrides, deletedDatasetIds, deletedEpisodeIds, episodeNameOverrides, episodeStatusOverrides, recordSession.datasetName, recordSession.episodeHistory, serverDatasets])
 
@@ -528,24 +541,29 @@ export function DatasetView() {
   const selectedEpisode = selectedDataset?.episodes.find((episode) => episode.id === selectedEpisodeId) ?? selectedDataset?.episodes[0]
   const selectedCameras = selectedDataset && selectedEpisode ? camerasForReview(selectedDataset, selectedEpisode) : cameras
   const livePreviewCameras = cameras
-    .map(({ key }) => frame.cameras.find((camera) => camera.key === key))
+    .map(({ key }) => liveCameras.find((camera) => camera.key === key))
     .filter((camera): camera is NonNullable<typeof camera> => Boolean(camera))
   const validEpisodes = selectedDataset?.episodes.filter((episode) => episode.status === 'valid').length ?? 0
   const avgQuality = selectedDataset && selectedDataset.episodes.length > 0
     ? Math.round(selectedDataset.episodes.reduce((sum, episode) => sum + episode.quality, 0) / selectedDataset.episodes.length)
     : 0
 
+  const detailDatasetId = selectedDataset?.id
+  const detailEpisodeId = selectedEpisode?.id
+  const needsEpisodeDetail = selectedEpisode?.samples.length === 0
   useEffect(() => {
-    if (mockMode || !selectedDataset || !selectedEpisode || selectedEpisode.samples.length > 0) return
-    const detailKey = `${selectedDataset.id}:${selectedEpisode.id}`
-    if (episodeDetailLoadingKeyRef.current === detailKey || episodeDetailRequestedKeysRef.current.has(detailKey)) return
-    episodeDetailLoadingKeyRef.current = detailKey
-    void fetchDatasetEpisodeApi(selectedDataset.id, selectedEpisode.id)
+    if (mockMode || !detailDatasetId || !detailEpisodeId || !needsEpisodeDetail) return
+    const detailKey = episodeKey(detailDatasetId, detailEpisodeId)
+    if (episodeDetailRequestedKeysRef.current.has(detailKey)) return
+    let cancelled = false
+    void fetchDatasetEpisodeApi(detailDatasetId, detailEpisodeId)
       .then((episode) => {
-        if (!episode) return
+        if (cancelled) return
+        if (!episode) throw new Error('未找到 episode 详情')
+        episodeDetailRequestedKeysRef.current.add(detailKey)
         setServerDatasets((items) =>
           items.map((dataset) =>
-            dataset.id === selectedDataset.id
+            dataset.id === detailDatasetId
               ? {
                   ...dataset,
                   episodes: dataset.episodes.map((item) =>
@@ -557,12 +575,11 @@ export function DatasetView() {
         )
         setBackendLoadError('')
       })
-      .catch((error) => setBackendLoadError(String(error)))
-      .finally(() => {
-        episodeDetailRequestedKeysRef.current.add(detailKey)
-        if (episodeDetailLoadingKeyRef.current === detailKey) episodeDetailLoadingKeyRef.current = ''
+      .catch((error) => {
+        if (!cancelled) setBackendLoadError(String(error))
       })
-  }, [selectedDataset, selectedEpisode])
+    return () => { cancelled = true }
+  }, [detailDatasetId, detailEpisodeId, needsEpisodeDetail, refreshToken])
 
   useEffect(() => {
     if (!playing || !selectedEpisode) return
@@ -587,78 +604,77 @@ const chooseDataset = (datasetId: string) => {
     setPlaying(false)
   }
 
-    /** 更新当前复核流程的本地状态。 */
-const commitRename = () => {
+  const runMutation = async (request: () => Promise<unknown>, apply?: () => void) => {
+    if (mutationPendingRef.current) return
+    if (mockMode) {
+      apply?.()
+      return
+    }
+    mutationPendingRef.current = true
+    setMutationPending(true)
+    setBackendLoadError('')
+    try {
+      await request()
+      if (!mountedRef.current) return
+      apply?.()
+      setRefreshToken((value) => value + 1)
+    } catch (error) {
+      if (mountedRef.current) setBackendLoadError(String(error))
+    } finally {
+      mutationPendingRef.current = false
+      if (mountedRef.current) setMutationPending(false)
+    }
+  }
+
+  /** 仅在后端确认后写入本地覆盖，失败时保留原值和编辑内容。 */
+  const commitRename = () => {
     if (!renameTarget) return
+    const target = renameTarget
+    const name = target.value.trim() || target.id
     if (renameTarget.type === 'dataset') {
-      setDatasetNameOverrides((current) => ({ ...current, [renameTarget.id]: renameTarget.value.trim() || renameTarget.id }))
-      if (!mockMode) {
-        void renameDatasetApi(renameTarget.id, renameTarget.value.trim() || renameTarget.id)
-          .then(() => setRefreshToken((value) => value + 1))
-          .catch((error) => setBackendLoadError(String(error)))
-      }
-    } else {
-      setEpisodeNameOverrides((current) => ({ ...current, [renameTarget.id]: renameTarget.value.trim() || renameTarget.id }))
-      if (!mockMode && selectedDataset) {
-        void updateDatasetEpisodeApi(selectedDataset.id, renameTarget.id, { name: renameTarget.value.trim() || renameTarget.id })
-          .then(() => setRefreshToken((value) => value + 1))
-          .catch((error) => setBackendLoadError(String(error)))
-      }
-    }
-    setRenameTarget(null)
-  }
-
-    /** 调用数据集后端接口并同步界面状态。 */
-const deleteDataset = (datasetId: string) => {
-    setDeletedDatasetIds((current) => [...current, datasetId])
-    if (!mockMode) {
-      void deleteDatasetApi(datasetId)
-        .then(() => setRefreshToken((value) => value + 1))
-        .catch((error) => setBackendLoadError(String(error)))
-    }
-    if (selectedDatasetId === datasetId) {
-      setSelectedDatasetId('')
-      setSelectedEpisodeId(null)
+      void runMutation(() => renameDatasetApi(target.id, name), () => {
+        setDatasetNameOverrides((current) => ({ ...current, [target.id]: name }))
+        setRenameTarget(null)
+      })
+    } else if (target.datasetId) {
+      const datasetId = target.datasetId
+      void runMutation(() => updateDatasetEpisodeApi(datasetId, target.id, { name }), () => {
+        setEpisodeNameOverrides((current) => ({ ...current, [episodeKey(datasetId, target.id)]: name }))
+        setRenameTarget(null)
+      })
     }
   }
 
-    /** 调用数据集后端接口并同步界面状态。 */
-const deleteEpisode = (episodeId: string) => {
-    setDeletedEpisodeIds((current) => [...current, episodeId])
-    if (!mockMode && selectedDataset) {
-      void deleteDatasetEpisodeApi(selectedDataset.id, episodeId)
-        .then(() => setRefreshToken((value) => value + 1))
-        .catch((error) => setBackendLoadError(String(error)))
-    }
-    if (selectedEpisodeId === episodeId) setSelectedEpisodeId(null)
+  const deleteDataset = (datasetId: string) => {
+    void runMutation(() => deleteDatasetApi(datasetId), () => {
+      setDeletedDatasetIds((current) => [...current, datasetId])
+    })
   }
 
-    /** 更新当前复核流程的本地状态。 */
-const setEpisodeStatus = (episodeId: string, status: EpisodeStatus) => {
-    setEpisodeStatusOverrides((current) => ({ ...current, [episodeId]: status }))
-    if (!mockMode && selectedDataset) {
-      void updateDatasetEpisodeApi(selectedDataset.id, episodeId, { status })
-        .then(() => setRefreshToken((value) => value + 1))
-        .catch((error) => setBackendLoadError(String(error)))
-    }
+  const deleteEpisode = (episodeId: string) => {
+    if (!selectedDataset) return
+    const datasetId = selectedDataset.id
+    void runMutation(() => deleteDatasetEpisodeApi(datasetId, episodeId), () => {
+      setDeletedEpisodeIds((current) => [...current, episodeKey(datasetId, episodeId)])
+    })
   }
 
-    /** 调用数据集后端接口并同步界面状态。 */
-const createDataset = () => {
+  const setEpisodeStatus = (episodeId: string, status: EpisodeStatus) => {
+    if (!selectedDataset) return
+    const datasetId = selectedDataset.id
+    void runMutation(() => updateDatasetEpisodeApi(datasetId, episodeId, { status }), () => {
+      setEpisodeStatusOverrides((current) => ({ ...current, [episodeKey(datasetId, episodeId)]: status }))
+    })
+  }
+
+  const createDataset = () => {
     const name = `dataset_${Date.now()}`
-    if (!mockMode) {
-      void createDatasetApi(name)
-        .then(() => setRefreshToken((value) => value + 1))
-        .catch((error) => setBackendLoadError(String(error)))
-    }
+    void runMutation(() => createDatasetApi(name))
   }
 
-    /** 调用数据集后端接口并同步界面状态。 */
-const saveReview = () => {
+  const saveReview = () => {
     if (!selectedDataset || mockMode) return
-    void saveDatasetReviewApi(selectedDataset.id)
-      .then(() => setRefreshToken((value) => value + 1))
-      .catch((error) => setBackendLoadError(String(error)))
+    void runMutation(() => saveDatasetReviewApi(selectedDataset.id))
   }
 
     /** 调用数据集后端接口并同步界面状态。 */
@@ -712,24 +728,34 @@ const openHubUpload = () => {
     <div className="view-stack dataset-review-page">
       <section className="page-header">
         <div>
-          <Typography.Title level={2}>数据集质检 Dataset</Typography.Title>
-          <Typography.Text type="secondary">选择数据集和 episode 后同步检查三路视频、双臂轨迹与双力传感器曲线。</Typography.Text>
+          <UiTitle level={2}>数据集质检 Dataset</UiTitle>
+          <UiText secondary>选择数据集和 episode 后同步检查三路视频、双臂轨迹与双力传感器曲线。</UiText>
         </div>
-        <Space wrap>
-          {!mockMode && <Tag color={backendLoadError ? 'error' : 'processing'}>{backendLoadError ? '后端数据异常' : '后端数据'}</Tag>}
-          <Button type="primary" icon={<Database size={16} />} onClick={createDataset}>新建数据集</Button>
-          {hubMessage && <Tag color="success">{hubMessage}</Tag>}
-          <Tag color={hubPushToHub ? 'success' : 'default'}>{hubPushToHub ? 'Hub enabled' : 'Hub disabled'}</Tag>
-          <Button icon={<Upload size={16} />} onClick={openHubUpload} disabled={!selectedDataset}>Hub 上传</Button>
-          <Button icon={<Save size={16} />} onClick={saveReview} disabled={!selectedDataset}>保存审核结果</Button>
-        </Space>
+        <UiSpace wrap>
+          {!mockMode && <UiTag tone={backendLoadError ? 'error' : 'processing'}>{backendLoadError ? '后端数据异常' : '后端数据'}</UiTag>}
+          <UiButton variant="primary" icon={<Database size={16} />} onClick={createDataset} disabled={mutationPending}>新建数据集</UiButton>
+          {hubMessage && <UiTag tone="success">{hubMessage}</UiTag>}
+          <UiTag tone={hubPushToHub ? 'success' : 'muted'}>{hubPushToHub ? 'Hub enabled' : 'Hub disabled'}</UiTag>
+          <UiButton icon={<Upload size={16} />} onClick={openHubUpload} disabled={!selectedDataset}>Hub 上传</UiButton>
+          <UiButton icon={<Save size={16} />} onClick={saveReview} disabled={!selectedDataset || mutationPending}>保存审核结果</UiButton>
+        </UiSpace>
       </section>
+
+      {backendLoadError && (
+        <div role="alert" className="ui-alert ui-alert-error">
+          {backendLoadError}
+          <UiButton disabled={mutationPending} onClick={() => {
+            episodeDetailRequestedKeysRef.current.clear()
+            setRefreshToken((value) => value + 1)
+          }}>重试读取</UiButton>
+        </div>
+      )}
 
       <section className="dataset-review-layout">
         <aside className="dataset-browser panel-surface">
           <div className="section-title">
             <span>数据集</span>
-            <Tag>{datasets.length}</Tag>
+            <UiTag>{datasets.length}</UiTag>
           </div>
           <div className="dataset-list">
             {datasets.map((dataset) => {
@@ -748,8 +774,8 @@ const openHubUpload = () => {
                     <b>{dataset.name}</b>
                     <small>{dataset.episodes.length} 条 · {frames} 帧</small>
                   </span>
-                  <Tag color={dataset.status === '待审核' ? 'warning' : 'processing'}>{dataset.status}</Tag>
-                  <Progress percent={quality} size="small" showInfo={false} strokeColor={qualityTone(quality)} />
+                  <UiTag tone={dataset.status === '待审核' ? 'warning' : 'processing'}>{dataset.status}</UiTag>
+                  <UiProgress percent={quality} status={quality >= 90 ? 'success' : quality >= 80 ? 'active' : 'exception'} />
                 </button>
               )
             })}
@@ -757,18 +783,25 @@ const openHubUpload = () => {
 
           {selectedDataset && (
             <div className="dataset-edit-actions">
-              <Button size="small" icon={<Edit3 size={14} />} onClick={() => setRenameTarget({ type: 'dataset', id: selectedDataset.id, value: selectedDataset.name })}>
+              <UiButton disabled={mutationPending} icon={<Edit3 size={14} />} onClick={() => setRenameTarget({ type: 'dataset', id: selectedDataset.id, value: selectedDataset.name })}>
                 重命名
-              </Button>
-              <Popconfirm title="删除该数据集？" okText="删除" cancelText="取消" onConfirm={() => deleteDataset(selectedDataset.id)}>
-                <Button size="small" danger icon={<Trash2 size={14} />}>删除</Button>
-              </Popconfirm>
+              </UiButton>
+              <UiButton
+                danger
+                disabled={mutationPending}
+                icon={<Trash2 size={14} />}
+                onClick={() => {
+                  if (window.confirm('删除该数据集？')) deleteDataset(selectedDataset.id)
+                }}
+              >
+                删除
+              </UiButton>
             </div>
           )}
 
           <div className="section-title dataset-episode-title">
             <span>Episode</span>
-            <Tag>{selectedDataset?.episodes.length ?? 0}</Tag>
+            <UiTag>{selectedDataset?.episodes.length ?? 0}</UiTag>
           </div>
           <div className="episode-list">
             {selectedDataset?.episodes.map((episode) => (
@@ -791,40 +824,47 @@ const openHubUpload = () => {
         <main className="dataset-inspector">
           {!selectedDataset || !selectedEpisode ? (
             <section className="panel-surface">
-              <Empty description="请选择数据集和 episode" />
+              <div className="empty">请选择数据集和 episode</div>
             </section>
           ) : (
             <>
               <section className="panel-surface dataset-summary-strip">
                 <div>
-                  <Typography.Title level={3}>{selectedDataset.name}</Typography.Title>
-                  <Typography.Text type="secondary">{selectedEpisode.name} · {selectedEpisode.createdAt}</Typography.Text>
+                  <UiTitle level={3}>{selectedDataset.name}</UiTitle>
+                  <UiText secondary>{selectedEpisode.name} · {selectedEpisode.createdAt}</UiText>
                 </div>
                 <div className="dataset-summary-metrics">
                   <span><small>平均质量</small><b>{avgQuality}%</b></span>
                   <span><small>有效条数</small><b>{validEpisodes}/{selectedDataset.episodes.length}</b></span>
                   <span><small>当前帧</small><b>{frameIndex + 1}/{selectedEpisode.frames}</b></span>
                 </div>
-                <Space wrap>
-                  <Button size="small" icon={<Edit3 size={14} />} onClick={() => setRenameTarget({ type: 'episode', id: selectedEpisode.id, value: selectedEpisode.name })}>
+                <UiSpace wrap>
+                  <UiButton disabled={mutationPending} icon={<Edit3 size={14} />} onClick={() => setRenameTarget({ type: 'episode', datasetId: selectedDataset.id, id: selectedEpisode.id, value: selectedEpisode.name })}>
                     重命名本条
-                  </Button>
-                  <Button size="small" icon={<CheckCircle2 size={14} />} onClick={() => setEpisodeStatus(selectedEpisode.id, 'valid')}>
+                  </UiButton>
+                  <UiButton disabled={mutationPending} icon={<CheckCircle2 size={14} />} onClick={() => setEpisodeStatus(selectedEpisode.id, 'valid')}>
                     标记有效
-                  </Button>
-                  <Button size="small" icon={<XCircle size={14} />} onClick={() => setEpisodeStatus(selectedEpisode.id, 'invalid')}>
+                  </UiButton>
+                  <UiButton disabled={mutationPending} icon={<XCircle size={14} />} onClick={() => setEpisodeStatus(selectedEpisode.id, 'invalid')}>
                     标记无效
-                  </Button>
-                  <Popconfirm title="删除该条数据？" okText="删除" cancelText="取消" onConfirm={() => deleteEpisode(selectedEpisode.id)}>
-                    <Button size="small" danger icon={<Trash2 size={14} />}>删除本条</Button>
-                  </Popconfirm>
-                </Space>
+                  </UiButton>
+                  <UiButton
+                    danger
+                    disabled={mutationPending}
+                    icon={<Trash2 size={14} />}
+                    onClick={() => {
+                      if (window.confirm('删除该条数据？')) deleteEpisode(selectedEpisode.id)
+                    }}
+                  >
+                    删除本条
+                  </UiButton>
+                </UiSpace>
               </section>
 
               <section className="panel-surface dataset-live-preview-strip">
                 <div className="section-title">
                   <span>实时相机预览</span>
-                  <Tag color="processing">Live</Tag>
+                  <UiTag tone="processing">Live</UiTag>
                 </div>
                 <div className="dataset-live-preview-grid">
                   {livePreviewCameras.map((camera) => (
@@ -836,12 +876,12 @@ const openHubUpload = () => {
               <section className="panel-surface dataset-quality-workbench">
                 <div className="section-title">
                   <span>同步视频检查</span>
-                  <Space size={6} wrap>
+                  <UiSpace size={6} wrap>
                     {statusTag(selectedEpisode.status)}
-                    <Tag>{featureShapeText(selectedEpisode.featureSummary ?? selectedDataset.featureSummary)}</Tag>
-                    <Tag>Fmax L/R {(selectedEpisode.maxForceLeft ?? 0).toFixed(2)} / {(selectedEpisode.maxForceRight ?? 0).toFixed(2)}</Tag>
-                    <Tag color={selectedEpisode.quality >= 85 ? 'success' : 'warning'}>质量 {selectedEpisode.quality}%</Tag>
-                  </Space>
+                    <UiTag>{featureShapeText(selectedEpisode.featureSummary ?? selectedDataset.featureSummary)}</UiTag>
+                    <UiTag>Fmax L/R {(selectedEpisode.maxForceLeft ?? 0).toFixed(2)} / {(selectedEpisode.maxForceRight ?? 0).toFixed(2)}</UiTag>
+                    <UiTag tone={selectedEpisode.quality >= 85 ? 'success' : 'warning'}>质量 {selectedEpisode.quality}%</UiTag>
+                  </UiSpace>
                 </div>
                 <div className="dataset-cockpit-grid">
                   <div className="dataset-video-grid">
@@ -857,36 +897,35 @@ const openHubUpload = () => {
                   </section>
                 </div>
                 <div className="dataset-player-controls">
-                  <Button icon={playing ? <Pause size={15} /> : <Play size={15} />} onClick={() => setPlaying((value) => !value)}>
+                  <UiButton icon={playing ? <Pause size={15} /> : <Play size={15} />} onClick={() => setPlaying((value) => !value)}>
                     {playing ? '暂停' : '播放'}
-                  </Button>
-                  <Button icon={<Rewind size={15} />} onClick={() => setFrameIndex((value) => clampFrame(value - 30, selectedEpisode.frames))}>
+                  </UiButton>
+                  <UiButton icon={<Rewind size={15} />} onClick={() => setFrameIndex((value) => clampFrame(value - 30, selectedEpisode.frames))}>
                     回退
-                  </Button>
-                  <Button icon={<FastForward size={15} />} onClick={() => setFrameIndex((value) => clampFrame(value + 30, selectedEpisode.frames))}>
+                  </UiButton>
+                  <UiButton icon={<FastForward size={15} />} onClick={() => setFrameIndex((value) => clampFrame(value + 30, selectedEpisode.frames))}>
                     快进
-                  </Button>
-                  <Segmented
-                    size="small"
-                    value={playbackRate}
+                  </UiButton>
+                  <UiSegmented
+                    value={String(playbackRate)}
                     onChange={(value) => setPlaybackRate(Number(value))}
                     options={[
-                      { label: 'x1', value: 1 },
-                      { label: 'x2', value: 2 },
-                      { label: 'x4', value: 4 },
+                      { label: 'x1', value: '1' },
+                      { label: 'x2', value: '2' },
+                      { label: 'x4', value: '4' },
                     ]}
                   />
-                  <Slider
+                  <input
+                    type="range"
                     className="dataset-frame-slider"
                     min={0}
                     max={selectedEpisode.frames - 1}
                     value={frameIndex}
-                    onChange={(value) => setFrameIndex(clampFrame(value, selectedEpisode.frames))}
-                    tooltip={{ formatter: (value) => `Frame ${Number(value ?? 0) + 1}` }}
+                    onChange={(event) => setFrameIndex(clampFrame(Number(event.target.value), selectedEpisode.frames))}
                   />
-                  <Typography.Text type="secondary">
+                  <UiText secondary>
                     {(frameIndex / selectedEpisode.fps).toFixed(2)}s / {selectedEpisode.durationS.toFixed(2)}s
-                  </Typography.Text>
+                  </UiText>
                 </div>
               </section>
 
@@ -909,75 +948,101 @@ const openHubUpload = () => {
         </main>
       </section>
 
-      <Modal
-        title="Hugging Face Hub 上传"
-        open={hubUploadOpen}
-        onCancel={() => {
-          setHubToken('')
-          setHubUploadOpen(false)
-        }}
-        onOk={uploadToHub}
-        okText="开始上传"
-        cancelText="取消"
-        confirmLoading={hubUploading}
-        okButtonProps={{ disabled: !hubRepoId.trim() || (!hubDryRun && !hubPushToHub) }}
-      >
-        <Form layout="vertical">
-          <Form.Item label="上传开关">
-            <Switch
-              aria-label="Hub 上传开关"
-              checked={hubPushToHub}
-              checkedChildren="On"
-              unCheckedChildren="Off"
-              onChange={updateHubSwitch}
-            />
-          </Form.Item>
-          <Form.Item label="Repo ID">
-            <Input
-              value={hubRepoId}
-              placeholder="org/dataset-name"
-              onChange={(event) => setHubRepoId(event.target.value)}
-            />
-          </Form.Item>
-          <Form.Item label="Local path">
-            <Input
-              aria-label="Local path"
-              value={hubLocalPath}
-              placeholder="E:\\data group\\text50"
-              onChange={(event) => setHubLocalPath(event.target.value)}
-            />
-          </Form.Item>
-          <Form.Item label="HF Token">
-            <Input.Password
-              value={hubToken}
-              placeholder="hf_xxx"
-              autoComplete="off"
-              onChange={(event) => setHubToken(event.target.value)}
-            />
-          </Form.Item>
-          <Space wrap>
-            <Checkbox checked={hubPrivate} onChange={(event) => setHubPrivate(event.target.checked)}>Private</Checkbox>
-            <Checkbox checked={hubDryRun} onChange={(event) => setHubDryRun(event.target.checked)}>Dry-run</Checkbox>
-          </Space>
-          {!hubDryRun && !hubPushToHub && (
-            <Typography.Text type="warning">关闭 Dry-run 前需要先打开 Hub 上传开关。</Typography.Text>
-          )}
-        </Form>
-      </Modal>
+      {hubUploadOpen && (
+        <div className="ui-modal-mask" role="presentation" onClick={() => { setHubToken(''); setHubUploadOpen(false) }}>
+          <div className="ui-modal" role="dialog" aria-label="Hugging Face Hub 上传" onClick={(event) => event.stopPropagation()}>
+            <header className="ui-modal-head"><strong>Hugging Face Hub 上传</strong></header>
+            <div className="ui-modal-body">
+              <label style={{ display: 'block', marginBottom: 10 }}>
+                <span style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#7a8b9c', marginBottom: 4 }}>上传开关</span>
+                <label className="ui-switch">
+                  <input
+                    aria-label="Hub 上传开关"
+                    type="checkbox"
+                    checked={hubPushToHub}
+                    onChange={(event) => updateHubSwitch(event.target.checked)}
+                  />
+                  <span />
+                </label>
+              </label>
+              <label style={{ display: 'block', marginBottom: 10 }}>
+                <span style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#7a8b9c', marginBottom: 4 }}>Repo ID</span>
+                <input
+                  className="ui-input"
+                  style={{ width: '100%' }}
+                  value={hubRepoId}
+                  placeholder="org/dataset-name"
+                  onChange={(event) => setHubRepoId(event.target.value)}
+                />
+              </label>
+              <label style={{ display: 'block', marginBottom: 10 }}>
+                <span style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#7a8b9c', marginBottom: 4 }}>Local path</span>
+                <input
+                  className="ui-input"
+                  style={{ width: '100%' }}
+                  aria-label="Local path"
+                  value={hubLocalPath}
+                  placeholder="E:\\data group\\text50"
+                  onChange={(event) => setHubLocalPath(event.target.value)}
+                />
+              </label>
+              <label style={{ display: 'block', marginBottom: 10 }}>
+                <span style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#7a8b9c', marginBottom: 4 }}>HF Token</span>
+                <input
+                  type="password"
+                  className="ui-input"
+                  style={{ width: '100%' }}
+                  value={hubToken}
+                  placeholder="hf_xxx"
+                  autoComplete="off"
+                  onChange={(event) => setHubToken(event.target.value)}
+                />
+              </label>
+              <UiSpace wrap>
+                <label className="ui-checkbox"><input type="checkbox" checked={hubPrivate} onChange={(event) => setHubPrivate(event.target.checked)} />Private</label>
+                <label className="ui-checkbox"><input type="checkbox" checked={hubDryRun} onChange={(event) => setHubDryRun(event.target.checked)} />Dry-run</label>
+              </UiSpace>
+              {!hubDryRun && !hubPushToHub && (
+                <UiTag tone="warning">关闭 Dry-run 前需要先打开 Hub 上传开关。</UiTag>
+              )}
+            </div>
+            <div className="ui-modal-actions">
+              <UiButton onClick={() => { setHubToken(''); setHubUploadOpen(false) }}>取消</UiButton>
+              <UiButton
+                variant="primary"
+                loading={hubUploading}
+                disabled={!hubRepoId.trim() || (!hubDryRun && !hubPushToHub)}
+                onClick={uploadToHub}
+              >
+                开始上传
+              </UiButton>
+            </div>
+          </div>
+        </div>
+      )}
 
-      <Modal
-        title={renameTarget?.type === 'dataset' ? '重命名数据集' : '重命名 Episode'}
-        open={Boolean(renameTarget)}
-        onCancel={() => setRenameTarget(null)}
-        onOk={commitRename}
-        okText="保存"
-        cancelText="取消"
-      >
-        <Input
-          value={renameTarget?.value ?? ''}
-          onChange={(event) => setRenameTarget((current) => current ? { ...current, value: event.target.value } : current)}
-        />
-      </Modal>
+      {renameTarget && (
+        <div className="ui-modal-mask" role="presentation" onClick={() => { if (!mutationPending) setRenameTarget(null) }}>
+          <div className="ui-modal" role="dialog" aria-label="重命名" onClick={(event) => event.stopPropagation()}>
+            <header className="ui-modal-head">
+              <strong>{renameTarget.type === 'dataset' ? '重命名数据集' : '重命名 Episode'}</strong>
+            </header>
+            <div className="ui-modal-body">
+              <input
+                className="ui-input"
+                style={{ width: '100%' }}
+                disabled={mutationPending}
+                value={renameTarget.value}
+                onChange={(event) => setRenameTarget((current) => current ? { ...current, value: event.target.value } : current)}
+              />
+            </div>
+            <div className="ui-modal-actions">
+              <UiButton disabled={mutationPending} onClick={() => setRenameTarget(null)}>取消</UiButton>
+              <UiButton variant="primary" loading={mutationPending} onClick={commitRename}>保存</UiButton>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

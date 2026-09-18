@@ -1,9 +1,15 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：提供本机 HTTP 健康探测入口；当前业务控制通过 DDS。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #endif
 
 #include "HalHttpServer.h"
+#include "HttpConnectionWorkers.h"
 
 #include "HalJson.h"
 
@@ -75,7 +81,10 @@ void serveConnection(
     SOCKET client,
     HalCommandDispatcher& commandDispatcher) {
   DWORD recvTimeoutMs = 30000;
-  setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recvTimeoutMs), sizeof(recvTimeoutMs));
+  if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recvTimeoutMs), sizeof(recvTimeoutMs)) == SOCKET_ERROR
+      || setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&recvTimeoutMs), sizeof(recvTimeoutMs)) == SOCKET_ERROR) {
+    throw std::runtime_error("HTTP socket timeout configuration failed");
+  }
   BOOL nodelay = TRUE;
   setsockopt(client, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
 
@@ -117,7 +126,6 @@ void serveConnection(
       break;
     }
   }
-  closesocket(client);
 }
 #endif
 
@@ -148,18 +156,28 @@ int runHalHttpServer(
   }
 
   std::cout << "HalServer listening on http://127.0.0.1:" << halPort << "\n";
+  HttpConnectionWorkers<32> connections;
   while (true) {
     SOCKET client = accept(server, nullptr, nullptr);
     if (client == INVALID_SOCKET) {
       continue;
     }
-    std::thread([client, &commandDispatcher]() {
-      try {
+    try {
+      const bool accepted = connections.tryStart([client, &commandDispatcher]() {
+        struct CloseClient {
+          SOCKET socket;
+          ~CloseClient() { closesocket(socket); }
+        } cleanup{client};
         serveConnection(client, commandDispatcher);
-      } catch (...) {
-        closesocket(client);
-      }
-    }).detach();
+      });
+      if (!accepted) closesocket(client);
+    } catch (const std::exception& error) {
+      closesocket(client);
+      std::fprintf(stderr, "HAL HTTP worker could not start: %s\n", error.what());
+    } catch (...) {
+      closesocket(client);
+      std::fputs("HAL HTTP worker could not start: unknown C++ exception\n", stderr);
+    }
   }
 #else
   std::cerr << "HalServer currently supports Windows Winsock only.\n";

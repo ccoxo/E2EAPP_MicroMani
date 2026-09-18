@@ -1,8 +1,15 @@
+# 阅读导航 05｜DDS 传输
+# 职责：定义 HAL 抽象接口及测试实现，并保留 HTTP 客户端类；实际 real 模式由 app 选择 DDS。
+# 先看：HalHealth → HalClient → TestHalClient → RealHalClient。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import asyncio
 import http.client
 import json
+import math
+from collections.abc import Callable
 import socket
 import threading
 import time
@@ -23,6 +30,7 @@ class HalHealth:
     connected: bool = True
     mode: str = "real"
     message: str | None = None
+    capabilities: list[str] | None = None
 
 
 class HalClient:
@@ -43,10 +51,21 @@ class HalClient:
 
 
 class TestHalClient(HalClient):
-    def __init__(self, logs: LogService) -> None:
+    def __init__(self, logs: LogService, *, clock: Callable[[], float] = time.monotonic) -> None:
         self.logs = logs
         self.uptime_s = 0.0
         self.motion_enabled = {"left": False, "right": False}
+        self._clock = clock
+        self._lease_until = 0.0
+        self._lease_owner = ""
+        self._lease_sequence = 0
+        self._estop = True
+        self._pulses = [0.0] * 12
+
+    def _poll_lease(self) -> None:
+        if self._clock() >= self._lease_until:
+            self._estop = True
+            self.motion_enabled = {"left": False, "right": False}
 
     async def health(self) -> HalHealth:
         # 测试 HAL 保持接口可用，但明确标记硬件 SDK 未加载。
@@ -63,30 +82,66 @@ class TestHalClient(HalClient):
 
     async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         # 本地演示模式只记录命令，不把任何动作发往真实硬件。
+        self._poll_lease()
+        payload = payload or {}
+        if name == "control.lease":
+            owner, sequence = payload.get("sessionId"), payload.get("sequence")
+            if not isinstance(owner, str) or not owner or len(owner) > 64 or type(sequence) is not int or sequence <= 0 or payload.get("timeoutMs") != 2500:
+                raise RuntimeError("invalid control lease")
+            if owner == self._lease_owner and sequence <= self._lease_sequence:
+                raise RuntimeError("control lease replay rejected")
+            if owner != self._lease_owner and self._lease_owner and self._clock() < self._lease_until:
+                raise RuntimeError("control lease already has a live owner")
+            self._lease_owner, self._lease_sequence = owner, sequence
+            self._lease_until = self._clock() + 2.5
+            return {"mode": "test", "command": name, "response": {
+                "ok": True, "leaseFresh": True, "timeoutMs": 2500,
+            }}
+        safe = name in {"motion.emergency_stop", "motion.disable_side", "motion.teleop_stop_side",
+                        "teleop.native.stop", "omega7.zero_force_feedback", "hal.reconnect", "teleop.native.status"}
+        safe = safe or (name == "omega7.gravity_compensation" and payload.get("leftEnabled") is False and payload.get("rightEnabled") is False)
+        if not safe:
+            if self._clock() >= self._lease_until:
+                raise RuntimeError("control lease unavailable")
+            if name == "motion.acknowledge_estop":
+                self._estop = False
+            elif self._estop:
+                raise RuntimeError("emergency stop active")
+        for key in ("step", "maxVelocityUiPerSec"):
+            if key in payload and not math.isfinite(float(payload[key])):
+                raise RuntimeError(f"{key} must be finite")
         if name == "motion.enable_side":
             side = str((payload or {}).get("side", ""))
             if side in self.motion_enabled:
                 self.motion_enabled[side] = True
+        if name == "motion.home_all":
+            self._pulses = list(payload["leftPulse"]) + list(payload["rightPulse"])
+        if name == "motion.home_origin_side":
+            offset = 0 if payload["side"] == "left" else 6
+            self._pulses[offset:offset + 6] = list(payload["pulse"])
         if name == "motion.disable_side":
             side = str((payload or {}).get("side", ""))
             if side in self.motion_enabled:
                 self.motion_enabled[side] = False
         if name == "motion.emergency_stop":
+            self._estop = True
             self.motion_enabled["left"] = False
             self.motion_enabled["right"] = False
         self.logs.info("[HAL]", f"{name} accepted by TestHalClient")
         return {"mode": "test", "command": name, "payload": payload or {}}
 
     async def motion_state(self) -> dict[str, Any]:
+        self._poll_lease()
         now_unix_ms = int(time.time() * 1000)
         now_monotonic_ms = int(time.monotonic() * 1000)
         return {
             "timestamp_ms": now_unix_ms,
             "received_timestamp_ms": now_unix_ms,
             "received_monotonic_ms": now_monotonic_ms,
-            "estop_active": False,
+            "estop_active": self._estop,
+            "moving": [False] * 12,
             "positions": [0.0] * 12,
-            "pulses": [0.0] * 12,
+            "pulses": list(self._pulses),
             "enabled": [self.motion_enabled["left"]] * 6 + [self.motion_enabled["right"]] * 6,
         }
 
@@ -192,6 +247,11 @@ class RealHalClient(HalClient):
             connected=True,
             mode="real",
             message=payload.get("message") if isinstance(payload.get("message"), str) else None,
+            capabilities=(
+                [str(value) for value in payload["capabilities"]]
+                if isinstance(payload.get("capabilities"), list)
+                else None
+            ),
         )
 
     async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:

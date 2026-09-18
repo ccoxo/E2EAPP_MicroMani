@@ -1,3 +1,7 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：请求 HAL /health 并报告端口所属进程和驱动健康状态。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 param(
   [int]$Port = 8091
 )

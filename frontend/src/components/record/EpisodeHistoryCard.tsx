@@ -1,9 +1,15 @@
-import { Button, Card, Tag } from 'antd'
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：合并后端历史与本次会话记录，去重后按时间展示近期 episode。
+ * 先看：RecentEpisode → episodeIndex → backendStatus → EpisodeHistoryCard。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { fetchDatasets } from '../../api'
 import { useTelemetryStore } from '../../stores/telemetry'
 import type { DatasetApi, DatasetEpisodeStatusApi } from '../../types'
+import { UiButton, UiCard, UiTag } from '../ui'
 
 interface RecentEpisode {
   key: string
@@ -21,9 +27,9 @@ function episodeIndex(id: string) {
 }
 
 function backendStatus(status: DatasetEpisodeStatusApi) {
-  if (status === 'valid') return { label: '有效', color: 'success' }
-  if (status === 'review') return { label: '待复核', color: 'warning' }
-  return { label: '无效', color: 'error' }
+  if (status === 'valid') return { label: '有效', color: 'success' as const }
+  if (status === 'review') return { label: '待复核', color: 'warning' as const }
+  return { label: '无效', color: 'error' as const }
 }
 
 /** 渲染当前界面单元，并连接所需数据。 */
@@ -91,13 +97,12 @@ export default function EpisodeHistoryCard() {
       : '暂无录制记录'
 
   return (
-    <Card
+    <UiCard
       title="录制历史"
-      size="small"
       extra={
-        <Button type="link" size="small" onClick={() => void navigate('/dataset')}>
+        <UiButton variant="text" onClick={() => void navigate('/dataset')}>
           查看全部 -&gt;
-        </Button>
+        </UiButton>
       }
     >
       {recent.length === 0 ? (
@@ -123,12 +128,12 @@ export default function EpisodeHistoryCard() {
               <span style={{ overflow: 'hidden', fontSize: 11, color: '#8c8c8c', fontFamily: 'monospace', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {ep.frameCount} 帧 / {ep.durationS.toFixed(1)}s
               </span>
-              <Tag
-                color={ep.statusColor}
+              <UiTag
+                tone={ep.statusColor as 'success' | 'warning' | 'error' | 'muted'}
                 style={{ fontSize: 10, padding: '0 4px', margin: 0 }}
               >
                 {ep.statusLabel}
-              </Tag>
+              </UiTag>
             </div>
           ))}
           {loadFailed && (
@@ -138,6 +143,6 @@ export default function EpisodeHistoryCard() {
           )}
         </div>
       )}
-    </Card>
+    </UiCard>
   )
 }

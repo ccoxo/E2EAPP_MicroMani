@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 02｜前端契约与状态
+ * 职责：集中声明配置、遥测、录制、诊断与页面状态类型；与后端 schemas 对照阅读。
+ * 先看：ConnectionState → TelemetryLinkState → TelemetryLinkStatus → LogLevel。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 export type ConnectionState = 'ok' | 'warn' | 'error' | 'checking' | 'pending'
 
 export type TelemetryLinkState = 'connecting' | 'live' | 'stale' | 'offline'
@@ -291,11 +297,6 @@ export interface MotionRelativeSoftLimitsConfig {
   right: ArmSoftLimitConfig
 }
 
-export interface MotionStartupHomeConfig {
-  enabled: boolean
-  mode: 'work_origin'
-}
-
 export type ManualControlSide = 'left' | 'right'
 export type ManualControlAxis = 'X' | 'Y' | 'Z' | 'Roll' | 'Pitch' | 'Yaw'
 export type ManualSpeedMode = 'fine' | 'medium' | 'coarse'
@@ -305,7 +306,7 @@ export type PicoVisionRotation = 'none' | 'cw90' | 'ccw90' | '180'
 export type Omega7StabilityMode = 'track' | 'hold' | 'off'
 export type TeleopControlMode = 'velocity_admittance' | 'incremental_position'
 
-export type RecorderPhase = 'idle' | 'starting' | 'recording' | 'reviewing' | 'resetting' | 'saving' | 'finishing'
+export type RecorderPhase = 'idle' | 'starting' | 'recording' | 'interrupted' | 'reviewing' | 'resetting' | 'saving' | 'finishing'
 
 export interface EpisodeRecord {
   index: number
@@ -558,7 +559,6 @@ export interface AppConfig {
     homeReference: MotionHomeReferenceConfig
     workOriginOffset: MotionWorkOriginOffsetConfig
     relativeSoftLimits: MotionRelativeSoftLimitsConfig
-    homeOnStartup: MotionStartupHomeConfig
     leftProfile: ArmMotionProfile
     rightProfile: ArmMotionProfile
     leftSoftLimits: ArmSoftLimitConfig

@@ -1,3 +1,8 @@
+# 阅读导航 03｜后端契约与配置
+# 职责：校验 HKVL 串口、六轴方向、安全阈值与柔顺参数，并转换为 HAL 的扁平配置。
+# 先看：validate_force_config → hal_force_config_payload。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import math
@@ -50,7 +55,7 @@ def _force_axis_signs(config: dict[str, Any]) -> dict[str, list[float]]:
 def validate_force_config(config: dict[str, Any]) -> None:
     force = _mapping(config.get("force"), "force")
     safety = _mapping(config.get("safety"), "safety")
-    source = str(force.get("source", "nidaq")).lower()
+    source = str(force.get("source", "hkvl_serial")).lower()
     if source not in {"nidaq", "hkvl_serial"}:
         raise ValueError("force.source must be nidaq or hkvl_serial")
 
@@ -119,6 +124,7 @@ def hal_force_config_payload(config: dict[str, Any]) -> dict[str, Any]:
     left_port = str(serial["leftPort"])
     right_port = str(serial["rightPort"])
     if source == "hkvl_serial":
+        # 启动脚本按设备 PnP 身份解析的实际 COM 口通过环境变量覆盖配置值，避免 USB 重枚举后左右错接。
         left_port = os.getenv("APPSTATION_HKVL_LEFT_PORT", left_port).strip().upper()
         right_port = os.getenv("APPSTATION_HKVL_RIGHT_PORT", right_port).strip().upper()
         if not left_port or not right_port or left_port == right_port:

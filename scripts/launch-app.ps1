@@ -1,3 +1,8 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：启动或复用本地应用服务，检测健康状态，打开浏览器并收集启动失败诊断。
+# 先看：Find-Browser → Wait-HttpOk → Test-HttpOk → Get-RecordStatus。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 param(
   [int]$BackendPort = 18082,
   [int]$FrontendPort = 5174,

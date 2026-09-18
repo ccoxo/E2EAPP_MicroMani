@@ -1,3 +1,8 @@
+# 阅读导航 03｜后端契约与配置
+# 职责：读取、迁移、校验与原子保存运行配置；管理参数快照和工作原点迁移。
+# 先看：SettingsService → reanchor_motion_soft_limits_to_current_origin。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import json
@@ -490,6 +495,8 @@ class SettingsService:
         if isinstance(config, dict):
             _normalize_right_pitch_window(config)
             raw_motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+            # 兼容旧配置/快照，但不再保存已移除的开机自动运动设置。
+            raw_motion.pop("homeOnStartup", None)
             _ensure_home_reference_model(
                 config,
                 isinstance(raw_motion, dict)
@@ -713,7 +720,10 @@ class SettingsService:
                 return result
             return current if current is not None else default
 
-        return cast(dict[str, Any], merge(default_config(), data))
+        merged = cast(dict[str, Any], merge(default_config(), data))
+        if isinstance(merged.get("motion"), dict):
+            merged["motion"].pop("homeOnStartup", None)
+        return merged
 
     def _migrate_config(
         self,
@@ -915,6 +925,11 @@ class SettingsService:
                 teleop["syncImpulseCoeffFromKinematics"] = False
         cameras = config.get("cameras", {})
         if isinstance(cameras, dict):
+            # 新绑定的稳定身份优先于历史 index 标签，重载时不能被默认迁移覆盖。
+            has_explicit_camera_identity = any(
+                cameras.get(key) and cameras[key] != ICF_CAMERA_DEFAULTS[key]
+                for key in ("globalIdentity", "wristLeftIdentity", "wristRightIdentity")
+            )
             has_legacy_reversed_wrist_cameras = (
                 cameras.get("global") == "AR0234 / index 2"
                 and cameras.get("wristLeft") == "IMX258 / index 1"
@@ -935,7 +950,7 @@ class SettingsService:
                 and cameras.get("wristLeft") == "IMX335 / index 2"
                 and cameras.get("wristRight") == "IMX335 / index 0"
             )
-            if (
+            if not has_explicit_camera_identity and (
                 has_legacy_reversed_wrist_cameras
                 or has_legacy_cyclic_camera_roles
                 or has_previous_imx258_camera_defaults

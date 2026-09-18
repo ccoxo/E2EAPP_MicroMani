@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：聚合相机、NI-DAQ、夹爪与 PICO 的 Python 驱动实例，并提供硬件状态查询。
+# 先看：HardwareService。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from typing import Any
@@ -22,7 +27,7 @@ class HardwareService:
     def status(self, *, include_gripper: bool = True) -> dict[str, Any]:
         config = self.settings.get_config()
         camera = self.cameras.probe(config)
-        force_source = str(config.get("force", {}).get("source", "nidaq")).lower()
+        force_source = str(config.get("force", {}).get("source", "hkvl_serial")).lower()
         force = self.force.probe(config) if force_source == "nidaq" else None
         gripper = self.gripper.probe(config) if include_gripper else None
         pico = self.pico.status(config)

@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：装配录制页面：相机、控制、遥测、预检查、质量报告和历史记录。
+ * 先看：RecordPage。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { useCallback, useEffect, useState } from 'react'
 import CameraPanel from '../components/record/CameraPanel'
 import EpisodeControlPanel from '../components/record/EpisodeControlPanel'
@@ -49,18 +55,18 @@ export default function RecordPage() {
         case ' ':
         case 'ArrowRight':
           e.preventDefault()
-          if (phase === 'recording') handleSave()
+          if (phase === 'recording' || phase === 'interrupted') handleSave()
           if (phase === 'resetting') handleSkipReset()
           break
 
         case 'ArrowLeft':
           e.preventDefault()
-          if (phase === 'recording') handleDiscard()
+          if (phase === 'recording' || phase === 'interrupted') handleDiscard()
           break
 
         case 'Escape':
           e.preventDefault()
-          if (phase === 'recording' || phase === 'resetting') handleStopSession()
+          if (phase === 'recording' || phase === 'interrupted' || phase === 'resetting') handleStopSession()
           break
 
         case 'Control':

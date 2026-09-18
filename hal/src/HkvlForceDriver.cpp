@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：管理双侧 HKVL 串口读取、协议解析、去皮、滤波与采样回调。
+ * 先看：HkvlForceDriver → SideState → HkvlForceDriver::start → HkvlForceDriver::stop。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "HkvlForceDriver.h"
 
 #include "HkvlForceProtocol.h"
@@ -55,6 +61,8 @@ struct HkvlForceDriver::Impl {
     HkvlForceParserStats parserStats{};
     std::string error;
     bool tarePending{false};
+    bool tareCancelled{false};
+    TareCommitCallback tareCommit;
     int tareRemaining{0};
     int tareRequested{0};
     std::array<double, 6> tareSum{};
@@ -62,9 +70,40 @@ struct HkvlForceDriver::Impl {
 
   HkvlSerialConfig config;
   SampleCallback callback;
+  FailureCallback failureCallback;
+  ReadLoop readLoop;
+  WorkerLauncher launcher;
   std::array<SideState, 2> sides;
   std::array<std::thread, 2> workers;
+  std::mutex tareMutex;
+  std::recursive_mutex lifecycleMutex;
   std::atomic<bool> running{false};
+  std::atomic_bool failed{false};
+
+  void requestStop() noexcept {
+    running.store(false, std::memory_order_release);
+    for (auto& state : sides) state.tareCondition.notify_all();
+  }
+
+  void reportFailure(int side, const char* message) noexcept {
+    failed.store(true);
+    requestStop();
+    // 不持有串口状态锁调用安全层，避免与快照/去皮的锁顺序相反。
+    try { if (failureCallback) failureCallback(side, message); }
+    catch (...) { std::fputs("HKVL failure callback threw an exception\n", stderr); }
+    std::fprintf(stderr, "HKVL reader %d stopped: %s\n", side, message);
+    for (int index = 0; index < 2; ++index) {
+      try {
+        auto& state = sides[index];
+        std::scoped_lock lock(state.mutex);
+        state.connected = false;
+        state.tarePending = false;
+        state.tareCancelled = true;
+        state.error = message;
+        state.tareCondition.notify_all();
+      } catch (...) { std::fputs("HKVL worker diagnostic update failed\n", stderr); }
+    }
+  }
 
   void resetSide(int side, const std::string& port) {
     auto& state = sides[side];
@@ -86,6 +125,8 @@ struct HkvlForceDriver::Impl {
     state.parserStats = {};
     state.error.clear();
     state.tarePending = false;
+    state.tareCancelled = false;
+    state.tareCommit = {};
     state.tareRemaining = 0;
     state.tareRequested = 0;
     state.tareSum = {};
@@ -132,16 +173,6 @@ struct HkvlForceDriver::Impl {
           state.tareSum[axis] += frame.values[axis];
         }
         --state.tareRemaining;
-        if (state.tareRemaining <= 0) {
-          for (std::size_t axis = 0; axis < state.tareBias.size(); ++axis) {
-            state.tareBias[axis] =
-                state.tareSum[axis] / static_cast<double>(state.tareRequested);
-          }
-          state.filterInitialized = false;
-          state.previousFilterMonotonicMs = 0.0;
-          state.tarePending = false;
-          state.tareCondition.notify_all();
-        }
       }
 
       for (std::size_t axis = 0; axis < state.tared.size(); ++axis) {
@@ -180,6 +211,26 @@ struct HkvlForceDriver::Impl {
 
     if (callback) {
       callback(sample);
+    }
+    // 最后一帧仍使用旧偏置接受力安全检查，通过后才允许提交新零点。
+    {
+      std::scoped_lock lock(state.mutex);
+      if (state.tarePending && state.tareRemaining <= 0) {
+        const auto commit = [&]() {
+          for (std::size_t axis = 0; axis < state.tareBias.size(); ++axis) {
+            state.tareBias[axis] = state.tareSum[axis] / static_cast<double>(state.tareRequested);
+          }
+          state.filterInitialized = false;
+          state.previousFilterMonotonicMs = 0.0;
+        };
+        if (state.tareCommit) {
+          state.tareCancelled = !state.tareCommit(commit);
+        } else {
+          commit();
+        }
+        state.tarePending = false;
+        state.tareCondition.notify_all();
+      }
     }
   }
 
@@ -259,6 +310,10 @@ struct HkvlForceDriver::Impl {
         }
         continue;
       }
+      struct ClosePort {
+        HANDLE handle;
+        ~ClosePort() { CloseHandle(handle); }
+      } closePort{handle};
       updateConnection(side, true, "");
       std::array<std::uint8_t, 4096> buffer{};
       while (running.load(std::memory_order_acquire)) {
@@ -279,17 +334,19 @@ struct HkvlForceDriver::Impl {
           processBytes(side, buffer.data(), bytesRead);
         }
       }
-      CloseHandle(handle);
     }
 #else
     updateConnection(side, false, "HKVL serial driver requires Windows");
 #endif
-    updateConnection(side, false, running ? "serial reader stopped unexpectedly" : "");
+    if (!failed.load()) updateConnection(side, false, running ? "serial reader stopped unexpectedly" : "");
   }
 };
 
-HkvlForceDriver::HkvlForceDriver()
-    : impl_(std::make_unique<Impl>()) {}
+HkvlForceDriver::HkvlForceDriver(ReadLoop readLoop, WorkerLauncher launcher)
+    : impl_(std::make_unique<Impl>()) {
+  impl_->readLoop = std::move(readLoop);
+  impl_->launcher = std::move(launcher);
+}
 
 HkvlForceDriver::~HkvlForceDriver() {
   stop();
@@ -297,20 +354,40 @@ HkvlForceDriver::~HkvlForceDriver() {
 
 void HkvlForceDriver::start(
     const HkvlSerialConfig& config,
-    SampleCallback callback) {
+    SampleCallback callback,
+    FailureCallback failure) {
+  std::scoped_lock lifecycleLock(impl_->lifecycleMutex);
   stop();
   impl_->config = config;
   impl_->callback = std::move(callback);
+  impl_->failureCallback = std::move(failure);
   impl_->resetSide(0, config.leftPort);
   impl_->resetSide(1, config.rightPort);
   impl_->running.store(true, std::memory_order_release);
-  for (int side = 0; side < 2; ++side) {
-    impl_->workers[side] = std::thread([this, side]() { impl_->runSide(side); });
+  impl_->failed.store(false);
+  int side = 0;
+  try {
+    for (; side < 2 && impl_->running.load(); ++side) {
+      impl_->workers[side] = launchWorker(impl_->launcher, [this, side]() {
+        runWorkerBoundary([this, side]() {
+          if (impl_->readLoop) impl_->readLoop(side, impl_->callback, impl_->running);
+          else impl_->runSide(side);
+          if (impl_->running.load()) throw std::runtime_error("HKVL reader exited unexpectedly");
+        }, [this, side](const char* error) { impl_->reportFailure(side, error); });
+      });
+    }
+  } catch (...) {
+    impl_->reportFailure(side, "HKVL reader worker could not be created");
+    stop();
+    throw;
   }
 }
 
+void HkvlForceDriver::requestStop() noexcept { impl_->requestStop(); }
+
 void HkvlForceDriver::stop() {
-  impl_->running.store(false, std::memory_order_release);
+  std::scoped_lock lifecycleLock(impl_->lifecycleMutex);
+  impl_->requestStop();
   for (auto& worker : impl_->workers) {
     if (worker.joinable()) {
       worker.join();
@@ -325,7 +402,9 @@ bool HkvlForceDriver::running() const {
 void HkvlForceDriver::tare(
     int side,
     int sampleCount,
-    std::chrono::milliseconds timeout) {
+    std::chrono::milliseconds timeout,
+    TareCommitCallback commitIfAllowed) {
+  std::scoped_lock tareOperation(impl_->tareMutex);
   if (!running()) {
     throw std::runtime_error("HKVL force driver is not running");
   }
@@ -334,33 +413,56 @@ void HkvlForceDriver::tare(
   }
   const int first = side < 0 ? 0 : side;
   const int last = side < 0 ? 1 : side;
-  for (int index = first; index <= last; ++index) {
-    auto& state = impl_->sides[index];
-    std::scoped_lock lock(state.mutex);
-    if (!state.connected) {
-      throw std::runtime_error(state.port + " is not connected");
+  {
+    std::scoped_lock lock(impl_->sides[0].mutex, impl_->sides[1].mutex);
+    // 双侧先全部预检，避免一侧断连时另一侧留下已启动的去皮窗口。
+    for (int index = first; index <= last; ++index) {
+      if (!impl_->sides[index].connected) {
+        throw std::runtime_error(impl_->sides[index].port + " is not connected");
+      }
     }
-    state.tarePending = true;
-    state.tareRemaining = sampleCount;
-    state.tareRequested = sampleCount;
-    state.tareSum = {};
+    if (commitIfAllowed && !commitIfAllowed([]() {})) {
+      throw std::runtime_error("HKVL tare cancelled by emergency stop");
+    }
+    for (int index = first; index <= last; ++index) {
+      auto& state = impl_->sides[index];
+      state.tarePending = true;
+      state.tareCancelled = false;
+      state.tareCommit = commitIfAllowed;
+      state.tareRemaining = sampleCount;
+      state.tareRequested = sampleCount;
+      state.tareSum = {};
+    }
   }
 
   const auto deadline = std::chrono::steady_clock::now() + timeout;
-  for (int index = first; index <= last; ++index) {
-    auto& state = impl_->sides[index];
-    std::unique_lock lock(state.mutex);
-    if (!state.tareCondition.wait_until(
-            lock,
-            deadline,
-            [&state]() { return !state.tarePending || !state.connected; })) {
-      state.tarePending = false;
-      throw std::runtime_error(state.port + " tare timed out");
+  try {
+    for (int index = first; index <= last; ++index) {
+      auto& state = impl_->sides[index];
+      std::unique_lock lock(state.mutex);
+      while (state.tarePending && state.connected && running()) {
+        // 即使串口不再来帧，也定期取消被急停失效的窗口。
+        if (commitIfAllowed && !commitIfAllowed([]() {})) {
+          throw std::runtime_error("HKVL tare cancelled by emergency stop");
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) throw std::runtime_error(state.port + " tare timed out");
+        state.tareCondition.wait_until(lock, std::min(deadline, now + std::chrono::milliseconds(10)));
+      }
+      if (!running()) throw std::runtime_error("HKVL reader stopped during tare");
+      if (state.tareCancelled) throw std::runtime_error("HKVL tare cancelled by emergency stop");
+      if (!state.connected) throw std::runtime_error(state.port + " disconnected during tare");
     }
-    if (!state.connected) {
+  } catch (...) {
+    for (int index = first; index <= last; ++index) {
+      auto& state = impl_->sides[index];
+      std::scoped_lock lock(state.mutex);
       state.tarePending = false;
-      throw std::runtime_error(state.port + " disconnected during tare");
+      state.tareCancelled = true;
+      state.tareCommit = {};
+      state.tareCondition.notify_all();
     }
+    throw;
   }
 }
 
