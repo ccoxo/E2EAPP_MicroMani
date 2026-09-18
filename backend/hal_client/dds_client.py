@@ -44,6 +44,11 @@ class DdsTransportCallError(RuntimeError):
     pass
 
 
+# 与运动反馈的新鲜度门限一致；不以 WebSocket 重发时间刷新 DDS 源时间。
+_DDS_STATE_MAX_AGE_MS = 500
+_DDS_STATE_MAX_FUTURE_MS = 100
+
+
 class DdsHalTransport(Protocol):
     def start(self) -> None:
         raise NotImplementedError
@@ -127,6 +132,7 @@ class DdsHalClient(HalClient):
                 if isinstance(payload.get("capabilities"), list)
                 else None
             ),
+            source_valid_until_ms=payload["dds_stamp_unix_ms"] + _DDS_STATE_MAX_AGE_MS,
         )
 
     async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -254,10 +260,15 @@ class DdsHalClient(HalClient):
         return self._payload_from_envelope(envelope, TOPIC_HAL_NATIVE_TELEOP_STATUS)
 
     def _payload_from_envelope(self, envelope: JsonEnvelope, topic_name: str) -> dict[str, Any]:
-        payload = _json_object(envelope.payload_json, topic_name)
-        payload = dict(payload)
-        stamp_unix_ms = int(envelope.stamp_unix_ms)
-        stamp_monotonic_ms = int(envelope.stamp_monotonic_ms)
+        stamp_unix_ms = envelope.stamp_unix_ms
+        stamp_monotonic_ms = envelope.stamp_monotonic_ms
+        if (type(stamp_unix_ms) is not int or stamp_unix_ms <= 0
+                or type(stamp_monotonic_ms) is not int or stamp_monotonic_ms < 0):
+            raise RuntimeError(f"DDS topic has invalid source timestamp: {topic_name}")
+        age_ms = now_unix_ms() - stamp_unix_ms
+        if age_ms > _DDS_STATE_MAX_AGE_MS or age_ms < -_DDS_STATE_MAX_FUTURE_MS:
+            raise RuntimeError(f"DDS topic source timestamp is stale or in the future: {topic_name} age_ms={age_ms}")
+        payload = dict(_json_object(envelope.payload_json, topic_name))
         payload.setdefault("timestamp_ms", stamp_unix_ms)
         payload.setdefault("monotonicMs", stamp_monotonic_ms)
         payload.setdefault("monotonic_s", stamp_monotonic_ms / 1000.0)

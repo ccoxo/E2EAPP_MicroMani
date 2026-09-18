@@ -105,18 +105,16 @@ const STEPS: StepDef[] = [
     },
   },
   {
-    title: '力觉 Tare',
-    description: '当前现场暂不具备条件，此项仅保留操作入口，不阻塞开始采集。',
+    title: '启动力觉自检',
+    description: 'HKVL 须完成双侧同步去皮、残差验证及人工安全确认；自检状态跨录制会话保持。',
     autoCheck: true,
-    required: false,
-    check: (frame, recordSession) =>
-      recordSession.forceTareActive &&
-      Math.abs(frame.forceLeft[2] ?? 0) < 0.1 &&
-      Math.abs(frame.forceRight[2] ?? 0) < 0.1,
+    check: (frame) => frame.forceStatus?.source !== 'hkvl_serial' || (
+      frame.forceStatus.calibration?.state === 'ready' && frame.forceStatus.safety?.latched === false
+    ),
   },
   {
     title: '验证力觉示数',
-    description: '当前现场暂不具备条件，此项仅作为参考，不阻塞开始采集。',
+    description: '显示当前力值是否接近零；HKVL 的强制残差验证由 HAL 启动自检执行。',
     autoCheck: true,
     required: false,
     check: (frame) =>
@@ -136,7 +134,7 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
   const diagnostics = useTelemetryStore((s) => s.diagnostics)
   const telemetryLink = useTelemetryStore((s) => s.telemetryLink)
   const recordSession = useTelemetryStore((s) => s.recordSession)
-  const tareRecordForceSensors = useTelemetryStore((s) => s.tareRecordForceSensors)
+  const forceSource = useTelemetryStore((s) => s.config.force.source)
   const homeRecordArms = useTelemetryStore((s) => s.homeRecordArms)
   const refreshHardwareStatus = useTelemetryStore((s) => s.refreshHardwareStatus)
   const [manualChecked, setManualChecked] = useState<Record<number, boolean>>({})
@@ -150,6 +148,10 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
 
   const stepStatuses = STEPS.map((step, i) => {
     if (step.autoCheck && step.check) {
+      if (i === 2 && forceSource === 'hkvl_serial') {
+        return frame.forceStatus?.source === 'hkvl_serial'
+          && frame.forceStatus.calibration?.state === 'ready' && frame.forceStatus.safety?.latched === false
+      }
       return step.check(frame, recordSession, diagnostics, telemetryLink)
     }
     return (manualChecked[i] ?? false) && !recordSession.returnOriginInFlight && requiredResetSides(recordSession).every((side) => recordSession.resetReturnedSides.includes(side))
@@ -272,8 +274,8 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
                       </>
                     )}
                     {i === 2 && (
-                      <UiButton style={{ marginTop: 6 }} onClick={tareRecordForceSensors}>
-                        执行 Tare
+                      <UiButton style={{ marginTop: 6 }} onClick={() => { handleClose(); navigate('/settings#safety') }}>
+                        前往力觉自检
                       </UiButton>
                     )}
                     {step.actionButton && (

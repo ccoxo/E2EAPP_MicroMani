@@ -86,6 +86,11 @@ class MotionSafetyGate:
         ):
             raise RuntimeError("motion cancelled by a newer stop")
 
+    def check_force_recovery_generation(self, token: MotionSafetyToken) -> None:
+        """仅核验恢复配置的停止代际；可用于落盘线程，不授予任何运动权限。"""
+        if not self.latched or token != self.capture(token.side):
+            raise RuntimeError("force configuration recovery cancelled by a newer safety operation")
+
     def interrupt(self, side: str | None = None, *, emergency: bool = False) -> None:
         if side is None:
             self._generation += 1

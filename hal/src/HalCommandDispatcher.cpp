@@ -7,6 +7,7 @@
 #include "HalCommandDispatcher.h"
 
 #include "HalJson.h"
+#include "CommandDeadline.h"
 
 #include <stdexcept>
 #include <cmath>
@@ -48,6 +49,17 @@ std::string HalCommandDispatcher::handleEmergencyStop() {
       "manual_emergency_stop", forceMonotonicMilliseconds()); });
   if (failure) std::rethrow_exception(failure);
   return "{\"ok\":true}";
+}
+
+void HalCommandDispatcher::requireForceMutationSafe(const char* operation) {
+  if (nativeTeleop_.running()) {
+    throw std::runtime_error(std::string(operation) + " requires native teleop to be stopped");
+  }
+  for (const auto& axis : motion_.readState().axes) {
+    if (axis.moving || axis.enabled) {
+      throw std::runtime_error(std::string(operation) + " requires all axes stopped and servos disabled");
+    }
+  }
 }
 
 std::string HalCommandDispatcher::handle(const std::string& name, const std::string& bodyText,
@@ -97,37 +109,44 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     return forceRuntime_.forceStateJson(forceMonotonicMilliseconds());
   }
   if (name == "force.configure") {
-    if (nativeTeleop_.running()) {
-      throw std::runtime_error("force configuration requires native teleop to be stopped");
-    }
-    const auto motionState = motion_.readState();
-    for (const auto& axis : motionState.axes) {
-      if (axis.moving || axis.enabled) {
-        throw std::runtime_error(
-            "force configuration requires all axes stopped and servos disabled");
-      }
-    }
+    requireForceMutationSafe("force configuration");
     forceRuntime_.configure(
         jsonForceRuntimeConfig(bodyText, forceRuntime_.config()),
         forceMonotonicMilliseconds());
     return "{\"ok\":true}";
   }
   if (name == "force.tare") {
-    ensureCurrentMotionCommand();
-    const auto sideValue = lowercase(jsonStringValueOr(bodyText, "side", "all"));
-    int side = -1;
-    if (sideValue == "left") {
-      side = 0;
-    } else if (sideValue == "right") {
-      side = 1;
-    } else if (sideValue != "all" && sideValue != "both") {
-      throw std::runtime_error("force.tare side must be left, right, or all");
+    const auto ensureTareDeadline = [&bodyText]() {
+      const auto now = std::chrono::duration<double, std::milli>(
+          std::chrono::system_clock::now().time_since_epoch()).count();
+      ensureCommandNotExpired(bodyText, now);
+    };
+    ensureTareDeadline();
+    if (!jsonBoolValue(bodyText, "unloadedConfirmed", false)) {
+      throw std::runtime_error("force tare requires confirmation that both sensors are unloaded");
     }
-    forceRuntime_.tare(
-        side,
-        static_cast<int>(jsonNumberValue(bodyText, "samples", 200)),
-        [motion = &motion_, commandEpoch]() { return motion->commandEpochAllowed(commandEpoch); });
-    return "{\"ok\":true}";
+    requireForceMutationSafe("force tare");
+    const auto sideValue = lowercase(jsonStringValueOr(bodyText, "side", "all"));
+    if (sideValue != "all" && sideValue != "both") {
+      throw std::runtime_error("HKVL startup force self-check requires side=all");
+    }
+    const auto samples = jsonNumberValue(bodyText, "samples", kHkvlTareMinSamples);
+    if (!std::isfinite(samples) || samples < kHkvlTareMinSamples
+        || samples > kHkvlTareMaxSamples || std::floor(samples) != samples) {
+      throw std::runtime_error("invalid HKVL tare sample count; expected 200..1000");
+    }
+    if (emergencyStopsInProgress_.load() != 0 || motion_.commandEpoch() != commandEpoch) {
+      throw std::runtime_error("HKVL tare cancelled by emergency stop");
+    }
+    // 此停止路径先撤销权限，再由 emergencyStop 再次锁存，共增加两次代际。
+    // 预先计算自身停机的代际，不能在停机后读取新值而吞掉并发急停。
+    const auto tareCommandEpoch = (commandEpoch + 4U) | 1U;
+    handleEmergencyStop();
+    return forceRuntime_.tare(-1, static_cast<int>(samples),
+        [this, tareCommandEpoch, &ensureTareDeadline]() {
+          ensureTareDeadline();
+          return emergencyStopsInProgress_.load() == 0 && motion_.commandEpoch() == tareCommandEpoch;
+        });
   }
   if (name == "teleop.native.configure") {
     nativeTeleop_.configure(jsonNativeTeleopConfig(bodyText), commandEpoch);

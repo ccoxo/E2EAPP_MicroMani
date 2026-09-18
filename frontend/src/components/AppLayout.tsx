@@ -14,7 +14,6 @@ import {
   PlayCircle,
   RadioTower,
   Settings,
-  SlidersHorizontal,
   SquareStack,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -151,23 +150,25 @@ export function AppLayout() {
             <Outlet />
           </RouteErrorBoundary>
         </main>
+        <aside className="safety-dock" aria-label="安全控制">
+          <ModuleErrorBoundary name="急停显示" fallback={
+            <div className="emergency-stop-stack">
+              <button type="button" className="ui-btn ui-btn-danger emergency-stop-button" aria-label="全局急停"
+                onClick={() => useTelemetryStore.getState().triggerEmergencyStop()}>
+                急停
+              </button>
+              <div role="alert" className="safety-control-error">急停状态显示异常</div>
+            </div>
+          }>
+            <GlobalEmergencyStopButton />
+          </ModuleErrorBoundary>
+        </aside>
       </div>
-
-      <ModuleErrorBoundary name="日志面板"><LogPanel /></ModuleErrorBoundary>
+      <div className="bottom-console">
+        <ModuleErrorBoundary name="日志面板"><LogPanel /></ModuleErrorBoundary>
+      </div>
       <ModuleErrorBoundary name="底部状态"><StatusBar /></ModuleErrorBoundary>
       <ModuleErrorBoundary name="安全提示"><SafetyOverlay /></ModuleErrorBoundary>
-      <ModuleErrorBoundary name="急停显示" fallback={
-        <div className="floating-emergency-stack">
-          <div role="alert">急停状态显示异常</div>
-          <button type="button" className="ui-btn ui-btn-danger floating-emergency-stop" aria-label="全局急停"
-            onClick={() => useTelemetryStore.getState().triggerEmergencyStop()}>
-            急停
-          </button>
-        </div>
-      }>
-        <GlobalEmergencyStopButton />
-      </ModuleErrorBoundary>
-      <UiButton aria-label="打开硬件设置" className="floating-settings" icon={<SlidersHorizontal size={16} />} onClick={() => navigate('/settings')} />
     </div>
   )
 }

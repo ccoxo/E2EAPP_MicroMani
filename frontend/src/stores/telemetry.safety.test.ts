@@ -210,7 +210,7 @@ describe('真实 HTTP 分支的急停保护（全部网络隔离）', () => {
     expect(store.getState().dangerOverride).toBeNull()
   })
 
-  it('锁存期间不能通过 Tare 重新置零来绕过安全确认', async () => {
+  it('锁存期间未确认卸载的 Tare 和单侧 Tare 仍被拒绝', async () => {
     const frame = liveFrame({ forceStatus: { safety: { latched: true } } })
     store.setState({ frame })
     store.getState().tareRecordForceSensors()
@@ -218,6 +218,22 @@ describe('真实 HTTP 分支的急停保护（全部网络隔离）', () => {
     await expect(api.tareForceSensor('left')).rejects.toThrow('锁存')
     expect(requests).toHaveLength(0)
     expect(store.getState().frame).toBe(frame)
+  })
+
+  it('锁存期间已确认卸载的双侧自检保留控制租约门闩，不伪造安全反馈', async () => {
+    const frame = liveFrame({ forceStatus: { source: 'hkvl_serial', calibration: { state: 'waiting_sensors' }, safety: { latched: true } } })
+    store.setState({ frame })
+    const pending = api.runHkvlStartupSelfCheck()
+    expect(requests[0].path).toBe('/api/sensors/tare')
+    expect(vi.mocked(fetch).mock.calls.at(-1)?.[1]?.body).toBe(JSON.stringify({ unloadedConfirmed: true }))
+    await expect(api.runHkvlStartupSelfCheck()).rejects.toThrow('正在进行')
+    await respond(0, { ok: true, data: { hal: { response: { calibration: { state: 'ready_for_ack' } } } } })
+    await pending
+    expect(store.getState().frame).toBe(frame)
+    expect(requests.some((request) => request.path.includes('acknowledge'))).toBe(false)
+    store.setState((state) => ({ controlLease: { ...state.controlLease, status: 'expired', expiresAt: 0, reason: '租约过期' } }))
+    await expect(api.runHkvlStartupSelfCheck()).rejects.toThrow('租约')
+    expect(requests).toHaveLength(1)
   })
 
   it('未知轴反馈拒绝点动，新鲜且明确使能的轴才发送', async () => {

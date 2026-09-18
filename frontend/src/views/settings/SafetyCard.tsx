@@ -3,6 +3,7 @@
  * 先看：SafetyCard。
  */
 import { ShieldAlert } from 'lucide-react'
+import { ForceStartupSelfCheck } from '../../components/ForceStartupSelfCheck'
 import { UiButton, UiField, UiNumber, UiSpace, UiSwitch, UiTag } from '../../components/ui'
 import { useTelemetryStore } from '../../stores/telemetry'
 import { canAcknowledgeControlSafety } from '../../utils/controlSafety'
@@ -67,6 +68,7 @@ export function SafetyCard({
       }
       wide
     >
+      {config.force.source === 'hkvl_serial' && <ForceStartupSelfCheck />}
       <div className="hardware-metric-grid">
         <MetricBox label="danger_index" value={dangerIndex.toFixed(3)} tone={dangerIndex > 0.7 ? 'warn' : 'ok'} />
         <MetricBox label="安全锁存" value={safetyLatched ? '已锁存' : '未锁存'} tone={safetyLatched ? 'warn' : 'ok'} />

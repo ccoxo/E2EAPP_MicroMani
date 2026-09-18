@@ -9,6 +9,18 @@ import math
 import os
 from typing import Any
 
+HKVL_TARE_DEFAULT_SAMPLES = 200
+HKVL_TARE_MAX_SAMPLES = 1000
+
+
+def hkvl_tare_sample_count(value: object) -> int:
+    samples = _number(value, "force.tareSamples")
+    if isinstance(value, bool) or not samples.is_integer() or (
+        samples != 0 and not HKVL_TARE_DEFAULT_SAMPLES <= samples <= HKVL_TARE_MAX_SAMPLES
+    ):
+        raise ValueError("HKVL force.tareSamples must be 0 (default 200) or an integer from 200 to 1000")
+    return int(samples) if samples else HKVL_TARE_DEFAULT_SAMPLES
+
 
 def _mapping(value: object, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
@@ -61,6 +73,7 @@ def validate_force_config(config: dict[str, Any]) -> None:
 
     serial = _mapping(force.get("serial"), "force.serial")
     if source == "hkvl_serial":
+        hkvl_tare_sample_count(force.get("tareSamples", 0))
         if str(serial.get("protocol", "")) != "hkvl_active_v1":
             raise ValueError("HKVL force protocol must be hkvl_active_v1")
         left_port = str(serial.get("leftPort", "")).strip().upper()

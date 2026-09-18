@@ -96,6 +96,12 @@ void ForceControlRuntime::configure(
     workerFailed_.store(false);
     workerError_.clear();
     ++tareEpoch_;
+    tareInProgress_ = false;
+    calibration_ = {};
+    if (config.source == "hkvl_serial") {
+      calibration_.state = "waiting_sensors";
+      calibration_.reason = "operator must confirm both sensors are unloaded";
+    }
     safety_.configure(config.safety, nowMonotonicMs);
     if (config.source == "hkvl_serial") {
       pendingTrip = safety_.latchExternal(
@@ -154,7 +160,22 @@ void ForceControlRuntime::start() {
 
 void ForceControlRuntime::stop() {
   std::scoped_lock lifecycleLock(lifecycleMutex_);
-  running_.store(false, std::memory_order_release);
+  const bool wasRunning = running_.exchange(false, std::memory_order_acq_rel);
+  std::optional<ForceSafetyTrip> pendingTrip;
+  {
+    std::scoped_lock lock(mutex_);
+    ++tareEpoch_;
+    if (config_.source == "hkvl_serial") {
+      if (wasRunning) {
+        pendingTrip = safety_.latchExternal("force_acquisition_stopped", forceMonotonicMilliseconds());
+      }
+      calibration_ = {};
+      calibration_.state = "waiting_sensors";
+      calibration_.reason = "force acquisition stopped; repeat startup force self-check";
+      tareInProgress_ = false;
+    }
+  }
+  invokeEmergencyStopIfNeeded(pendingTrip);
   driver_.stop();
   if (monitor_.joinable()) {
     monitor_.join();
@@ -199,6 +220,10 @@ void ForceControlRuntime::acceptSample(
     hasSample_[side] = true;
     // 安全阈值使用方向校准后的去皮值，柔顺计算另用滤波值，避免低通滤波延迟削弱超限检测。
     trip = safety_.onSample(side, alignedTared, monotonicMs);
+    if (tareInProgress_ && calibration_.epoch == tareEpoch_) {
+      const auto tareTrip = tareSafety_.onSample(side, alignedTared, monotonicMs);
+      if (tareTrip.has_value()) trip = tareTrip;
+    }
     if (trip.has_value()) {
       ++tareEpoch_;
       compliance_.reset();
@@ -217,6 +242,10 @@ void ForceControlRuntime::checkSafety(double nowMonotonicMs) {
       return;
     }
     trip = safety_.checkWatchdog(nowMonotonicMs);
+    if (tareInProgress_ && calibration_.epoch == tareEpoch_) {
+      const auto tareTrip = tareSafety_.checkWatchdog(nowMonotonicMs);
+      if (tareTrip.has_value()) trip = tareTrip;
+    }
     if (trip.has_value()) {
       ++tareEpoch_;
       compliance_.reset();
@@ -253,6 +282,9 @@ void ForceControlRuntime::acknowledgeEmergencyStop(
   }
   if (workerFailed_.load()) throw std::runtime_error("force worker failed; reconfigure before acknowledgement");
   if (config_.source == "hkvl_serial") {
+    if (calibration_.state != "ready_for_ack" && calibration_.state != "ready") {
+      throw std::runtime_error("startup force self-check is not complete");
+    }
     std::string blocker;
     if (!safety_.canAcknowledge(nowMonotonicMs, &blocker)) {
       throw std::runtime_error(blocker);
@@ -261,7 +293,10 @@ void ForceControlRuntime::acknowledgeEmergencyStop(
   // 先确认同一运动急停代际；若其已更新，力锁存也必须保留。
   const auto& callback = acknowledge ? acknowledge : acknowledge_;
   if (callback) callback();
-  if (config_.source == "hkvl_serial") safety_.acknowledge(nowMonotonicMs);
+  if (config_.source == "hkvl_serial") {
+    safety_.acknowledge(nowMonotonicMs);
+    calibration_.state = "ready";
+  }
   compliance_.reset();
   lastCompliance_ = {};
   lastComplianceActualUm_ = {};
@@ -273,27 +308,91 @@ bool ForceControlRuntime::safetyLatched() const {
   return workerFailed_.load() || safety_.latched();
 }
 
-void ForceControlRuntime::tare(int side, int sampleCount, std::function<bool()> commandAllowed) {
+std::string ForceControlRuntime::tare(int side, int sampleCount, std::function<bool()> commandAllowed) {
+  std::unique_lock operationLock(tareMutex_, std::try_to_lock);
+  if (!operationLock.owns_lock()) throw std::runtime_error("force self-check is already running");
+  if (side != -1) throw std::runtime_error("HKVL startup force self-check requires side=all");
+  if (sampleCount < kHkvlTareMinSamples || sampleCount > kHkvlTareMaxSamples) {
+    throw std::runtime_error("invalid HKVL tare sample count; expected 200..1000");
+  }
   std::uint64_t epoch;
+  std::optional<ForceSafetyTrip> pendingTrip;
   {
     std::scoped_lock lock(mutex_);
     if (config_.source != "hkvl_serial") {
       throw std::runtime_error("force.tare is only available for hkvl_serial");
     }
-    if (safety_.latched() || (commandAllowed && !commandAllowed())) {
-      throw std::runtime_error("force.tare is blocked while emergency stop is latched");
+    if (workerFailed_.load() || emergencyCallbackFailed_.load()) {
+      throw std::runtime_error("force worker or emergency-stop callback failed; reconfigure before self-check");
     }
-    epoch = tareEpoch_;
+    if (commandAllowed && !commandAllowed()) throw std::runtime_error("HKVL tare cancelled by emergency stop");
+    epoch = ++tareEpoch_;
+    pendingTrip = safety_.latchExternal("force_tare_pending", forceMonotonicMilliseconds());
+    compliance_.reset();
+    lastCompliance_ = {};
+    lastComplianceActualUm_ = {};
+    calibration_ = {};
+    calibration_.epoch = epoch;
+    calibration_.state = "checking_stability";
+    calibration_.progress = 5;
+    tareSafety_.configure(config_.safety, forceMonotonicMilliseconds());
+    for (int index = 0; index < 2; ++index) {
+      if (hasSample_[index]) {
+        tareSafety_.onSample(index, latestTared_[index], latestMonotonicMs_[index]);
+      }
+    }
+    tareInProgress_ = true;
   }
-  driver_.tare(side, sampleCount, std::chrono::milliseconds(2000),
-      [this, epoch, commandAllowed](const std::function<void()>& commit) {
-        std::scoped_lock lock(mutex_);
-        if (tareEpoch_ != epoch || safety_.latched() || (commandAllowed && !commandAllowed())) {
-          return false;
-        }
-        commit();
-        return true;
-      });
+  invokeEmergencyStopIfNeeded(pendingTrip);
+  const auto allowed = [&]() {
+    return tareEpoch_ == epoch && !tareSafety_.latched()
+        && !workerFailed_.load() && !emergencyCallbackFailed_.load()
+        && (!commandAllowed || commandAllowed());
+  };
+  try {
+    const auto result = driver_.tare(side, sampleCount, std::chrono::milliseconds(kHkvlTareWindowTimeoutMs),
+        [&](const std::function<void()>& commit) {
+          std::scoped_lock lock(mutex_);
+          if (!allowed()) return false;
+          commit();
+          return true;
+        },
+        [&](const std::string& state, int progress) {
+          std::scoped_lock lock(mutex_);
+          if (!allowed()) throw std::runtime_error("HKVL tare cancelled by emergency stop");
+          calibration_.state = state;
+          calibration_.progress = progress;
+        });
+    std::scoped_lock lock(mutex_);
+    if (!allowed()) throw std::runtime_error("HKVL tare cancelled by emergency stop");
+    tareInProgress_ = false;
+    // 提交后重新等待双侧新样本和稳定窗口，再允许操作者确认恢复。
+    safety_.markDisconnected(0, forceMonotonicMilliseconds());
+    safety_.markDisconnected(1, forceMonotonicMilliseconds());
+    calibration_.state = "ready_for_ack";
+    calibration_.progress = 100;
+    calibration_.hasResult = true;
+    calibration_.result = result;
+    std::ostringstream out;
+    out << "{\"ok\":true,\"calibration\":";
+    appendCalibrationJson(out);
+    out << "}";
+    return out.str();
+  } catch (...) {
+    std::string reason = "unknown force self-check failure";
+    try { throw; }
+    catch (const std::exception& error) { reason = error.what(); }
+    catch (...) {}
+    std::scoped_lock lock(mutex_);
+    if (calibration_.epoch == epoch) {
+      tareInProgress_ = false;
+      calibration_.state = "failed";
+      calibration_.progress = 0;
+      calibration_.reason = reason;
+      calibration_.hasResult = false;
+    }
+    throw;
+  }
 }
 
 ForceComplianceResult ForceControlRuntime::complianceCorrection(
@@ -359,6 +458,8 @@ std::string ForceControlRuntime::forceStateJson(
   out << ",\"sensorRawRight\":";
   appendArray(out, driverSnapshot.sides[1].raw);
   out << ",\"dangerIndex\":" << safety_.dangerIndex();
+  out << ",\"calibration\":";
+  appendCalibrationJson(out);
   const double skewMs = hasSample_[0] && hasSample_[1]
       ? std::abs(latestMonotonicMs_[0] - latestMonotonicMs_[1])
       : 0.0;
@@ -403,6 +504,11 @@ std::string ForceControlRuntime::forceStateJson(
   std::string acknowledgeBlocker;
   bool canAcknowledge =
       safety_.canAcknowledge(nowMonotonicMs, &acknowledgeBlocker);
+  if (config_.source == "hkvl_serial"
+      && calibration_.state != "ready_for_ack" && calibration_.state != "ready") {
+    canAcknowledge = false;
+    acknowledgeBlocker = "startup force self-check is not complete";
+  }
   if (emergencyCallbackFailed_.load()) {
     canAcknowledge = false;
     acknowledgeBlocker = "force emergency-stop callback failed; diagnose and reconfigure before acknowledgement";
@@ -445,6 +551,42 @@ std::string ForceControlRuntime::forceStateJson(
   }
   out << "}}";
   return out.str();
+}
+
+void ForceControlRuntime::appendCalibrationJson(std::ostringstream& out) const {
+  out << "{\"state\":\"" << escapeJson(calibration_.state) << "\""
+      << ",\"progress\":" << calibration_.progress
+      << ",\"reason\":\"" << escapeJson(calibration_.reason) << "\""
+      << ",\"completedAtUnixMs\":"
+      << (calibration_.hasResult ? calibration_.result.completedAtUnixMs : 0)
+      << ",\"sides\":{";
+  if (!calibration_.hasResult) {
+    out << "}}";
+    return;
+  }
+  for (int side = 0; side < 2; ++side) {
+    if (side > 0) {
+      out << ",";
+    }
+    const auto& result = calibration_.result.sides[side];
+    out << "\"" << (side == 0 ? "left" : "right") << "\":{";
+    out << "\"bias\":";
+    appendArray(out, result.bias);
+    out << ",\"preMean\":";
+    appendArray(out, result.before.mean);
+    out << ",\"preStdDev\":";
+    appendArray(out, result.before.standardDeviation);
+    out << ",\"prePeakToPeak\":";
+    appendArray(out, result.before.peakToPeak);
+    out << ",\"residualMean\":";
+    appendArray(out, result.after.mean);
+    out << ",\"residualStdDev\":";
+    appendArray(out, result.after.standardDeviation);
+    out << ",\"residualPeakToPeak\":";
+    appendArray(out, result.after.peakToPeak);
+    out << "}";
+  }
+  out << "}}";
 }
 
 void ForceControlRuntime::validateConfig(

@@ -90,6 +90,7 @@ export function ForceSensorCard({
   const ipKey = sideSpec.forceIpKey
   const isHkvl = config.force.source === 'hkvl_serial'
   const sideStatus = forceStatus?.sides?.[hardwareSide]
+  const calibration = forceStatus?.calibration?.sides?.[hardwareSide]
   const state = isHkvl && !sideStatus?.healthy ? 'error' : forceState(values, config)
   const id = `force-${side}`
   const serialPortKey = hardwareSide === 'left' ? 'leftPort' : 'rightPort'
@@ -158,7 +159,7 @@ export function ForceSensorCard({
       state={state}
       actions={
         <UiSpace wrap>
-            <UiButton
+            {!isHkvl && <UiButton
               icon={<RotateCcw size={15} />}
               disabled={Boolean(tareBlockedReason)}
               title={tareBlockedReason ?? undefined}
@@ -171,7 +172,7 @@ export function ForceSensorCard({
             }}
           >
             Tare
-          </UiButton>
+          </UiButton>}
           <UiButton icon={<Download size={15} />} onClick={() => commandLog(injectLog, '[FORCE]', `${operatorLabel} 力数据导出`)}>
             CSV
           </UiButton>
@@ -199,7 +200,14 @@ export function ForceSensorCard({
                   { value: 'hkvl_serial', label: 'HKVL-36A / HAL 串口（主用）' },
                   { value: 'nidaq', label: 'ATI Nano-17 / NI-DAQ（备用）' },
                 ]}
-                onChange={(source) => updateConfig({ force: { ...config.force, source } })}
+                onChange={(source) => updateConfig({ force: {
+                  ...config.force,
+                  source,
+                  tareSamples: source === 'hkvl_serial' && (
+                    !Number.isInteger(config.force.tareSamples)
+                    || config.force.tareSamples < 200 || config.force.tareSamples > 1000
+                  ) ? 0 : config.force.tareSamples,
+                } })}
               />
             </UiField>
             {isHkvl ? (
@@ -227,7 +235,11 @@ export function ForceSensorCard({
                 <UiField label="录制窗口样本"><UiNumber min={0} max={512} value={config.force.recordWindowSamples} onChange={(value) => updateConfig({ force: { ...config.force, recordWindowSamples: Number(value ?? 0) } })} /></UiField>
               </>
             )}
-            <UiField label="Tare 样本"><UiNumber min={0} max={512} value={config.force.tareSamples} onChange={(value) => updateConfig({ force: { ...config.force, tareSamples: Number(value ?? 0) } })} /></UiField>
+            <UiField label={isHkvl ? 'Tare 样本（200–1000）' : 'Tare 样本'}>
+              <UiNumber min={isHkvl ? 200 : 0} max={isHkvl ? 1000 : 512} step={1}
+                value={isHkvl && config.force.tareSamples === 0 ? 200 : config.force.tareSamples}
+                onChange={(value) => updateConfig({ force: { ...config.force, tareSamples: Number(value ?? 0) } })} />
+            </UiField>
             <UiField label="低通滤波">
               <UiSwitch
                 checked={config.force.lowpassEnabled}
@@ -265,6 +277,26 @@ export function ForceSensorCard({
           </div>
           {isHkvl && (
             <>
+              <details className="gripper-config-section">
+                <summary>{operatorLabel}去皮统计（Fx/Fy/Fz：N，Mx/My/Mz：N·m）</summary>
+                <div style={{ overflowX: 'auto' }}>
+                <table className="ui-table" aria-label={`${operatorLabel}去皮统计`}>
+                  <thead><tr><th>统计项</th>{forceChannels.map((channel) => <th key={channel}>{channel}</th>)}</tr></thead>
+                  <tbody>
+                {([
+                  ['零点', calibration?.bias], ['去皮前均值', calibration?.preMean],
+                  ['去皮前标准差', calibration?.preStdDev], ['去皮前峰峰值', calibration?.prePeakToPeak],
+                  ['残差均值', calibration?.residualMean], ['残差标准差', calibration?.residualStdDev],
+                  ['残差峰峰值', calibration?.residualPeakToPeak],
+                ] as const).map(([label, statistics]) => (
+                  <tr key={label}><th scope="row">{label}</th>{forceChannels.map((channel, index) => (
+                    <td key={channel}>{statistics?.[index]?.toFixed(5) ?? '—'}</td>
+                  ))}</tr>
+                ))}
+                  </tbody>
+                </table>
+                </div>
+              </details>
               <div className="force-control-workbench">
                 <section className="force-control-panel force-coordinate-panel">
                   <div className="force-control-panel-head">

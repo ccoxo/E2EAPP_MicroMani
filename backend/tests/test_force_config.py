@@ -13,7 +13,7 @@ import pytest
 
 from backend.core.config import SettingsService
 from backend.core.defaults import default_config
-from backend.core.force_config import hal_force_config_payload, validate_force_config
+from backend.core.force_config import hal_force_config_payload, hkvl_tare_sample_count, validate_force_config
 from backend.core.logging import LogService
 
 
@@ -49,6 +49,28 @@ def hkvl_config() -> dict:
     config = default_config()
     config["force"]["source"] = "hkvl_serial"
     return config
+
+
+@pytest.mark.parametrize("value", [1, 12, 199, 1001, 5000, 200.5, -1, True, None, "nan"])
+def test_hkvl_tare_rejects_inadequate_or_unbounded_sample_windows(value: object) -> None:
+    config = hkvl_config()
+    config["force"]["tareSamples"] = value
+    with pytest.raises(ValueError, match="tareSamples"):
+        validate_force_config(config)
+
+
+@pytest.mark.parametrize(("value", "expected"), [(0, 200), (200, 200), (512, 512), (1000, 1000)])
+def test_hkvl_tare_default_and_supported_window_sizes(value: int, expected: int) -> None:
+    config = hkvl_config()
+    config["force"]["tareSamples"] = value
+    validate_force_config(config)
+    assert hkvl_tare_sample_count(value) == expected
+
+
+def test_nidaq_keeps_its_independent_tare_sample_range() -> None:
+    config = hkvl_config()
+    config["force"].update(source="nidaq", tareSamples=12)
+    validate_force_config(config)
 
 
 def test_hkvl_force_config_payload_matches_hal_flat_contract() -> None:

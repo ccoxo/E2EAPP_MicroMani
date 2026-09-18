@@ -23,6 +23,15 @@
 #include <string>
 #include <vector>
 
+namespace appstation::hal {
+struct ForceControlRuntimeTestAccess {
+  static void markCalibrationReady(ForceControlRuntime& runtime) {
+    std::scoped_lock lock(runtime.mutex_);
+    runtime.calibration_.state = "ready_for_ack";
+  }
+};
+}  // namespace appstation::hal
+
 namespace {
 
 using appstation::hal::ForceComplianceConfig;
@@ -276,6 +285,8 @@ void testDefaultHkvlForceRuntime() {
   config.safety = safetyConfig();
   config.safety.watchdogMs = 1000.0;
   runtime.configure(config, 0.0);
+  // 本用例验证安全阈值/坐标映射；真实自检流程由 ForceTareRuntimeTests 覆盖。
+  appstation::hal::ForceControlRuntimeTestAccess::markCalibrationReady(runtime);
   require(runtime.usesHkvl(), "default runtime must select HKVL");
   require(runtime.safetyLatched(), "HKVL configuration must begin in a safety latch");
   require(emergencyStops == 1, "HKVL configuration must invoke the global emergency stop");
@@ -338,6 +349,8 @@ void testForceRuntimeAlignsAllSixChannelsBeforeStandardConsumption() {
   config.safety.watchdogMs = 1000.0;
   config.compliance = complianceConfig();
   runtime.configure(config, 0.0);
+  // 本用例验证安全阈值/坐标映射；真实自检流程由 ForceTareRuntimeTests 覆盖。
+  appstation::hal::ForceControlRuntimeTestAccess::markCalibrationReady(runtime);
 
   runtime.acceptSample(
       0,
@@ -420,6 +433,9 @@ void testMotionAcknowledge() {
 }
 
 void testForceConfigJson() {
+  require(appstation::hal::jsonHealth({}, false, "").find(
+      "\"capabilities\":[\"force_calibration_state_v1\"]") != std::string::npos,
+      "health must advertise the implemented startup force calibration contract");
   require(
       appstation::hal::jsonForceRuntimeConfig("{}").source == "hkvl_serial",
       "force config without a source must default to HKVL");

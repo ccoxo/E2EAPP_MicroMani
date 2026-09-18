@@ -4,7 +4,7 @@
  * 先看：makeReadyForRecordPrecheck。
  * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
  */
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MemoryRouter } from 'react-router-dom'
 import * as api from '../../api'
@@ -46,6 +46,7 @@ function makeReadyForRecordPrecheck() {
       },
       halOk: true,
       wsOk: true,
+      forceStatus: { source: 'hkvl_serial', calibration: { state: 'ready', progress: 100 }, safety: { latched: false, canAcknowledge: true } },
       cameras: state.frame.cameras.map((camera) => ({ ...camera, fps: 30, health: 'ok' })),
       teleopHands: state.frame.teleopHands.map((hand) =>
         hand.side === 'left'
@@ -91,6 +92,32 @@ afterEach(() => {
 })
 
 describe('PreCheckModal', () => {
+  it('HKVL 自检仅收到 ready_for_ack 时仍阻止录制，人工确认反馈 ready 后才能开始', () => {
+    makeReadyForRecordPrecheck()
+    useTelemetryStore.setState((state) => ({
+      recordSession: { ...state.recordSession, resetReturnedSides: ['left'] },
+      frame: { ...state.frame, forceStatus: { source: 'hkvl_serial', calibration: { state: 'ready_for_ack' }, safety: { latched: true, canAcknowledge: true } } },
+    }))
+    renderPreCheck()
+    fireEvent.click(screen.getByRole('checkbox', { name: '已完成' }))
+    expect(screen.getByRole('button', { name: '确认开始' })).toBeDisabled()
+    act(() => useTelemetryStore.setState((state) => ({ frame: {
+      ...state.frame, forceStatus: { source: 'hkvl_serial', calibration: { state: 'ready' }, safety: { latched: false, canAcknowledge: true } },
+    } })))
+    expect(screen.getByRole('button', { name: '确认开始' })).toBeEnabled()
+  })
+
+  it('HKVL 配置下缺失自检遥测不能视为已通过', () => {
+    makeReadyForRecordPrecheck()
+    useTelemetryStore.setState((state) => ({
+      recordSession: { ...state.recordSession, resetReturnedSides: ['left'] },
+      frame: { ...state.frame, forceStatus: undefined },
+    }))
+    renderPreCheck()
+    fireEvent.click(screen.getByRole('checkbox', { name: '已完成' }))
+    expect(screen.getByRole('button', { name: '确认开始' })).toBeDisabled()
+  })
+
   it('allows a single logically connected Omega hand to satisfy the record hardware check', () => {
     const onConfirm = vi.fn()
     makeReadyForRecordPrecheck()

@@ -40,7 +40,6 @@ const kbdStyle: React.CSSProperties = {
 const HINTS = [
   { key: 'Ctrl', desc: '离合器切换' },
   { key: '1/2/3', desc: '速度粗/中/细' },
-  { key: 'T', desc: '力觉 Tare' },
   { key: 'R', desc: '回工作原点' },
   { key: 'P', desc: '暂停遥操作' },
 ]
@@ -69,7 +68,6 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
   const discardRecordEpisode = useTelemetryStore((s) => s.discardRecordEpisode)
   const finishRecordSession = useTelemetryStore((s) => s.finishRecordSession)
   const skipRecordReset = useTelemetryStore((s) => s.skipRecordReset)
-  const tareRecordForceSensors = useTelemetryStore((s) => s.tareRecordForceSensors)
   const toggleRecordClutch = useTelemetryStore((s) => s.toggleRecordClutch)
   const setRecordSpeedMode = useTelemetryStore((s) => s.setRecordSpeedMode)
   const returnRecordMotionOrigin = useTelemetryStore((s) => s.returnRecordMotionOrigin)
@@ -175,9 +173,6 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
         <div className="record-action-stack">
           <UiButton variant="primary" block onClick={onStartSession}>
             开始采集会话
-          </UiButton>
-          <UiButton block onClick={tareRecordForceSensors}>
-            力觉 Tare
           </UiButton>
         </div>
       )}

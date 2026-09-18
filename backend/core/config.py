@@ -9,6 +9,7 @@ import json
 import os
 import re
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -35,7 +36,7 @@ from backend.core.defaults import (
     default_config,
     rotation_work_limits_from_soft_limits,
 )
-from backend.core.force_config import validate_force_config
+from backend.core.force_config import hkvl_tare_sample_count, validate_force_config
 from backend.core.logging import LogService, now_ms, stable_config_hash
 from backend.core.motion_limits import (
     WorkOriginMissing,
@@ -464,6 +465,15 @@ class SettingsService:
                 has_current_camera_tuning_defaults,
                 has_axis_sign_calibration,
             )
+            force = merged.get("force", {})
+            if isinstance(force, dict) and str(force.get("source", "hkvl_serial")).lower() == "hkvl_serial":
+                try:
+                    hkvl_tare_sample_count(force.get("tareSamples", 0))
+                except ValueError:
+                    # 旧版允许不足的样本窗口；只迁移这一项，不能因此重置整份设备配置。
+                    old_samples = force.get("tareSamples")
+                    force["tareSamples"] = 0
+                    self.logs.warning("[FORCE]", f"旧 HKVL Tare 样本数 {old_samples!r} 不再支持，已改为默认 200")
             validated = AppConfig.model_validate(merged).model_dump(mode="json")
             if merged != data:
                 self.save_config(validated, emit_log=False, source="startup")
@@ -484,6 +494,7 @@ class SettingsService:
         *,
         source: str = "ui",
         op_id: str | None = None,
+        before_commit: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         old_config: dict[str, Any] = {}
         if self.config_path.exists():
@@ -507,7 +518,7 @@ class SettingsService:
         old_hash = stable_config_hash(old_config) if old_config else "-"
         new_hash = stable_config_hash(validated)
         self._backup_current_work_origin(old_config)
-        self._atomic_write_json(self.config_path, validated)
+        self._atomic_write_json(self.config_path, validated, before_commit=before_commit)
         if emit_log:
             changes = _changed_config_leaves(old_config, validated)
             for key, old, new in changes[:50]:
@@ -544,8 +555,11 @@ class SettingsService:
                 )
         return validated
 
-    def apply_config(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        active = self.save_config(config) if config is not None else self.get_config()
+    def apply_config(
+        self, config: dict[str, Any] | None = None, *,
+        before_commit: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        active = self.save_config(config, before_commit=before_commit) if config is not None else self.get_config()
         self.logs.info("[HAL]", "settings applied to backend runtime config")
         return active
 
@@ -577,10 +591,12 @@ class SettingsService:
         self.logs.info("[BACKEND]", f"{self._scope_label(request.scope)}快照已保存：{request.name}")
         return snapshot.model_dump(mode="json")
 
-    def apply_snapshot(self, snapshot_id: str) -> dict[str, Any]:
+    def apply_snapshot(
+        self, snapshot_id: str, *, before_commit: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         snapshot = self._read_snapshot(snapshot_id)
         next_config = self._snapshot_config_for_apply(snapshot)
-        saved = self.save_config(next_config, emit_log=False)
+        saved = self.save_config(next_config, emit_log=False, before_commit=before_commit)
         self.logs.info("[BACKEND]", f"{self._scope_label(snapshot.scope)}快照已应用：{snapshot.name}")
         return saved
 
@@ -675,7 +691,10 @@ class SettingsService:
             payload["workOriginOffset"] = json.loads(json.dumps(work_origin_offset))
         self._atomic_write_json(backup_path, payload)
 
-    def _atomic_write_json(self, path: Path, payload: dict[str, Any]) -> None:
+    def _atomic_write_json(
+        self, path: Path, payload: dict[str, Any], *,
+        before_commit: Callable[[], None] | None = None,
+    ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_name: str | None = None
         try:
@@ -691,6 +710,8 @@ class SettingsService:
                 temp_file.write(json.dumps(payload, ensure_ascii=False, indent=2))
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
+            if before_commit is not None:
+                before_commit()
             os.replace(temp_name, path)
         finally:
             if temp_name is not None:

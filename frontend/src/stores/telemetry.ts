@@ -25,6 +25,7 @@ import {
   finishSession as finishRecordSessionApi,
   gripperCommand as gripperCommandApi,
   installControlCommandGuard,
+  installForceSelfCheckGuard,
   manualAxisMove as manualAxisMoveApi,
   mockMode,
   returnMotionOriginSide as returnMotionOriginSideApi,
@@ -50,7 +51,7 @@ import { motionSideReturnOriginReady } from '../motionReturnReady'
 import { initialGripperCommandProgress, type GripperCommandProgress } from '../gripperDisplay'
 import { createMotionCommandController, initialMotionCommand, type MotionCommands } from './motionCommands'
 import { isWireRecord, parseLogEntry, parseTelemetryFrame, wireFrameIsLatched } from './telemetryIngress'
-import { canAcknowledgeControlSafety, controlSafetyBlockReason, initialControlSafety, type ControlSafetyState } from '../utils/controlSafety'
+import { canAcknowledgeControlSafety, controlSafetyBlockReason, forceSelfCheckBlockReason, initialControlSafety, type ControlSafetyState } from '../utils/controlSafety'
 import { createControlLeaseSession, initialControlLease, type ControlLeaseState } from './controlLease'
 import type {
   AppConfig,
@@ -753,8 +754,10 @@ function makeLog(level: LogLevel, msg: string, channel?: LogEntry['channel']): L
     msg,
   }
 }
-/** Append one log while enforcing the UI retention limit. */
+/** 重连重放不占用日志容量；本地与后端编号相同但内容不同的记录仍保留。 */
 function appendLog(logs: LogEntry[], entry: LogEntry) {
+  if (logs.some((existing) => existing.id === entry.id && existing.ts === entry.ts
+    && existing.channel === entry.channel && existing.level === entry.level && existing.msg === entry.msg)) return logs
   return [...logs, entry].slice(-maxLogEntries)
 }
 
@@ -2479,9 +2482,10 @@ sendBackendCommandLog: (level, msg, channel) => {
           logs: appendLog(state.logs, makeLog('ERROR', `settings log command failed: ${String(error)}`, '[BACKEND]')),
         }))
       })
+      return
     }
     set((state) => ({
-      logs: appendLog(state.logs, makeLog(level, `${msg}${mockMode ? ' · test fixture' : ' · backend command'}`, channel)),
+      logs: appendLog(state.logs, makeLog(level, `${msg} · test fixture`, channel)),
     }))
   },
 
@@ -3035,5 +3039,6 @@ const motionCommands = createMotionCommandController(
 )
 
 installControlCommandGuard(() => controlSafetyBlockReason(useTelemetryStore.getState(), !mockMode))
+installForceSelfCheckGuard(() => forceSelfCheckBlockReason(useTelemetryStore.getState(), !mockMode))
 installControlSessionProvider(() => useTelemetryStore.getState().controlLease.sessionId)
 installControlCommandTimeoutHandler((reason) => useTelemetryStore.getState().revokeControlLease(reason))

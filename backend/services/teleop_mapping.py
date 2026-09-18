@@ -73,6 +73,7 @@ class TeleopMappingService:
         self._arm_sources: set[str] = set()
         self._last_blockers: dict[str, dict[str, Any]] = {}
         self._last_diag_zero_log_ms: dict[str, int] = {}
+        self._last_diag_fault_log: dict[str, tuple[tuple[str, str, str], int]] = {}
         self._last_native_diag_action_key = ""
         self._last_native_status_summary = ""
         self._last_native_status_summary_ms = 0
@@ -738,6 +739,10 @@ class TeleopMappingService:
     def _log_diag_action(self, config: dict[str, Any], action: dict[str, Any]) -> None:
         if self.logs is None or not bool(config.get("teleop", {}).get("diagLog", False)):
             return
+        last_error = str(action.get("lastError", self._last_error) or "")
+        level = self._diagnostic_log_level("teleop_status", action, last_error)
+        if level is None:
+            return
         requested = action.get("requestedDeltas")
         applied = action.get("appliedDeltas")
         requested_pulse = action.get("halRequestedPulseDeltas") or action.get("requestedPulseDeltas")
@@ -755,7 +760,7 @@ class TeleopMappingService:
         has_clip = isinstance(clipped, dict) and any(bool(clipped.get(axis)) for axis in AXES)
         now = now_ms()
         zero_key = f"{action.get('sourceSide')}->{action.get('side')}"
-        if not has_motion and not has_clip:
+        if level == "DEBUG" and not has_motion and not has_clip:
             last_zero_ms = self._last_diag_zero_log_ms.get(zero_key, 0)
             if now - last_zero_ms < 1000:
                 return
@@ -767,11 +772,11 @@ class TeleopMappingService:
         latency = float(action.get("commandLatencyMs", 0.0))
         self.logs.event(
             "[HAL]",
-            "INFO",
+            level,
             "teleop_status",
             component="TELEOP",
             rate_key=f"teleop_status:{action.get('sourceSide')}->{action.get('side')}",
-            rate_ms=1000 if not has_motion and not has_clip else None,
+            rate_ms=1000 if level == "DEBUG" and not has_motion and not has_clip else None,
             sideMap=f"{action.get('sourceSide')}->{action.get('side')}",
             refState="active",
             blockReason="-",
@@ -782,32 +787,16 @@ class TeleopMappingService:
             emitPulse=self._format_axis_values(applied_pulse or requested_pulse),
             targetPulse=self._format_axis_values(target_pulse),
             currentPulse=self._format_axis_values(current_pulse),
+            launchPulse=self._format_axis_values(launch_pulse),
+            movingBefore=self._format_axis_flags(moving_before),
+            moveStarted=self._format_axis_flags(move_started),
             limit="payload",
             clip=clip_axes,
             updateRet=self._format_axis_values(update_return),
             stopReason=self._format_axis_values(stop_reason),
             axisIoStatus=self._format_axis_values(axis_io_status),
-            lastError=self._last_error or "",
+            lastError=last_error,
             latencyMs=round(latency, 3),
-        )
-        self.logs.info(
-            "[HAL]",
-            (
-                f"teleop diag {action.get('sourceSide')}->{action.get('side')} "
-                f"axis={action.get('axis')} clip={clip_axes} latency={latency:.1f}ms "
-                f"req={self._format_axis_values(requested)} "
-                f"app={self._format_axis_values(applied)} "
-                f"pulseReq={self._format_axis_values(requested_pulse)} "
-                f"pulseApp={self._format_axis_values(applied_pulse)} "
-                f"targetPulse={self._format_axis_values(target_pulse)} "
-                f"currentPulse={self._format_axis_values(current_pulse)} "
-                f"launchPulse={self._format_axis_values(launch_pulse)} "
-                f"movingBefore={self._format_axis_flags(moving_before)} "
-                f"moveStarted={self._format_axis_flags(move_started)} "
-                f"updateRet={self._format_axis_values(update_return)} "
-                f"stopReason={self._format_axis_values(stop_reason)} "
-                f"axisIoStatus={self._format_axis_values(axis_io_status)}"
-            ),
         )
 
     def _log_native_diag_action(
@@ -818,11 +807,14 @@ class TeleopMappingService:
     ) -> None:
         if not bool(config.get("teleop", {}).get("diagLog", False)):
             return
-        action_key = self._native_diag_action_key(action)
+        fallback_error = action.get("lastError", self._last_error)
+        payload_error = str(payload.get("lastError", fallback_error) or "") if isinstance(payload, dict) else str(fallback_error or "")
+        action_key = f"{self._native_diag_action_key(action)}|{payload_error}"
         if action_key == self._last_native_diag_action_key:
             return
         self._last_native_diag_action_key = action_key
         diag_action = dict(action)
+        diag_action["lastError"] = payload_error
         diag_action["requestedDeltas"] = self._axis_dict_from_six(
             action.get("requestedDeltas") or action.get("deltas")
         )
@@ -858,6 +850,10 @@ class TeleopMappingService:
     ) -> None:
         if self.logs is None or not bool(config.get("teleop", {}).get("diagLog", False)):
             return
+        last_error = str(payload.get("lastError", action.get("lastError", self._last_error)) or "")
+        level = self._diagnostic_log_level("teleop_axis_trace", action, last_error)
+        if level is None:
+            return
         source = str(action.get("sourceSide") or "?")
         target = str(action.get("side") or "?")
         input_detail = self._native_input_detail(payload, source)
@@ -887,7 +883,7 @@ class TeleopMappingService:
         latency = float(action.get("commandLatencyMs", 0.0))
         self.logs.event(
             "[HAL]",
-            "INFO",
+            level,
             "teleop_axis_trace",
             component="TELEOP",
             source=source,
@@ -913,9 +909,29 @@ class TeleopMappingService:
             blockReason=self._native_block_reason(block),
             referenceValid=bool(input_detail.get("referenceValid", False)),
             inputActive=bool(input_detail.get("inputActive", False)),
-            lastError=str(payload.get("lastError") or self._last_error or ""),
+            lastError=last_error,
             latencyMs=round(latency, 3),
         )
+
+    def _diagnostic_log_level(
+        self, event: str, action: dict[str, Any], last_error: str,
+    ) -> Literal["DEBUG", "WARNING"] | None:
+        key = f"{event}:{action.get('sourceSide')}->{action.get('side')}"
+        has_fault = bool(last_error) or any(
+            self._axis_dict_has_motion(action.get(field)) for field in ("updateReturn", "stopReason")
+        )
+        if not has_fault:
+            self._last_diag_fault_log.pop(key, None)
+            return "DEBUG"
+        # 脉冲值和裁剪可持续变化；只按异常原因限频，新的异常立即可见。
+        signature = (last_error, self._format_axis_values(action.get("updateReturn")),
+                     self._format_axis_values(action.get("stopReason")))
+        now = now_ms()
+        previous = self._last_diag_fault_log.get(key)
+        if previous is not None and previous[0] == signature and now - previous[1] < 5000:
+            return None
+        self._last_diag_fault_log[key] = (signature, now)
+        return "WARNING"
 
     def _native_input_detail(self, payload: dict[str, Any], source: str) -> dict[str, Any]:
         inputs = payload.get("inputs")
@@ -955,7 +971,17 @@ class TeleopMappingService:
         self._last_native_status_summary = summary
         self._last_native_status_summary_ms = now
         self._log_native_status_events(payload)
-        self.logs.info("[HAL]", summary)
+        grippers = payload.get("grippers")
+        has_fault = bool(payload.get("lastError")) or (
+            isinstance(grippers, dict)
+            and any(
+                isinstance(detail, dict)
+                and bool(detail.get("lastCommandTs"))
+                and detail.get("ok") is False
+                for detail in grippers.values()
+            )
+        )
+        (self.logs.warning if has_fault else self.logs.debug)("[HAL]", summary)
 
     def _log_teleop_mode(
         self,
@@ -1048,7 +1074,7 @@ class TeleopMappingService:
             block = blockers.get(source_side, {}) if isinstance(blockers, dict) else {}
             self.logs.event(
                 "[HAL]",
-                "INFO",
+                "DEBUG",
                 "teleop_status",
                 component="TELEOP",
                 sideMap=f"{source_side}->{target_side}",
@@ -1199,6 +1225,9 @@ class TeleopMappingService:
                 "axis",
                 "delta",
                 "unit",
+                "updateReturn",
+                "stopReason",
+                "lastError",
             )
         )
 

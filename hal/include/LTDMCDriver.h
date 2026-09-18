@@ -98,6 +98,8 @@ class LTDMCDriver {
   void stopTeleopSide(Side side);
 
  private:
+  friend struct ForceTareDispatcherTestAccess;
+
   void ensureInitialized() const;
   void throwIfEstopActive() const;
   // 配置某侧控制卡轴的脉冲模式、限位模式等基础参数。

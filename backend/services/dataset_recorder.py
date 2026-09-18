@@ -525,6 +525,7 @@ class DatasetRecorderService:
         self._record_fps_hz = 30
         self._force_sample_hz = 200.0
         self._latest_force_state: dict[str, Any] = {}
+        self._episode_force_calibration: dict[str, Any] = {}
         self._recording_config_snapshot: dict[str, Any] = {}
         self._last_motion_pulses = [0.0] * 12
         self._source_sample_indices: dict[str, int] = {key: 0 for key in SOURCE_KEYS}
@@ -577,6 +578,7 @@ class DatasetRecorderService:
                 self._reset_returned_sides = set()
                 self._record_fps_hz = self._record_fps_from_config(config)
                 self._force_sample_hz = self._force_sample_hz_from_config(config)
+                self._latest_force_state = {}
                 self._dataset_dir = dataset_dir
                 self._native_dataset = None
                 self._native_error = ""
@@ -2648,6 +2650,7 @@ class DatasetRecorderService:
         self._max_force_right = 0.0
         if not self._native_writer_active():
             raise DatasetSaveError(self._native_required_message())
+        self._episode_force_calibration = self._force_calibration_snapshot(self._recording_config())
         self._native_dataset_from_index = self._native_total_frames_cached
         self._samplers_paused = False
         self._recording = True
@@ -2699,6 +2702,7 @@ class DatasetRecorderService:
             "warnings": self._quality_warnings(),
             "motionOrigin": self._episode_motion_origin_snapshot(config_snapshot),
             "motionCalibration": self._motion_calibration_snapshot(config_snapshot),
+            "forceCalibration": deepcopy(getattr(self, "_episode_force_calibration", {})),
         }
         episodes = self._read_episodes(dataset_dir)
         episodes = [item for item in episodes if str(item.get("id")) != episode_id]
@@ -2712,6 +2716,43 @@ class DatasetRecorderService:
                 self._write_appstation_info(dataset_dir, config_snapshot)
         self._episode_index += 1
         return episode
+
+    def _force_calibration_snapshot(self, config_snapshot: dict[str, Any]) -> dict[str, Any]:
+        """在 episode 开始时冻结力校准；缺失遥测保持未知，不用零值补造。"""
+        force = config_snapshot.get("force", {})
+        force = force if isinstance(force, dict) else {}
+        source = str(force.get("source", "hkvl_serial")).lower()
+        latest = getattr(self, "_latest_force_state", {})
+        state: dict[str, Any] = {}
+        if (
+            source == "hkvl_serial"
+            and isinstance(latest, dict)
+            and latest.get("source", source) == source
+        ):
+            for key in ("timestamp_ms", "dds_stamp_unix_ms", "dds_stamp_monotonic_ms", "calibration"):
+                if key in latest:
+                    state[key] = deepcopy(latest[key])
+            sides = latest.get("sides", {})
+            if isinstance(sides, dict):
+                state["sides"] = {
+                    side: {
+                        key: deepcopy(values[key])
+                        for key in ("axisSign", "tareBias", "sensorTareBias")
+                        if key in values
+                    }
+                    for side in ("left", "right")
+                    if isinstance(values := sides.get(side), dict)
+                }
+        return {
+            "version": "appstation.force_calibration.v1",
+            "source": source,
+            "capturedAtUnixMs": now_ms(),
+            "sideSemantics": "hardware",
+            "hardwareSideForDatasetSide": data_contract_metadata()["hardwareSideForDatasetSide"],
+            "configuration": deepcopy(force),
+            "stateAvailable": bool(state.get("sides") or state.get("calibration")),
+            "state": state,
+        }
 
     # 原地位置快照
     def _episode_motion_origin_snapshot(self, config_snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -3367,6 +3408,7 @@ class DatasetRecorderService:
             "maxForceRight": float(episode.get("maxForceRight", 0.0)),
             "motionOrigin": episode.get("motionOrigin", {}),
             "motionCalibration": episode.get("motionCalibration", {}),
+            "forceCalibration": deepcopy(episode.get("forceCalibration", {})),
             "features": features,
             "featureSummary": features,
             "cameraResolutions": camera_resolutions,

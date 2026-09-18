@@ -2314,6 +2314,7 @@ describe('AppStation M0 frontend', () => {
 
     render(<LogPanel />)
 
+    fireEvent.click(screen.getByRole('button', { name: '显示诊断日志' }))
     expect(screen.getByText((text) => text.endsWith('.827'))).toBeInTheDocument()
     expect(screen.getByText(/event=teleop_status/)).toHaveAttribute(
       'title',
@@ -2344,6 +2345,8 @@ describe('AppStation M0 frontend', () => {
 
     render(<LogPanel />)
 
+    fireEvent.click(screen.getByRole('button', { name: '显示诊断日志' }))
+    fireEvent.click(screen.getByRole('button', { name: '日志筛选' }))
     expect(screen.getByText(/axis=Roll/)).toBeInTheDocument()
     expect(screen.getByText(/axis=X/)).toBeInTheDocument()
 

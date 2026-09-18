@@ -28,6 +28,8 @@ export const wsUrl = import.meta.env.VITE_WS_URL || 'ws://127.0.0.1:18082/ws'
 export const mockMode = import.meta.env.MODE === 'test'
 
 let controlCommandBlockedReason: () => string | null = () => null
+let forceSelfCheckBlockedReason: () => string | null = () => '力觉自检控制状态尚未就绪'
+let forceSelfCheckPending = false
 let controlCommandUncertain: (reason: string) => void = () => undefined
 let controlSessionId: () => string | null = () => null
 let returnOriginPending = false
@@ -38,6 +40,15 @@ function commandHeaders() {
 /** 注入只读门闩，避免 API 层反向依赖 Zustand；覆盖页面直接调用的控制入口。 */
 export function installControlCommandGuard(read: () => string | null) {
   controlCommandBlockedReason = read
+}
+
+export function installForceSelfCheckGuard(read: () => string | null) {
+  forceSelfCheckBlockedReason = read
+}
+
+function isConfirmedForceSelfCheck(path: string, body: unknown): boolean {
+  return path === '/api/sensors/tare' && Boolean(body && typeof body === 'object'
+    && 'unloadedConfirmed' in body && body.unloadedConfirmed === true)
 }
 
 export function installControlCommandTimeoutHandler(handler: (reason: string) => void) {
@@ -291,7 +302,8 @@ export async function fetchHardwareStatus(): Promise<HardwareProbeStatus> {
 export async function postCommand(path: string, body?: unknown) {
   // 调用方可以传完整接口路径或短路径，这里统一规范成后端路由。
   const apiPath = path.startsWith('/api/') ? path : `/api${path.startsWith('/') ? path : `/${path}`}`
-  const blocked = commandRequiresSafetyClear(apiPath, body) ? controlCommandBlockedReason() : null
+  const blocked = isConfirmedForceSelfCheck(apiPath, body) ? forceSelfCheckBlockedReason()
+    : commandRequiresSafetyClear(apiPath, body) ? controlCommandBlockedReason() : null
   if (blocked) throw new Error(blocked)
   const returningOrigin = /\/motion\/(home_all|(left|right)\/(home|return_origin))$/.test(apiPath)
   if (returningOrigin && returnOriginPending) throw new Error('已有回原点操作进行中，请等待设备确认')
@@ -797,6 +809,16 @@ export async function deleteDatasetEpisodeApi(datasetId: string, episodeId: stri
 // 说明当前代码块的功能用途。
 /** 发送或封装对应的后端命令。 */
 export const tareForceSensors = () => postCommand('/sensors/tare')
+/** 仅在操作者明确确认双侧卸载后调用；结果等待 HAL 遥测核验，不自动 ACK。 */
+export async function runHkvlStartupSelfCheck() {
+  if (forceSelfCheckPending) throw new Error('双侧力觉自检正在进行，请等待结果')
+  forceSelfCheckPending = true
+  try {
+    return await postCommand('/sensors/tare', { unloadedConfirmed: true })
+  } finally {
+    forceSelfCheckPending = false
+  }
+}
 /** 发送或封装对应的后端命令。 */
 export const tareForceSensor = (side: ManualControlSide) => postCommand(`/force/${side}/tare`)
 

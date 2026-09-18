@@ -47,6 +47,7 @@ def test_health_preserves_reported_capabilities_without_inference(
 
         monkeypatch.setattr(client, "_request", request)
     else:
+        monkeypatch.setattr("backend.hal_client.dds_client.now_unix_ms", lambda: 123)
         transport = FakeDdsTransport()
         transport.latest[TOPIC_HAL_HEALTH] = JsonEnvelope(
             stamp_unix_ms=123,

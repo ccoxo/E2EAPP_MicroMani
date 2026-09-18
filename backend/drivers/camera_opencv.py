@@ -515,6 +515,7 @@ class OpenCVCameraDriver:
         self._frame_locks: dict[int, Lock] = {}
         self._frame_events: dict[int, Event] = {}
         self._last_camera_runtime_log_ms: dict[int, int] = {}
+        self._last_mapping_log: dict[str, dict[str, Any]] = {}
         self._resolved_cache_key: tuple[object, ...] | None = None
         self._resolved_cache_at = 0.0
         self._resolved_cache: dict[str, int] | None = None
@@ -538,7 +539,7 @@ class OpenCVCameraDriver:
     def _event(self, level: str, event: str, **fields: Any) -> None:
         if self._logs is None:
             return
-        level_name = "ERROR" if level == "error" else "WARNING" if level == "warning" else "INFO"
+        level_name = "ERROR" if level == "error" else "WARNING" if level == "warning" else "DEBUG" if level == "debug" else "INFO"
         try:
             self._logs.event("[CAMERA]", level_name, event, component="CAMERA", **fields)
         except Exception:
@@ -902,6 +903,7 @@ class OpenCVCameraDriver:
     def _clear_probe_cache(self) -> None:
         self._cached = None
         self._last_probe = 0.0
+        self._identity_cache = None
         self._resolved_cache_key = None
         self._resolved_cache_at = 0.0
         self._resolved_cache = None
@@ -987,7 +989,12 @@ class OpenCVCameraDriver:
         if (
             self._resolved_cache_key == cache_key
             and self._resolved_cache is not None
-            and now - self._resolved_cache_at < 30
+            # 成功绑定保留到配置变更或显式重连，避免定时枚举持锁阻塞预览和录制。
+            # 尚未找到的设备仍按原有间隔重试，不用其他相机替代绑定身份。
+            and (
+                all(index >= 0 for index in self._resolved_cache.values())
+                or now - self._resolved_cache_at < 30
+            )
         ):
             return dict(self._resolved_cache)
         resolved = {
@@ -1022,9 +1029,7 @@ class OpenCVCameraDriver:
         identities = self._camera_identities_by_index()
         for role, resolved_index in resolved.items():
             identity = identities.get(resolved_index, {})
-            self._event(
-                "info",
-                "camera_mapping",
+            fields = dict(
                 role=role,
                 logicalIndex=role,
                 preferredIndex=str(cameras.get(CAMERA_DESCRIPTOR_KEYS[role], "")),
@@ -1035,6 +1040,11 @@ class OpenCVCameraDriver:
                 configPath="runtime/config.json",
                 configHash=config_hash,
             )
+            # 未找到设备时会周期性重新解析；只记录映射本身的变化。
+            identity_fields = {key: value for key, value in fields.items() if key != "configHash"}
+            if self._last_mapping_log.get(role) != identity_fields:
+                self._event("info", "camera_mapping", **fields)
+                self._last_mapping_log[role] = identity_fields
         return resolved
 
     def _resolve_indices_by_identity(self, cameras: dict[str, Any]) -> dict[str, int]:
@@ -1525,7 +1535,7 @@ class OpenCVCameraDriver:
             return
         self._last_camera_runtime_log_ms[index] = now_ms_value
         self._event(
-            "info",
+            "debug",
             "camera_runtime",
             role=role,
             fps=round(self._latest_fps.get(index, 0.0), 1),

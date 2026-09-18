@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <iosfwd>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -65,7 +66,7 @@ class ForceControlRuntime {
   void acknowledgeEmergencyStop(double nowMonotonicMs, AcknowledgeCallback acknowledge = {});
   bool safetyLatched() const;
 
-  void tare(int side, int sampleCount, std::function<bool()> commandAllowed = {});
+  std::string tare(int side, int sampleCount, std::function<bool()> commandAllowed = {});
   ForceComplianceResult complianceCorrection(
       int side,
       std::uint64_t targetMonotonicMs);
@@ -77,12 +78,24 @@ class ForceControlRuntime {
   std::string forceStateJson(double nowMonotonicMs);
 
  private:
+  friend struct ForceControlRuntimeTestAccess;
+
   static void validateConfig(const ForceRuntimeConfig& config);
   void monitorLoop();
   void invokeEmergencyStopIfNeeded(
       const std::optional<ForceSafetyTrip>& trip) noexcept;
   void recordEmergencyCallbackFailure(const char* message) noexcept;
   void reportWorkerFailure(const char* message) noexcept;
+  void appendCalibrationJson(std::ostringstream& out) const;
+
+  struct CalibrationState {
+    std::string state{"not_required"};
+    int progress{0};
+    std::string reason;
+    bool hasResult{false};
+    HkvlTareResult result{};
+    std::uint64_t epoch{0};
+  };
 
   EmergencyStopCallback emergencyStop_;
   AcknowledgeCallback acknowledge_;
@@ -94,9 +107,14 @@ class ForceControlRuntime {
   WorkerLauncher launcher_;
   std::recursive_mutex lifecycleMutex_;
   mutable std::mutex mutex_;
+  std::mutex tareMutex_;
   ForceRuntimeConfig config_{};
   ForceSafetyLatch safety_{};
+  // 主锁存保持停机；独立检测自检期间新增的超限和失联，不能用新零点掩盖它们。
+  ForceSafetyLatch tareSafety_{};
+  bool tareInProgress_{false};
   std::uint64_t tareEpoch_{0};
+  CalibrationState calibration_{};
   ForceComplianceController compliance_;
   std::array<std::array<double, 6>, 2> latestTared_{};
   std::array<std::array<double, 6>, 2> latestFiltered_{};
