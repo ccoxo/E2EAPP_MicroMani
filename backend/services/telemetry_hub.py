@@ -127,6 +127,12 @@ class TelemetryHub:
             "compliance": {"enabled": False},
         }
         gripper_status = dict(native_gripper_status) if isinstance(native_gripper_status, dict) else {}
+        native_detail = gripper_status.get("nativeStatus")
+        if isinstance(native_detail, dict):
+            # Action history belongs to the recorder, not each UI telemetry frame.
+            gripper_status["nativeStatus"] = {
+                key: value for key, value in native_detail.items() if key != "actionHistory"
+            }
         if real_mode and native_gripper_status is not None:
             self.apply_native_gripper_status(native_gripper_status, now)
         if real_mode and force_source == "hkvl_serial":

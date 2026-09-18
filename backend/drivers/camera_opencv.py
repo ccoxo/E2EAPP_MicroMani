@@ -860,6 +860,7 @@ class OpenCVCameraDriver:
     def _clear_probe_cache(self) -> None:
         self._cached = None
         self._last_probe = 0.0
+        self._identity_cache = None
         self._resolved_cache_key = None
         self._resolved_cache_at = 0.0
         self._resolved_cache = None
@@ -945,7 +946,11 @@ class OpenCVCameraDriver:
         if (
             self._resolved_cache_key == cache_key
             and self._resolved_cache is not None
-            and now - self._resolved_cache_at < 30
+            # Keep successful bindings until configuration changes or explicit
+            # reconnect. Periodic enumeration holds the shared resolution lock
+            # for seconds, blocking both preview and recording samplers.
+            and (all(index >= 0 for index in self._resolved_cache.values())
+                 or now - self._resolved_cache_at < 30)
         ):
             return dict(self._resolved_cache)
         resolved = {
