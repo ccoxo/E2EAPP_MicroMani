@@ -1,9 +1,17 @@
+"""Validate operator commands before they reach HAL or simulated telemetry.
+
+Command handlers are the backend safety boundary for manual jog, work-origin,
+gripper, and emergency-stop operations. The comments below emphasize checks
+that protect real hardware or keep frontend state aligned with command effects.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import os
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from typing import Any, cast
 
 from backend.core.config import SettingsService, reanchor_motion_soft_limits_to_current_origin
@@ -24,12 +32,17 @@ from backend.core.motion_limits import (
 from backend.core.schemas import GripperCommandRequest, ManualAxisMoveRequest, SettingsCommandRequest
 from backend.core.units import motion_pulse_per_unit, pulse_to_ui
 from backend.hal_client.client import HalClient
+from backend.services.gripper_backend import (
+    NativeGripperAdapter,
+    hal_response_message,
+    native_teleop_enabled,
+)
+from backend.services.gripper_router import GripperRouter
 from backend.services.hardware_service import HardwareService
 from backend.services.telemetry_hub import TelemetryHub
 
 AXIS_ORDER = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
 AXIS_LABELS = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
-RIGHT_YAW_DISABLED_AXES = [True, True, True, True, True, False]
 MANUAL_AXIS_STEP_LIMIT_PULSE = 100000.0
 MANUAL_TRANSLATION_STEP_LIMIT_UM = 5000.0
 MANUAL_ROTATION_STEP_LIMIT_DEG = 2.0
@@ -66,6 +79,8 @@ class MotionOriginDriftConfirmationRequired(RuntimeError):
 
 
 class CommandService:
+    """Dispatch UI commands through policy checks, telemetry updates, and HAL."""
+
     def __init__(
         self,
         settings: SettingsService,
@@ -73,19 +88,20 @@ class CommandService:
         hal: HalClient,
         logs: LogService,
         hardware: HardwareService | None = None,
-        gripper_workers: Any | None = None,
         origin_mutation_locked: Callable[[], bool] | None = None,
         teleop: Any | None = None,
+        gripper_router: Any | None = None,
     ) -> None:
         self.settings = settings
         self.telemetry = telemetry
         self.hal = hal
         self.logs = logs
         self.hardware = hardware
-        self.gripper_workers = gripper_workers
         self.teleop = teleop
+        self.gripper_router = gripper_router
+        if self.gripper_router is None:
+            self.gripper_router = GripperRouter(native=NativeGripperAdapter(hal, teleop))
         self._origin_mutation_locked = origin_mutation_locked or (lambda: False)
-        self._motion_enable_restore_snapshot: dict[str, list[bool]] | None = None
 
     def set_origin_mutation_lock_checker(self, checker: Callable[[], bool]) -> None:
         self._origin_mutation_locked = checker
@@ -153,8 +169,6 @@ class CommandService:
 
     async def emergency_stop(self) -> dict[str, object]:
         # 先更新本地遥测状态，再请求 HAL 急停，让 UI 能立即进入安全态。
-        if self._motion_enable_restore_snapshot is None:
-            self._motion_enable_restore_snapshot = self._motion_enable_snapshot()
         self.telemetry.emergency_stop()
         result = await self.hal.command("motion.emergency_stop")
         self.logs.error("[SAFETY]", "hardware emergency stop requested")
@@ -178,8 +192,8 @@ class CommandService:
             raise RuntimeError("motion work origin is not captured")
         left_pulse = cast(list[float], origin["leftPulse"])
         right_pulse = cast(list[float], origin["rightPulse"])
-        left_enabled_axes = self._home_enabled_axes("left")
-        right_enabled_axes = self._home_enabled_axes("right")
+        left_enabled_axes = self._home_enabled_axes("left", config)
+        right_enabled_axes = self._home_enabled_axes("right", config)
         await self._stop_manual_teleop_connect_before_motion_return()
         self._validate_work_origin_target(config, "left", left_enabled_axes)
         self._validate_work_origin_target(config, "right", right_enabled_axes)
@@ -251,7 +265,7 @@ class CommandService:
         if not bool(origin[valid_key]):
             raise RuntimeError(f"{side} motion work origin is not captured")
         pulse = cast(list[float], origin[pulse_key])
-        enabled_axes = self._home_enabled_axes(side)
+        enabled_axes = self._home_enabled_axes(side, config)
         await self._stop_manual_teleop_connect_before_motion_return()
         self._validate_work_origin_target(config, side, enabled_axes)
         self._validate_motion_axes_enabled_for_work_origin(motion_state, side, enabled_axes)
@@ -292,7 +306,9 @@ class CommandService:
 
     async def enable_motion_side(self, side: str, enabled_axes: list[bool] | None = None) -> dict[str, object]:
         self._validate_side(side)
-        enabled_axes = self._home_enabled_axes(side) if enabled_axes is None else enabled_axes
+        if enabled_axes is None:
+            config = await self._get_config_async()
+            enabled_axes = self._home_enabled_axes(side, config)
         payload: dict[str, object] = {"side": side}
         payload["enabledAxes"] = list(enabled_axes)
         result = await self.hal.command("motion.enable_side", payload)
@@ -319,13 +335,14 @@ class CommandService:
     async def home_motion_side(self, side: str) -> dict[str, object]:
         self._validate_side(side)
         self._ensure_origin_mutation_allowed()
+        config = await self._get_config_async()
+        enabled_axes = self._home_enabled_axes(side, config)
         result = await self.hal.command(
             "motion.home_side",
-            {"side": side, "enabledAxes": self._home_enabled_axes(side)},
+            {"side": side, "enabledAxes": enabled_axes},
         )
         state = await self.hal.motion_state()
         pulses = self._motion_state_pulses(state)
-        config = await self._get_config_async()
         origin = self._normalized_motion_origin(config)
         home_reference = self._normalized_home_reference(config)
         work_origin_offset = self._normalized_work_origin_offset(config)
@@ -341,7 +358,7 @@ class CommandService:
         work_origin_invalidated = False
         if bool(origin.get(valid_key)):
             try:
-                self._validate_work_origin_target(config, side, self._home_enabled_axes(side))
+                self._validate_work_origin_target(config, side, enabled_axes)
             except RuntimeError as exc:
                 origin[valid_key] = False
                 origin["valid"] = bool(origin["leftValid"] and origin["rightValid"])
@@ -374,6 +391,58 @@ class CommandService:
             "origin": self._normalized_motion_origin(config),
             "homeReference": self._normalized_home_reference(config),
             "workOriginOffset": self._normalized_work_origin_offset(config),
+            "previousRestore": self.previous_motion_origin_restore_status(config),
+        }
+
+    def previous_motion_origin_restore_status(self, config: dict[str, Any]) -> dict[str, object]:
+        origin = self._normalized_motion_origin(config)
+        if not bool(origin["previousValid"]):
+            return {
+                "available": False,
+                "restorable": False,
+                "message": "previous motion work origin is not available",
+            }
+        preview = deepcopy(config)
+        preview_origin = self._normalized_motion_origin(preview)
+        preview_origin["leftPulse"] = list(cast(list[float], origin["previousLeftPulse"]))
+        preview_origin["rightPulse"] = list(cast(list[float], origin["previousRightPulse"]))
+        preview_origin["updatedAt"] = int(cast(Any, origin["previousUpdatedAt"]))
+        preview_origin["leftValid"] = True
+        preview_origin["rightValid"] = True
+        preview_origin["valid"] = True
+        home_reference = self._normalized_home_reference(preview)
+        work_origin_offset = self._normalized_work_origin_offset(preview)
+        self._set_work_origin_offset_side(
+            work_origin_offset,
+            home_reference,
+            "left",
+            cast(list[float], preview_origin["leftPulse"]),
+            int(cast(Any, preview_origin["updatedAt"])),
+        )
+        self._set_work_origin_offset_side(
+            work_origin_offset,
+            home_reference,
+            "right",
+            cast(list[float], preview_origin["rightPulse"]),
+            int(cast(Any, preview_origin["updatedAt"])),
+        )
+        preview["motion"]["origin"] = preview_origin
+        preview["motion"]["homeReference"] = home_reference
+        preview["motion"]["workOriginOffset"] = work_origin_offset
+        reanchor_motion_soft_limits_to_current_origin(preview)
+        try:
+            self._validate_work_origin_target(preview, "left", self._home_enabled_axes("left", preview))
+            self._validate_work_origin_target(preview, "right", self._home_enabled_axes("right", preview))
+        except RuntimeError as exc:
+            return {
+                "available": True,
+                "restorable": False,
+                "message": str(exc),
+            }
+        return {
+            "available": True,
+            "restorable": True,
+            "message": "previous motion work origin is restorable",
         }
 
     async def capture_motion_origin(
@@ -419,7 +488,7 @@ class CommandService:
         config["motion"]["workOriginOffset"] = work_origin_offset
         reanchor_motion_soft_limits_to_current_origin(config, side)
         for active_side in ("left", "right") if side is None else (side,):
-            self._validate_work_origin_target(config, active_side, self._home_enabled_axes(active_side))
+            self._validate_work_origin_target(config, active_side, self._home_enabled_axes(active_side, config))
         saved = await self._save_config_async(config, emit_log=False)
         label = side or "both"
         self.logs.info("[HAL]", f"{label} motion work origin recorded")
@@ -446,8 +515,28 @@ class CommandService:
         origin["previousLeftPulse"] = current_left
         origin["previousRightPulse"] = current_right
         origin["previousUpdatedAt"] = current_updated_at if current_valid else 0
+        home_reference = self._normalized_home_reference(config)
+        work_origin_offset = self._normalized_work_origin_offset(config)
+        self._set_work_origin_offset_side(
+            work_origin_offset,
+            home_reference,
+            "left",
+            cast(list[float], origin["leftPulse"]),
+            int(cast(Any, origin["updatedAt"])),
+        )
+        self._set_work_origin_offset_side(
+            work_origin_offset,
+            home_reference,
+            "right",
+            cast(list[float], origin["rightPulse"]),
+            int(cast(Any, origin["updatedAt"])),
+        )
         config["motion"]["origin"] = origin
+        config["motion"]["homeReference"] = home_reference
+        config["motion"]["workOriginOffset"] = work_origin_offset
         reanchor_motion_soft_limits_to_current_origin(config)
+        self._validate_work_origin_target(config, "left", self._home_enabled_axes("left", config))
+        self._validate_work_origin_target(config, "right", self._home_enabled_axes("right", config))
         saved = await self._save_config_async(config, emit_log=False)
         self.logs.info("[HAL]", "previous motion work origin restored")
         await self._stop_native_teleop_after_origin_change()
@@ -484,39 +573,43 @@ class CommandService:
         return {"origin": saved["motion"]["origin"], "config": saved}
 
     async def acknowledge_safety(self) -> dict[str, object]:
-        restored_sides: list[str] = []
-        snapshot = self._motion_enable_restore_snapshot
-        if snapshot:
-            for side in ("left", "right"):
-                enabled_axes = snapshot.get(side)
-                if enabled_axes is None or not any(enabled_axes):
-                    continue
-                await self.hal.command("motion.enable_side", {"side": side, "enabledAxes": list(enabled_axes)})
-                await self._refresh_motion_enabled(side)
-                restored_sides.append(side)
-            self._motion_enable_restore_snapshot = None
+        result = await self.hal.command("motion.acknowledge_estop", {})
         self.telemetry.acknowledge_safety()
-        restored = ",".join(restored_sides) if restored_sides else "none"
-        self.logs.info("[SAFETY]", f"safety state acknowledged; restored_motion_enable={restored}")
-        return {"accepted": True, "restoredMotionEnable": restored_sides}
+        self.logs.info("[SAFETY]", "safety state acknowledged; servos remain disabled")
+        return {
+            "accepted": True,
+            "servoRestored": False,
+            "restoredMotionEnable": [],
+            "hal": result,
+        }
 
     async def tare_force(self, side: str | None = None) -> dict[str, object]:
         # 真机模式优先执行传感器 tare；测试模式仅重置本地模拟力数据。
         config = await self._get_config_async()
-        if self.hardware is not None and self._real_hardware_mode(config):
+        force = config.get("force", {}) if isinstance(config.get("force"), dict) else {}
+        source = str(force.get("source", "hkvl_serial")).lower()
+        hal_result: dict[str, object] | None = None
+        real_hardware = self._real_hardware_mode(config)
+        if real_hardware and source == "hkvl_serial":
+            payload: dict[str, object] = {"side": side or "all"}
+            tare_samples = int(force.get("tareSamples", 0) or 0)
+            if tare_samples > 0:
+                payload["samples"] = tare_samples
+            hal_result = await self.hal.command("force.tare", payload)
+        elif self.hardware is not None and real_hardware:
             result = await asyncio.to_thread(self.hardware.force.tare, config, side)
             if not result.ok:
                 self.logs.error("[FORCE]", result.message)
                 raise RuntimeError(result.message)
-        self.telemetry.tare_force()
+        if not (real_hardware and source == "hkvl_serial"):
+            self.telemetry.tare_force()
         label = "both sides" if side is None else ("left" if side == "left" else "right")
-        self.logs.info("[FORCE]", f"{label} Nano-17 tare requested")
-        return {"side": side or "all"}
+        self.logs.info("[FORCE]", f"{label} {source} tare requested")
+        return {"side": side or "all", "source": source, "hal": hal_result}
 
     async def manual_axis_move(self, request: ManualAxisMoveRequest) -> dict[str, object]:
         config = await self._get_config_async()
         # 所有手动 jog 都先过后端安全边界，再决定发往真机还是本地模拟。
-        self._validate_manual_axis_policy(config, request)
         self._validate_manual_axis_safety(config, request)
         effective_direction = self._manual_axis_effective_direction(request.side, request.axis, request.direction)
         op_id = self.logs.new_op_id("manual")
@@ -530,6 +623,9 @@ class CommandService:
             for index, chunk_step in enumerate(chunk_steps):
                 chunk_request = request.model_copy(update={"step": chunk_step})
                 if index > 0:
+                    # Coarse rotation jogs are split into HAL-safe chunks. Recheck
+                    # the remaining move after each chunk because the operator or
+                    # hardware limit state may have changed while the axis moved.
                     current_config = await self._get_config_async()
                     remaining_step = sum(chunk_steps[index:])
                     remaining_request = request.model_copy(update={"step": remaining_step})
@@ -568,7 +664,7 @@ class CommandService:
                         effective_direction,
                         safe_delta,
                         backend="hal",
-                        dmc_ret=self._hal_response_message(hal_result) or "accepted",
+                        dmc_ret=hal_response_message(hal_result) or "accepted",
                         soft_limit=soft_limit_diag,
                     ),
                     "chunkCount": len(chunk_steps),
@@ -596,151 +692,9 @@ class CommandService:
 
     async def gripper_command(self, request: GripperCommandRequest) -> dict[str, object]:
         config = await self._get_config_async()
-        gripper_workers = self.gripper_workers
-        use_gripper_workers = gripper_workers is not None and gripper_workers.is_enabled(config)
-        if (
-            self.hardware is not None
-            and self._real_hardware_mode(config)
-            and self._hal_native_teleop(config)
-            and not use_gripper_workers
-        ):
-            target = self._gripper_command_target(config, request)
-            side_label = "left gripper" if request.side == "left" else "right gripper"
-            if target is None:
-                if request.command == "enable":
-                    target_key = "targetLeftMm" if request.side == "left" else "targetRightMm"
-                    target = protected_gripper_target_mm(
-                        config,
-                        float(config.get("gripper", {}).get(target_key, 0.0)),
-                    )
-                    payload = self._native_gripper_payload(config, request.side, target)
-                    try:
-                        hal_result = await self.hal.command("teleop.native.gripper_command", payload)
-                    except Exception as exc:
-                        self._log_gripper_command(
-                            config,
-                            request,
-                            backend="hal_native",
-                            target=target,
-                            run_ret=False,
-                            ipc_ok=False,
-                            error=str(exc),
-                        )
-                        raise
-                    await self._save_gripper_command_state_async(config, request, target)
-                    self._log_gripper_command(
-                        config,
-                        request,
-                        backend="hal_native",
-                        target=target,
-                        run_ret=True,
-                        ipc_ok=True,
-                    )
-                    response_message = self._hal_response_message(hal_result) or "HAL-native gripper enable accepted"
-                    self.logs.info("[GRIPPER]", f"{side_label} {request.command}: {response_message}")
-                    return {
-                        "message": response_message,
-                        "nativeManaged": True,
-                        "targetMm": target,
-                        "hal": hal_result,
-                    }
-                await self._save_gripper_command_state_async(config, request, target)
-                message = "HAL-native gripper state updated; no position command required"
-                self._log_gripper_command(
-                    config,
-                    request,
-                    backend="hal_native",
-                    target=target,
-                    run_ret="not_called",
-                    ipc_ok=True,
-                )
-                self.logs.info("[GRIPPER]", f"{side_label} {request.command}: {message}")
-                return {"message": message, "nativeManaged": True}
-            payload = self._native_gripper_payload(config, request.side, target)
-            try:
-                hal_result = await self.hal.command("teleop.native.gripper_command", payload)
-            except Exception as exc:
-                self._log_gripper_command(
-                    config,
-                    request,
-                    backend="hal_native",
-                    target=target,
-                    run_ret=False,
-                    ipc_ok=False,
-                    error=str(exc),
-                )
-                raise
-            if request.command in {"open", "close", "home", "target"}:
-                config.setdefault("gripper", {})[f"{request.side}Enabled"] = True
-            await self._save_gripper_command_state_async(config, request, target)
-            self._log_gripper_command(
-                config,
-                request,
-                backend="hal_native",
-                target=target,
-                run_ret=True,
-                ipc_ok=True,
-            )
-            response_message = self._hal_response_message(hal_result) or "HAL-native gripper command accepted"
-            self.logs.info("[GRIPPER]", f"{side_label} {request.command}: {response_message}")
-            response: dict[str, object] = {
-                "message": response_message,
-                "nativeManaged": True,
-                "targetMm": target,
-                "hal": hal_result,
-            }
-            return response
-        self._validate_gripper_command_enabled(config, request)
         if self.hardware is not None and self._real_hardware_mode(config):
-            # 真机成功响应后才保存目标开合度，避免 UI 记住未执行的硬件状态。
-            gripper_backend = "dual_worker" if use_gripper_workers else "python_rs485"
-            target = self._gripper_command_target(config, request)
-            dispatch_command, dispatch_target = self._gripper_dispatch_command(config, request, target)
-            if use_gripper_workers:
-                if gripper_workers is None:
-                    raise RuntimeError("gripper worker service is not available")
-                result = await asyncio.to_thread(
-                    gripper_workers.command,
-                    config,
-                    request.side,
-                    dispatch_command,
-                    dispatch_target,
-                )
-            else:
-                result = await asyncio.to_thread(
-                    self.hardware.gripper.command,
-                    config,
-                    request.side,
-                    dispatch_command,
-                    dispatch_target,
-                )
-            if not result.ok:
-                self._log_gripper_command(
-                    config,
-                    request,
-                    backend=gripper_backend,
-                    target=target,
-                    run_ret=result.ok,
-                    ipc_ok=True,
-                    error=result.message,
-                )
-                self.logs.error("[GRIPPER]", result.message)
-                raise RuntimeError(result.message)
-            await self._save_gripper_command_state_async(config, request, target)
-            self._log_gripper_command(
-                config,
-                request,
-                backend=gripper_backend,
-                target=target,
-                run_ret=result.ok,
-                ipc_ok=True,
-            )
-            side_label = "left gripper" if request.side == "left" else "right gripper"
-            self.logs.info("[GRIPPER]", f"{side_label} {request.command}: {result.message}")
-            worker_response: dict[str, object] = {"message": result.message}
-            if target is not None:
-                worker_response["targetMm"] = target
-            return worker_response
+            return await self._dispatch_real_gripper_command(config, request)
+        self._validate_gripper_command_enabled(config, request)
         target = self._gripper_command_target(config, request)
         if target is None:
             target = self.telemetry.apply_gripper(request.side, request.command, request.targetMm, config)
@@ -758,6 +712,68 @@ class CommandService:
         side_label = "left gripper" if request.side == "left" else "right gripper"
         self.logs.info("[GRIPPER]", f"{side_label} {request.command} -> {target:.1f} mm local fallback")
         return {"targetMm": target}
+
+    async def _dispatch_real_gripper_command(
+        self,
+        config: dict[str, Any],
+        request: GripperCommandRequest,
+    ) -> dict[str, object]:
+        if self.gripper_router is None:
+            raise RuntimeError("gripper router is not available")
+        gripper_backend = self.gripper_router.backend_name(config)
+        target = self._gripper_command_target(config, request)
+        if target is None and request.command == "enable":
+            target_key = "targetLeftMm" if request.side == "left" else "targetRightMm"
+            target = protected_gripper_target_mm(
+                config,
+                float(config.get("gripper", {}).get(target_key, 0.0)),
+            )
+        try:
+            result = await self.gripper_router.command(config, request.side, request.command, target)
+        except Exception as exc:
+            self._log_gripper_command(
+                config,
+                request,
+                backend=gripper_backend,
+                target=target,
+                run_ret=False,
+                ipc_ok=False,
+                error=str(exc),
+            )
+            raise
+        if not result.ok:
+            self._log_gripper_command(
+                config,
+                request,
+                backend=gripper_backend,
+                target=target,
+                run_ret=result.ok,
+                ipc_ok=True,
+                error=result.message,
+            )
+            self.logs.error("[GRIPPER]", result.message)
+            raise RuntimeError(result.message)
+        if request.command in {"open", "close", "home", "target"}:
+            config.setdefault("gripper", {})[f"{request.side}Enabled"] = True
+        await self._save_gripper_command_state_async(config, request, target)
+        self._log_gripper_command(
+            config,
+            request,
+            backend=gripper_backend,
+            target=target,
+            run_ret=result.ok if target is not None else "not_called",
+            ipc_ok=True,
+        )
+        side_label = "left gripper" if request.side == "left" else "right gripper"
+        self.logs.info("[GRIPPER]", f"{side_label} {request.command}: {result.message}")
+        response: dict[str, object] = {"message": result.message}
+        response["nativeManaged"] = True
+        hal_result = result.details.get("hal") if isinstance(result.details, dict) else None
+        if isinstance(hal_result, dict):
+            response["hal"] = hal_result
+        if target is not None:
+            response["targetMm"] = target
+        return response
 
     def _manual_axis_log_fields(
         self,
@@ -912,7 +928,7 @@ class CommandService:
         if request.command == "close":
             return protected_gripper_target_mm(config, 0.0)
         if request.command == "home":
-            if self._hal_native_teleop(config):
+            if native_teleop_enabled(config):
                 return protected_gripper_target_mm(config, 0.0)
             return 0.0
         if request.command == "target":
@@ -957,35 +973,6 @@ class CommandService:
             config["gripper"][f"{request.side}Enabled"] = False
         self.settings.save_config(config, emit_log=False)
 
-    def _native_gripper_payload(self, config: dict[str, Any], side: str, target: float) -> dict[str, object]:
-        gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
-        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
-        gripper_teleop = teleop.get("gripperTeleop", {}) if isinstance(teleop.get("gripperTeleop"), dict) else {}
-        return {
-            "side": side,
-            "targetMm": target,
-            "leftPort": str(gripper.get("leftPort", "COM8")),
-            "rightPort": str(gripper.get("rightPort", "COM9")),
-            "leftSlaveId": int(gripper.get("leftSlaveId", 10)),
-            "rightSlaveId": int(gripper.get("rightSlaveId", 9)),
-            "baudrate": int(gripper.get("baudrate", 115200)),
-            "strokeMm": float(gripper.get("strokeMm", 26)),
-            "jodellDllPath": str(gripper.get("jodellDllPath", "")),
-            "gripSpeed": int(gripper_teleop.get("gripSpeed", 255)),
-            "gripTorque": int(gripper_teleop.get("gripTorque", 1)),
-            "icfTargetProtectionEnabled": icf_target_protection_enabled(config),
-            "icfTargetMinGapMm": icf_target_min_gap_mm(config),
-        }
-
-    def _hal_response_message(self, result: dict[str, object]) -> str:
-        response = result.get("response")
-        if isinstance(response, dict):
-            message = response.get("message")
-            if message is not None:
-                return str(message)
-        message = result.get("message")
-        return str(message) if message is not None else ""
-
     def _validate_gripper_command_enabled(self, config: dict[str, Any], request: GripperCommandRequest) -> None:
         if request.command in {"enable", "disable", "stop"}:
             return
@@ -1003,11 +990,6 @@ class CommandService:
             )
         if self._axis_profile(config, request)["maxVelocity"] <= 0:
             raise RuntimeError("manual axis velocity must be positive")
-
-    def _validate_manual_axis_policy(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> None:
-        _ = config
-        if request.side == "right" and request.axis == "Yaw":
-            raise RuntimeError("right Yaw motion axis is disabled by safety policy")
 
     def _manual_axis_step_pulse(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> float:
         return abs(float(request.step)) * self._manual_axis_pulse_per_ui_unit(config, request.side, request.axis)
@@ -1040,6 +1022,8 @@ class CommandService:
         hal_step_limit = self._manual_axis_hal_step_limit(request.axis)
         if request.axis in {"X", "Y", "Z"} or request.speedMode != "coarse" or total_step <= hal_step_limit:
             return [total_step]
+        # UI coarse rotation can be larger than the HAL single-step rotation
+        # cap, so preserve the requested direction and send bounded chunks.
         chunks: list[float] = []
         remaining = total_step
         epsilon = 1e-9
@@ -1057,18 +1041,6 @@ class CommandService:
         if axis_index < 3:
             return pulse_per_unit / 1000.0
         return pulse_per_unit
-
-    def _motion_enable_snapshot(self) -> dict[str, list[bool]]:
-        snapshot: dict[str, list[bool]] = {}
-        for side in ("left", "right"):
-            side_enabled = self.telemetry.motion_enabled.get(side)
-            raw_axes = list(self.telemetry.motion_axis_enabled.get(side, [None] * 6))[:6]
-            while len(raw_axes) < 6:
-                raw_axes.append(None)
-            enabled_axes = [value is True or (value is None and side_enabled is True) for value in raw_axes]
-            if any(enabled_axes):
-                snapshot[side] = enabled_axes
-        return snapshot
 
     async def _refresh_motion_enabled(self, side: str) -> None:
         state = await self.hal.motion_state()
@@ -1177,7 +1149,7 @@ class CommandService:
         axes = (
             enabled_axes
             if isinstance(enabled_axes, list) and len(enabled_axes) >= 6
-            else self._home_enabled_axes(side)
+            else self._home_enabled_axes(side, config)
         )
         for axis_index, axis_name in enumerate(AXIS_ORDER):
             if not axes[axis_index]:
@@ -1264,10 +1236,6 @@ class CommandService:
         mode = os.environ.get("APPSTATION_HAL_MODE") or config["hal"].get("mode", "real")
         return str(mode).lower() == "real"
 
-    def _hal_native_teleop(self, config: dict[str, Any]) -> bool:
-        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
-        return str(teleop.get("engine", "")).lower() == "hal_native"
-
     def _motion_origin_capture_drift(
         self,
         config: dict[str, Any],
@@ -1340,8 +1308,8 @@ class CommandService:
         if side not in {"left", "right"}:
             raise RuntimeError("side must be left or right")
 
-    def _home_enabled_axes(self, side: str) -> list[bool]:
-        return list(RIGHT_YAW_DISABLED_AXES if side == "right" else [True] * 6)
+    def _home_enabled_axes(self, side: str, config: dict[str, Any] | None = None) -> list[bool]:
+        return [True] * 6
 
     def _motion_state_pulses(self, state: dict[str, Any]) -> list[float]:
         raw_pulses = state.get("pulses")

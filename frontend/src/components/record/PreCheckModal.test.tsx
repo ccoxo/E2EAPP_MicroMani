@@ -18,6 +18,10 @@ function makeReadyForRecordPrecheck() {
     diagnostics: structuredClone(defaultDiagnostics).map((item) =>
       item.key === 'omega7' || item.key === 'gripper' ? { ...item, status: 'ok' } : item,
     ),
+    telemetryLink: {
+      state: 'live',
+      lastFrameReceivedAt: Date.now(),
+    },
     frame: {
       ...state.frame,
       motionEnabled: { left: true, right: true },
@@ -27,6 +31,12 @@ function makeReadyForRecordPrecheck() {
       },
       halOk: true,
       wsOk: true,
+      forceStatus: {
+        ...state.frame.forceStatus,
+        source: 'hkvl_serial',
+        calibration: { state: 'ready', progress: 1 },
+        safety: { latched: false, reason: '', canAcknowledge: true },
+      },
       cameras: state.frame.cameras.map((camera) => ({ ...camera, fps: 30, health: 'ok' })),
       teleopHands: state.frame.teleopHands.map((hand) =>
         hand.side === 'left'
@@ -43,10 +53,6 @@ function makeReadyForRecordPrecheck() {
               message: '',
             },
       ),
-    },
-    recordSession: {
-      ...state.recordSession,
-      forceTareActive: false,
     },
   }))
 }
@@ -125,6 +131,43 @@ describe('PreCheckModal', () => {
     expect(confirmButton).toBeEnabled()
     fireEvent.click(confirmButton)
     expect(onConfirm).toHaveBeenCalledTimes(1)
+  })
+
+  it('blocks an HKVL recording session until startup tare is acknowledged', async () => {
+    makeReadyForRecordPrecheck()
+    useTelemetryStore.setState((state) => ({
+      config: {
+        ...state.config,
+        force: { ...state.config.force, source: 'hkvl_serial' },
+      },
+      frame: {
+        ...state.frame,
+        forceStatus: {
+          ...state.frame.forceStatus,
+          source: 'hkvl_serial',
+          calibration: { state: 'waiting_sensors', progress: 0 },
+          safety: { latched: true, canAcknowledge: false },
+        },
+      },
+    }))
+
+    render(<PreCheckModal open onConfirm={vi.fn()} onCancel={vi.fn()} />)
+    fireEvent.click(screen.getByRole('checkbox'))
+    const confirmButton = document.querySelector('.ant-modal-footer .ant-btn-primary') as HTMLButtonElement
+    expect(confirmButton).toBeDisabled()
+
+    useTelemetryStore.setState((state) => ({
+      frame: {
+        ...state.frame,
+        forceStatus: {
+          ...state.frame.forceStatus,
+          calibration: { state: 'ready', progress: 100 },
+          safety: { latched: false, canAcknowledge: true },
+        },
+      },
+    }))
+
+    await vi.waitFor(() => expect(confirmButton).toBeEnabled())
   })
 
   it('does not label direct camera capture as worker fallback', () => {

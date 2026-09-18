@@ -408,7 +408,7 @@ Fx, Fy, Fz, Mx, My, Mz
 | 前端 UI 显示（可选格式化） | `mN`（×1000）或 `N` | `mNm`（×1000）或 `Nm` |
 | Settings 安全阈值配置字段 | `N`（存储），UI 可显示 `mN` | `Nm`（存储），UI 可显示 `mNm` |
 
-> ⚠️ Settings 页面旧版显示过 `mN`/`mN·m`，但 **config.json 落盘必须存 N/Nm**，前端做显示格式化，后端不做单位转换。dangerIndex 计算基于 N/Nm 阈值（Fxy_stop=4N，Fz_stop=5N，Txy_stop=0.04Nm）。
+> ⚠️ Settings 页面旧版显示过 `mN`/`mN·m`，但 **config.json 落盘必须存 N/Nm**，前端做显示格式化，后端不做单位转换。dangerIndex 计算基于 N/Nm 阈值（Fxy_stop=30N，Fz_stop=30N，Txy_stop=1Nm）。这些 stop 值暂按 HKVL-36A 官方额定量程填写，并非厂家给出的应用安全阈值；warn 与 watchdog 仍需后续实机测试收敛。
 
 必须实现：
 

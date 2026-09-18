@@ -39,6 +39,7 @@ using DhdGripperEncoderToGap = int(__stdcall*)(int, double*, char);
 using DhdEnableExpertMode = int(__stdcall*)();
 using DhdEnableForce = int(__stdcall*)(unsigned char, char);
 using DhdSetGravityCompensation = int(__stdcall*)(int, char);
+using DhdSetStandardGravity = int(__stdcall*)(double, char);
 using DhdSetForceAndTorqueAndGripperForce =
     int(__stdcall*)(double, double, double, double, double, double, double, char);
 using DhdErrorGetLastStr = const char* (__stdcall*)();
@@ -59,9 +60,11 @@ DhdGripperEncoderToGap dhdGripperEncoderToGap = nullptr;
 DhdEnableExpertMode dhdEnableExpertMode = nullptr;
 DhdEnableForce dhdEnableForce = nullptr;
 DhdSetGravityCompensation dhdSetGravityCompensation = nullptr;
+DhdSetStandardGravity dhdSetStandardGravity = nullptr;
 DhdSetForceAndTorqueAndGripperForce dhdSetForceAndTorqueAndGripperForce = nullptr;
 DhdErrorGetLastStr dhdErrorGetLastStr = nullptr;
 
+constexpr double kStandardGravity = 9.81;
 constexpr double kOmega7GripperOpenDeg = 30.0;
 constexpr double kOmega7GripperOpenMm = 25.0;
 // 有些 SDK/设备在开口读取失败时会返回接近 0 的噪声值，低于该阈值不作为可信开口。
@@ -77,6 +80,13 @@ std::string sdkError() {
   return message ? std::string(message) : std::string("unknown SDK error");
 }
 #endif
+
+double normalizeGravityScale(double value, double fallback) {
+  if (!std::isfinite(value)) {
+    return fallback;
+  }
+  return std::clamp(value, 0.0, 1.0);
+}
 }  // namespace
 
 bool Omega7Driver::initialize(int leftOpenId, int rightOpenId, bool swapHands) {
@@ -85,11 +95,13 @@ bool Omega7Driver::initialize(int leftOpenId, int rightOpenId, bool swapHands) {
   rightOpenId_ = rightOpenId;
   swapHands_ = swapHands;
   const auto forceOutputEnabled = forceOutputEnabled_;
+  const auto gravityScale = gravityScale_;
   // initialize 可能被重复调用；先清空旧状态，后续任一步失败都保持未初始化。
   initialized_ = false;
   lastError_.clear();
   state_ = {};
   forceOutputEnabled_ = forceOutputEnabled;
+  gravityScale_ = gravityScale;
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   // 优先加载 64 位 SDK DLL，失败时再尝试旧名称 dhd.dll。
   // HalServer 运行目录或 PATH 里必须能找到该 DLL。
@@ -125,6 +137,7 @@ bool Omega7Driver::initialize(int leftOpenId, int rightOpenId, bool swapHands) {
   dhdEnableForce = reinterpret_cast<DhdEnableForce>(GetProcAddress(dhdModule, "dhdEnableForce"));
   dhdSetGravityCompensation = reinterpret_cast<DhdSetGravityCompensation>(
       GetProcAddress(dhdModule, "dhdSetGravityCompensation"));
+  dhdSetStandardGravity = reinterpret_cast<DhdSetStandardGravity>(GetProcAddress(dhdModule, "dhdSetStandardGravity"));
   dhdSetForceAndTorqueAndGripperForce = reinterpret_cast<DhdSetForceAndTorqueAndGripperForce>(
       GetProcAddress(dhdModule, "dhdSetForceAndTorqueAndGripperForce"));
   dhdErrorGetLastStr = reinterpret_cast<DhdErrorGetLastStr>(GetProcAddress(dhdModule, "dhdErrorGetLastStr"));
@@ -364,9 +377,12 @@ std::array<Omega7State, 2> Omega7Driver::readState() {
   return state_;
 }
 
-void Omega7Driver::setGravityCompensation(bool leftEnabled, bool rightEnabled) {
+void Omega7Driver::setGravityCompensation(bool leftEnabled, bool rightEnabled, double leftScale, double rightScale) {
   std::scoped_lock lock(mutex_);
+  gravityScale_[0] = normalizeGravityScale(leftScale, gravityScale_[0]);
+  gravityScale_[1] = normalizeGravityScale(rightScale, gravityScale_[1]);
   // 两侧独立控制，允许只给已连接或需要的主手开启力输出。
+  applyForceOutputUnlocked(0, leftEnabled);
   applyForceOutputUnlocked(0, leftEnabled);
   applyForceOutputUnlocked(1, rightEnabled);
 }
@@ -400,6 +416,9 @@ void Omega7Driver::applyForceOutputUnlocked(std::size_t index, bool enabled) {
   if (dhdEnableExpertMode) {
     // Force Dimension SDK 的力输出通常要求先进入 expert mode；失败不阻断后续尝试。
     (void)dhdEnableExpertMode();
+  }
+  if (dhdSetStandardGravity) {
+    (void)dhdSetStandardGravity(kStandardGravity * gravityScale_[index], deviceId);
   }
   if (dhdSetGravityCompensation) {
     (void)dhdSetGravityCompensation(enabled ? 1 : 0, deviceId);

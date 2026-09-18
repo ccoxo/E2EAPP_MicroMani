@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
@@ -36,6 +37,9 @@ class FakeSettings:
 
 
 class FakeTelemetry:
+    def __init__(self) -> None:
+        self.force_tare_calls = 0
+
     def apply_axis_move(
         self,
         side: str,
@@ -56,6 +60,9 @@ class FakeTelemetry:
     def set_motion_axis_enabled(self, side: str, values: list[bool | None]) -> None:
         _ = (side, values)
 
+    def tare_force(self) -> None:
+        self.force_tare_calls += 1
+
 
 class FakeHal:
     async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -73,6 +80,20 @@ class RecordingHal(FakeHal):
         active_payload = payload or {}
         self.commands.append((name, active_payload))
         return {"mode": "test", "command": name, "payload": active_payload, "response": {"ok": True}}
+
+
+class CalibrationHal(RecordingHal):
+    async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        active_payload = payload or {}
+        self.commands.append((name, active_payload))
+        return {
+            "ok": True,
+            "calibration": {
+                "state": "ready_for_ack",
+                "progress": 100,
+                "completedAtUnixMs": 1234,
+            },
+        }
 
 
 class DisabledMotionHal(RecordingHal):
@@ -125,6 +146,25 @@ def _set_home_reference_to_origin(config: dict[str, Any]) -> None:
     }
 
 
+def test_hkvl_tare_returns_hal_calibration_result_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+    config = default_config()
+    config["force"]["source"] = "hkvl_serial"
+    config["force"]["tareSamples"] = 200
+    logs = LogService(monotonic_ms=lambda: 123, session_id="s", emit_startup=False)
+    hal = CalibrationHal()
+    telemetry = FakeTelemetry()
+    service = CommandService(FakeSettings(config), telemetry, hal, logs)
+
+    result = asyncio.run(service.tare_force())
+
+    assert hal.commands == [("force.tare", {"side": "all", "samples": 200})]
+    assert result["hal"]["calibration"]["state"] == "ready_for_ack"
+    assert telemetry.force_tare_calls == 0
+
+
 def test_manual_axis_move_logs_structured_event(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     logs = LogService(monotonic_ms=lambda: 123, session_id="s", emit_startup=False)
@@ -165,7 +205,7 @@ def test_work_origin_home_all_logs_operation_and_moves(monkeypatch: pytest.Monke
     messages = [entry.msg for entry in logs.list_entries()]
     assert any("event=work_origin_op" in message and "phase=start" in message for message in messages)
     assert any("event=work_origin_move" in message and "axis=left.Yaw" in message for message in messages)
-    assert not any("event=work_origin_move" in message and "axis=right.Yaw" in message for message in messages)
+    assert any("event=work_origin_move" in message and "axis=right.Yaw" in message for message in messages)
     assert any("event=work_origin_op" in message and "phase=complete" in message for message in messages)
 
 
@@ -306,17 +346,19 @@ def test_return_motion_origin_side_logs_planned_axis_delta_before_hal_command(
     )
 
 
-def test_capture_motion_origin_reanchors_rotation_limits_to_hardware_zero(
+def test_capture_motion_origin_keeps_mechanical_soft_limits_stable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     config = default_config()
-    config["motion"]["leftSoftLimits"]["yaw"] = {"min": -9000.0, "max": 9000.0}
+    config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
+    soft_limits_before = json.loads(json.dumps(config["motion"]["leftSoftLimits"]))
     pulses = list(config["motion"]["origin"]["leftPulse"] + config["motion"]["origin"]["rightPulse"])
     service = _service_with_hal(config, LogService(emit_startup=False), FakeMotionStateHal(pulses))
 
     asyncio.run(service.capture_motion_origin("left", confirm_large_drift=True))
 
+    assert config["motion"]["leftSoftLimits"] == soft_limits_before
     home_reference = side_home_reference_ui(config, "left")
     assert home_reference is not None
     limits = effective_limits_ui(config, "left")

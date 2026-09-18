@@ -2,13 +2,18 @@ import { Alert, Button, Checkbox, Modal, Steps } from 'antd'
 import { useEffect, useState } from 'react'
 import { motionSideReturnOriginReady } from '../../motionReturnReady'
 import { useTelemetryStore } from '../../stores/telemetry'
-import type { DiagnosticItem, RecordSessionState, TelemetryFrame } from '../../types'
+import type { DiagnosticItem, RecordSessionState, TelemetryFrame, TelemetryLinkStatus } from '../../types'
 
 interface StepDef {
   title: string
   description: string
   autoCheck: boolean
-  check: ((frame: TelemetryFrame, recordSession: RecordSessionState, diagnostics: DiagnosticItem[]) => boolean) | null
+  check: ((
+    frame: TelemetryFrame,
+    recordSession: RecordSessionState,
+    diagnostics: DiagnosticItem[],
+    telemetryLink: TelemetryLinkStatus,
+  ) => boolean) | null
   required?: boolean
   actionButton?: {
     label: string
@@ -50,7 +55,8 @@ const STEPS: StepDef[] = [
     title: '硬件连接',
     description: '确认 HAL、WebSocket、相机、Omega.7 和夹爪串口均可识别。',
     autoCheck: true,
-    check: (frame, _recordSession, diagnostics) =>
+    check: (frame, _recordSession, diagnostics, telemetryLink) =>
+      telemetryLink.state === 'live' &&
       frame.halOk &&
       frame.wsOk &&
       frame.cameras.every((camera) => camera.health === 'ok') &&
@@ -69,18 +75,18 @@ const STEPS: StepDef[] = [
     },
   },
   {
-    title: '力觉 Tare',
-    description: '当前现场暂不具备条件，此项仅保留操作入口，不阻塞开始采集。',
+    title: '启动力觉自检',
+    description: 'HKVL 必须已完成双侧同步 Tare、零后验证和人工安全确认；该状态跨录制会话保持。',
     autoCheck: true,
-    required: false,
-    check: (frame, recordSession) =>
-      recordSession.forceTareActive &&
-      Math.abs(frame.forceLeft[2] ?? 0) < 0.1 &&
-      Math.abs(frame.forceRight[2] ?? 0) < 0.1,
+    check: (frame) =>
+      frame.forceStatus?.source !== 'hkvl_serial' || (
+        frame.forceStatus?.calibration?.state === 'ready' &&
+        frame.forceStatus?.safety?.latched === false
+      ),
   },
   {
     title: '验证力觉示数',
-    description: '当前现场暂不具备条件，此项仅作为参考，不阻塞开始采集。',
+    description: '显示当前力值是否接近零；HKVL 的强制残差验证已由 HAL 启动自检完成。',
     autoCheck: true,
     required: false,
     check: (frame) =>
@@ -98,8 +104,8 @@ interface PreCheckModalProps {
 export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckModalProps) {
   const frame = useTelemetryStore((s) => s.frame)
   const diagnostics = useTelemetryStore((s) => s.diagnostics)
+  const telemetryLink = useTelemetryStore((s) => s.telemetryLink)
   const recordSession = useTelemetryStore((s) => s.recordSession)
-  const tareRecordForceSensors = useTelemetryStore((s) => s.tareRecordForceSensors)
   const homeRecordArms = useTelemetryStore((s) => s.homeRecordArms)
   const refreshHardwareStatus = useTelemetryStore((s) => s.refreshHardwareStatus)
   const [manualChecked, setManualChecked] = useState<Record<number, boolean>>({})
@@ -110,7 +116,7 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
 
   const stepStatuses = STEPS.map((step, i) => {
     if (step.autoCheck && step.check) {
-      return step.check(frame, recordSession, diagnostics)
+      return step.check(frame, recordSession, diagnostics, telemetryLink)
     }
     return manualChecked[i] ?? false
   })
@@ -190,12 +196,6 @@ export default function PreCheckModal({ open, onConfirm, onCancel }: PreCheckMod
                   >
                     已完成
                   </Checkbox>
-                )}
-
-                {i === 2 && (
-                  <Button size="small" style={{ marginTop: 6 }} onClick={tareRecordForceSensors}>
-                    执行 Tare
-                  </Button>
                 )}
 
                 {step.actionButton && (

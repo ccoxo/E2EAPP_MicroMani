@@ -1,0 +1,44 @@
+module appstation {
+  struct JsonEnvelope {
+    uint64 stamp_unix_ms;
+    uint64 stamp_monotonic_ms;
+    string source;
+    string payload_json;
+  };
+
+  struct HalCommandRequest {
+    string request_id;
+    uint64 stamp_unix_ms;
+    string name;
+    string payload_json;
+  };
+
+  struct HalCommandReply {
+    string request_id;
+    boolean ok;
+    string result_json;
+    string error;
+  };
+
+  struct TeleopHardwareTarget {
+    uint64 sequence;
+    uint64 stamp_unix_ms;
+    uint64 stamp_monotonic_ms;
+    long side;
+    double deltas[6];
+    double translation_step_limit_pulse;
+    double rotation_step_limit_pulse;
+    double translation_pulse_deadband;
+    double rotation_pulse_deadband;
+    boolean enabled_axes[6];
+    boolean sync_zero_delta_target;
+    double soft_limit_min[6];
+    double soft_limit_max[6];
+    double translation_velocity_ui_per_sec;
+    double rotation_velocity_ui_per_sec;
+    double translation_start_velocity_ui_per_sec;
+    double rotation_start_velocity_ui_per_sec;
+    double acc_time_sec;
+    double dec_time_sec;
+  };
+};

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <sstream>
+#include <utility>
 
 namespace appstation::hal {
 
@@ -352,7 +353,11 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config) {
   if (!normalized.gripperTeleopEnabled) {
     stopGripperWorker();
   }
-  omega_.setGravityCompensation(normalized.leftGravityCompensation, normalized.rightGravityCompensation);
+  omega_.setGravityCompensation(
+      normalized.leftGravityCompensation,
+      normalized.rightGravityCompensation,
+      normalized.leftGravityScale,
+      normalized.rightGravityScale);
 }
 
 void NativeTeleopController::configureGripper(const JodellGripperConfig& config) {
@@ -471,6 +476,35 @@ void NativeTeleopController::stop() {
     lastOutputDeltaUi_ = {};
 }
 
+void NativeTeleopController::requestEmergencyStop() {
+  running_.store(false);
+  gripperWorkerRunning_.store(false);
+  gripperCv_.notify_all();
+  {
+    std::scoped_lock gripperLock(gripperMutex_);
+    pendingGripperCommands_ = {};
+  }
+  std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return;
+  }
+  logicalConnected_ = {false, false};
+  referenceValid_ = {false, false};
+  targetActive_ = {false, false};
+  velocityUiPerSec_ = {};
+  incrementalCarry_ = {};
+  incrementalDirection_ = {};
+  incrementalInputActive_ = {false, false};
+  continuousPulseCarry_ = {};
+  continuousDirection_ = {};
+  continuousStreak_ = {};
+  lastRawDelta_ = {};
+  lastFilteredDelta_ = {};
+  lastRequestedPulse_ = {};
+  lastEmittedPulse_ = {};
+  lastOutputDeltaUi_ = {};
+}
+
 void NativeTeleopController::startGripperWorker() {
   bool expected = false;
   if (!gripperWorkerRunning_.compare_exchange_strong(expected, true)) {
@@ -564,6 +598,16 @@ bool NativeTeleopController::running() const {
   return running_.load();
 }
 
+void NativeTeleopController::setLeaderStatePublisher(LeaderStatePublisher publisher) {
+  std::scoped_lock lock(mutex_);
+  leaderStatePublisher_ = std::move(publisher);
+}
+
+void NativeTeleopController::setHardwareTargetPublisher(HardwareTargetPublisher publisher) {
+  std::scoped_lock lock(mutex_);
+  hardwareTargetPublisher_ = std::move(publisher);
+}
+
 bool NativeTeleopController::commandGripperTarget(
     Side side,
     double targetMm,
@@ -616,6 +660,16 @@ std::string NativeTeleopController::statusJson() const {
   std::scoped_lock lock(mutex_);
   const auto gripperPositions = gripper_.positionMmSnapshot(gripperPositionsMm_);
   std::ostringstream out;
+  auto appendGripperSourceDiagnostics = [&](int index) {
+    out << ",\"sourceHand\":\"" << jsonEscape(config_.gripperSourceHand[index]) << "\""
+        << ",\"sourceGapAvailable\":" << (gripperSourceGapAvailable_[index] ? "true" : "false")
+        << ",\"sourceGapMm\":";
+    if (gripperSourceGapAvailable_[index] && gripperSourceGapMm_[index] >= 0.0) {
+      out << gripperSourceGapMm_[index];
+    } else {
+      out << "null";
+    }
+  };
   out << "{\"running\":" << (running_.load() ? "true" : "false")
       << ",\"controlMode\":\"" << jsonEscape(config_.controlMode) << "\""
       << ",\"mappingMode\":\"" << jsonEscape(config_.mappingMode) << "\""
@@ -675,8 +729,9 @@ std::string NativeTeleopController::statusJson() const {
   out << "},\"gripperTargets\":";
   appendArray(out, gripperTargetsMm_);
   out << ",\"grippers\":{\"left\":{\"ok\":" << (gripperLastCommandOk_[0] ? "true" : "false")
-      << ",\"targetMm\":" << gripperTargetsMm_[0]
-      << ",\"positionMm\":";
+      << ",\"targetMm\":" << gripperTargetsMm_[0];
+  appendGripperSourceDiagnostics(0);
+  out << ",\"positionMm\":";
   if (gripperPositions[0] >= 0.0) {
     out << gripperPositions[0];
   } else {
@@ -686,8 +741,9 @@ std::string NativeTeleopController::statusJson() const {
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[0]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[0]
       << "},\"right\":{\"ok\":" << (gripperLastCommandOk_[1] ? "true" : "false")
-      << ",\"targetMm\":" << gripperTargetsMm_[1]
-      << ",\"positionMm\":";
+      << ",\"targetMm\":" << gripperTargetsMm_[1];
+  appendGripperSourceDiagnostics(1);
+  out << ",\"positionMm\":";
   if (gripperPositions[1] >= 0.0) {
     out << gripperPositions[1];
   } else {
@@ -700,6 +756,7 @@ std::string NativeTeleopController::statusJson() const {
   out << ",\"gravityCompensation\":["
       << (config_.leftGravityCompensation ? "true" : "false") << ","
       << (config_.rightGravityCompensation ? "true" : "false") << "]"
+      << ",\"gravityScale\":[" << config_.leftGravityScale << "," << config_.rightGravityScale << "]"
       << ",\"forceOutputEnabled\":["
       << (forceOutput[0] ? "true" : "false") << ","
       << (forceOutput[1] ? "true" : "false") << "]"
@@ -744,8 +801,20 @@ void NativeTeleopController::loop() {
 }
 
 void NativeTeleopController::tick(double dtSec) {
-  // 每帧先读取两只主手状态，再分别处理左右通道，最后处理夹爪映射。
   const auto hands = omega_.readState();
+  LeaderStatePublisher publisher;
+  {
+    std::scoped_lock lock(mutex_);
+    publisher = leaderStatePublisher_;
+  }
+  if (publisher) {
+    publisher(hands);
+    return;
+  }
+  processLeaderState(hands, dtSec);
+}
+
+void NativeTeleopController::processLeaderState(const std::array<Omega7State, 2>& hands, double dtSec) {
   tickSideBestEffort(0, hands[0], dtSec);
   tickSideBestEffort(1, hands[1], dtSec);
   try {
@@ -875,6 +944,39 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
   }
 
   const auto limits = effectiveSoftLimits(targetSide, targetIndex);
+  if (hardwareTargetPublisher_) {
+    TeleopHardwareTarget target;
+    target.sequence = ++hardwareTargetSequence_;
+    target.stampUnixMs = static_cast<std::uint64_t>(unixTimeMs());
+    target.stampMonotonicMs = static_cast<std::uint64_t>(monotonicSeconds() * 1000.0);
+    target.side = targetSide == Side::Left ? 0 : 1;
+    target.deltas = deltas;
+    target.translationStepLimitPulse = config_.translationStepLimitPulse;
+    target.rotationStepLimitPulse = config_.rotationStepLimitPulse;
+    target.translationPulseDeadband = config_.translationPulseDeadband;
+    target.rotationPulseDeadband = config_.rotationPulseDeadband;
+    target.enabledAxes = config_.enabledAxes[targetIndex];
+    target.syncZeroDeltaTarget = true;
+    for (size_t i = 0; i < limits.size(); ++i) {
+      target.softLimitMin[i] = limits[i].min;
+      target.softLimitMax[i] = limits[i].max;
+    }
+    target.translationVelocityUiPerSec = config_.translationMaxVelocityUmS;
+    target.rotationVelocityUiPerSec = config_.rotationMaxVelocityDegS;
+    target.translationStartVelocityUiPerSec = config_.translationStartVelocityUmS;
+    target.rotationStartVelocityUiPerSec = config_.rotationStartVelocityDegS;
+    target.accTimeSec = config_.accTimeSec;
+    target.decTimeSec = config_.decTimeSec;
+    hardwareTargetPublisher_(target);
+    recordPublishedTargetActionUnlocked(sourceSide, target, sourceIndex);
+    targetActive_[targetIndex] = true;
+    setBlockerUnlocked(sourceIndex, "active", "");
+    if (config_.controlMode == kIncrementalPositionMode) {
+      referencePose_[sourceIndex] = semanticPose;
+    }
+    return;
+  }
+
   const auto result = motion_.updateTeleopTargetUi(
       targetSide,
       deltas,
@@ -1196,15 +1298,6 @@ bool NativeTeleopController::suppressIncrementalRotationSpikeUnlocked(
 
 std::array<AxisLimit, 6> NativeTeleopController::effectiveSoftLimits(Side targetSide, int targetIndex) const {
   auto limits = config_.softLimits[targetIndex];
-  if (config_.homeReferenceValid[targetIndex]) {
-    // 平移软限位以 home reference 为零点平移到当前硬件坐标系。
-    for (int axisIndex = 0; axisIndex < 3; ++axisIndex) {
-      const auto axis = static_cast<SemanticAxis>(axisIndex);
-      const double originUi = pulseToUi(config_.homeReferencePulse[targetIndex][axisIndex], targetSide, axis);
-      limits[axisIndex].min += originUi;
-      limits[axisIndex].max += originUi;
-    }
-  }
   if (!config_.rotationWorkLimitEnabled) {
     return limits;
   }
@@ -1427,9 +1520,11 @@ void NativeTeleopController::tickGrippers(const std::array<Omega7State, 2>& hand
   }
   const auto now = std::chrono::steady_clock::now();
   for (int targetIndex = 0; targetIndex < 2; ++targetIndex) {
-    // 每个目标夹爪可配置从哪只主手读取开口，默认与运动通道相反。
+    // gripperSourceHand is indexed by target hardware side; defaults follow operator-to-hardware mapping.
     const int sourceIndex = gripperSourceIndex(targetIndex);
     const auto& hand = hands[sourceIndex];
+    gripperSourceGapAvailable_[targetIndex] = hand.gripperGapAvailable;
+    gripperSourceGapMm_[targetIndex] = hand.gripperGapAvailable ? hand.gripperGap * 1000.0 : -1.0;
     if (!hand.connected || !hand.lastReadOk) {
       gripperLastRaw_[targetIndex] = -1;
       continue;
@@ -1509,6 +1604,41 @@ void NativeTeleopController::setBlockerUnlocked(
   // blocker 描述当前输入通道是否正在输出、等待参考或被安全条件阻断。
   blockerState_[sourceIndex] = state;
   blockerMessage_[sourceIndex] = message;
+}
+
+void NativeTeleopController::recordPublishedTargetActionUnlocked(
+    Side sourceSide,
+    const TeleopHardwareTarget& target,
+    int sourceIndex) {
+  int dominant = 0;
+  for (int i = 1; i < 6; ++i) {
+    if (std::abs(target.deltas[i]) > std::abs(target.deltas[dominant])) {
+      dominant = i;
+    }
+  }
+
+  NativeTeleopAction action;
+  action.ts = static_cast<std::int64_t>(target.stampUnixMs);
+  action.monotonicS = static_cast<double>(target.stampMonotonicMs) / 1000.0;
+  action.side = target.side == 0 ? Side::Left : Side::Right;
+  action.sourceSide = sourceSide;
+  action.axisIndex = dominant;
+  action.delta = target.deltas[dominant];
+  action.deltas = target.deltas;
+  if (sourceIndex >= 0 && sourceIndex < 2) {
+    action.requestedDeltaPulse = lastRequestedPulse_[sourceIndex];
+    action.appliedDeltaPulse = lastEmittedPulse_[sourceIndex];
+  }
+  const int offset = sideIndex(action.side) * 6;
+  for (int i = 0; i < 6; ++i) {
+    action.deltaVector[offset + i] = target.deltas[i];
+  }
+  lastAction_ = action;
+  hasLastAction_ = true;
+  actionHistory_.push_back(action);
+  while (actionHistory_.size() > 1000) {
+    actionHistory_.pop_front();
+  }
 }
 
 void NativeTeleopController::recordActionUnlocked(

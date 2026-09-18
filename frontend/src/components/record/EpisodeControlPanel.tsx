@@ -1,6 +1,7 @@
 import { Button, Card, Divider, Form, Input, Progress, Select, Spin } from 'antd'
 import { Crosshair } from 'lucide-react'
 import React from 'react'
+import { hardwareSideForOperatorSide } from '../../data'
 import { motionSideReturnOriginReady } from '../../motionReturnReady'
 import { useTelemetryStore } from '../../stores/telemetry'
 
@@ -61,7 +62,6 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
   const discardRecordEpisode = useTelemetryStore((s) => s.discardRecordEpisode)
   const finishRecordSession = useTelemetryStore((s) => s.finishRecordSession)
   const skipRecordReset = useTelemetryStore((s) => s.skipRecordReset)
-  const tareRecordForceSensors = useTelemetryStore((s) => s.tareRecordForceSensors)
   const toggleRecordClutch = useTelemetryStore((s) => s.toggleRecordClutch)
   const setRecordSpeedMode = useTelemetryStore((s) => s.setRecordSpeedMode)
   const returnRecordMotionOrigin = useTelemetryStore((s) => s.returnRecordMotionOrigin)
@@ -76,13 +76,16 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
   const progressTotalS =
     totalS >= 0 ? totalS : phase === 'recording' ? episodeTimeS : phase === 'resetting' ? resetTimeS : -1
   const phasePercent = progressTotalS > 0 ? Math.min(100, Math.round((elapsedS / progressTotalS) * 100)) : 0
-  const leftReturnReady = motionSideReturnOriginReady('left', motionEnabled, motionAxisEnabled)
-  const rightReturnReady = motionSideReturnOriginReady('right', motionEnabled, motionAxisEnabled)
+  const leftHardwareSide = hardwareSideForOperatorSide('left')
+  const rightHardwareSide = hardwareSideForOperatorSide('right')
+  const leftReturnReady = motionSideReturnOriginReady(leftHardwareSide, motionEnabled, motionAxisEnabled)
+  const rightReturnReady = motionSideReturnOriginReady(rightHardwareSide, motionEnabled, motionAxisEnabled)
   const handleReturnOrigin = async (side: 'left' | 'right') => {
-    if (!motionSideReturnOriginReady(side, motionEnabled, motionAxisEnabled)) return
+    const hardwareSide = hardwareSideForOperatorSide(side)
+    if (!motionSideReturnOriginReady(hardwareSide, motionEnabled, motionAxisEnabled)) return
     setPendingOriginSide(side)
     try {
-      await returnRecordMotionOrigin(side)
+      await returnRecordMotionOrigin(hardwareSide)
     } finally {
       setPendingOriginSide(null)
     }
@@ -160,9 +163,6 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
         <div className="record-action-stack">
           <Button type="primary" block onClick={onStartSession}>
             开始采集会话
-          </Button>
-          <Button size="small" block onClick={tareRecordForceSensors}>
-            力觉 Tare
           </Button>
         </div>
       )}

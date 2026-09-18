@@ -33,15 +33,19 @@ def lerobot_to_ui_state(values: list[float]) -> list[float]:
     return [float(value) / 1000.0 if idx in ROTATION_AXES else float(value) for idx, value in enumerate(values)]
 
 
-def motion_pulse_per_unit(config: dict[str, Any] | None = None) -> tuple[float, ...]:
-    """Return signed pulse-per-unit for all 12 axes from runtime kinematics config."""
+def motion_pulse_per_unit(
+    config: dict[str, Any] | None = None,
+    *,
+    side_order: str = "hardware",
+) -> tuple[float, ...]:
+    """Return signed pulse-per-unit in hardware or operator/dataset side order."""
     motion = config.get("motion", {}) if isinstance(config, dict) else {}
     kinematics = motion.get("kinematics", {}) if isinstance(motion, dict) else {}
     if not isinstance(kinematics, dict):
         kinematics = ICF_KINEMATICS_DEFAULTS
     left = _side_pulse_per_unit("left", kinematics)
     right = _side_pulse_per_unit("right", kinematics)
-    return left + right
+    return left + right if side_order == "hardware" else right + left
 
 
 def pulses_to_ui_state(pulses: list[float], config: dict[str, Any] | None = None) -> list[float]:
@@ -52,6 +56,13 @@ def pulses_to_ui_state(pulses: list[float], config: dict[str, Any] | None = None
         pulse_to_ui(float(pulse), idx, pulse_per_unit[idx])
         for idx, pulse in enumerate(values)
     ]
+
+
+def dataset_pulses_to_ui_state(pulses: list[float], config: dict[str, Any] | None = None) -> list[float]:
+    """Convert dataset/operator-order pulses using the matching hardware calibration."""
+    values = (list(pulses) + [0.0] * 12)[:12]
+    pulse_per_unit = motion_pulse_per_unit(config, side_order="dataset")
+    return [pulse_to_ui(float(pulse), idx, pulse_per_unit[idx]) for idx, pulse in enumerate(values)]
 
 
 def _side_pulse_per_unit(side: str, kinematics: dict[str, Any]) -> tuple[float, ...]:

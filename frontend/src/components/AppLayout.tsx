@@ -36,6 +36,7 @@ function TopStatus({ clock }: { clock: string }) {
   const wsOk = useTelemetryStore((state) => state.frame.wsOk)
   const wsHz = useTelemetryStore((state) => state.frame.resource.wsHz)
   const dangerIndex = useTelemetryStore((state) => state.frame.dangerIndex)
+  const safetyLatched = useTelemetryStore((state) => Boolean(state.frame.forceStatus?.safety?.latched))
   const phase = useTelemetryStore((state) => state.recordSession.phase)
   const recorderFps = useTelemetryStore((state) => state.recordSession.recorderFps)
 
@@ -43,7 +44,10 @@ function TopStatus({ clock }: { clock: string }) {
     <Space className="top-status" size={8}>
       <MetricPill state={halOk ? 'ok' : 'error'} label="HAL" />
       <MetricPill state={wsOk ? 'ok' : 'error'} label={`WS ${wsHz}Hz`} />
-      <MetricPill state={dangerIndex > 0.7 ? 'warn' : 'ok'} label={`Safety ${dangerIndex.toFixed(2)}`} />
+      <MetricPill
+        state={safetyLatched ? 'error' : dangerIndex > 0.7 ? 'warn' : 'ok'}
+        label={`Safety ${safetyLatched ? 'LOCK' : dangerIndex.toFixed(2)}`}
+      />
       {phase === 'recording' && (
         <Tag color="error" style={{ animation: 'blink 1s step-end infinite' }}>
           ● REC

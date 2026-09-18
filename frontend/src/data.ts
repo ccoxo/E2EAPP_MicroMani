@@ -21,6 +21,22 @@ export const semanticAxes = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'] as const
 
 export type RobotSide = 'left' | 'right'
 
+export function hardwareSideForOperatorSide(side: RobotSide): RobotSide {
+  return side === 'left' ? 'right' : 'left'
+}
+
+export function operatorSideForHardwareSide(side: RobotSide): RobotSide {
+  return side === 'left' ? 'right' : 'left'
+}
+
+export function operatorSideLabel(side: RobotSide) {
+  return side === 'left' ? '左臂' : '右臂'
+}
+
+export function hardwareChannelLabel(side: RobotSide) {
+  return side === 'left' ? '硬件左侧通道' : '硬件右侧通道'
+}
+
 export const motionCardModelByNo: Record<number, string> = {
   0: 'DMC5C10',
   1: 'DMC3C00',
@@ -69,7 +85,7 @@ export const axisHardwareSpecs = [
     unit: 'µm',
     travel: '75 mm',
     model: 'KXL06075-C1-G4',
-    leftPulsePerUnit: 10000,
+    leftPulsePerUnit: 5000,
     rightPulsePerUnit: 10000,
     softLimit: '机械行程 75 mm',
     warning: false,
@@ -80,7 +96,7 @@ export const axisHardwareSpecs = [
     travel: '75 mm',
     model: 'KXL06075-C1-G4',
     leftPulsePerUnit: 10000,
-    rightPulsePerUnit: 10000,
+    rightPulsePerUnit: 5000,
     softLimit: '机械行程 75 mm',
     warning: false,
   },
@@ -89,8 +105,8 @@ export const axisHardwareSpecs = [
     unit: '°',
     travel: '360°',
     model: 'KRW04360M-LC',
-    leftPulsePerUnit: 1666.6667,
-    rightPulsePerUnit: 1666.6667,
+    leftPulsePerUnit: 1666.666667,
+    rightPulsePerUnit: 1666.666667,
     softLimit: '硬件零点 ±100°',
     warning: false,
   },
@@ -120,7 +136,7 @@ export const cameraHardwareSpecs = {
   global: {
     label: '全局相机',
     model: 'IMX335',
-    device: 'IMX335 / index 1',
+    device: 'IMX335 / index 0',
     rawResolution: '1920x1080',
     previewResolution: '640x480',
     fps: 30,
@@ -129,7 +145,7 @@ export const cameraHardwareSpecs = {
   wrist_left: {
     label: '左腕相机',
     model: 'IMX335',
-    device: 'IMX335 / index 0',
+    device: 'IMX335 / index 1',
     rawResolution: '1920x1080',
     previewResolution: '640x480',
     fps: 30,
@@ -259,12 +275,12 @@ export const defaultKinematics = {
   leftPhysicalAxis: [0, 1, 3, 5, 4, 2],
   rightPhysicalAxis: [2, 0, 5, 8, 1, 7],
   axisUnitSpec: ['mm', 'mm', 'mm', 'deg', 'deg', 'deg'],
-  leftPulsePerUnit: [5000, 10000, 10000, 1666.666667, 2500, 3333.333],
-  rightPulsePerUnit: [5000, 10000, 10000, 1666.666667, 2500, 333.3333],
+  leftPulsePerUnit: [5000, 5000, 10000, 1666.666667, 2500, 3333.333],
+  rightPulsePerUnit: [5000, 10000, 5000, 1666.666667, 2500, 333.3333],
   leftDirectionSign: [-1, 1, -1, 1, -1, -1],
   rightDirectionSign: [-1, -1, -1, 1, 1, 1],
-  leftSignedPulsePerUnit: [-5000, 10000, -10000, 1666.666667, -2500, -3333.333],
-  rightSignedPulsePerUnit: [-5000, -10000, -10000, 1666.666667, 2500, 333.3333],
+  leftSignedPulsePerUnit: [-5000, 5000, -10000, 1666.666667, -2500, -3333.333],
+  rightSignedPulsePerUnit: [-5000, -10000, -5000, 1666.666667, 2500, 333.3333],
   syncActionPulseCoeff: true,
   updatedAt: '2026-04-17T00:00:00',
 }
@@ -374,39 +390,41 @@ export const defaultConfig: AppConfig = {
     apiConfirmed: false,
   },
   cameras: {
-    global: 'IMX335 / index 1',
-    globalIdentity: 'USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000',
-    wristLeft: 'IMX335 / index 0',
-    wristLeftIdentity: 'USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000',
+    global: 'IMX335 / index 0',
+    globalIdentity: '20250606105',
+    wristLeft: 'IMX335 / index 1',
+    wristLeftIdentity: 'PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)',
     wristRight: 'IMX335 / index 2',
-    wristRightIdentity: 'USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000',
+    wristRightIdentity: 'PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)',
     previewResolution: '640x480',
     globalResolution: '640x480',
     wristLeftResolution: '640x480',
     wristRightResolution: '640x480',
     fps: 30,
+    tuningDefaultsVersion: 'auto_awb_exposure_20260616',
     tuning: {
       global: {
-        autoExposure: false,
+        autoExposure: true,
         exposure: -5.5,
         gain: 0,
-        autoWhiteBalance: false,
+        autoWhiteBalance: true,
       },
       wrist_left: {
-        autoExposure: false,
+        autoExposure: true,
         exposure: -6,
         gain: 0,
-        autoWhiteBalance: false,
+        autoWhiteBalance: true,
       },
       wrist_right: {
-        autoExposure: false,
+        autoExposure: true,
         exposure: -6,
         gain: 0,
-        autoWhiteBalance: false,
+        autoWhiteBalance: true,
       },
     },
   },
   force: {
+    source: 'hkvl_serial',
     leftIp: 'Dev5/ai0:5',
     rightIp: 'Dev3/ai0:5',
     port: 49152,
@@ -423,6 +441,36 @@ export const defaultConfig: AppConfig = {
     lowpassEnabled: true,
     lowpassCutoffHz: 10,
     swapHands: false,
+    serial: {
+      protocol: 'hkvl_active_v1',
+      leftPort: 'COM15',
+      rightPort: 'COM14',
+      baudrate: 1_000_000,
+      expectedSampleHz: 1000,
+    },
+    axisSign: {
+      left: [1, 1, -1, -1, -1, 1],
+      right: [1, -1, 1, -1, 1, -1],
+    },
+    compliance: {
+      enabled: false,
+      left: {
+        mappingConfirmed: false,
+        matrix: [1, 0, 0, 1],
+        deadbandN: [0, 0],
+        gainUmPerNs: [0, 0],
+        maxStepUm: [0, 0],
+        maxOffsetUm: [0, 0],
+      },
+      right: {
+        mappingConfirmed: false,
+        matrix: [1, 0, 0, 1],
+        deadbandN: [0, 0],
+        gainUmPerNs: [0, 0],
+        maxStepUm: [0, 0],
+        maxOffsetUm: [0, 0],
+      },
+    },
   },
   motion: {
     leftCardNo: 1,
@@ -490,7 +538,6 @@ export const defaultConfig: AppConfig = {
     commandTorque: 1,
     icfTargetProtectionEnabled: true,
     icfTargetMinGapMm: 1.02,
-    sampleMode: 'dual_worker',
     sampleHz: 30,
     sampleStaleMs: 500,
     sampleEnableOnNegative: true,
@@ -499,11 +546,11 @@ export const defaultConfig: AppConfig = {
   },
   safety: {
     fxyWarnN: 2,
-    fxyStopN: 4,
+    fxyStopN: 30,
     fzWarnN: 3,
-    fzStopN: 5,
+    fzStopN: 30,
     momentWarnNm: 0.02,
-    momentStopNm: 0.04,
+    momentStopNm: 1,
     yawSoftLimitDeg: 7,
     watchdogMs: 50,
   },
@@ -536,7 +583,6 @@ export const defaultConfig: AppConfig = {
     cameraSource: 'global',
   },
   teleop: {
-    engine: 'hal_native',
     controlMode: 'incremental_position',
     nativeLoopHz: 100,
     nativeTranslationDeadzoneM: 0.002,
@@ -575,7 +621,9 @@ export const defaultConfig: AppConfig = {
     rightGravityCompensation: true,
     leftForceFeedback: true,
     rightForceFeedback: true,
-    strategyVersion: 'e2e_omega7_native_v29_stable_feel_lead_20260612',
+    leftGravityScale: 0.45,
+    rightGravityScale: 1.0,
+    strategyVersion: 'e2e_omega7_native_v32_card0_yaw_20260804',
     mappingMode: 'direct',
     swapHands: false,
     swapTeleopChannels: true,
@@ -610,7 +658,7 @@ export const defaultConfig: AppConfig = {
     continuousMicroConfirmTicks: 0,
     diagLog: false,
     leftEnabledAxes: [true, true, true, true, true, true],
-    rightEnabledAxes: [true, true, true, true, true, false],
+    rightEnabledAxes: [true, true, true, true, true, true],
     softLimitUnitSpec: ['um', 'um', 'um', 'deg', 'deg', 'deg'],
     leftSoftLimitMin: [-25000, -37500, -37500, -5, -30, -7],
     leftSoftLimitMax: [25000, 37500, 37500, 95, 30, 7],
@@ -644,8 +692,8 @@ export const defaultConfig: AppConfig = {
       autoGapMarginMm: 1.0,
       releaseSpeed: 255,
       releaseTorque: 1,
-      leftSourceHand: 'PhysicalRight',
-      rightSourceHand: 'PhysicalLeft',
+      leftSourceHand: 'PhysicalLeft',
+      rightSourceHand: 'PhysicalRight',
       objectDetectMargin: 10,
       buttonFallback: true,
       diagLog: false,

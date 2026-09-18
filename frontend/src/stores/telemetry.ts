@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import {
   acknowledgeSafety as acknowledgeSafetyApi,
+  autoConfigurePicoNetwork as autoConfigurePicoNetworkApi,
   applyParameterSnapshotApi,
   createParameterSnapshot as createParameterSnapshotApi,
   createSession as createRecordSessionApi,
@@ -22,14 +23,15 @@ import {
   startAutoExecution,
   skipReset as skipRecordResetApi,
   stopAutoExecution,
-  tareForceSensors as tareForceSensorsApi,
   toggleClutch as toggleClutchApi,
   putConfig,
+  type PicoNetworkInfo,
   type RecordEpisodeSaveApi,
   type RecordStatusApi,
   wsUrl,
 } from '../api/index'
-import { defaultConfig, defaultDiagnostics, logChannels } from '../data'
+import { defaultConfig, defaultDiagnostics, logChannels, operatorSideForHardwareSide, operatorSideLabel } from '../data'
+import { telemetryStaleAfterMs } from '../hardwareStatus'
 import { manualAxisStepLimitFromPulse } from '../manualMotionLimits'
 import { manualMaxVelocity } from '../manualSpeed'
 import { motionSideReturnOriginReady } from '../motionReturnReady'
@@ -53,6 +55,7 @@ import type {
   RecordQualityReport,
   RecordSessionState,
   TelemetryFrame,
+  TelemetryLinkStatus,
   TelemetrySample,
 } from '../types'
 
@@ -60,8 +63,7 @@ const maxLogEntries = 5000
 export const uiFrameIntervalMs = 66
 export const chartHistoryIntervalMs = 100
 export const mockTelemetryIntervalMs = 33
-// 说明当前代码块的功能用途。
-// 说明当前代码块的功能用途。
+// Keep mock history short enough for smooth chart rendering during long demos.
 const maxHistorySamples = 120
 const parameterSnapshotStorageKey = 'appstation.parameterSnapshots.v1'
 const cameraLabels = {
@@ -92,7 +94,7 @@ const manualAxisDirectionSign = {
   left: [1, 1, 1, 1, 1, 1],
   right: [1, 1, 1, 1, 1, 1],
 } as const
-/** 计算或执行手动控制的对应逻辑。 */
+/** Key used to lock one manual jog button until the estimated HAL move settles. */
 function manualAxisBusyKey(side: ManualControlState['selectedSide'], axis: ManualControlAxis) {
   return `${side}-${axis}`
 }
@@ -103,7 +105,7 @@ function queueConfigSave(config: AppConfig) {
   configSaveQueue = nextSave.catch(() => undefined)
   return nextSave
 }
-/** 计算或执行手动控制的对应逻辑。 */
+/** Convert UI units to pulse units for per-axis jog safety limits. */
 function manualAxisPulsePerUiUnit(
   config: AppConfig,
   side: ManualControlState['selectedSide'],
@@ -116,7 +118,7 @@ function manualAxisPulsePerUiUnit(
   if (!Number.isFinite(pulsePerUnit) || pulsePerUnit <= 0) return 0
   return axisIndex < 3 ? pulsePerUnit / 1000 : pulsePerUnit
 }
-/** 计算或执行手动控制的对应逻辑。 */
+/** Clamp frontend jog steps to the same pulse-derived limits as the backend. */
 function manualAxisStepLimit(
   config: AppConfig,
   side: ManualControlState['selectedSide'],
@@ -139,7 +141,7 @@ function clampManualAxisStep(
   return Math.min(Math.max(0, step), manualAxisStepLimit(config, side, axis, speedMode))
 }
 
-/** 计算或执行手动控制的对应逻辑。 */
+/** Apply side-specific sign conventions before sending a manual jog command. */
 function manualAxisEffectiveDirection(
   side: ManualControlState['selectedSide'],
   axisIndex: number,
@@ -205,7 +207,6 @@ const initialRecordSession: RecordSessionState = {
   resetReturnedSides: [],
   resetReady: false,
   returnOriginInFlight: false,
-  forceTareActive: false,
   speedMode: 'fine',
 }
 /** 读取对应的本地状态或存储数据。 */
@@ -279,8 +280,7 @@ function applyMotionCardSnapshotConfig(config: AppConfig, scope: Exclude<Paramet
 /** 描述当前方法的功能边界。 */
 function parameterSnapshotScopeLabel(scope: ParameterSnapshotScope) {
   if (scope === 'all') return '全局硬件'
-  if (scope === 'motion-left') return '左臂运动控制卡'
-  return '右臂运动控制卡'
+  return `${operatorSideLabel(operatorSideForHardwareSide(scope === 'motion-left' ? 'left' : 'right'))}运动控制卡`
 }
 
 /** 读取对应的本地状态或存储数据。 */
@@ -321,6 +321,7 @@ interface TelemetryStore {
   diagnostics: DiagnosticItem[]
   config: AppConfig
   picoConnection: { state: ConnectionState; message: string; checkedAt: number | null }
+  picoNetworkInfo: PicoNetworkInfo | null
   recording: boolean
   autoRunning: boolean
   clutchActive: boolean
@@ -337,6 +338,7 @@ interface TelemetryStore {
   backendWs: WebSocket | null
   backendReconnectTimer: number | null
   backendReconnectAttempts: number
+  telemetryLink: TelemetryLinkStatus
   startMock: () => void
   stopMock: () => void
   startBackend: () => void
@@ -358,7 +360,6 @@ interface TelemetryStore {
   rejectRecordQualityReport: () => void
   finishRecordSession: () => void
   skipRecordReset: () => void
-  tareRecordForceSensors: () => void
   toggleRecordClutch: () => void
   setRecordSpeedMode: (mode: ManualSpeedMode) => void
   homeRecordArms: () => void
@@ -374,6 +375,7 @@ interface TelemetryStore {
   refreshHardwareStatus: () => Promise<void>
   runDiagnostics: () => Promise<void>
   setPicoConnectionStatus: (state: ConnectionState, message: string) => void
+  autoConfigurePicoNetwork: (picoIp?: string) => Promise<PicoNetworkInfo>
   updateConfig: (patch: Partial<AppConfig>) => void
   saveParameterSnapshot: (scope: ParameterSnapshotScope, name: string) => void
   applyParameterSnapshot: (id: string) => void
@@ -401,6 +403,15 @@ const emptyFrame: TelemetryFrame = {
   motionAxisEnabled: { left: Array.from({ length: 6 }, () => null), right: Array.from({ length: 6 }, () => null) },
   forceLeft: [0, 0, 0, 0, 0, 0],
   forceRight: [0, 0, 0, 0, 0, 0],
+  forceStatus: {
+    source: 'hkvl_serial',
+    sides: {
+      left: { connected: false, healthy: false },
+      right: { connected: false, healthy: false },
+    },
+    safety: { latched: false, reason: '', canAcknowledge: false },
+    compliance: { enabled: false },
+  },
   dangerIndex: 0,
   recording: false,
   episodeCount: 0,
@@ -450,7 +461,7 @@ const emptyFrame: TelemetryFrame = {
     },
   ],
 }
-/** 构建当前流程需要的数据结构。 */
+/** Build deterministic process rows for mock telemetry mode. */
 function nextProcessStatus(t: number, autoRunning: boolean): ProcessStatus[] {
   return [
     {
@@ -498,9 +509,9 @@ function nextProcessStatus(t: number, autoRunning: boolean): ProcessStatus[] {
     },
   ]
 }
-/** 构建当前流程需要的数据结构。 */
+/** Synthesize one mock telemetry frame that exercises dashboard edge states. */
 function buildFrame(state: TelemetryStore): TelemetryFrame {
-  // 说明当前代码块的功能用途。
+  // The mock signal is deterministic so tests and visual checks stay stable.
   const tick = state.tick + 1
   const t = tick / 50
   const jointPositions = Array.from({ length: 12 }, (_, index) => {
@@ -526,29 +537,11 @@ function buildFrame(state: TelemetryStore): TelemetryFrame {
     Math.sin(t * 1.4) * 0.013,
     Math.cos(t * 0.6) * 0.007,
   ]
-  const forceLeft = state.recordSession.forceTareActive
-    ? [
-        Math.sin(t * 0.9) * 0.035,
-        Math.cos(t * 0.8) * 0.028,
-        Math.sin(t * 0.7) * 0.045,
-        Math.sin(t * 0.6) * 0.003,
-        Math.cos(t * 0.55) * 0.003,
-        Math.sin(t * 0.5) * 0.002,
-      ]
-    : forceLeftRaw
-  const forceRight = state.recordSession.forceTareActive
-    ? [
-        Math.cos(t * 0.75) * 0.033,
-        Math.sin(t * 0.85) * 0.03,
-        Math.cos(t * 0.65) * 0.042,
-        Math.cos(t * 0.5) * 0.003,
-        Math.sin(t * 0.58) * 0.003,
-        Math.cos(t * 0.48) * 0.002,
-      ]
-    : forceRightRaw
+  const forceLeft = forceLeftRaw
+  const forceRight = forceRightRaw
   const pulse = Math.sin(t * 0.18) > 0.92 ? 0.38 : 0
   const computedDanger = Math.min(1.16, Math.max(0, Math.sin(t * 0.31) * 0.48 + pulse))
-  const dangerIndex = state.dangerOverride ?? (state.recordSession.forceTareActive ? Math.min(0.18, computedDanger) : computedDanger)
+  const dangerIndex = state.dangerOverride ?? computedDanger
   const recordActive = state.recordSession.phase === 'recording'
   const frameCount = recordActive ? state.recordSession.recorderFrameCount : state.recording ? state.frameCount + 1 : state.frameCount
   const queueLeft = Math.round(45 + Math.sin(t * 1.1) * 22 + (state.autoRunning ? 18 : -24))
@@ -571,6 +564,16 @@ function buildFrame(state: TelemetryStore): TelemetryFrame {
     },
     forceLeft,
     forceRight,
+    forceStatus: {
+      source: state.config.force.source,
+      protocol: state.config.force.serial.protocol,
+      sides: {
+        left: { port: state.config.force.serial.leftPort, connected: true, healthy: true, sampleAgeMs: 1, sampleHz: 1000, crcErrors: 0 },
+        right: { port: state.config.force.serial.rightPort, connected: true, healthy: true, sampleAgeMs: 1, sampleHz: 1000, crcErrors: 0 },
+      },
+      safety: { latched: dangerIndex >= 1, reason: dangerIndex >= 1 ? '模拟安全锁存' : '', canAcknowledge: dangerIndex >= 1 },
+      compliance: { enabled: state.config.force.compliance.enabled },
+    },
     dangerIndex,
     recording: state.recording || recordActive,
     episodeCount: state.recordSession.currentEpisode || state.episodeCount,
@@ -672,7 +675,7 @@ function buildFrame(state: TelemetryStore): TelemetryFrame {
 let _logIdSeq = 0
 let _manualActionIdSeq = 0
 let _manualMemoryIdSeq = 0
-/** 构建当前流程需要的数据结构。 */
+/** Create a bounded in-memory log entry for UI-only events. */
 function makeLog(level: LogLevel, msg: string, channel?: LogEntry['channel']): LogEntry {
   const id = ++_logIdSeq
   return {
@@ -683,7 +686,7 @@ function makeLog(level: LogLevel, msg: string, channel?: LogEntry['channel']): L
     msg,
   }
 }
-/** 构建当前流程需要的数据结构。 */
+/** Append one log while enforcing the UI retention limit. */
 function appendLog(logs: LogEntry[], entry: LogEntry) {
   return [...logs, entry].slice(-maxLogEntries)
 }
@@ -692,7 +695,7 @@ type BackendWsMessage =
   | { type: 'telemetry'; data: TelemetryFrame }
   | { type: 'log'; data: LogEntry }
   | { type: 'config'; data: AppConfig }
-/** 描述当前方法的功能边界。 */
+/** Strip a backend telemetry frame down to the fields rendered in charts. */
 function telemetrySampleFromFrame(frame: TelemetryFrame): TelemetrySample {
   // 图表只保留绘制需要的字段，避免历史缓冲持有整帧对象造成渲染压力。
   return {
@@ -705,7 +708,7 @@ function telemetrySampleFromFrame(frame: TelemetryFrame): TelemetrySample {
     queueRight: frame.queueDepth.right,
   }
 }
-/** 构建当前流程需要的数据结构。 */
+/** Append chart history without retaining old full telemetry frames. */
 function appendTelemetryHistory(history: TelemetrySample[], sample: TelemetrySample) {
   const nextHistory = history.length >= maxHistorySamples
     ? history.slice(history.length - maxHistorySamples + 1)
@@ -725,9 +728,11 @@ let recordResetSkipInFlight = false
 let pendingBackendFrame: TelemetryFrame | null = null
 let backendFrameDelayTimer: number | null = null
 let backendFrameRaf: number | null = null
+let backendStaleWatchdogTimer: number | null = null
+let lastBackendFrameReceivedAt: number | null = null
 let lastBackendFrameCommitAt = 0
 let lastBackendHistoryCommitAt = 0
-/** 描述当前方法的功能边界。 */
+/** Finalize the backend session after the quality-report review flow closes. */
 function finishRecordSessionNow(set: TelemetryStoreSet) {
   void finishRecordSessionApi().finally(() => {
     finishRecordSessionAfterReview = false
@@ -833,6 +838,10 @@ function commitBackendFrame(set: TelemetryStoreSet, frame: TelemetryFrame, force
     return {
       tick: state.tick + 1,
       frame: nextFrame,
+      telemetryLink: {
+        state: 'live',
+        lastFrameReceivedAt: lastBackendFrameReceivedAt ?? now,
+      },
       recording: nextFrame.recording,
       episodeCount: nextFrame.episodeCount,
       frameCount: nextFrame.frameCount,
@@ -887,6 +896,26 @@ function enqueueBackendFrame(set: TelemetryStoreSet, get: TelemetryStoreGet, fra
   schedulePendingBackendFrame(set, get)
 }
 /** 删除对应数据并同步界面状态。 */
+function startBackendStaleWatchdog(set: TelemetryStoreSet, get: TelemetryStoreGet) {
+  if (backendStaleWatchdogTimer !== null) return
+  backendStaleWatchdogTimer = window.setInterval(() => {
+    const receivedAt = lastBackendFrameReceivedAt
+    if (
+      get().telemetryLink.state === 'live'
+      && receivedAt !== null
+      && Date.now() - receivedAt > telemetryStaleAfterMs
+    ) {
+      set((state) => ({
+        telemetryLink: { state: 'stale', lastFrameReceivedAt: receivedAt },
+        frame: { ...state.frame, wsOk: false, resource: { ...state.frame.resource, wsHz: 0 } },
+      }))
+    }
+  }, 250)
+}
+function stopBackendStaleWatchdog() {
+  if (backendStaleWatchdogTimer !== null) window.clearInterval(backendStaleWatchdogTimer)
+  backendStaleWatchdogTimer = null
+}
 function clearPendingBackendFrameFlush() {
   if (backendFrameDelayTimer !== null) {
     window.clearTimeout(backendFrameDelayTimer)
@@ -922,6 +951,7 @@ function mergeConfig(current: AppConfig, patch: Partial<AppConfig>): AppConfig {
 
 /** 应用当前现场硬件的前端配置迁移。 */
 export function normalizeConfig(config: AppConfig): AppConfig {
+  const hasMissingForceSource = !config.force?.source
   const hasPreviousImx258CameraDefaults =
     config.cameras.global === 'AR0234 / index 1'
     && config.cameras.wristLeft === 'IMX258 / index 2'
@@ -930,6 +960,13 @@ export function normalizeConfig(config: AppConfig): AppConfig {
     config.cameras.global === 'IMX335 / index 1'
     && config.cameras.wristLeft === 'IMX335 / index 2'
     && config.cameras.wristRight === 'IMX335 / index 0'
+  const hasPreviousDevicePathCameraBindings =
+    config.cameras.global === 'IMX335 / index 1'
+    && config.cameras.globalIdentity === 'USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000'
+    && config.cameras.wristLeft === 'IMX335 / index 0'
+    && config.cameras.wristLeftIdentity === 'USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000'
+    && config.cameras.wristRight === 'IMX335 / index 2'
+    && config.cameras.wristRightIdentity === 'USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000'
   const hasLegacyReversedWristCameras =
     config.cameras.global === 'AR0234 / index 2'
     && config.cameras.wristLeft === 'IMX258 / index 1'
@@ -942,16 +979,20 @@ export function normalizeConfig(config: AppConfig): AppConfig {
   if (
     !hasPreviousImx258CameraDefaults
     && !hasPreviousImx335CameraDefaults
+    && !hasPreviousDevicePathCameraBindings
     && !hasLegacyReversedWristCameras
     && !hasLegacyCyclicCameraRoles
     && !hasStalePicoIp
+    && !hasMissingForceSource
   ) {
     return config
   }
   const next = cloneConfig(config)
+  if (!next.force.source) next.force.source = defaultConfig.force.source
   if (
     hasPreviousImx258CameraDefaults
     || hasPreviousImx335CameraDefaults
+    || hasPreviousDevicePathCameraBindings
     || hasLegacyReversedWristCameras
     || hasLegacyCyclicCameraRoles
   ) {
@@ -976,15 +1017,36 @@ export function normalizeConfig(config: AppConfig): AppConfig {
   return next
 }
 /** 计算对应的业务值或展示值。 */
-function diagnosticsFromHardwareStatus(
+export function diagnosticsFromHardwareStatus(
   diagnostics: DiagnosticItem[],
   status: Awaited<ReturnType<typeof fetchHardwareStatus>>,
 ): DiagnosticItem[] {
   return diagnostics.map((item) => {
+    if (item.key === 'hal-health' && (status.runtime?.backendDeployment || status.runtime?.halDeployment)) {
+      const backendDeployment = status.runtime?.backendDeployment
+      const halDeployment = status.runtime?.halDeployment
+      const restartMessages = [backendDeployment, halDeployment]
+        .filter((deployment) => deployment?.restartRequired)
+        .map((deployment) => deployment?.message)
+        .filter((message): message is string => Boolean(message))
+      const restartRequired = Boolean(backendDeployment?.restartRequired || halDeployment?.restartRequired)
+      return {
+        ...item,
+        status: restartRequired ? 'warn' : 'ok',
+        remediation: restartMessages.join('; ') || halDeployment?.message || backendDeployment?.message || item.remediation,
+      }
+    }
     if (item.key.startsWith('cam-') && status.camera) {
       return { ...item, status: status.camera.ok ? 'ok' : 'error', remediation: status.camera.message }
     }
     if (item.key.startsWith('ati-') && status.force) {
+      if (status.force.source === 'hkvl_serial') {
+        return {
+          ...item,
+          status: 'pending',
+          remediation: '当前数据源为 HAL 原生 HKVL-36A；NI-DAQ 探测已跳过',
+        }
+      }
       return { ...item, status: status.force.ok ? 'ok' : 'error', remediation: status.force.message }
     }
     if (item.key === 'gripper' && status.gripper) {
@@ -1163,6 +1225,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   diagnostics: defaultDiagnostics,
   config: defaultConfig,
   picoConnection: { state: 'pending', message: '尚未检查 PICO ADB', checkedAt: null },
+  picoNetworkInfo: null,
   recording: false,
   autoRunning: false,
   clutchActive: false,
@@ -1179,6 +1242,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   backendWs: null,
   backendReconnectTimer: null,
   backendReconnectAttempts: 0,
+  telemetryLink: { state: 'connecting', lastFrameReceivedAt: null },
 
 /** 启动对应流程。 */
 startMock: () => {
@@ -1210,6 +1274,7 @@ startMock: () => {
         return {
           tick,
           frame,
+          telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
           recordSession,
           frameCount: frame.frameCount,
           history: state.history.length === 0 || tick % Math.max(1, Math.round(chartHistoryIntervalMs / mockTelemetryIntervalMs)) === 0
@@ -1232,6 +1297,10 @@ stopMock: () => {
 /** 启动对应流程。 */
 startBackend: () => {
     if (get().backendWs) return
+    startBackendStaleWatchdog(set, get)
+    set((state) => ({
+      telemetryLink: { state: 'connecting', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
+    }))
     clearPendingBackendFrameFlush()
     const reconnectTimer = get().backendReconnectTimer
     if (reconnectTimer) {
@@ -1240,7 +1309,14 @@ startBackend: () => {
     }
     // 网页套接字建立前先拉一次静态配置和硬件概况，首屏不会等到下一帧遥测才有数据。
     void fetchConfig()
-      .then((config) => set({ config: normalizeConfig(config) }))
+      .then((config) => {
+        set({ config: normalizeConfig(config) })
+        void get().autoConfigurePicoNetwork().catch((error) => {
+          set((state) => ({
+            logs: appendLog(state.logs, makeLog('WARNING', `PICO network detection failed: ${String(error)}`, '[CAMERA]')),
+          }))
+        })
+      })
       .catch((error) => {
         set((state) => ({
           logs: appendLog(state.logs, makeLog('ERROR', `settings fetch failed: ${String(error)}`, '[BACKEND]')),
@@ -1267,18 +1343,35 @@ startBackend: () => {
         }))
       })
     const ws = new WebSocket(wsUrl)
+    let rateWindowStart = performance.now()
+    let receivedFrames = 0
+    let receivedHz = 0
     ws.onopen = () => {
       set((state) => ({
         backendReconnectAttempts: 0,
+        telemetryLink: { state: 'connecting', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
         logs: appendLog(state.logs, makeLog('INFO', `Backend WebSocket connected: ${wsUrl}`, '[BACKEND]')),
       }))
     }
     ws.onmessage = (event) => {
+      if (get().backendWs !== ws) return
       try {
         const message = JSON.parse(String(event.data)) as BackendWsMessage
         if (message.type === 'telemetry') {
+          lastBackendFrameReceivedAt = Date.now()
+          // Count this connection's received telemetry, not shared backend calls
+          // or throttled UI commits. Logs and other browser tabs do not count.
+          receivedFrames += 1
+          const receivedAt = performance.now()
+          const windowMs = receivedAt - rateWindowStart
+          if (windowMs >= 1000) {
+            receivedHz = Math.round(receivedFrames * 1000 / windowMs * 10) / 10
+            receivedFrames = 0
+            rateWindowStart = receivedAt
+          }
           const frame = {
             ...message.data,
+            resource: { ...message.data.resource, wsHz: receivedHz },
             motionEnabled: message.data.motionEnabled ?? { left: null, right: null },
             motionAxisEnabled: message.data.motionAxisEnabled ?? {
               left: Array.from({ length: 6 }, () => null),
@@ -1304,7 +1397,8 @@ startBackend: () => {
     }
     ws.onerror = () => {
       set((state) => ({
-        frame: { ...state.frame, wsOk: false },
+        frame: { ...state.frame, wsOk: false, resource: { ...state.frame.resource, wsHz: 0 } },
+        telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
         logs: appendLog(state.logs, makeLog('ERROR', 'Backend WebSocket error', '[BACKEND]')),
       }))
     }
@@ -1323,7 +1417,8 @@ startBackend: () => {
         backendWs: null,
         backendReconnectTimer: reconnectTimer,
         backendReconnectAttempts: attempts,
-        frame: { ...state.frame, wsOk: false },
+        frame: { ...state.frame, wsOk: false, resource: { ...state.frame.resource, wsHz: 0 } },
+        telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
         logs: appendLog(
           state.logs,
           makeLog(
@@ -1342,8 +1437,14 @@ stopBackend: () => {
     const ws = get().backendWs
     const timer = get().backendReconnectTimer
     if (timer) window.clearTimeout(timer)
+    stopBackendStaleWatchdog()
     clearPendingBackendFrameFlush()
-    set({ backendWs: null, backendReconnectTimer: null, backendReconnectAttempts: 0 })
+    set((state) => ({
+      backendWs: null,
+      backendReconnectTimer: null,
+      backendReconnectAttempts: 0,
+      telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
+    }))
     if (ws) ws.close()
   },
 
@@ -1790,25 +1891,6 @@ skipRecordReset: () => {
   },
 
 /** 发送或封装对应的后端命令。 */
-tareRecordForceSensors: () => {
-    void tareForceSensorsApi()
-    set((state) => ({
-      dangerOverride: 0,
-      frame: {
-        ...state.frame,
-        dangerIndex: 0,
-        forceLeft: [0, 0, 0, 0, 0, 0],
-        forceRight: [0, 0, 0, 0, 0, 0],
-      },
-      recordSession: {
-        ...state.recordSession,
-        forceTareActive: true,
-      },
-      logs: appendLog(state.logs, makeLog('INFO', '力觉 Tare 已执行', '[FORCE]')),
-    }))
-  },
-
-/** 发送或封装对应的后端命令。 */
 toggleRecordClutch: () => {
     void toggleClutchApi()
     set((state) => ({
@@ -1899,16 +1981,17 @@ homeRecordArms: () => {
 
 /** 描述当前方法的功能边界。 */
 returnRecordMotionOrigin: async (side) => {
+    const operatorLabel = operatorSideLabel(operatorSideForHardwareSide(side))
     if (recordMotionOriginInFlight) {
       set((state) => ({
-        logs: appendLog(state.logs, makeLog('WARNING', `${side} slave arm return-to-work-origin ignored: request is already pending`, '[HAL]')),
+        logs: appendLog(state.logs, makeLog('WARNING', `${operatorLabel} slave arm return-to-work-origin ignored: request is already pending`, '[HAL]')),
       }))
       return
     }
     const frame = get().frame
     if (!motionSideReturnOriginReady(side, frame.motionEnabled, frame.motionAxisEnabled)) {
       set((state) => ({
-        logs: appendLog(state.logs, makeLog('WARNING', `${side} slave arm return-to-work-origin ignored: motion side is disabled`, '[HAL]')),
+        logs: appendLog(state.logs, makeLog('WARNING', `${operatorLabel} slave arm return-to-work-origin ignored: motion side is disabled`, '[HAL]')),
       }))
       return
     }
@@ -1926,11 +2009,11 @@ returnRecordMotionOrigin: async (side) => {
           ...state.recordSession,
           ...returnedRecordResetState(state.recordSession, side),
         },
-        logs: appendLog(state.logs, makeLog('INFO', `${side} slave arm returned to work origin`, '[HAL]')),
+        logs: appendLog(state.logs, makeLog('INFO', `${operatorLabel} slave arm returned to work origin`, '[HAL]')),
       }))
     } catch (error) {
       set((state) => ({
-        logs: appendLog(state.logs, makeLog('ERROR', `${side} slave arm return-to-work-origin failed: ${String(error)}`, '[HAL]')),
+        logs: appendLog(state.logs, makeLog('ERROR', `${operatorLabel} slave arm return-to-work-origin failed: ${String(error)}`, '[HAL]')),
       }))
     } finally {
       recordMotionOriginInFlight = false
@@ -2022,19 +2105,31 @@ setDangerOverride: (danger) =>
 
 /** 应用对应配置或状态。 */
 acknowledgeSafety: () => {
-    void acknowledgeSafetyApi().catch((error) => {
-      set((state) => ({
-        logs: appendLog(state.logs, makeLog('ERROR', `safety acknowledge failed: ${String(error)}`, '[SAFETY]')),
-      }))
-    })
-    set((state) => ({
-      dangerOverride: null,
-      frame: {
-        ...state.frame,
-        dangerIndex: 0,
-      },
-      logs: appendLog(state.logs, makeLog('INFO', '操作员确认安全态（不恢复运动）', '[SAFETY]')),
-    }))
+    void acknowledgeSafetyApi()
+      .then(() => {
+        set((state) => ({
+          dangerOverride: null,
+          frame: {
+            ...state.frame,
+            dangerIndex: 0,
+            forceStatus: {
+              ...state.frame.forceStatus,
+              safety: {
+                ...state.frame.forceStatus?.safety,
+                latched: false,
+                reason: '',
+                acknowledgeBlocker: '',
+              },
+            },
+          },
+          logs: appendLog(state.logs, makeLog('INFO', '操作员确认安全态（伺服保持关闭）', '[SAFETY]')),
+        }))
+      })
+      .catch((error) => {
+        set((state) => ({
+          logs: appendLog(state.logs, makeLog('ERROR', `safety acknowledge failed: ${String(error)}`, '[SAFETY]')),
+        }))
+      })
   },
 
 /** 描述当前方法的功能边界。 */
@@ -2092,6 +2187,27 @@ sendBackendCommandLog: (level, msg, channel) => {
  /** 设置当前流程的对应状态。 */
  setPicoConnectionStatus: (state, message) => {
     set({ picoConnection: { state, message, checkedAt: Date.now() } })
+  },
+
+/** Detect the active PC network path and accept the config already persisted by the backend. */
+autoConfigurePicoNetwork: async (picoIp) => {
+    const response = await autoConfigurePicoNetworkApi(picoIp)
+    const network = response.data?.network
+    const config = response.data?.config
+    if (!network || !config) throw new Error('PICO network detection returned an incomplete response')
+    set((state) => ({
+      config: normalizeConfig(config),
+      picoNetworkInfo: network,
+      logs: appendLog(
+        state.logs,
+        makeLog(
+          'INFO',
+          `PICO network: ${network.interfaceAlias} IF ${network.ifIndex}, ${network.localIp}/${network.prefixLength}`,
+          '[CAMERA]',
+        ),
+      ),
+    }))
+    return network
   },
 
 /** 描述当前方法的功能边界。 */
@@ -2231,12 +2347,13 @@ setManualSpeedMode: (mode) =>
 
 /** 计算或执行手动控制的对应逻辑。 */
 issueManualAxisMove: (side, axis, direction) => {
+    const operatorLabel = operatorSideLabel(operatorSideForHardwareSide(side))
     if (!mockMode) {
       const state = get()
       const axisIndex = manualAxisOrder.indexOf(axis)
       if (state.frame.motionAxisEnabled?.[side]?.[axisIndex] === false) {
         set((current) => ({
-          logs: appendLog(current.logs, makeLog('WARNING', `${side} ${axis} jog skipped: motion axis is disabled`, '[HAL]')),
+          logs: appendLog(current.logs, makeLog('WARNING', `${operatorLabel} ${axis} jog skipped: motion axis is disabled`, '[HAL]')),
         }))
         return
       }
@@ -2252,7 +2369,7 @@ issueManualAxisMove: (side, axis, direction) => {
         set((current) => ({
           logs: appendLog(
             current.logs,
-            makeLog('WARNING', `${side} ${axis} jog skipped: axis is still moving (${remainingS}s)`, '[HAL]'),
+            makeLog('WARNING', `${operatorLabel} ${axis} jog skipped: axis is still moving (${remainingS}s)`, '[HAL]'),
           ),
         }))
         return
@@ -2274,7 +2391,7 @@ issueManualAxisMove: (side, axis, direction) => {
       void manualAxisMoveApi(side, axis, effectiveDirection, step, speedMode)
         .then(() => {
           set((current) => ({
-            logs: appendLog(current.logs, makeLog('INFO', `${side} ${axis} jog command accepted by HAL`, '[HAL]')),
+            logs: appendLog(current.logs, makeLog('INFO', `${operatorLabel} ${axis} jog command accepted by HAL`, '[HAL]')),
           }))
         })
         .catch((error) => {
@@ -2332,11 +2449,11 @@ issueManualAxisMove: (side, axis, direction) => {
         frame: { ...state.frame, jointPositions },
         logs: appendLog(
           state.logs,
-          makeLog(
-            'INFO',
-            `${side === 'left' ? '左臂' : '右臂'} ${axis} ${appliedDelta >= 0 ? '+' : ''}${appliedDelta.toFixed(unit === 'um' ? 1 : 3)}${unit} · ${speedModeText(state.manualControl.speedMode)} · test fixture`,
-            '[HAL]',
-          ),
+            makeLog(
+              'INFO',
+              `${operatorLabel} ${axis} ${appliedDelta >= 0 ? '+' : ''}${appliedDelta.toFixed(unit === 'um' ? 1 : 3)}${unit} · ${speedModeText(state.manualControl.speedMode)} · test fixture`,
+              '[HAL]',
+            ),
         ),
       }
     })
@@ -2344,19 +2461,11 @@ issueManualAxisMove: (side, axis, direction) => {
 
 /** 计算或执行手动控制的对应逻辑。 */
 issueManualGripperMove: (side, command, targetMm) => {
+    const operatorSide = operatorSideForHardwareSide(side)
+    const operatorLabel = operatorSideLabel(operatorSide)
+    const operatorGripperLabel = operatorSide === 'left' ? '左夹爪' : '右夹爪'
     if (!mockMode) {
       const enabledKey = side === 'left' ? 'leftEnabled' : 'rightEnabled'
-      const config = get().config
-      if (
-        config.teleop.engine !== 'hal_native'
-        && !['enable', 'disable', 'stop'].includes(command)
-        && !config.gripper[enabledKey]
-      ) {
-        set((current) => ({
-          logs: appendLog(current.logs, makeLog('WARNING', `${side} gripper ${command} skipped: gripper is disabled`, '[GRIPPER]')),
-        }))
-        return
-      }
       const previousEnabled = Boolean(get().config.gripper[enabledKey])
       // 夹爪启停先乐观更新界面，再由后端持久化和回读校准最终状态。
       // 说明当前代码块的功能用途。
@@ -2377,7 +2486,7 @@ issueManualGripperMove: (side, command, targetMm) => {
       void gripperCommandApi(side, command, targetMm, get().config.gripper.commandForceLimitN)
         .then(() => {
           set((current) => ({
-            logs: appendLog(current.logs, makeLog('INFO', `${side} gripper ${command} accepted by backend`, '[GRIPPER]')),
+            logs: appendLog(current.logs, makeLog('INFO', `${operatorLabel} gripper ${command} accepted by backend`, '[GRIPPER]')),
           }))
           // 说明当前代码块的功能用途。
           // 说明当前代码块的功能用途。
@@ -2436,7 +2545,6 @@ issueManualGripperMove: (side, command, targetMm) => {
         enabled: nextEnabled,
       }
       const nextManual = appendManualAction(state.manualControl, action)
-      const label = side === 'left' ? '左夹爪' : '右夹爪'
       const commandText: Record<ManualGripperCommand, string> = {
         enable: '使能',
         disable: '断使能',
@@ -2449,7 +2557,7 @@ issueManualGripperMove: (side, command, targetMm) => {
       return {
         config: nextConfig,
         manualControl: nextManual,
-        logs: appendLog(state.logs, makeLog('INFO', `${label} ${commandText[command]} · gripper test fixture`, '[GRIPPER]')),
+        logs: appendLog(state.logs, makeLog('INFO', `${operatorGripperLabel} ${commandText[command]} · gripper test fixture`, '[GRIPPER]')),
       }
     })
   },

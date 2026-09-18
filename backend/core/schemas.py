@@ -104,6 +104,8 @@ class TelemetryFrame(BaseModel):
     )
     forceLeft: list[float] = Field(min_length=6, max_length=6)
     forceRight: list[float] = Field(min_length=6, max_length=6)
+    forceStatus: dict[str, Any] = Field(default_factory=dict)
+    gripperStatus: dict[str, Any] = Field(default_factory=dict)
     dangerIndex: float
     recording: bool
     episodeCount: int

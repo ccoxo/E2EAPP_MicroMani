@@ -26,7 +26,15 @@ from types import SimpleNamespace
 from typing import Any
 
 from backend.core.config import SettingsService
+from backend.core.data_contract import (
+    data_contract_metadata,
+    hardware_to_dataset_grippers,
+    hardware_to_dataset_motion,
+    hardware_to_dataset_state,
+    validate_data_contract,
+)
 from backend.core.defaults import ICF_KINEMATICS_DEFAULTS, ICF_TELEOP_DEFAULTS
+from backend.core.force_config import hal_force_config_payload
 from backend.core.logging import LogService, now_ms, stable_config_hash
 from backend.core.units import lerobot_to_ui_state, motion_pulse_per_unit, pulses_to_ui_state
 from backend.hal_client.client import HalClient
@@ -333,6 +341,7 @@ class FrameAssembler:
             motion_pulses = [float(value) for value in raw_pulses]
             recorder._remember_motion_pulses(motion_pulses)
         motion_positions = recorder._recording_motion_positions(config, motion_positions, motion_pulses)
+        recording_motion_pulses = hardware_to_dataset_motion(motion_pulses)
         force_values = recorder._force_values_from_sample(force_sample.value)
         if force_values is not None:
             force_left, force_right = force_values
@@ -356,9 +365,9 @@ class FrameAssembler:
             "frame_index": frame_index,
             "episode_index": recorder._episode_index,
             "observation.state": observation_state,
-            "observation.pulses": motion_pulses,
-            "observation.force_left": force_left,
-            "observation.force_right": force_right,
+            "observation.pulses": recording_motion_pulses,
+            "observation.force_left": force_right,
+            "observation.force_right": force_left,
             "action": recorder._latest_action_vector(observation_state, config, target_monotonic_s),
             "images": image_payload,
         }
@@ -427,13 +436,6 @@ class TimedRingBuffer:
 
 
 class DatasetRecorderService:
-    """Recorder using the app hardware services with a native LeRobot path.
-
-    Frames are written through `LeRobotDataset.create/resume/add_frame/save_episode`.
-    AppStation owns hardware collection, time alignment, quality stats and UI
-    metadata. LeRobot owns dataset layout, frame persistence and standard metadata.
-    """
-
     def __init__(
         self,
         settings: SettingsService,
@@ -478,6 +480,7 @@ class DatasetRecorderService:
         self._episode_started_at = 0.0
         self._episode_start_monotonic_s = 0.0
         self._sampler_start_monotonic_s = 0.0
+        self._sampler_schedule_start_s = 0.0
         self._record_loop_start_monotonic_s = 0.0
         self._episode_source_time0_s = 0.0
         self._session_started_at = 0.0
@@ -507,8 +510,10 @@ class DatasetRecorderService:
         self._native_dataset_from_index = 0
         self._native_total_frames_cached = 0
         self._last_native_camera_frames: dict[str, Any] = {}
+        self._last_native_gripper_sample: tuple[tuple[float, float], float] | None = None
         self._record_fps_hz = 30
         self._force_sample_hz = 200.0
+        self._latest_force_state: dict[str, Any] = {}
         self._recording_config_snapshot: dict[str, Any] = {}
         self._last_motion_pulses = [0.0] * 12
         self._source_sample_indices: dict[str, int] = {key: 0 for key in SOURCE_KEYS}
@@ -537,6 +542,9 @@ class DatasetRecorderService:
             dataset_root = self._dataset_root(config)
             dataset_dir = dataset_root / next_dataset_id
             await asyncio.to_thread(dataset_root.mkdir, parents=True, exist_ok=True)
+            contract_error = self._dataset_contract_error(dataset_dir)
+            if contract_error:
+                raise RuntimeError(contract_error)
 
             async with self._lock:
                 self._recording_config_snapshot = deepcopy(config)
@@ -555,6 +563,7 @@ class DatasetRecorderService:
                 self._native_error = ""
                 self._native_total_frames_cached = 0
                 self._last_native_camera_frames = {}
+                self._last_native_gripper_sample = None
                 self._assembly_queue = asyncio.Queue(maxsize=ASSEMBLY_QUEUE_MAX_FRAMES)
                 self._write_queue = queue.Queue(maxsize=WRITE_QUEUE_MAX_FRAMES)
                 self._writer_thread = LeRobotWriterThread(self, self._write_queue)
@@ -565,6 +574,15 @@ class DatasetRecorderService:
             raise
 
         try:
+            if (
+                self._real_hardware_mode(config)
+                and str(config.get("force", {}).get("source", "hkvl_serial")).lower() == "hkvl_serial"
+            ):
+                try:
+                    self._latest_force_state = dict(await self.hal.force_state())
+                except Exception as exc:  # noqa: BLE001
+                    self._latest_force_state = {}
+                    self.logs.warning("[FORCE]", f"HKVL metadata state unavailable: {exc}")
             native_started = await self._try_begin_native_dataset(config)
             if not native_started:
                 await self._stop_writer_task()
@@ -577,6 +595,7 @@ class DatasetRecorderService:
         try:
             await asyncio.to_thread(self._write_appstation_info, dataset_dir, config)
             episode_index = await asyncio.to_thread(self._next_episode_index, dataset_dir)
+            sample_clock_now_s, schedule_now_s = await self._episode_clock_pair(config)
             async with self._lock:
                 self._dataset_dir = dataset_dir
                 self._episode_index = episode_index
@@ -585,7 +604,7 @@ class DatasetRecorderService:
                 self._session_starting = False
                 self._write_enqueue_pending = 0
                 self._write_enqueue_idle.set()
-                self._begin_episode_locked()
+                self._begin_episode_locked(sample_clock_now_s=sample_clock_now_s, schedule_now_s=schedule_now_s)
                 self._start_sampler_tasks_locked()
                 self._loop_task = asyncio.create_task(self._record_loop(), name="dataset-recorder")
                 self._assembler_task = asyncio.create_task(self._frame_assembler_loop(), name="dataset-frame-assembler")
@@ -671,6 +690,7 @@ class DatasetRecorderService:
 
     async def skip_reset(self) -> dict[str, Any]:
         """跳过复位等待，清理已保存标记并启动下一条 episode 录制。"""
+        sample_clock_now_s, schedule_now_s = await self._episode_clock_pair(self._recording_config())
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
@@ -688,7 +708,7 @@ class DatasetRecorderService:
                 self._last_saved_episode = None
                 self._reset_pending = False
                 self._reset_returned_sides = set()
-                self._begin_episode_locked()
+                self._begin_episode_locked(sample_clock_now_s=sample_clock_now_s, schedule_now_s=schedule_now_s)
                 self.telemetry.recording = True
                 self.telemetry.frame_count = 0
             except (asyncio.CancelledError, Exception):
@@ -850,6 +870,7 @@ class DatasetRecorderService:
                 continue
             app_info = self._read_json(dataset_dir / "meta" / "appstation_info.json")
             native_format = self._is_native_dataset(dataset_dir, info)
+            contract_error = self._dataset_contract_error(dataset_dir)
             episodes = self._read_episodes(dataset_dir)
             if not episodes and native_format:
                 episodes = self._native_episodes_from_meta(dataset_dir, info)
@@ -871,6 +892,11 @@ class DatasetRecorderService:
                         app_info.get("format")
                         or info.get("format")
                         or ("lerobot-v3-native" if native_format else "lerobot-v3-native-required")
+                    ),
+                    "dataContract": (
+                        app_info.get("dataContract")
+                        or info.get("dataContract")
+                        or {"status": "unknown", "message": contract_error}
                     ),
                     "episodes": [
                         self._episode_for_api(dataset_dir, dataset_dir.name, episode, include_samples=False)
@@ -997,6 +1023,7 @@ class DatasetRecorderService:
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
             raise FileNotFoundError(dataset_id)
+        self._require_dataset_contract(dataset_dir)
         episodes = self._visible_episodes_for_dataset(dataset_dir, info)
         status_counts: dict[str, int] = {}
         warnings: list[str] = []
@@ -1038,6 +1065,7 @@ class DatasetRecorderService:
         info = self._read_json(dataset_dir / "meta" / "info.json")
         if not info:
             raise FileNotFoundError(dataset_id)
+        self._require_dataset_contract(dataset_dir)
         episode = next(
             (
                 item
@@ -1417,7 +1445,27 @@ class DatasetRecorderService:
 
     def _recording_config(self) -> dict[str, Any]:
         """返回会话开始时冻结的录制配置，缺省时读取当前配置。"""
-        return self._recording_config_snapshot or self.settings.get_config()
+        snapshot = getattr(self, "_recording_config_snapshot", None)
+        if snapshot:
+            return snapshot
+        settings = getattr(self, "settings", None)
+        return settings.get_config() if settings is not None else {}
+
+    async def _episode_clock_pair(self, config: dict[str, Any]) -> tuple[float, float]:
+        """返回 (HAL 采样时间, Python 调度时间)，采样时间优先来自 DDS steady_clock。"""
+        schedule_now_s = time.monotonic()
+        sample_clock_now_s = schedule_now_s
+        hal = getattr(self, "hal", None)
+        motion_state = getattr(hal, "motion_state", None)
+        if self._real_hardware_mode(config) and callable(motion_state):
+            try:
+                state = await motion_state()
+                sample_clock_now_s = self._source_sample_monotonic(state, schedule_now_s)
+            except Exception as exc:  # noqa: BLE001
+                warning = getattr(getattr(self, "logs", None), "warning", None)
+                if callable(warning):
+                    warning("[LEROBOT]", f"HAL steady clock unavailable, using scheduler clock: {exc}")
+        return sample_clock_now_s, schedule_now_s
 
     async def _wait_for_episode_warmup(self) -> None:
         """等待采样预热完成后再让录制帧进入时间轴。"""
@@ -1615,7 +1663,10 @@ class DatasetRecorderService:
 
     def _sample_source_loop(self, source: str) -> None:
         """按源采样频率循环采样硬件数据并写入时间缓存。"""
-        epoch_s = 0.0
+        # Source samplers run in ordinary threads so slow hardware calls cannot
+        # block the asyncio event loop that drives UI commands and status.
+        sample_epoch_s = 0.0
+        schedule_epoch_s = 0.0
         sample_index = 0
         while self._session_active and not self._sampler_stop_event.is_set():
             try:
@@ -1624,26 +1675,30 @@ class DatasetRecorderService:
                     continue
                 config = self._recording_config()
                 start_s = self._sampler_start_monotonic_s
-                if start_s <= 0.0:
+                schedule_start_s = getattr(self, "_sampler_schedule_start_s", 0.0) or start_s
+                if start_s <= 0.0 or schedule_start_s <= 0.0:
                     self._sampler_stop_event.wait(0.01)
                     continue
-                if start_s != epoch_s:
-                    epoch_s = start_s
+                if start_s != sample_epoch_s or schedule_start_s != schedule_epoch_s:
+                    sample_epoch_s = start_s
+                    schedule_epoch_s = schedule_start_s
                     sample_index = 0
                     self._source_sample_indices[source] = 0
                 rate_hz = self._source_sample_rate_hz(source, config)
                 period_s = 1.0 / rate_hz
-                next_sample_s = epoch_s + self._source_sample_timestamp_s(source, sample_index, config)
+                relative_sample_s = self._source_sample_timestamp_s(source, sample_index, config)
+                next_schedule_s = schedule_epoch_s + relative_sample_s
                 now = time.monotonic()
-                if now > next_sample_s + period_s:
-                    sample_index = max(sample_index, int(math.floor((now - epoch_s) * rate_hz)))
-                    next_sample_s = epoch_s + self._source_sample_timestamp_s(source, sample_index, config)
-                if now < next_sample_s:
-                    if self._sampler_stop_event.wait(next_sample_s - now):
+                if now > next_schedule_s + period_s:
+                    sample_index = max(sample_index, int(math.floor((now - schedule_epoch_s) * rate_hz)))
+                    relative_sample_s = self._source_sample_timestamp_s(source, sample_index, config)
+                    next_schedule_s = schedule_epoch_s + relative_sample_s
+                if now < next_schedule_s:
+                    if self._sampler_stop_event.wait(next_schedule_s - now):
                         return
-                target_s = self._source_sample_timestamp_s(source, sample_index, config)
-                sample = self._sample_source_once_sync(source, config, epoch_s + target_s)
-                if epoch_s != self._sampler_start_monotonic_s:
+                target_s = sample_epoch_s + self._source_sample_timestamp_s(source, sample_index, config)
+                sample = self._sample_source_once_sync(source, config, target_s)
+                if sample_epoch_s != self._sampler_start_monotonic_s:
                     continue
                 self._sample_buffers.setdefault(source, TimedRingBuffer()).append(sample)
                 sample_index += 1
@@ -1661,9 +1716,18 @@ class DatasetRecorderService:
         record_start_s = self._sampler_start_monotonic_s or self._episode_start_monotonic_s
         return record_start_s + RECORDER_HARDWARE_WARMUP_S + max(0, int(frame_index)) / max(1, self._record_fps_hz)
 
+    def _record_schedule_timestamp_s(self, frame_index: int) -> float:
+        """根据帧号和 Python 调度起点计算本机唤醒时间。"""
+        record_start_s = self._record_loop_start_monotonic_s or self._episode_started_at
+        return record_start_s + max(0, int(frame_index)) / max(1, self._record_fps_hz)
+
     def _frame_assembly_due_s(self, target_monotonic_s: float, config: dict[str, Any]) -> float:
         """计算目标帧在对齐延迟之后允许组帧的时间。"""
         return target_monotonic_s + self._alignment_delay_s(config)
+
+    def _frame_assembly_schedule_due_s(self, frame_index: int, config: dict[str, Any]) -> float:
+        """计算目标帧在对齐延迟之后的本机唤醒时间。"""
+        return self._record_schedule_timestamp_s(frame_index) + self._alignment_delay_s(config)
 
     def _alignment_delay_s(self, config: dict[str, Any]) -> float:
         """读取配置中的源对齐延迟并转换为秒。"""
@@ -1737,8 +1801,21 @@ class DatasetRecorderService:
             )
             return SourceSample("force", sampled_at, value, True, "", target_monotonic_s=target_s)
         started = time.monotonic()
+        source = str(config.get("force", {}).get("source", "hkvl_serial")).lower()
         try:
-            value = self.hardware.force.sample(config)
+            if source == "hkvl_serial":
+                value = asyncio.run(self.hal.force_state())
+                self._latest_force_state = dict(value)
+                sides = value.get("sides", {}) if isinstance(value, dict) else {}
+                left_status = sides.get("left", {}) if isinstance(sides, dict) else {}
+                right_status = sides.get("right", {}) if isinstance(sides, dict) else {}
+                value["ok"] = bool(left_status.get("healthy")) and bool(right_status.get("healthy"))
+                if not value["ok"]:
+                    value["message"] = "HKVL force sample is stale or unhealthy"
+            elif source == "nidaq":
+                value = self.hardware.force.sample(config)
+            else:
+                value = {"ok": False, "message": f"unsupported force source: {source}"}
             ok = bool(getattr(value, "ok", True) if not isinstance(value, dict) else value.get("ok", True))
             raw_message = getattr(value, "message", "") if not isinstance(value, dict) else value.get("message", "")
             message = "" if ok else str(raw_message)
@@ -1889,9 +1966,10 @@ class DatasetRecorderService:
                     await asyncio.sleep(0.05)
                     continue
                 target_tick = self._record_target_timestamp_s(frame_index)
+                schedule_tick = self._record_schedule_timestamp_s(frame_index)
                 now = time.monotonic()
-                if now < target_tick:
-                    await asyncio.sleep(target_tick - now)
+                if now < schedule_tick:
+                    await asyncio.sleep(schedule_tick - now)
                 job = FrameAssemblyJob(
                     episode_index=episode_index,
                     episode_generation=episode_generation,
@@ -1900,8 +1978,8 @@ class DatasetRecorderService:
                     period_s=period_s,
                 )
                 await self._enqueue_assembly_job(job)
-                next_target = self._record_target_timestamp_s(frame_index + 1)
-                await asyncio.sleep(max(0.0, next_target - time.monotonic()))
+                next_schedule = self._record_schedule_timestamp_s(frame_index + 1)
+                await asyncio.sleep(max(0.0, next_schedule - time.monotonic()))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -1936,6 +2014,8 @@ class DatasetRecorderService:
 
     async def _frame_assembler_loop(self) -> None:
         """按队列顺序等待对齐时刻、组装帧并移交写线程。"""
+        # Assembly is intentionally decoupled from writing: if disk/video work
+        # stalls, backpressure is detected here before frames cross episodes.
         while self._session_active:
             assembly_queue = self._assembly_queue
             if assembly_queue is None:
@@ -1949,7 +2029,7 @@ class DatasetRecorderService:
                 if not await self._frame_job_is_current(job):
                     continue
                 config = self._recording_config()
-                scheduled_tick = self._frame_assembly_due_s(job.target_monotonic_s, config)
+                scheduled_tick = self._frame_assembly_schedule_due_s(job.frame_index, config)
                 now = time.monotonic()
                 if now < scheduled_tick:
                     await asyncio.sleep(scheduled_tick - now)
@@ -2064,9 +2144,12 @@ class DatasetRecorderService:
         record_quality: bool = True,
     ) -> SourceSample:
         """同步读取夹爪位置，优先使用 native teleop 缓存并记录陈旧状态。"""
-        native_positions = self._latest_native_gripper_positions(config)
-        if native_positions is not None:
-            sampled_at = time.monotonic()
+        native_sample = self._latest_native_gripper_sample(config)
+        if native_sample is not None:
+            native_positions, sampled_at = native_sample
+            if sampled_at <= 0.0:
+                sampled_at = target_monotonic_s
+            self._last_native_gripper_sample = (native_positions, sampled_at)
             sample = SourceSample(
                 "gripper",
                 sampled_at,
@@ -2080,6 +2163,26 @@ class DatasetRecorderService:
             if record_quality:
                 self._record_source_quality(sample, target_monotonic_s, 0.0)
             return sample
+        if self._using_real_hal_native_teleop(config):
+            cached_sample = getattr(self, "_last_native_gripper_sample", None)
+            if cached_sample is not None:
+                native_positions, sampled_at = cached_sample
+                finished = time.monotonic()
+                sample = SourceSample(
+                    "gripper",
+                    sampled_at,
+                    list(native_positions),
+                    False,
+                    "native gripper status missing",
+                    target_monotonic_s=target_monotonic_s,
+                    started_monotonic_s=sampled_at,
+                    finished_monotonic_s=finished,
+                    stale=True,
+                    cache_used=True,
+                )
+                if record_quality:
+                    self._record_source_quality(sample, target_monotonic_s, 0.0)
+                return sample
         if not self._real_hardware_mode(config):
             sampled_at = time.monotonic()
             sample = SourceSample(
@@ -2121,12 +2224,15 @@ class DatasetRecorderService:
 
     def _latest_native_gripper_positions(self, config: dict[str, Any]) -> tuple[float, float] | None:
         """从 hal_native teleop 状态中提取最新左右夹爪当前位置。"""
-        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
-        if str(teleop.get("engine", "")).lower() != "hal_native":
+        native_sample = self._latest_native_gripper_sample(config)
+        return native_sample[0] if native_sample is not None else None
+
+    def _latest_native_gripper_sample(self, config: dict[str, Any]) -> tuple[tuple[float, float], float] | None:
+        """从 hal_native teleop 状态中提取夹爪位置和 native status 时间戳。"""
+        teleop = getattr(self, "teleop", None)
+        if teleop is None:
             return None
-        if self._gripper_workers_enabled(config):
-            return None
-        status = self.teleop.status()
+        status = teleop.status()
         native_status = status.get("nativeStatus") if isinstance(status, dict) else None
         if not isinstance(native_status, dict):
             return None
@@ -2141,7 +2247,7 @@ class DatasetRecorderService:
         right_position = self._coerce_float(right.get("positionMm"))
         if left_position is None or right_position is None:
             return None
-        return left_position, right_position
+        return (left_position, right_position), self._source_sample_monotonic(native_status, 0.0)
 
     async def _refresh_gripper_cache(self, config: dict[str, Any]) -> None:
         """在线程池中刷新夹爪位置缓存，避免阻塞事件循环。"""
@@ -2257,13 +2363,13 @@ class DatasetRecorderService:
         if isinstance(value, dict):
             candidates = (
                 (value.get("sample_monotonic_s"), 1.0),
-                (value.get("received_monotonic_ms"), 0.001),
+                (value.get("dds_stamp_monotonic_ms"), 0.001),
                 (value.get("monotonicMs"), 0.001),
             )
         else:
             candidates = (
                 (getattr(value, "sample_monotonic_s", None), 1.0),
-                (getattr(value, "received_monotonic_ms", None), 0.001),
+                (getattr(value, "dds_stamp_monotonic_ms", None), 0.001),
                 (getattr(value, "monotonicMs", None), 0.001),
             )
         for raw, scale in candidates:
@@ -2419,15 +2525,25 @@ class DatasetRecorderService:
         except (TypeError, ValueError):
             return None
 
-    def _begin_episode_locked(self) -> None:
+    def _begin_episode_locked(
+        self,
+        *,
+        sample_clock_now_s: float | None = None,
+        schedule_now_s: float | None = None,
+    ) -> None:
         """初始化新 episode 的时间轴、缓存、计数器、质量统计和录制状态。"""
         # 每个 episode 独立统计质量指标，保存或丢弃时可以精确回滚。
-        sampler_start_s = time.monotonic() + SAMPLER_START_LEAD_S
+        schedule_now_s = time.monotonic() if schedule_now_s is None else schedule_now_s
+        sample_clock_now_s = schedule_now_s if sample_clock_now_s is None else sample_clock_now_s
+        sampler_start_s = sample_clock_now_s + SAMPLER_START_LEAD_S
+        sampler_schedule_start_s = schedule_now_s + SAMPLER_START_LEAD_S
         record_start_s = sampler_start_s + RECORDER_HARDWARE_WARMUP_S
+        record_schedule_start_s = sampler_schedule_start_s + RECORDER_HARDWARE_WARMUP_S
         self._episode_generation += 1
         self._sampler_start_monotonic_s = sampler_start_s
-        self._record_loop_start_monotonic_s = record_start_s
-        self._episode_started_at = record_start_s
+        self._sampler_schedule_start_s = sampler_schedule_start_s
+        self._record_loop_start_monotonic_s = record_schedule_start_s
+        self._episode_started_at = record_schedule_start_s
         self._episode_start_monotonic_s = record_start_s
         self._episode_source_time0_s = RECORDER_HARDWARE_WARMUP_S
         self._episode_frames = 0
@@ -2450,6 +2566,7 @@ class DatasetRecorderService:
         self._sample_buffers = self._new_sample_buffers(self._recording_config())
         self._source_sample_indices = {key: 0 for key in SOURCE_KEYS}
         self._source_warnings = []
+        self._last_native_gripper_sample = None
         self._max_force_left = 0.0
         self._max_force_right = 0.0
         if not self._native_writer_active():
@@ -2656,6 +2773,7 @@ class DatasetRecorderService:
             "name": str(info.get("name") or self._dataset_name),
             "status": str(info.get("status", "local")) if info else "local",
             "format": "lerobot-v3-native",
+            "dataContract": data_contract_metadata(),
             "codebase_version": "v3.0",
             "nativeLeRobotAvailable": True,
             "useVideos": self._native_use_videos,
@@ -2678,15 +2796,65 @@ class DatasetRecorderService:
             "hardware": {
                 "cameras": config.get("cameras", {}),
                 "cameraResolutions": self._camera_resolution_summary_from_config(config),
-                "force": {
-                    "leftIp": config.get("force", {}).get("leftIp"),
-                    "rightIp": config.get("force", {}).get("rightIp"),
-                    "sampleHz": config.get("force", {}).get("sampleHz"),
-                },
+                "force": self._force_metadata(config),
                 "motion": self._motion_calibration_snapshot(config),
             },
         }
         self._write_json(path, payload)
+        info_path = dataset_dir / "meta" / "info.json"
+        info = self._read_json(info_path)
+        if info:
+            info["dataContract"] = data_contract_metadata()
+            self._write_json(info_path, info)
+
+    def _force_metadata(self, config: dict[str, Any]) -> dict[str, Any]:
+        force = config.get("force", {}) if isinstance(config.get("force"), dict) else {}
+        source = str(force.get("source", "hkvl_serial")).lower()
+        if source != "hkvl_serial":
+            if source != "nidaq":
+                return {"source": source, "message": f"unsupported force source: {source}"}
+            return {
+                "source": "nidaq",
+                "leftIp": force.get("leftIp"),
+                "rightIp": force.get("rightIp"),
+                "sampleHz": force.get("sampleHz"),
+            }
+        serial = force.get("serial", {}) if isinstance(force.get("serial"), dict) else {}
+        latest = getattr(self, "_latest_force_state", {})
+        sides = latest.get("sides", {}) if isinstance(latest, dict) else {}
+        left = sides.get("left", {}) if isinstance(sides, dict) else {}
+        right = sides.get("right", {}) if isinstance(sides, dict) else {}
+        force_payload = hal_force_config_payload(config)
+        return {
+            "source": source,
+            "protocol": serial.get("protocol"),
+            "serial": deepcopy(serial),
+            "measurementSampleHz": serial.get("expectedSampleHz"),
+            "recordSampleHz": self._force_sample_hz,
+            "axisSign": {
+                "left": list(left.get("axisSign", force_payload["leftAxisSign"])),
+                "right": list(right.get("axisSign", force_payload["rightAxisSign"])),
+            },
+            "tareBias": {
+                "left": list(left.get("tareBias", [0.0] * 6)),
+                "right": list(right.get("tareBias", [0.0] * 6)),
+            },
+            "sensorTareBias": {
+                "left": list(left.get("sensorTareBias", [0.0] * 6)),
+                "right": list(right.get("sensorTareBias", [0.0] * 6)),
+            },
+            "calibration": deepcopy(
+                latest.get("calibration", {}) if isinstance(latest, dict) else {}
+            ),
+            "mapping": {
+                side: list(force.get("compliance", {}).get(side, {}).get("matrix", []))
+                for side in ("left", "right")
+            },
+            "compliance": deepcopy(force.get("compliance", {})),
+            "runtimeCompliance": deepcopy(
+                latest.get("compliance", {}) if isinstance(latest, dict) else {}
+            ),
+        }
 
     def _create_native_dataset_metadata(self, dataset_dir: Path, config: dict[str, Any]) -> bool:
         """预检依赖后创建 native LeRobot 数据集并写入 AppStation 元数据。"""
@@ -2747,6 +2915,9 @@ class DatasetRecorderService:
             raise RuntimeError("record dataset is not initialized")
         LeRobotDataset, _np = imports
         dataset_dir = self._dataset_dir
+        contract_error = self._dataset_contract_error(dataset_dir)
+        if contract_error:
+            raise RuntimeError(contract_error)
         repo_id = f"local/{self._dataset_id}"
         self._native_use_videos = self._native_use_videos_requested()
         try:
@@ -2945,6 +3116,26 @@ class DatasetRecorderService:
         app_info = self._read_json(dataset_dir / "meta" / "appstation_info.json")
         return str(app_info.get("format", "")) == "lerobot-v3-native"
 
+    def _dataset_contract_error(self, dataset_dir: Path) -> str:
+        """Reject native datasets whose numeric side order cannot be proven."""
+        info = self._read_json(dataset_dir / "meta" / "info.json")
+        app_info = self._read_json(dataset_dir / "meta" / "appstation_info.json")
+        if not info and not app_info:
+            return ""
+        if not self._is_native_dataset(dataset_dir, info):
+            return ""
+        try:
+            validate_data_contract(app_info.get("dataContract") or info.get("dataContract"))
+        except ValueError as exc:
+            return f"dataset numeric channel order is not compatible: {exc}"
+        return ""
+
+    def _require_dataset_contract(self, dataset_dir: Path) -> None:
+        """Reject native reads when the numeric side order is missing or incompatible."""
+        contract_error = self._dataset_contract_error(dataset_dir)
+        if contract_error:
+            raise RuntimeError(contract_error)
+
     def _open_native_dataset_for_read(self, dataset_id: str, dataset_dir: Path, LeRobotDataset: Any) -> Any:
         """以兼容不同 LeRobot 版本的方式打开数据集用于预览读取。"""
         try:
@@ -3047,6 +3238,8 @@ class DatasetRecorderService:
 
     def _force_sample_hz_from_config(self, config: dict[str, Any]) -> float:
         """从配置中读取力传感器采样频率，并限制合法范围。"""
+        if str(config.get("force", {}).get("source", "hkvl_serial")).lower() == "hkvl_serial":
+            return 200.0
         try:
             raw = float(config.get("force", {}).get("sampleHz", 200))
         except (TypeError, ValueError):
@@ -3172,6 +3365,7 @@ class DatasetRecorderService:
         max_samples: int = 300,
     ) -> list[dict[str, Any]]:
         """为 episode 生成预览样本，native 数据集和 fallback jsonl 分别处理。"""
+        self._require_dataset_contract(dataset_dir)
         native_episode = bool(episode.get("native", False))
         native_dataset = self._is_native_dataset(dataset_dir, self._read_json(dataset_dir / "meta" / "info.json"))
         if native_episode or native_dataset:
@@ -3438,9 +3632,9 @@ class DatasetRecorderService:
 
     def _compose_observation_state(self, motion_positions: list[float], gripper_positions: list[Any]) -> list[float]:
         # 将运动状态和夹爪位置组合成 LeRobot v3 的 state。
-        """把 12 维运动位姿和左右夹爪值拼成 14 维 LeRobot state。"""
-        motion = (list(motion_positions) + [0.0] * 12)[:12]
-        gripper = [self._float_or_zero(value) for value in (list(gripper_positions) + [0.0, 0.0])[:2]]
+        """按操作者左（硬件右）、操作者右（硬件左）拼成 14 维 state。"""
+        motion = hardware_to_dataset_motion(motion_positions)
+        gripper = [self._float_or_zero(value) for value in hardware_to_dataset_grippers(gripper_positions)]
         return [
             motion[0],
             motion[1],
@@ -3639,25 +3833,29 @@ class DatasetRecorderService:
         config: dict[str, Any] | None = None,
         target_monotonic_s: float | None = None,
     ) -> list[float]:
-        # action 记录绝对目标：当前 observation.state 加主手增量，夹爪目标取配置值。
+        # action 记录绝对目标：当前 observation.state 加主手增量，夹爪目标取实时目标或配置值。
         """根据 observation、teleop 增量和夹爪目标生成 14 维 action。"""
         base = (list(observation_state) + [0.0] * 14)[:14] if observation_state is not None else [0.0] * 14
         config = config or {}
-        vector = self._latest_action_delta_vector(target_monotonic_s)
+        vector = hardware_to_dataset_state(self._latest_action_delta_vector(target_monotonic_s))
         action = [base[index] + vector[index] for index in range(14)]
-        gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
-        if gripper:
-            action[6] = self._float_or_zero(gripper.get("targetLeftMm", base[6]))
-            action[13] = self._float_or_zero(gripper.get("targetRightMm", base[13]))
         native_gripper_targets = self._latest_native_gripper_targets(config)
         if native_gripper_targets is not None:
-            action[6], action[13] = native_gripper_targets
+            action[6], action[13] = hardware_to_dataset_grippers(list(native_gripper_targets))
+            return action
+        if not self._using_real_hal_native_teleop(config):
+            gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
+            if gripper:
+                action[6], action[13] = hardware_to_dataset_grippers(
+                    [
+                        self._float_or_zero(gripper.get("targetLeftMm", base[13])),
+                        self._float_or_zero(gripper.get("targetRightMm", base[6])),
+                    ]
+                )
         return action
 
     def _latest_native_gripper_targets(self, config: dict[str, Any]) -> tuple[float, float] | None:
         """从 native teleop 状态中提取左右夹爪目标值。"""
-        if self._gripper_workers_enabled(config):
-            return None
         status = self.teleop.status()
         native_status = status.get("nativeStatus") if isinstance(status, dict) else None
         if not isinstance(native_status, dict):
@@ -3674,11 +3872,6 @@ class DatasetRecorderService:
         if left is None or right is None:
             return None
         return left, right
-
-    def _gripper_workers_enabled(self, config: dict[str, Any]) -> bool:
-        gripper_workers = getattr(getattr(self, "telemetry", None), "gripper_workers", None)
-        is_enabled = getattr(gripper_workers, "is_enabled", None)
-        return bool(callable(is_enabled) and is_enabled(config))
 
     def _latest_action_delta_vector(self, target_monotonic_s: float | None = None) -> list[float]:
         """汇总目标时间附近 teleop 动作形成 14 维动作增量。"""
@@ -3775,10 +3968,10 @@ class DatasetRecorderService:
         return last_action
 
     def _action_monotonic_s(self, action: dict[str, Any]) -> float | None:
-        """从 teleop 动作中解析主机单调时间戳。"""
+        """从 teleop 动作中解析 HAL steady_clock 时间戳。"""
         for raw, scale in (
-            (action.get("monotonic_s"), 1.0),
             (action.get("monotonicMs"), 0.001),
+            (action.get("monotonic_s"), 1.0),
         ):
             parsed = self._coerce_float(raw)
             if parsed is not None and parsed >= 0:
@@ -3886,6 +4079,11 @@ class DatasetRecorderService:
         """根据环境变量或配置判断当前是否使用真实硬件。"""
         mode = os.environ.get("APPSTATION_HAL_MODE") or config.get("hal", {}).get("mode", "real")
         return str(mode).lower() == "real"
+
+    def _using_real_hal_native_teleop(self, config: dict[str, Any]) -> bool:
+        """判断当前录制是否由 HAL-native 直接提供实机 teleop 数据。"""
+        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
+        return self._real_hardware_mode(config) and str(teleop.get("engine", "")).lower() == "hal_native"
 
     def _force_norm(self, values: object) -> float:
         """计算前三轴力值的最大绝对值作为力幅度指标。"""

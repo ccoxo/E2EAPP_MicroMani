@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from backend.core.logging import LogService
+from backend.hal_client.protocol import command_request_policy, command_spec, hal_command_payload
 
 
 @dataclass
@@ -22,6 +23,7 @@ class HalHealth:
     connected: bool = True
     mode: str = "real"
     message: str | None = None
+    capabilities: list[str] | None = None
 
 
 class HalClient:
@@ -35,6 +37,9 @@ class HalClient:
         raise NotImplementedError
 
     async def omega_state(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def force_state(self) -> dict[str, Any]:
         raise NotImplementedError
 
 
@@ -129,6 +134,24 @@ class TestHalClient(HalClient):
             ]
         }
 
+    async def force_state(self) -> dict[str, Any]:
+        now_unix_ms = int(time.time() * 1000)
+        now_monotonic_ms = int(time.monotonic() * 1000)
+        return {
+            "timestamp_ms": now_unix_ms,
+            "monotonicMs": now_monotonic_ms,
+            "source": "test",
+            "left": [0.0] * 6,
+            "right": [0.0] * 6,
+            "dangerIndex": 0.0,
+            "sides": {
+                "left": {"healthy": False, "connected": False},
+                "right": {"healthy": False, "connected": False},
+            },
+            "safety": {"latched": False, "reason": ""},
+            "compliance": {"enabled": False},
+        }
+
 
 class RealHalClient(HalClient):
     """带 keep-alive 的 HAL HTTP 客户端：每个工作线程复用自己的 TCP 连接。
@@ -170,37 +193,29 @@ class RealHalClient(HalClient):
             connected=True,
             mode="real",
             message=payload.get("message") if isinstance(payload.get("message"), str) else None,
+            capabilities=(
+                [str(value) for value in payload["capabilities"]]
+                if isinstance(payload.get("capabilities"), list)
+                else None
+            ),
         )
 
     async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        path_by_command = {
-            "hal.reconnect": "/health",
-            "motion.emergency_stop": "/motion/emergency_stop",
-            "motion.home_all": "/motion/home_all",
-            "motion.home_origin_side": "/motion/home_origin_side",
-            "motion.enable_side": "/motion/enable_side",
-            "motion.disable_side": "/motion/disable_side",
-            "motion.home_side": "/motion/home_side",
-            "motion.manual_axis_move": "/motion/manual_axis_move",
-            "motion.teleop_target_update": "/motion/teleop_target_update",
-            "motion.teleop_stop_side": "/motion/teleop_stop_side",
-            "omega7.gravity_compensation": "/omega7/gravity_compensation",
-            "omega7.zero_force_feedback": "/omega7/zero_force_feedback",
-            "teleop.native.configure": "/teleop/native/configure",
-            "teleop.native.start": "/teleop/native/start",
-            "teleop.native.stop": "/teleop/native/stop",
-            "teleop.native.status": "/teleop/native/status",
-            "teleop.native.gripper_command": "/teleop/native/gripper_command",
-            "gripper.command": "/gripper/command",
-        }
-        path = path_by_command.get(name)
-        if path is None:
-            raise RuntimeError(f"Real HAL command is not mapped: {name}")
-        method = "GET" if name in {"hal.reconnect", "teleop.native.status"} else "POST"
-        request_payload = self._hal_command_payload(name, payload or {})
+        spec = command_spec(name)
+        request_payload = hal_command_payload(name, payload or {})
         try:
-            timeout_s, attempts = self._command_request_policy(name)
-            response = await self._request(method, path, request_payload, timeout_s=timeout_s, max_attempts=attempts)
+            timeout_s, attempts = command_request_policy(
+                name,
+                self.timeout_s,
+                long_timeout_s=self._long_motion_timeout_s,
+            )
+            response = await self._request(
+                spec.method,
+                spec.path,
+                request_payload,
+                timeout_s=timeout_s,
+                max_attempts=attempts,
+            )
         except RuntimeError as exc:
             if name.startswith("motion."):
                 self.logs.event(
@@ -226,28 +241,14 @@ class RealHalClient(HalClient):
             self.logs.info("[HAL]", f"{name} forwarded to real HAL")
         return {"mode": "real", "command": name, "response": response}
 
-    def _command_request_policy(self, name: str) -> tuple[float, int]:
-        if name in {"motion.home_all", "motion.home_origin_side", "motion.home_side"}:
-            return max(self.timeout_s, self._long_motion_timeout_s), 1
-        return self.timeout_s, 2
-
-    def _hal_command_payload(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if name != "motion.teleop_target_update":
-            return payload
-        deltas = payload.get("deltas")
-        if not isinstance(deltas, dict):
-            return payload
-        request_payload = dict(payload)
-        for axis in ("X", "Y", "Z", "Roll", "Pitch", "Yaw"):
-            if axis in deltas:
-                request_payload[axis] = deltas[axis]
-        return request_payload
-
     async def motion_state(self) -> dict[str, Any]:
         return self._with_receive_timestamp(await self._request("GET", "/motion/state"))
 
     async def omega_state(self) -> dict[str, Any]:
         return self._with_receive_timestamp(await self._request("GET", "/omega/state"))
+
+    async def force_state(self) -> dict[str, Any]:
+        return self._with_receive_timestamp(await self._request("GET", "/force/state"))
 
     def _with_receive_timestamp(self, payload: dict[str, Any]) -> dict[str, Any]:
         now_unix_ms = int(time.time() * 1000)

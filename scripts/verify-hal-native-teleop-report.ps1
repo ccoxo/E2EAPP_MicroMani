@@ -112,7 +112,7 @@ if ($directionPolicy -ne $expectedDirectionPolicy) {
   Add-Failure "Unexpected directionPolicy: $directionPolicy; expected $expectedDirectionPolicy"
 }
 if ([int]$observation.sampleCount -le 0) {
-  Add-Failure "Observation mode was not run or captured no samples; rerun scripts\accept-hal-native-teleop.ps1 -Strict under supervision, or pass -ObserveSeconds with the required gates while moving both Omega.7 hands"
+  Add-Failure "Observation mode was not run or captured no samples; collect a backend/UI DDS native teleop report with ObserveSeconds and the required gates while moving both Omega.7 hands"
 }
 if ([int]$observation.maxActionHistoryCount -le 0) {
   Add-Failure "Observation captured no native teleop actions"

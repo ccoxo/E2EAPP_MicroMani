@@ -34,7 +34,7 @@ function formatLogTime(ts: number) {
   const date = new Date(ts)
   return `${date.toLocaleTimeString()}.${String(date.getMilliseconds()).padStart(3, '0')}`
 }
-/** 描述当前方法的功能边界。 */
+/** Match either a regex query or a plain keyword without breaking the panel. */
 function matchesSearch(text: string, search: string) {
   if (!search.trim()) return true
   try {
@@ -62,7 +62,7 @@ export function LogPanel() {
     [level, logs, search, selectedChannels],
   )
 
-  // 说明当前代码块的功能用途。
+  // Virtualization keeps long diagnostic sessions usable in the fixed-height log panel.
   // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
     count: filtered.length,
@@ -75,7 +75,7 @@ export function LogPanel() {
     ? virtualItems
     : filtered.map((_, index) => ({ index, start: index * 24, key: index }))
 
- /** 描述当前方法的功能边界。 */
+ /** Export the currently filtered log view, not the full backing store. */
  function exportLogs() {
     const body = filtered.map((entry) => `${new Date(entry.ts).toISOString()} ${entry.channel} ${entry.level} ${entry.msg}`).join('\n')
     const url = URL.createObjectURL(new Blob([body], { type: 'text/plain;charset=utf-8' }))

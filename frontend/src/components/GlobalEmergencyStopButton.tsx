@@ -4,9 +4,13 @@ import { useTelemetryStore } from '../stores/telemetry'
 /** 渲染当前界面单元，并连接所需数据。 */
 export function GlobalEmergencyStopButton() {
   const dangerIndex = useTelemetryStore((state) => state.frame.dangerIndex)
+  const forceStatus = useTelemetryStore((state) => state.frame.forceStatus)
+  const safetyLatched = Boolean(forceStatus?.safety?.latched)
   const triggerEmergencyStop = useTelemetryStore((state) => state.triggerEmergencyStop)
   const acknowledgeSafety = useTelemetryStore((state) => state.acknowledgeSafety)
-  const active = dangerIndex >= 1
+  const active = safetyLatched || dangerIndex >= 1
+  const acknowledgeDisabled = forceStatus?.source === 'hkvl_serial'
+    && forceStatus.safety?.canAcknowledge !== true
 
   return (
     <div className={`floating-emergency-stack ${active ? 'floating-emergency-stack-active' : ''}`}>
@@ -26,10 +30,16 @@ export function GlobalEmergencyStopButton() {
         </Button>
       </Tooltip>
       {active && (
-        <Tooltip title="只确认安全态，不恢复运动" placement="left">
+        <Tooltip
+          title={acknowledgeDisabled
+            ? forceStatus?.safety?.acknowledgeBlocker || '启动力觉自检尚未完成'
+            : '只确认安全态，不恢复运动'}
+          placement="left"
+        >
           <Button
             aria-label="确认安全态"
             className="floating-safety-reset"
+            disabled={acknowledgeDisabled}
             icon={<RotateCcw size={16} />}
             onClick={acknowledgeSafety}
           >

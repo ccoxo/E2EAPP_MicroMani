@@ -13,10 +13,8 @@ interface HistoryProps {
   height?: number
 }
 
-// 说明当前代码块的功能用途。
-// 说明当前代码块的功能用途。
-// 之前每个网页套接字帧都会重建多个图表配置，
-// 说明当前代码块的功能用途。
+// Chart options are memoized because every websocket frame can otherwise
+// rebuild several ECharts option trees and stall the operator view.
 /** 渲染当前界面单元，并连接所需数据。 */
 export const JointChart = memo(function JointChart({ history, height = 210 }: HistoryProps) {
   const option = useMemo(

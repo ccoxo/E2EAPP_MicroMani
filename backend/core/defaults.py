@@ -18,40 +18,43 @@ DEFAULT_MOTION_PROFILE: dict[str, Any] = {
     },
 }
 
-ICF_TELEOP_STRATEGY_VERSION = "e2e_omega7_native_v29_stable_feel_lead_20260612"
+ICF_TELEOP_PREVIOUS_STRATEGY_VERSION = "e2e_omega7_native_v31_gravity_scale_20260617"
+ICF_TELEOP_STRATEGY_VERSION = "e2e_omega7_native_v32_card0_yaw_20260804"
 ICF_WORK_ORIGIN_VERSION = "icf_work_origin_20260521_rotation_limit_v2"
 ICF_HOME_REFERENCE_VERSION = "icf_home_reference_20260602_v1"
+ICF_CAMERA_TUNING_DEFAULTS_VERSION = "auto_awb_exposure_20260616"
 
 ICF_CAMERA_DEFAULTS: dict[str, Any] = {
-    "global": "IMX335 / index 1",
-    "globalIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000",
-    "wristLeft": "IMX335 / index 0",
-    "wristLeftIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000",
+    "global": "IMX335 / index 0",
+    "globalIdentity": "20250606105",
+    "wristLeft": "IMX335 / index 1",
+    "wristLeftIdentity": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)",
     "wristRight": "IMX335 / index 2",
-    "wristRightIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000",
+    "wristRightIdentity": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)",
     "previewResolution": "640x480",
     "globalResolution": "640x480",
     "wristLeftResolution": "640x480",
     "wristRightResolution": "640x480",
     "fps": 30,
+    "tuningDefaultsVersion": ICF_CAMERA_TUNING_DEFAULTS_VERSION,
     "tuning": {
         "global": {
-            "autoExposure": False,
+            "autoExposure": True,
             "exposure": -5.5,
             "gain": 0.0,
-            "autoWhiteBalance": False,
+            "autoWhiteBalance": True,
         },
         "wrist_left": {
-            "autoExposure": False,
+            "autoExposure": True,
             "exposure": -6.0,
             "gain": 0.0,
-            "autoWhiteBalance": False,
+            "autoWhiteBalance": True,
         },
         "wrist_right": {
-            "autoExposure": False,
+            "autoExposure": True,
             "exposure": -6.0,
             "gain": 0.0,
-            "autoWhiteBalance": False,
+            "autoWhiteBalance": True,
         },
     },
 }
@@ -108,7 +111,6 @@ ICF_RIGHT_TELEOP_SOFT_LIMIT_MIN = [-25000.0, -37500.0, -37500.0, -95.0, -30.0, -
 ICF_RIGHT_TELEOP_SOFT_LIMIT_MAX = [25000.0, 37500.0, 37500.0, 5.0, 30.0, 7.0]
 
 ICF_TELEOP_DEFAULTS: dict[str, Any] = {
-    "engine": "hal_native",
     "controlMode": "incremental_position",
     "nativeLoopHz": 100,
     "nativeTranslationDeadzoneM": 0.002,
@@ -135,6 +137,8 @@ ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "kalmanTranslationIntentVelocityThreshold": 0.0005,
     "kalmanRotationIntentVelocityThreshold": 0.5,
     "strategyVersion": ICF_TELEOP_STRATEGY_VERSION,
+    "leftGravityScale": 0.45,
+    "rightGravityScale": 1.0,
     "mappingMode": "direct",
     "swapHands": False,
     "swapTeleopChannels": True,
@@ -170,7 +174,7 @@ ICF_TELEOP_DEFAULTS: dict[str, Any] = {
     "continuousMicroConfirmTicks": 0,
     "diagLog": False,
     "leftEnabledAxes": [True, True, True, True, True, True],
-    "rightEnabledAxes": [True, True, True, True, True, False],
+    "rightEnabledAxes": [True, True, True, True, True, True],
     "softLimitUnitSpec": list(ICF_TELEOP_SOFT_LIMIT_UNIT_SPEC),
     "leftSoftLimitMin": list(ICF_LEFT_TELEOP_SOFT_LIMIT_MIN),
     "leftSoftLimitMax": list(ICF_LEFT_TELEOP_SOFT_LIMIT_MAX),
@@ -274,17 +278,34 @@ def rotation_work_limits_from_soft_limits(left_limits: dict[str, Any], right_lim
     }
 
 
-ICF_LEFT_MOTION_MECHANICAL_LIMITS: dict[str, Any] = anchored_mechanical_soft_limits(
+ICF_LEFT_MOTION_LEGACY_ANCHORED_LIMITS: dict[str, Any] = anchored_mechanical_soft_limits(
     ICF_LEFT_MOTION_SOFT_LIMITS,
     ICF_WORK_ORIGIN_DEFAULTS["leftPulse"],
     ICF_KINEMATICS_DEFAULTS["leftSignedPulsePerUnit"],
 )
 
-ICF_RIGHT_MOTION_MECHANICAL_LIMITS: dict[str, Any] = anchored_mechanical_soft_limits(
+ICF_RIGHT_MOTION_LEGACY_ANCHORED_LIMITS: dict[str, Any] = anchored_mechanical_soft_limits(
     ICF_RIGHT_MOTION_SOFT_LIMITS,
     ICF_WORK_ORIGIN_DEFAULTS["rightPulse"],
     ICF_KINEMATICS_DEFAULTS["rightSignedPulsePerUnit"],
 )
+
+ICF_ROTATION_MECHANICAL_LIMIT_CONFIG = 1_000_000_000.0
+
+
+def stable_mechanical_soft_limits(relative_limits: dict[str, Any]) -> dict[str, Any]:
+    limits = deepcopy(relative_limits)
+    for axis_key in ("roll", "pitch", "yaw"):
+        limits[axis_key] = {
+            "min": -ICF_ROTATION_MECHANICAL_LIMIT_CONFIG,
+            "max": ICF_ROTATION_MECHANICAL_LIMIT_CONFIG,
+        }
+    return limits
+
+
+ICF_LEFT_MOTION_MECHANICAL_LIMITS: dict[str, Any] = stable_mechanical_soft_limits(ICF_LEFT_MOTION_SOFT_LIMITS)
+
+ICF_RIGHT_MOTION_MECHANICAL_LIMITS: dict[str, Any] = stable_mechanical_soft_limits(ICF_RIGHT_MOTION_SOFT_LIMITS)
 
 ICF_ROTATION_WORK_LIMIT_DEFAULTS: dict[str, Any] = rotation_work_limits_from_soft_limits(
     ICF_LEFT_MOTION_SOFT_LIMITS,
@@ -305,6 +326,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "cameras": deepcopy(ICF_CAMERA_DEFAULTS),
     "force": {
+        "source": "hkvl_serial",
         "leftIp": "Dev5/ai0:5",
         "rightIp": "Dev3/ai0:5",
         "port": 49152,
@@ -321,6 +343,36 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "lowpassEnabled": True,
         "lowpassCutoffHz": 10,
         "swapHands": False,
+        "serial": {
+            "protocol": "hkvl_active_v1",
+            "leftPort": "COM15",
+            "rightPort": "COM14",
+            "baudrate": 1_000_000,
+            "expectedSampleHz": 1000,
+        },
+        "axisSign": {
+            "left": [1.0, 1.0, -1.0, -1.0, -1.0, 1.0],
+            "right": [1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
+        },
+        "compliance": {
+            "enabled": False,
+            "left": {
+                "mappingConfirmed": False,
+                "matrix": [1.0, 0.0, 0.0, 1.0],
+                "deadbandN": [0.0, 0.0],
+                "gainUmPerNs": [0.0, 0.0],
+                "maxStepUm": [0.0, 0.0],
+                "maxOffsetUm": [0.0, 0.0],
+            },
+            "right": {
+                "mappingConfirmed": False,
+                "matrix": [1.0, 0.0, 0.0, 1.0],
+                "deadbandN": [0.0, 0.0],
+                "gainUmPerNs": [0.0, 0.0],
+                "maxStepUm": [0.0, 0.0],
+                "maxOffsetUm": [0.0, 0.0],
+            },
+        },
     },
     "motion": {
         "leftCardNo": 1,
@@ -363,7 +415,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "commandTorque": 1,
         "icfTargetProtectionEnabled": True,
         "icfTargetMinGapMm": 1.02,
-        "sampleMode": "dual_worker",
         "sampleHz": 30,
         "sampleStaleMs": 500,
         "sampleEnableOnNegative": True,
@@ -377,11 +428,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "safety": {
         "fxyWarnN": 2,
-        "fxyStopN": 4,
+        "fxyStopN": 30,
         "fzWarnN": 3,
-        "fzStopN": 5,
+        "fzStopN": 30,
         "momentWarnNm": 0.02,
-        "momentStopNm": 0.04,
+        "momentStopNm": 1,
         "yawSoftLimitDeg": 7,
         "watchdogMs": 50,
     },
@@ -429,6 +480,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "rightGravityCompensation": True,
         "leftForceFeedback": True,
         "rightForceFeedback": True,
+        "leftGravityScale": 0.45,
+        "rightGravityScale": 1.0,
         **deepcopy(ICF_TELEOP_DEFAULTS),
         "requireClutch": False,
         "stabilityMode": "off",
@@ -453,8 +506,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "autoGapMarginMm": 1.0,
             "releaseSpeed": 255,
             "releaseTorque": 1,
-            "leftSourceHand": "PhysicalRight",
-            "rightSourceHand": "PhysicalLeft",
+            "leftSourceHand": "PhysicalLeft",
+            "rightSourceHand": "PhysicalRight",
             "objectDetectMargin": 10,
             "buttonFallback": True,
             "diagLog": False,

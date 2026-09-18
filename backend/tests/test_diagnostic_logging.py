@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 from backend.core.config import SettingsService
+from backend.core.defaults import default_config
 from backend.core.logging import LOG_SCHEMA_VERSION, LogService, stable_config_hash
 
 
@@ -172,6 +174,63 @@ def test_settings_save_logs_config_write_hash_and_changed_keys(tmp_path: Path) -
         and "newHash=" in message
         for message in messages
     )
+
+
+def test_invalid_config_recovery_logs_validation_reason(tmp_path: Path) -> None:
+    logs = LogService(emit_startup=False)
+    invalid = default_config()
+    invalid["teleop"]["translationDeadzone"] = "not-a-number"
+    (tmp_path / "config.json").write_text(json.dumps(invalid), encoding="utf-8")
+
+    config = SettingsService(tmp_path, logs).get_config()
+
+    assert config["teleop"]["translationDeadzone"] == 0.00002
+    assert any(
+        entry.msg
+        == (
+            "config.json was invalid; default config restored: "
+            "ValueError: could not convert string to float: 'not-a-number'"
+        )
+        for entry in logs.list_entries()
+    )
+
+
+def test_transient_config_replace_failure_preserves_persisted_config(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    persisted = default_config()
+    persisted["force"]["source"] = "hkvl_serial"
+    persisted["force"]["serial"]["leftPort"] = "COM31"
+    persisted["force"]["serial"]["rightPort"] = "COM32"
+    persisted["storage"]["datasetRoot"] = "E:/bound-data"
+    persisted["force"].pop("recordWindowSamples")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(persisted), encoding="utf-8")
+    logs = LogService(emit_startup=False)
+    settings = SettingsService(tmp_path, logs)
+    original_replace = os.replace
+    failed_once = False
+
+    def fail_first_config_replace(source: str, destination: str) -> None:
+        nonlocal failed_once
+        if Path(destination) == config_path and not failed_once:
+            failed_once = True
+            raise PermissionError(13, "Permission denied", str(config_path))
+        original_replace(source, destination)
+
+    monkeypatch.setattr("backend.core.config.os.replace", fail_first_config_replace)  # type: ignore[attr-defined]
+
+    restored = settings.get_config()
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert failed_once is True
+    assert restored["force"]["source"] == "hkvl_serial"
+    assert restored["force"]["serial"]["leftPort"] == "COM31"
+    assert restored["force"]["serial"]["rightPort"] == "COM32"
+    assert restored["storage"]["datasetRoot"] == "E:/bound-data"
+    assert saved == restored
+    assert not any("default config restored" in entry.msg for entry in logs.list_entries())
 
 
 def test_force_probe_logs_resource_error(monkeypatch: object) -> None:

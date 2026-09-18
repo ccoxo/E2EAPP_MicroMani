@@ -50,7 +50,7 @@ class Omega7Driver {
   std::array<Omega7State, 2> readState();
   std::array<bool, 2> forceOutputEnabled() const;
   // 控制 SDK 力输出/重力补偿。关闭力输出时会写零力，避免残留力反馈。
-  void setGravityCompensation(bool leftEnabled, bool rightEnabled);
+  void setGravityCompensation(bool leftEnabled, bool rightEnabled, double leftScale, double rightScale);
   void zeroForceFeedback(int openId);
 
  private:
@@ -69,6 +69,7 @@ class Omega7Driver {
   std::array<Omega7State, 2> state_{};
   // 每侧是否保持 Force Dimension 力输出/重力补偿开启；关闭时会尽量写零力。
   std::array<bool, 2> forceOutputEnabled_{{true, true}};
+  std::array<double, 2> gravityScale_{{0.45, 1.0}};
 };
 
 }  // namespace appstation::hal

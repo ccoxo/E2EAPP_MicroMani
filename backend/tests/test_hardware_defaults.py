@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from backend.core.defaults import default_config
+from backend.core.force_config import hal_force_config_payload, validate_force_config
 
 
 def _target_arm_gain(config: dict, side: str, axis_index: int) -> float:
@@ -40,7 +41,7 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     config = default_config()
     teleop = config["teleop"]
 
-    assert teleop["engine"] == "hal_native"
+    assert "engine" not in teleop
     assert teleop["controlMode"] == "incremental_position"
     assert teleop["nativeLoopHz"] == 100
     assert teleop["nativeTranslationDeadzoneM"] == 0.002
@@ -66,7 +67,7 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["kalmanRotationProcessVelocityVariance"] == 1e-3
     assert teleop["kalmanTranslationIntentVelocityThreshold"] == 0.0005
     assert teleop["kalmanRotationIntentVelocityThreshold"] == 0.5
-    assert teleop["strategyVersion"] == "e2e_omega7_native_v29_stable_feel_lead_20260612"
+    assert teleop["strategyVersion"] == "e2e_omega7_native_v32_card0_yaw_20260804"
     assert teleop["mappingMode"] == "direct"
     assert teleop["swapHands"] is False
     assert teleop["swapTeleopChannels"] is True
@@ -75,8 +76,12 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["rightTranslationScale"] == 1.0
     assert teleop["leftRotationScale"] == 1.0
     assert teleop["rightRotationScale"] == 1.0
+    assert teleop["leftGravityCompensation"] is True
+    assert teleop["rightGravityCompensation"] is True
     assert teleop["leftForceFeedback"] is True
     assert teleop["rightForceFeedback"] is True
+    assert teleop["leftGravityScale"] == 0.45
+    assert teleop["rightGravityScale"] == 1.0
     assert teleop["leftAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.10]
     assert teleop["rightAxisOutputScale"] == [0.60, 0.50, 0.375, 0.60, 0.08, 0.001]
     assert teleop["translationStepLimitPulse"] == 4000
@@ -95,7 +100,7 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["continuousMicroConfirmTicks"] == 0
     assert teleop["diagLog"] is False
     assert teleop["leftEnabledAxes"] == [True] * 6
-    assert teleop["rightEnabledAxes"] == [True, True, True, True, True, False]
+    assert teleop["rightEnabledAxes"] == [True] * 6
     assert teleop["softLimitUnitSpec"] == ["um", "um", "um", "deg", "deg", "deg"]
     assert teleop["leftSoftLimitMin"] == [-25000.0, -37500.0, -37500.0, -5.0, -30.0, -7.0]
     assert teleop["leftSoftLimitMax"] == [25000.0, 37500.0, 37500.0, 95.0, 30.0, 7.0]
@@ -105,8 +110,8 @@ def test_omega7_teleop_defaults_match_icf_strategy() -> None:
     assert teleop["rightImpulseCoeff"] == [-5000000, 10000000, -5000000, 1667, -2500, 3333.333]
     assert teleop["leftDirectionSign"] == [1, -1, -1, 1, -1, -1]
     assert teleop["rightDirectionSign"] == [1, 1, -1, 1, 1, 1]
-    assert teleop["gripperTeleop"]["leftSourceHand"] == "PhysicalRight"
-    assert teleop["gripperTeleop"]["rightSourceHand"] == "PhysicalLeft"
+    assert teleop["gripperTeleop"]["leftSourceHand"] == "PhysicalLeft"
+    assert teleop["gripperTeleop"]["rightSourceHand"] == "PhysicalRight"
     assert teleop["gripperTeleop"]["leftGapInvert"] is False
     assert teleop["gripperTeleop"]["rightGapInvert"] is False
 
@@ -143,23 +148,59 @@ def test_work_origin_defaults_match_icf_reference_position() -> None:
     assert origin["rightPulse"] == [99772.0, 382486.0, 881207.0, 19527.0, -175127.0, -9668.0]
 
 
-def test_force_defaults_match_nidaq_reference_project() -> None:
+def test_force_defaults_start_with_hkvl_reference_project() -> None:
     config = default_config()
 
+    assert config["force"]["source"] == "hkvl_serial"
     assert config["force"]["leftIp"] == "Dev5/ai0:5"
     assert config["force"]["rightIp"] == "Dev3/ai0:5"
     assert config["force"]["sampleHz"] == 200
     assert config["force"]["inputMode"] == "DIFF"
     assert config["force"]["leftCalibrationPath"].endswith("FT32918.cal")
     assert config["force"]["rightCalibrationPath"].endswith("FT38799.cal")
+    assert config["force"]["serial"] == {
+        "protocol": "hkvl_active_v1",
+        "leftPort": "COM15",
+        "rightPort": "COM14",
+        "baudrate": 1_000_000,
+        "expectedSampleHz": 1000,
+    }
+    assert config["force"]["axisSign"]["left"] == [1.0, 1.0, -1.0, -1.0, -1.0, 1.0]
+    assert config["force"]["axisSign"]["right"] == [1.0, -1.0, 1.0, -1.0, 1.0, -1.0]
+    assert config["force"]["compliance"]["enabled"] is False
+    assert config["force"]["compliance"]["left"]["mappingConfirmed"] is False
+    assert config["force"]["compliance"]["right"]["mappingConfirmed"] is False
+    assert config["force"]["compliance"]["left"]["matrix"] == [1.0, 0.0, 0.0, 1.0]
+    assert config["force"]["compliance"]["right"]["matrix"] == [1.0, 0.0, 0.0, 1.0]
+    assert config["force"]["compliance"]["left"]["gainUmPerNs"] == [0.0, 0.0]
+    assert config["force"]["compliance"]["right"]["gainUmPerNs"] == [0.0, 0.0]
+
+
+@pytest.mark.parametrize("source", ["hkvl_serial", "nidaq"])
+def test_explicit_force_source_is_preserved(source: str) -> None:
+    config = default_config()
+    config["force"]["source"] = source
+
+    validate_force_config(config)
+
+    assert hal_force_config_payload(config)["source"] == source
+
+
+def test_missing_force_source_uses_hkvl_without_enabling_nidaq() -> None:
+    config = default_config()
+    del config["force"]["source"]
+
+    validate_force_config(config)
+
+    assert hal_force_config_payload(config)["source"] == "hkvl_serial"
 
 
 def test_safety_defaults_are_stored_in_backend_units() -> None:
     config = default_config()
 
-    assert config["safety"]["fxyStopN"] == 4
-    assert config["safety"]["fzStopN"] == 5
-    assert config["safety"]["momentStopNm"] == 0.04
+    assert config["safety"]["fxyStopN"] == 30
+    assert config["safety"]["fzStopN"] == 30
+    assert config["safety"]["momentStopNm"] == 1
     assert "fxyStopMn" not in config["safety"]
     assert "momentStopMNm" not in config["safety"]
 
@@ -177,12 +218,12 @@ def test_pico_script_defaults_point_to_reference_tools() -> None:
 def test_storage_defaults_separate_recording_fps_from_camera_preview() -> None:
     config = default_config()
 
-    assert config["cameras"]["global"] == "IMX335 / index 1"
-    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000"
-    assert config["cameras"]["wristLeft"] == "IMX335 / index 0"
-    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
+    assert config["cameras"]["global"] == "IMX335 / index 0"
+    assert config["cameras"]["globalIdentity"] == "20250606105"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 1"
+    assert config["cameras"]["wristLeftIdentity"] == "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)"
     assert config["cameras"]["wristRight"] == "IMX335 / index 2"
-    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000"
+    assert config["cameras"]["wristRightIdentity"] == "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)"
     assert config["cameras"]["previewResolution"] == "640x480"
     assert config["cameras"]["fps"] == 30
     assert config["storage"]["recordFps"] == 30
@@ -200,8 +241,8 @@ def test_gripper_teleop_defaults_match_omega7_gap_range() -> None:
     assert gripper_teleop["minCommandIntervalMs"] == 20
     assert gripper_teleop["gripTorque"] == 1
     assert gripper_teleop["releaseTorque"] == 1
-    assert gripper_teleop["leftSourceHand"] == "PhysicalRight"
-    assert gripper_teleop["rightSourceHand"] == "PhysicalLeft"
+    assert gripper_teleop["leftSourceHand"] == "PhysicalLeft"
+    assert gripper_teleop["rightSourceHand"] == "PhysicalRight"
     assert gripper_teleop["leftGapInvert"] is False
     assert gripper_teleop["rightGapInvert"] is False
     assert gripper_teleop["autoGapCalibration"] is True
@@ -245,4 +286,4 @@ def test_native_teleop_axis_scales_match_requested_left_boost_and_right_feel() -
         assert _target_arm_gain(config, "left", axis_index) == pytest.approx(expected, rel=5e-4)
         assert _target_arm_gain(config, "right", axis_index) == pytest.approx(expected, rel=5e-4)
 
-    assert teleop["rightEnabledAxes"][5] is False
+    assert teleop["rightEnabledAxes"][5] is True
