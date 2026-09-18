@@ -183,7 +183,7 @@ describe('AppStation M0 frontend', () => {
     const ws = MockWebSocket.instances[0]
     expect(ws).toBeTruthy()
 
-    for (let frameCount = 1; frameCount <= 30; frameCount += 1) {
+    for (let frameCount = 1; frameCount <= 40; frameCount += 1) {
       ws.emitTelemetry({
         ...baseFrame,
         timestamp: Date.now(),
@@ -191,18 +191,20 @@ describe('AppStation M0 frontend', () => {
         frameCount,
         episodeCount: 0,
         recording: false,
-        resource: { ...baseFrame.resource, wsHz: 30 },
+        resource: { ...baseFrame.resource, wsHz: 233.4 },
       })
       await vi.advanceTimersByTimeAsync(33)
     }
 
     await vi.advanceTimersByTimeAsync(uiFrameIntervalMs * 2)
     const state = useTelemetryStore.getState()
-    expect(state.frame.frameCount).toBe(30)
+    expect(state.frame.frameCount).toBe(40)
+    expect(state.frame.resource.wsHz).toBeGreaterThan(29)
+    expect(state.frame.resource.wsHz).toBeLessThan(32)
     expect(state.tick).toBeGreaterThanOrEqual(10)
     expect(state.tick).toBeLessThan(30)
     expect(state.history.length).toBeGreaterThanOrEqual(6)
-    expect(state.history.length).toBeLessThanOrEqual(Math.ceil((30 * 33) / chartHistoryIntervalMs) + 2)
+    expect(state.history.length).toBeLessThanOrEqual(Math.ceil((40 * 33) / chartHistoryIntervalMs) + 2)
     expect(state.history.length).toBeLessThan(state.tick)
     expect(state.telemetryLink.state).toBe('live')
 
@@ -210,6 +212,7 @@ describe('AppStation M0 frontend', () => {
 
     expect(useTelemetryStore.getState().telemetryLink.state).toBe('stale')
     expect(useTelemetryStore.getState().frame.wsOk).toBe(false)
+    expect(useTelemetryStore.getState().frame.resource.wsHz).toBe(0)
   })
 
   it('renders the operator navigation in the requested order', () => {

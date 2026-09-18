@@ -907,7 +907,7 @@ function startBackendStaleWatchdog(set: TelemetryStoreSet, get: TelemetryStoreGe
     ) {
       set((state) => ({
         telemetryLink: { state: 'stale', lastFrameReceivedAt: receivedAt },
-        frame: { ...state.frame, wsOk: false },
+        frame: { ...state.frame, wsOk: false, resource: { ...state.frame.resource, wsHz: 0 } },
       }))
     }
   }, 250)
@@ -1343,6 +1343,9 @@ startBackend: () => {
         }))
       })
     const ws = new WebSocket(wsUrl)
+    let rateWindowStart = performance.now()
+    let receivedFrames = 0
+    let receivedHz = 0
     ws.onopen = () => {
       set((state) => ({
         backendReconnectAttempts: 0,
@@ -1351,12 +1354,24 @@ startBackend: () => {
       }))
     }
     ws.onmessage = (event) => {
+      if (get().backendWs !== ws) return
       try {
         const message = JSON.parse(String(event.data)) as BackendWsMessage
         if (message.type === 'telemetry') {
           lastBackendFrameReceivedAt = Date.now()
+          // Count this connection's received telemetry, not shared backend calls
+          // or throttled UI commits. Logs and other browser tabs do not count.
+          receivedFrames += 1
+          const receivedAt = performance.now()
+          const windowMs = receivedAt - rateWindowStart
+          if (windowMs >= 1000) {
+            receivedHz = Math.round(receivedFrames * 1000 / windowMs * 10) / 10
+            receivedFrames = 0
+            rateWindowStart = receivedAt
+          }
           const frame = {
             ...message.data,
+            resource: { ...message.data.resource, wsHz: receivedHz },
             motionEnabled: message.data.motionEnabled ?? { left: null, right: null },
             motionAxisEnabled: message.data.motionAxisEnabled ?? {
               left: Array.from({ length: 6 }, () => null),
@@ -1382,7 +1397,7 @@ startBackend: () => {
     }
     ws.onerror = () => {
       set((state) => ({
-        frame: { ...state.frame, wsOk: false },
+        frame: { ...state.frame, wsOk: false, resource: { ...state.frame.resource, wsHz: 0 } },
         telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
         logs: appendLog(state.logs, makeLog('ERROR', 'Backend WebSocket error', '[BACKEND]')),
       }))
@@ -1402,7 +1417,7 @@ startBackend: () => {
         backendWs: null,
         backendReconnectTimer: reconnectTimer,
         backendReconnectAttempts: attempts,
-        frame: { ...state.frame, wsOk: false },
+        frame: { ...state.frame, wsOk: false, resource: { ...state.frame.resource, wsHz: 0 } },
         telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
         logs: appendLog(
           state.logs,
