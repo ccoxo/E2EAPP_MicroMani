@@ -58,6 +58,8 @@ describe('frame 切片相等性', () => {
     expect(preCheckFrameEqual(preCheckFrameSlice(a), preCheckFrameSlice(b))).toBe(true)
     const c = { ...a, motionEnabled: { left: true, right: false } }
     expect(preCheckFrameEqual(preCheckFrameSlice(a), preCheckFrameSlice(c))).toBe(false)
+    const ready = { ...a, forceStatus: { source: 'hkvl_serial', calibration: { state: 'ready' }, safety: { latched: false } } }
+    expect(preCheckFrameEqual(preCheckFrameSlice(a), preCheckFrameSlice(ready))).toBe(false)
   })
 
   it('遥操作切片忽略力与相机', () => {

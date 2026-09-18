@@ -21,6 +21,7 @@ from copy import deepcopy
 from typing import Any, cast
 
 from backend.core.config import SettingsService, reanchor_motion_soft_limits_to_current_origin
+from backend.core.force_config import hkvl_tare_sample_count
 from backend.core.gripper_protection import (
     icf_target_min_gap_mm,
     icf_target_protection_enabled,
@@ -671,29 +672,57 @@ class CommandService:
             "hal": result,
         }
 
-    @motion_operation()
-    async def tare_force(self, side: str | None = None) -> dict[str, object]:
-        # 真机模式优先执行传感器 tare；测试模式仅重置本地模拟力数据。
+    async def tare_force(
+        self, side: str | None = None, *, unloaded_confirmed: bool = False,
+        readiness_check: Callable[[], None] | None = None,
+    ) -> dict[str, object]:
         token = self.safety.capture()
         config = await self._get_config_async()
-        self.safety.check(token)
         force = config.get("force", {}) if isinstance(config.get("force"), dict) else {}
         source = str(force.get("source", "hkvl_serial")).lower()
-        if self._real_hardware_mode(config) and source == "hkvl_serial":
-            payload: dict[str, object] = {"side": side or "all"}
-            tare_samples = int(force.get("tareSamples", 0) or 0)
-            if tare_samples > 0:
-                payload["samples"] = tare_samples
-            await self.hal.command("force.tare", payload)
-        elif self.hardware is not None and self._real_hardware_mode(config):
-            result = await asyncio.to_thread(self.hardware.force.tare, config, side)
-            if not result.ok:
-                self.logs.error("[FORCE]", result.message)
-                raise RuntimeError(result.message)
-        self.telemetry.tare_force()
+        is_hkvl = source == "hkvl_serial"
+        if is_hkvl and side is not None:
+            raise RuntimeError("HKVL startup self-check requires both sensors; use the all-sensors Tare entry")
+        if is_hkvl and unloaded_confirmed is not True:
+            raise RuntimeError("confirm both force sensors are unloaded before HKVL startup self-check")
+
+        def check_ready() -> None:
+            # 一个 episode 只能对应一次力校准，暂停或待保存的会话也不能换零点。
+            if self._origin_mutation_locked():
+                raise RuntimeError("finish the recording session before changing force calibration")
+            if not is_hkvl:
+                self.safety.check(token)
+                return
+            # 自检不会运动，可在锁存中执行，但仍需当前控制租约、互斥资源和停止代际。
+            check = readiness_check or self.safety.readiness_check
+            if check is not None:
+                check()
+            if token != self.safety.capture():
+                raise RuntimeError("force self-check cancelled by a newer stop")
+
+        hal_result: dict[str, object] | None = None
+        with self.safety.operation():
+            check_ready()
+            real_hardware = self._real_hardware_mode(config)
+            if real_hardware and is_hkvl:
+                payload: dict[str, object] = {"side": "all", "unloadedConfirmed": True}
+                payload["samples"] = hkvl_tare_sample_count(force.get("tareSamples", 0))
+                try:
+                    hal_result = await self.hal.command("force.tare", payload)
+                except Exception as exc:
+                    self.logs.error("[FORCE]", f"HKVL startup self-check failed: {exc}")
+                    raise
+            elif self.hardware is not None and real_hardware:
+                result = await asyncio.to_thread(self.hardware.force.tare, config, side)
+                if not result.ok:
+                    self.logs.error("[FORCE]", result.message)
+                    raise RuntimeError(result.message)
+            check_ready()
+            if not is_hkvl:
+                self.telemetry.tare_force()
         label = "both sides" if side is None else ("left" if side == "left" else "right")
         self.logs.info("[FORCE]", f"{label} {source} tare requested")
-        return {"side": side or "all", "source": source}
+        return {"side": side or "all", "source": source, "hal": hal_result}
 
     async def validate_policy_axis_action(self, action: dict[str, Any]) -> None:
         """策略方向已是硬件方向；复用位置边界，不重复操作者方向转换。"""

@@ -322,6 +322,7 @@ struct HalDdsControlServer::Impl {
   DataReader* emergencyStopReader_{nullptr};
   std::thread worker;
   std::thread emergencyWorker;
+  std::thread telemetryWorker;
   std::mutex replyMutex_;
   std::mutex lifecycleMutex_;
   std::atomic_bool workerFailed_{false};
@@ -430,13 +431,16 @@ struct HalDdsControlServer::Impl {
     }
     workerFailed_.store(false);
     running = true;
-    // 普通命令和遥测共用 5 ms 级轮询；急停单独线程缩短响应路径。
+    // 命令、急停/租约、遥测各自运行，Tare 等同步命令不能暂停状态发布。
     try {
       worker = std::thread([this]() {
         runWorkerBoundary([this]() { loop(); }, [this](const char* error) { reportWorkerFailure(error); });
       });
       emergencyWorker = std::thread([this]() {
         runWorkerBoundary([this]() { emergencyLoop(); }, [this](const char* error) { reportWorkerFailure(error); });
+      });
+      telemetryWorker = std::thread([this]() {
+        runWorkerBoundary([this]() { telemetryLoop(); }, [this](const char* error) { reportWorkerFailure(error); });
       });
     } catch (...) {
       reportWorkerFailure("DDS control worker could not be created");
@@ -452,6 +456,9 @@ struct HalDdsControlServer::Impl {
   }
 
   void joinWorkers() {
+    if (telemetryWorker.joinable()) {
+      telemetryWorker.join();
+    }
     if (emergencyWorker.joinable()) {
       emergencyWorker.join();
     }
@@ -474,13 +481,20 @@ struct HalDdsControlServer::Impl {
   }
 
   void loop() {
+    while (running) {
+      if (!pollCommands()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+    }
+  }
+
+  void telemetryLoop() {
     auto nextTelemetryAt = std::chrono::steady_clock::now();
     auto nextForceAt = nextTelemetryAt;
     while (running) {
-      const bool handledCommand = pollCommands();
       const auto now = std::chrono::steady_clock::now();
       if (now >= nextTelemetryAt) {
-        // 遥测以 100 Hz 发布，控制命令有数据时优先被处理。
+        // 普通遥测 100 Hz、力状态 200 Hz；只有本线程写入这些 topic。
         publishTelemetry();
         nextTelemetryAt = now + std::chrono::milliseconds(10);
       }
@@ -488,9 +502,7 @@ struct HalDdsControlServer::Impl {
         publishForceState();
         nextForceAt = now + std::chrono::milliseconds(5);
       }
-      if (!handledCommand) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-      }
+      std::this_thread::sleep_until((std::min)(nextTelemetryAt, nextForceAt));
     }
   }
 

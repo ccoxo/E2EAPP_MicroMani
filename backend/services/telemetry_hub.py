@@ -132,6 +132,12 @@ class TelemetryHub:
             "compliance": {"enabled": False},
         }
         gripper_status = dict(native_gripper_status) if isinstance(native_gripper_status, dict) else {}
+        native_detail = gripper_status.get("nativeStatus")
+        if isinstance(native_detail, dict):
+            # 动作历史供录制器使用，不随每帧 UI 遥测重复传输；保留原始状态对象。
+            gripper_status["nativeStatus"] = {
+                key: value for key, value in native_detail.items() if key != "actionHistory"
+            }
         if real_mode and native_gripper_status is not None:
             self.apply_native_gripper_status(native_gripper_status, now)
         if real_mode and force_source == "hkvl_serial":
@@ -151,6 +157,11 @@ class TelemetryHub:
                     and sides["left"].get("healthy") is True
                     and sides["right"].get("healthy") is True
                 )
+            else:
+                # DDS 源数据失效后可保留最后数值供诊断，但不能延续上一帧的健康状态。
+                self.force_ok = False
+                force_status["sides"]["left"]["healthy"] = False
+                force_status["sides"]["right"]["healthy"] = False
             force_left = list(self.force_left)
             force_right = list(self.force_right)
         elif self.hardware is not None and real_mode:

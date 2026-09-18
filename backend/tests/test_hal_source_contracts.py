@@ -443,13 +443,27 @@ def test_hal_direct_dds_control_server_replaces_backend_http_control_plane() -> 
 
 def test_hal_dds_motion_state_telemetry_publishes_at_100hz() -> None:
     source = (REPO_ROOT / "hal" / "src" / "HalDdsControlServer.cpp").read_text(encoding="utf-8")
-    loop_body = source.split("void loop()", 1)[1].split("void emergencyLoop()", 1)[0]
+    loop_body = source.split("void telemetryLoop()", 1)[1].split("void emergencyLoop()", 1)[0]
     telemetry_body = source.split("void publishTelemetry()", 1)[1].split("void publishJson", 1)[0]
 
     assert "publishJson(motionWriter_, jsonMotionState(motion_.readState()))" in telemetry_body
     assert "100 Hz" in loop_body
     assert "std::chrono::milliseconds(10)" in loop_body
     assert "std::chrono::milliseconds(50)" not in loop_body
+
+
+def test_hal_dds_telemetry_is_independent_of_synchronous_command_dispatch() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "HalDdsControlServer.cpp").read_text(encoding="utf-8")
+    command_loop = source.split("void loop()", 1)[1].split("void telemetryLoop()", 1)[0]
+    telemetry_loop = source.split("void telemetryLoop()", 1)[1].split("void emergencyLoop()", 1)[0]
+    worker = source.split("telemetryWorker = std::thread([this]()", 1)[1].split("catch (...)" , 1)[0]
+    join = source.split("void joinWorkers()", 1)[1].split("void reportWorkerFailure", 1)[0]
+    assert "pollCommands()" in command_loop and "publishTelemetry()" not in command_loop
+    assert "pollCommands()" not in telemetry_loop
+    assert "publishTelemetry();" in telemetry_loop and "publishForceState();" in telemetry_loop
+    assert "runWorkerBoundary([this]() { telemetryLoop(); }" in worker
+    assert "reportWorkerFailure(error)" in worker
+    assert "telemetryWorker.join();" in join
 
 
 def test_hal_build_links_fastdds_for_direct_hal_dds() -> None:
@@ -2323,20 +2337,24 @@ def test_hal_native_configuration_and_omega_force_share_the_emergency_gate() -> 
     assert "omega_.requestEmergencyStop();" in dispatcher
 
 
-def test_hal_tare_rejects_stopped_requests_and_commits_after_force_safety() -> None:
+def test_hal_tare_requires_safe_stopped_self_check_and_preserves_epoch_guard() -> None:
     dispatcher = (REPO_ROOT / "hal" / "src" / "HalCommandDispatcher.cpp").read_text(encoding="utf-8")
     runtime = (REPO_ROOT / "hal" / "src" / "ForceControlRuntime.cpp").read_text(encoding="utf-8")
     driver = (REPO_ROOT / "hal" / "src" / "HkvlForceDriver.cpp").read_text(encoding="utf-8")
     branch = dispatcher.split('if (name == "force.tare")', 1)[1].split('if (name == "teleop.native.configure")', 1)[0]
-    assert branch.index("ensureCurrentMotionCommand();") < branch.index("forceRuntime_.tare(")
-    assert "motion->commandEpochAllowed(commandEpoch)" in branch
-    runtime_tare = runtime.split("void ForceControlRuntime::tare(", 1)[1].split("ForceComplianceResult ForceControlRuntime::complianceCorrection", 1)[0]
-    assert runtime_tare.index("safety_.latched()") < runtime_tare.index("driver_.tare(")
-    assert "tareEpoch_ != epoch || safety_.latched()" in runtime_tare
-    assert runtime_tare.index("tareEpoch_ != epoch") < runtime_tare.index("commit();")
-    frame = driver.split("void processFrame(", 1)[1].split("#ifdef _WIN32", 1)[0]
-    assert frame.index("callback(sample);") < frame.index("state.tareBias[axis] =")
-    assert "state.tareCancelled = !state.tareCommit(commit);" in frame
+    assert '"unloadedConfirmed", false' in branch
+    assert branch.index('requireForceMutationSafe("force tare");') < branch.index("forceRuntime_.tare(")
+    assert "motion_.commandEpoch() == tareCommandEpoch" in branch
+    assert branch.index("const auto tareCommandEpoch") < branch.index("handleEmergencyStop();")
+    runtime_tare = runtime.split("std::string ForceControlRuntime::tare(", 1)[1].split("ForceComplianceResult ForceControlRuntime::complianceCorrection", 1)[0]
+    assert 'safety_.latchExternal("force_tare_pending"' in runtime_tare
+    assert "tareEpoch_ == epoch" in runtime_tare
+    assert "!tareSafety_.latched()" in runtime_tare
+    assert runtime_tare.index("if (!allowed()) return false;") < runtime_tare.index("commit();")
+    assert "tareSafety_.onSample" in runtime and "tareSafety_.checkWatchdog" in runtime
+    tare = driver.split("HkvlTareResult HkvlForceDriver::tare(", 1)[1]
+    assert tare.index("hkvlTareResidualBlocker") < tare.index("state.tareBias = candidate[index];")
+    assert "commitIfAllowed(commit)" in tare
     assert "HKVL tare cancelled by emergency stop" in driver
     assert "now + std::chrono::milliseconds(10)" in driver
 

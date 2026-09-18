@@ -30,7 +30,7 @@ from backend.core.data_contract import (
     validate_data_contract,
 )
 from backend.core.force_config import hal_force_config_payload
-from backend.core.logging import LOG_SCHEMA_VERSION, LogService, now_ms, stable_config_hash
+from backend.core.logging import LOG_SCHEMA_VERSION, LogService, PollingErrorLog, now_ms, stable_config_hash
 from backend.core.motion_safety import MotionSafetyToken
 from backend.core.operator_view import hardware_side_for_operator_side
 from backend.core.schemas import (
@@ -312,7 +312,7 @@ def emit_omega_device_logs(logs: LogService, config: dict[str, Any], hands: list
             continue
         logs.event(
             "[HAL]",
-            "INFO",
+            "DEBUG",
             "omega_device",
             component="TELEOP",
             rate_key=f"omega_device:{side}",
@@ -878,20 +878,45 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
     @contextlib.asynccontextmanager
     async def configuration_change(current, candidate, *, force_apply=False):
+        force_only = all(current.get(key) == candidate.get(key)
+                         for key in current.keys() | candidate.keys() if key != "force")
+        recovering_force = commands.safety.latched and force_only
         protected = force_apply or any(current.get(key) != candidate.get(key)
                                        for key in ("motion", "force", "teleop", "gripper", "auto", "hal"))
-        if not protected:
-            yield
+        if not protected and not recovering_force:
+            yield (lambda: None), None
             return
         token = commands.safety.capture()
-        commands.safety.check(token)
+
+        def check_configuration() -> None:
+            if not recovering_force:
+                commands.safety.check(token)
+                return
+            # 只为停机后的力传感器修复开放入口，租约与停止代际仍须持续有效。
+            control_watchdog.require_ack_ready()
+            commands.safety.check_force_recovery_generation(token)
+            commands._ensure_origin_mutation_allowed()
+            automatic = policy.auto_status(current)
+            if automatic["running"] or automatic["queueDepth"]:
+                raise RuntimeError("force configuration recovery requires automatic execution and queued actions stopped")
+            teleop = teleop_mapper.status(current)
+            if any(teleop[key] for key in ("armed", "running", "transitioning", "sources")):
+                raise RuntimeError("force configuration recovery requires all teleop sources stopped")
+
+        check_configuration()
         with commands.safety.operation():
             commands._ensure_origin_mutation_allowed()
             state = await hal.motion_state()
             commands.require_stationary_motion(state)
-            commands.safety.check(token)
-            yield token
-            commands.safety.check(token)
+            if recovering_force:
+                enabled = state.get("enabled")
+                if not isinstance(enabled, list) or len(enabled) != 12 or any(value is not False for value in enabled):
+                    raise RuntimeError("force configuration recovery requires all servos confirmed disabled")
+            check_configuration()
+            # 落盘线程只核验代际；租约、活动状态和资源互斥保留在请求上下文。
+            before_commit = (lambda: commands.safety.check_force_recovery_generation(token)) if recovering_force else None
+            yield check_configuration, before_commit
+            check_configuration()
 
     # 保存新的应用配置。
     @app.put("/api/settings")
@@ -899,12 +924,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         try:
             current = await get_config_async()
             candidate = config.model_dump(mode="json")
-            async with configuration_change(current, candidate) as config_token:
-                if hal_force_config_payload(current) != hal_force_config_payload(candidate):
+            async with configuration_change(current, candidate) as (check_configuration, before_commit):
+                if before_commit is not None or hal_force_config_payload(current) != hal_force_config_payload(candidate):
                     await hal.command("force.configure", hal_force_config_payload(candidate))
-                if config_token is not None:
-                    commands.safety.check(config_token)
-                return await asyncio.to_thread(settings.save_config, candidate)
+                check_configuration()
+                save_options = {"before_commit": before_commit} if before_commit is not None else {}
+                return await asyncio.to_thread(settings.save_config, candidate, **save_options)
         except ValueError as exc:
             raise HTTPException(
                 status_code=400,
@@ -928,16 +953,17 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 if config is not None
                 else current
             )
-            async with configuration_change(current, candidate, force_apply=config is None) as config_token:
+            async with configuration_change(current, candidate, force_apply=config is None) as (check_configuration, before_commit):
                 current_force_payload = hal_force_config_payload(current)
                 candidate_force_payload = hal_force_config_payload(candidate)
-                if config is None or current_force_payload != candidate_force_payload:
+                if before_commit is not None or config is None or current_force_payload != candidate_force_payload:
                     await hal.command("force.configure", candidate_force_payload)
-                if config_token is not None:
-                    commands.safety.check(config_token)
+                check_configuration()
+                save_options = {"before_commit": before_commit} if before_commit is not None else {}
                 active = await asyncio.to_thread(
                     settings.apply_config,
                     candidate,
+                    **save_options,
                 )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": str(exc)}) from exc
@@ -965,12 +991,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         try:
             current = await get_config_async()
             candidate = await asyncio.to_thread(settings.preview_snapshot, snapshot_id)
-            async with configuration_change(current, candidate) as config_token:
-                if hal_force_config_payload(current) != hal_force_config_payload(candidate):
+            async with configuration_change(current, candidate) as (check_configuration, before_commit):
+                if before_commit is not None or hal_force_config_payload(current) != hal_force_config_payload(candidate):
                     await hal.command("force.configure", hal_force_config_payload(candidate))
-                if config_token is not None:
-                    commands.safety.check(config_token)
-                config = await asyncio.to_thread(settings.apply_snapshot, snapshot_id)
+                check_configuration()
+                save_options = {"before_commit": before_commit} if before_commit is not None else {}
+                config = await asyncio.to_thread(settings.apply_snapshot, snapshot_id, **save_options)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "snapshot not found"}) from exc
         except ValueError as exc:
@@ -1495,15 +1521,21 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     async def acknowledge_safety() -> ApiEnvelope:
         policy.invalidate_pending_actions()
         try:
-            return envelope(await commands.acknowledge_safety(readiness_check=control_watchdog.require_ack_ready))
+            with commands.safety.operation():
+                return envelope(await commands.acknowledge_safety(readiness_check=control_watchdog.require_ack_ready))
         except ControlLeaseUnavailable as exc:
             raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_REQUIRED", "message": str(exc)}) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail={"code": "HAL_REJECTED", "message": str(exc)}) from exc
 
     # 对所有力传感器执行去皮。
     @app.post("/api/sensors/tare")
-    async def tare_sensors() -> ApiEnvelope:
+    async def tare_sensors(payload: dict[str, Any] | None = None) -> ApiEnvelope:
         try:
-            return envelope(await commands.tare_force())
+            return envelope(await commands.tare_force(
+                unloaded_confirmed=(payload or {}).get("unloadedConfirmed") is True,
+                readiness_check=control_watchdog.require_ack_ready,
+            ))
         except ControlLeaseUnavailable as exc:
             raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
@@ -1868,7 +1900,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             else config
         )
         network["changed"] = changed
-        logs.info(
+        (logs.info if changed else logs.debug)(
             "[CAMERA]",
             f"PICO network selected {network['interfaceAlias']} IF {network['ifIndex']} "
             f"{network['localIp']}/{network['prefixLength']} gateway={gateway or '-'}",
@@ -2157,9 +2189,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             logs.info("[BACKEND]", "runtime shutdown cancelled; WebSocket client reconnected")
         client_token = id(ws)
         last_log_id = 0
+        polling_errors = PollingErrorLog(logs)
         last_loop_error = ""
         last_loop_error_at = 0.0
-        # Cache HAL HTTP reads so the WS loop is not dominated by localhost round trips.
+        # 缓存低频健康读取，但 DDS 源有效期优先于界面刷新周期。
         cached_health = HalHealth(
             ltdmc_ok=False, omega7_ok=False, version="unknown", uptime_s=0,
             connected=False,
@@ -2200,16 +2233,21 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             while True:
                 try:
                     now = time.monotonic()
-                    if now - last_health_at >= health_period:
+                    health_source_expired = (
+                        cached_health.source_valid_until_ms is not None
+                        and int(time.time() * 1000) > cached_health.source_valid_until_ms
+                    )
+                    if now - last_health_at >= health_period or health_source_expired:
                         try:
                             cached_health = await hal.health()
+                            polling_errors.recovered("health refresh")
                         except Exception as exc:  # noqa: BLE001
                             # 读取失败即标记当前状态不可用，不能延用旧 connected=True。
                             cached_health = HalHealth(
                                 ltdmc_ok=False, omega7_ok=False, version="unknown", uptime_s=0,
                                 connected=False, mode=cached_health.mode, message=str(exc),
                             )
-                            logs.error("[HAL]", f"health refresh failed: {exc}")
+                            polling_errors.failed("health refresh", "[HAL]", f"health refresh failed: {exc}")
                         last_health_at = now
                     hal_health = cached_health
                     active_config = await get_config_async()
@@ -2221,9 +2259,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                             try:
                                 # 运动轴状态变化快，但 50ms 缓存足够支撑 UI，并减少 HAL HTTP 往返。
                                 cached_motion_state = await hal.motion_state()
+                                polling_errors.recovered("motion state")
                             except RuntimeError as exc:
                                 cached_motion_state = None
-                                logs.error("[HAL]", f"motion state failed: {exc}")
+                                polling_errors.failed("motion state", "[HAL]", f"motion state failed: {exc}")
                         motion_state = cached_motion_state
                     motion_positions = None
                     motion_pulses = None
@@ -2281,6 +2320,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                             try:
                                 # Omega.7 状态随遥操作连接一起推送，前端再按逻辑连接过滤显示。
                                 omega_state = await hal.omega_state()
+                                polling_errors.recovered("omega state")
                                 raw_hands = omega_state.get("hands")
                                 cached_omega_hands = [
                                     item for item in raw_hands if isinstance(item, dict)
@@ -2289,7 +2329,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                                     emit_omega_device_logs(logs, active_config, cached_omega_hands)
                             except RuntimeError as exc:
                                 cached_omega_hands = None
-                                logs.error("[HAL]", f"omega state failed: {exc}")
+                                polling_errors.failed("omega state", "[HAL]", f"omega state failed: {exc}")
                         omega_hands = cached_omega_hands
                     force_state: dict[str, Any] | None = None
                     force_source = str(active_config.get("force", {}).get("source", "hkvl_serial")).lower()
@@ -2298,11 +2338,14 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                             last_force_state_at = now
                             try:
                                 cached_force_state = await hal.force_state()
+                                polling_errors.recovered("HAL force state")
                             except RuntimeError as exc:
                                 cached_force_state = None
-                                logs.error("[FORCE]", f"HAL force state failed: {exc}")
+                                polling_errors.failed("HAL force state", "[FORCE]", f"HAL force state failed: {exc}")
                         force_state = cached_force_state
-                    hal_ok = hal_health.connected and (hal_health.mode != "real" or hal_health.ltdmc_ok)
+                    hal_ok = hal_health.connected and (
+                        hal_health.mode != "real" or (hal_health.ltdmc_ok and motion_state is not None)
+                    )
                     active_native_gripper_status = None
                     if gripper_router.is_native(active_config):
                         try:
@@ -2372,6 +2415,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         except WebSocketDisconnect:
             return
         finally:
+            polling_errors.flush()
             app.state.ws_clients.discard(client_token)
             if control_session_id is not None:
                 control_watchdog.remove(control_session_id)

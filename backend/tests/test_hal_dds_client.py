@@ -18,9 +18,15 @@ from backend.hal_client.dds_types import (
     TOPIC_HAL_HEALTH,
     TOPIC_HAL_MOTION_STATE,
     TOPIC_HAL_NATIVE_TELEOP_STATUS,
+    TOPIC_HAL_OMEGA_STATE,
     HalCommandReply,
     JsonEnvelope,
 )
+
+
+@pytest.fixture(autouse=True)
+def fixed_dds_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("backend.hal_client.dds_client.now_unix_ms", lambda: 100_000)
 
 
 class FakeDdsTransport:
@@ -56,7 +62,7 @@ class FakeDdsTransport:
 def test_dds_hal_client_reads_health_from_topic_cache() -> None:
     transport = FakeDdsTransport()
     transport.latest[TOPIC_HAL_HEALTH] = JsonEnvelope(
-        stamp_unix_ms=123,
+        stamp_unix_ms=100_000,
         stamp_monotonic_ms=456,
         source="bridge",
         payload_json=json.dumps(
@@ -79,12 +85,13 @@ def test_dds_hal_client_reads_health_from_topic_cache() -> None:
     assert health.omega7_ok is False
     assert health.version == "real-hal/1.2.3"
     assert health.uptime_s == 7.5
+    assert health.source_valid_until_ms == 100_500
 
 
 def test_dds_hal_client_reads_motion_state_from_topic_cache() -> None:
     transport = FakeDdsTransport()
     transport.latest[TOPIC_HAL_MOTION_STATE] = JsonEnvelope(
-        stamp_unix_ms=123,
+        stamp_unix_ms=100_000,
         stamp_monotonic_ms=456,
         source="bridge",
         payload_json='{"positions":[1,2,3]}',
@@ -94,10 +101,10 @@ def test_dds_hal_client_reads_motion_state_from_topic_cache() -> None:
     state = asyncio.run(client.motion_state())
 
     assert state["positions"] == [1, 2, 3]
-    assert state["timestamp_ms"] == 123
+    assert state["timestamp_ms"] == 100_000
     assert state["monotonicMs"] == 456
     assert state["monotonic_s"] == pytest.approx(0.456)
-    assert state["dds_stamp_unix_ms"] == 123
+    assert state["dds_stamp_unix_ms"] == 100_000
     assert state["dds_stamp_monotonic_ms"] == 456
     assert "received_monotonic_ms" not in state
 
@@ -105,7 +112,7 @@ def test_dds_hal_client_reads_motion_state_from_topic_cache() -> None:
 def test_dds_hal_client_reads_force_state_from_topic_cache() -> None:
     transport = FakeDdsTransport()
     transport.latest[TOPIC_HAL_FORCE_STATE] = JsonEnvelope(
-        stamp_unix_ms=123,
+        stamp_unix_ms=100_000,
         stamp_monotonic_ms=456,
         source="hal-cpp",
         payload_json='{"source":"hkvl_serial","left":[1,2,3,4,5,6],"right":[6,5,4,3,2,1],"dangerIndex":0.5}',
@@ -124,7 +131,7 @@ def test_dds_hal_client_reads_force_state_from_topic_cache() -> None:
 def test_dds_hal_client_reads_native_teleop_status_from_topic_cache() -> None:
     transport = FakeDdsTransport()
     transport.latest[TOPIC_HAL_NATIVE_TELEOP_STATUS] = JsonEnvelope(
-        stamp_unix_ms=1111,
+        stamp_unix_ms=100_000,
         stamp_monotonic_ms=456000,
         source="hal-cpp",
         payload_json=json.dumps({"running": True, "lastAction": {"monotonicMs": 455900}}),
@@ -138,11 +145,11 @@ def test_dds_hal_client_reads_native_teleop_status_from_topic_cache() -> None:
     assert result["command"] == "teleop.native.status"
     response = result["response"]
     assert response["running"] is True
-    assert response["timestamp_ms"] == 1111
+    assert response["timestamp_ms"] == 100_000
     assert response["monotonicMs"] == 456000
     assert response["monotonic_s"] == pytest.approx(456.0)
     assert response["dds_source"] == "hal-cpp"
-    assert response["dds_stamp_unix_ms"] == 1111
+    assert response["dds_stamp_unix_ms"] == 100_000
     assert response["dds_stamp_monotonic_ms"] == 456000
     assert "received_monotonic_ms" not in response
 
@@ -341,3 +348,119 @@ def test_dds_lost_reply_does_not_reissue_mutating_command(name: str) -> None:
     with pytest.raises(RuntimeError, match="timed out"):
         asyncio.run(client.command(name, {"side": "left", "step": 5}))
     assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize("stamp", [0, -1, None, True, "100000", float("nan"), 99_499, 100_101])
+@pytest.mark.parametrize("topic,method", [
+    (TOPIC_HAL_HEALTH, "health"),
+    (TOPIC_HAL_MOTION_STATE, "motion_state"),
+    (TOPIC_HAL_OMEGA_STATE, "omega_state"),
+    (TOPIC_HAL_FORCE_STATE, "force_state"),
+    (TOPIC_HAL_NATIVE_TELEOP_STATUS, "teleop.native.status"),
+])
+def test_dds_source_timestamp_cannot_be_refreshed_by_payload(stamp, topic, method) -> None:
+    transport = FakeDdsTransport()
+    transport.latest[topic] = JsonEnvelope(
+        stamp_unix_ms=stamp, stamp_monotonic_ms=456, source="hal-cpp",
+        payload_json='{"timestamp_ms":100000,"ltdmc_ok":true,"running":false}',
+    )
+    client = DdsHalClient(LogService(emit_startup=False), transport=transport)
+    try:
+        if method == "health":
+            health = asyncio.run(client.health())
+            assert not health.connected and not health.ltdmc_ok
+            assert "source timestamp" in health.message
+        else:
+            with pytest.raises(RuntimeError, match="source timestamp"):
+                asyncio.run(client.command(method) if method == "teleop.native.status" else getattr(client, method)())
+        assert transport.requests == []
+    finally:
+        client.close()
+
+
+def test_unchanged_dds_force_cache_expires_and_ws_frame_loses_health(monkeypatch) -> None:
+    from backend.tests.test_telemetry_hub import FakeSettings, FakeHardware
+    from backend.services.telemetry_hub import TelemetryHub
+
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+    transport = FakeDdsTransport()
+    transport.latest[TOPIC_HAL_FORCE_STATE] = JsonEnvelope(
+        stamp_unix_ms=100_000, stamp_monotonic_ms=456, source="hal-cpp",
+        payload_json=json.dumps({
+            "source": "hkvl_serial", "left": [1] * 6, "right": [2] * 6,
+            "sides": {"left": {"healthy": True}, "right": {"healthy": True}},
+            "calibration": {"phase": "ready"},
+        }),
+    )
+    client = DdsHalClient(LogService(emit_startup=False), transport=transport)
+    telemetry = TelemetryHub(FakeSettings(), FakeHardware())
+    try:
+        frame = telemetry.next_frame(force_state=asyncio.run(client.force_state()), hal_ok=True)
+        assert frame.forceStatus["sides"]["left"]["healthy"] is True
+        monkeypatch.setattr("backend.hal_client.dds_client.now_unix_ms", lambda: 100_501)
+        with pytest.raises(RuntimeError, match="stale"):
+            asyncio.run(client.force_state())
+        frame = telemetry.next_frame(force_state=None, hal_ok=True)
+        assert frame.forceLeft == [1] * 6
+        assert frame.forceRight == [2] * 6
+        assert not telemetry.force_ok
+        assert all(side["healthy"] is False for side in frame.forceStatus["sides"].values())
+        assert "calibration" not in frame.forceStatus
+    finally:
+        client.close()
+        telemetry.shutdown()
+
+
+def test_tare_wait_preserves_state_reads_and_has_its_own_nonretrying_budget() -> None:
+    from threading import Event
+
+    async def exercise() -> None:
+        started, release = Event(), Event()
+        transport = FakeDdsTransport()
+        client = DdsHalClient(LogService(emit_startup=False), transport=transport)
+
+        def wait(request_id, timeout):
+            transport.waits.append((request_id, timeout))
+            started.set()
+            release.wait(2)
+            return HalCommandReply(request_id=request_id, ok=True, result_json='{"ok":true}', error="")
+
+        transport.wait_for_command_reply = wait
+        pending = asyncio.create_task(client.command("force.tare", {"samples": 200, "unloadedConfirmed": True}))
+        try:
+            for _ in range(100):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.005)
+            assert started.is_set() and not pending.done()
+            for phase in ("checking_stability", "validating"):
+                transport.latest[TOPIC_HAL_FORCE_STATE] = JsonEnvelope(
+                    stamp_unix_ms=100_000, stamp_monotonic_ms=456, source="hal-cpp",
+                    payload_json=json.dumps({"calibration": {"phase": phase}}),
+                )
+                assert (await client.force_state())["calibration"]["phase"] == phase
+                assert not pending.done()
+            request = transport.requests[0]
+            assert transport.waits == [(request.request_id, 6.0)]
+            assert json.loads(request.payload_json)["commandExpiresAtUnixMs"] == 106_000
+        finally:
+            release.set()
+            await pending
+            await client.aclose()
+        assert len(transport.requests) == 1
+
+    asyncio.run(exercise())
+
+
+def test_tare_lost_reply_never_retries_or_keeps_control_lease() -> None:
+    transport = FakeDdsTransport()
+    client = DdsHalClient(LogService(emit_startup=False), transport=transport)
+    try:
+        with pytest.raises(RuntimeError, match="timed out"):
+            asyncio.run(client.command("force.tare", {"samples": 200}))
+        assert len(transport.requests) == 1
+        assert transport.waits == [(transport.requests[0].request_id, 6.0)]
+        with pytest.raises(RuntimeError, match="quarantined"):
+            asyncio.run(client.command("control.lease"))
+    finally:
+        client.close()

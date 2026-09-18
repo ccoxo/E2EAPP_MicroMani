@@ -60,6 +60,9 @@ def command_spec(name: str) -> HalCommandSpec:
 
 def command_request_policy(name: str, timeout_s: float, *, long_timeout_s: float = 75.0) -> tuple[float, int]:
     command_spec(name)
+    if name == "force.tare":
+        # 两个最多 2 秒的窗口，另留 2 秒给停机与调度；去皮不得自动重试。
+        return max(timeout_s, 6.0), 1
     if name in _LONG_RUNNING_COMMANDS:
         # 回零类命令可能跨越多轴运动，DDS/HTTP 两条路径都使用同一套长 timeout 策略。
         return max(timeout_s, long_timeout_s), 1

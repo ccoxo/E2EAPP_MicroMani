@@ -5,12 +5,13 @@
  * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
  */
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { Activity, ChevronDown, ChevronUp, Download, RotateCw, Search, TriangleAlert } from 'lucide-react'
-import { useMemo, useRef, useState } from 'react'
+import { Activity, ArrowDownToLine, ChevronDown, ChevronUp, Download, Maximize2, Minimize2, RotateCw, Search, SlidersHorizontal, TriangleAlert } from 'lucide-react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react'
 import { channelColor, logChannels } from '../data'
 import { useTelemetryStore } from '../stores/telemetry'
 import type { LogLevel } from '../types'
-import { UiButton, UiSpace, UiText } from './ui'
+import { buildLogRows, deduplicateLogEntries, isDiagnosticLog } from '../utils/logPresentation'
+import { UiButton, UiText } from './ui'
 
 const levelOptions: Array<LogLevel | 'ALL'> = ['ALL', 'DEBUG', 'INFO', 'WARNING', 'ERROR']
 const quickFilters = [
@@ -57,21 +58,62 @@ export function LogPanel() {
   const [selectedChannels, setSelectedChannels] = useState<string[]>(logChannels)
   const [level, setLevel] = useState<LogLevel | 'ALL'>('ALL')
   const [search, setSearch] = useState('')
+  const [includeDiagnostics, setIncludeDiagnostics] = useState(false)
+  const [filtersOpen, setFiltersOpen] = useState(false)
+  const [followLatest, setFollowLatest] = useState(true)
+  const [height, setHeight] = useState(260)
+  const [maxHeight, setMaxHeight] = useState(520)
+  const [maximized, setMaximized] = useState(false)
+  const [resizing, setResizing] = useState(false)
+  const panelRef = useRef<HTMLElement>(null)
   const parentRef = useRef<HTMLDivElement>(null)
+  const dragRef = useRef<{ y: number; height: number } | null>(null)
+  const errorCursor = useRef<string | null>(null)
+  const minHeight = Math.min(180, maxHeight)
+  const panelHeight = maximized ? maxHeight : Math.min(maxHeight, Math.max(minHeight, height))
+
+  // 抽屉上限为悬浮急停和主导航留出空间；不依赖固定的状态栏高度。
+  useLayoutEffect(() => {
+    const shell = panelRef.current?.closest('.app-shell')
+    const top = shell?.querySelector('.top-bar')
+    const status = shell?.querySelector('.status-bar')
+    const dock = shell?.querySelector('.safety-dock')
+    const nav = shell?.querySelector('.left-nav')
+    const measure = () => {
+      const viewportHeight = shell?.getBoundingClientRect().height || window.innerHeight
+      const navigationHeight = nav && getComputedStyle(nav).flexDirection === 'row' ? nav.getBoundingClientRect().height : 0
+      const reserved = (top?.getBoundingClientRect().height ?? 0) + (status?.getBoundingClientRect().height ?? 0)
+        + navigationHeight + Math.max(160, (dock?.getBoundingClientRect().height ?? 0) + 24)
+      setMaxHeight(Math.max(120, Math.floor(Math.min(viewportHeight * 0.68, viewportHeight - reserved))))
+    }
+    measure()
+    const observer = new ResizeObserver(measure)
+    for (const element of [shell, top, status, dock, nav]) if (element) observer.observe(element)
+    window.addEventListener('resize', measure)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', measure)
+    }
+  }, [])
+
+  const uniqueLogs = useMemo(() => deduplicateLogEntries(logs), [logs])
+  const diagnosticCount = useMemo(() => uniqueLogs.filter(isDiagnosticLog).length, [uniqueLogs])
 
   const filtered = useMemo(
     () =>
-      logs.filter((entry) => {
+      uniqueLogs.filter((entry) => {
         const text = `${entry.channel} ${entry.level} ${entry.msg}`
-        return selectedChannels.includes(entry.channel) && (level === 'ALL' || entry.level === level) && matchesSearch(text, search)
+        return (includeDiagnostics || level === 'DEBUG' || !isDiagnosticLog(entry))
+          && selectedChannels.includes(entry.channel) && (level === 'ALL' || entry.level === level) && matchesSearch(text, search)
       }),
-    [level, logs, search, selectedChannels],
+    [includeDiagnostics, level, uniqueLogs, search, selectedChannels],
   )
+  const rows = useMemo(() => buildLogRows(filtered), [filtered])
 
   // Virtualization keeps long diagnostic sessions usable in the fixed-height log panel.
   // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
-    count: filtered.length,
+    count: rows.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => 24,
     overscan: 20,
@@ -79,7 +121,44 @@ export function LogPanel() {
   const virtualItems = virtualizer.getVirtualItems()
   const visibleItems = virtualItems.length > 0
     ? virtualItems
-    : filtered.map((_, index) => ({ index, start: index * 24, key: index }))
+    : rows.slice(0, Math.ceil(panelHeight / 24)).map((row, index) => ({ index, start: index * 24, key: row.key }))
+
+  useEffect(() => {
+    if (!open || !followLatest) return
+    const id = requestAnimationFrame(() => {
+      const viewport = parentRef.current
+      if (viewport) viewport.scrollTop = viewport.scrollHeight
+    })
+    return () => cancelAnimationFrame(id)
+  }, [open, followLatest, rows, panelHeight])
+
+  function startResize(event: PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return
+    event.preventDefault()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    dragRef.current = { y: event.clientY, height: panelHeight }
+    setMaximized(false)
+    setResizing(true)
+  }
+
+  function resize(event: PointerEvent<HTMLDivElement>) {
+    if (!dragRef.current) return
+    setHeight(Math.min(maxHeight, Math.max(minHeight, dragRef.current.height + dragRef.current.y - event.clientY)))
+  }
+
+  function stopResize() {
+    dragRef.current = null
+    setResizing(false)
+  }
+
+  function resizeWithKeyboard(event: KeyboardEvent<HTMLDivElement>) {
+    const next = event.key === 'ArrowUp' ? panelHeight + 32 : event.key === 'ArrowDown' ? panelHeight - 32
+      : event.key === 'Home' ? minHeight : event.key === 'End' ? maxHeight : null
+    if (next === null) return
+    event.preventDefault()
+    setMaximized(false)
+    setHeight(Math.min(maxHeight, Math.max(minHeight, next)))
+  }
 
  /** Export the currently filtered log view, not the full backing store. */
  function exportLogs() {
@@ -94,19 +173,72 @@ export function LogPanel() {
 
   /** 处理对应的用户交互。 */
   function jumpNextError() {
-    const index = filtered.findIndex((entry) => entry.level === 'ERROR')
-    if (index >= 0) virtualizer.scrollToIndex(index, { align: 'center' })
+    const previous = rows.findIndex((row) => row.key === errorCursor.current)
+    let index = rows.findIndex((row, rowIndex) => rowIndex > previous && row.entry.level === 'ERROR')
+    if (index < 0) index = rows.findIndex((row) => row.entry.level === 'ERROR')
+    if (index >= 0) {
+      errorCursor.current = rows[index].key
+      setFollowLatest(false)
+      virtualizer.scrollToIndex(index, { align: 'center' })
+    }
   }
 
   return (
-    <section className={`log-panel ${open ? 'log-panel-open' : 'log-panel-closed'}`}>
+    <section ref={panelRef} aria-label="日志面板" className={`log-panel ${open ? 'log-panel-open' : 'log-panel-closed'} ${resizing ? 'log-panel-resizing' : ''}`}
+      style={open ? { height: panelHeight } : undefined}>
+      {open && <div role="separator" aria-label="调整日志高度" aria-orientation="horizontal" tabIndex={0}
+        aria-valuemin={minHeight} aria-valuemax={maxHeight} aria-valuenow={panelHeight}
+        title="向上拖动扩展日志；方向键调整高度，Home / End 切换最小 / 最大高度"
+        className="log-resize-handle" onPointerDown={startResize} onPointerMove={resize}
+        onPointerUp={stopResize} onPointerCancel={stopResize} onLostPointerCapture={stopResize}
+        onKeyDown={resizeWithKeyboard} />}
       <header className="log-toolbar">
-        <UiSpace size={8} wrap>
-          <UiButton icon={open ? <ChevronDown size={14} /> : <ChevronUp size={14} />} onClick={() => setOpen(!open)}>
-            Log Panel
-          </UiButton>
+        <UiButton aria-expanded={open} aria-controls={open ? 'log-panel-content' : undefined} icon={open ? <ChevronDown size={14} /> : <ChevronUp size={14} />} onClick={() => setOpen(!open)}>
+          Log Panel
+        </UiButton>
+        <div className="log-actions">
+          <UiText secondary>{open ? `${rows.length} / ${uniqueLogs.length}` : `${uniqueLogs.length} 条`}</UiText>
           {open && (
             <>
+              <UiButton aria-label="下一个错误" title="下一个错误" disabled={!rows.some((row) => row.entry.level === 'ERROR')} icon={<TriangleAlert size={14} />} onClick={jumpNextError}>
+                <span className="log-action-label">下一个错误</span>
+              </UiButton>
+              <UiButton aria-label="导出" title="导出当前筛选的原始日志，包含合并显示的重复项" icon={<Download size={14} />} onClick={exportLogs}>
+                <span className="log-action-label">导出</span>
+              </UiButton>
+              <UiButton aria-label={maximized ? '还原日志高度' : '最大化日志'} title={maximized ? '还原日志高度' : '向上扩展至最大高度'}
+                icon={maximized ? <Minimize2 size={14} /> : <Maximize2 size={14} />} onClick={() => setMaximized(!maximized)} />
+            </>
+          )}
+        </div>
+      </header>
+      {open && (
+        <div id="log-panel-content" className="log-panel-content">
+          <div className="log-filters">
+            <div className="log-primary-filters">
+              <select
+                aria-label="日志级别"
+                className="ui-select log-level-select"
+                value={level}
+                onChange={(event) => setLevel(event.target.value as LogLevel | 'ALL')}
+              >
+                {levelOptions.map((item) => (
+                  <option key={item} value={item}>{item === 'ALL' ? '全部级别' : item}</option>
+                ))}
+              </select>
+              <span className="log-search">
+                <Search size={14} />
+                <input aria-label="搜索日志" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索日志 / 正则" />
+              </span>
+              <UiButton aria-label="显示诊断日志" aria-pressed={includeDiagnostics} variant={includeDiagnostics ? 'primary' : 'default'}
+                title={`常规视图保留操作与异常；${diagnosticCount} 条详细诊断可展开查看`}
+                onClick={() => setIncludeDiagnostics(!includeDiagnostics)}>诊断 {diagnosticCount}</UiButton>
+              <UiButton aria-label="日志筛选" aria-expanded={filtersOpen} title="通道与诊断快捷筛选" icon={<SlidersHorizontal size={14} />}
+                onClick={() => setFiltersOpen(!filtersOpen)} />
+              <UiButton aria-label="跟随最新日志" aria-pressed={followLatest} title={followLatest ? '暂停自动滚动' : '跟随最新日志'}
+                variant={followLatest ? 'primary' : 'default'} icon={<ArrowDownToLine size={14} />} onClick={() => setFollowLatest(!followLatest)} />
+            </div>
+            {filtersOpen && <div className="log-advanced-filters">
               <span className="log-channel-filters">
                 {logChannels.map((channel) => (
                   <label key={channel}>
@@ -123,64 +255,42 @@ export function LogPanel() {
                   </label>
                 ))}
               </span>
-              <select
-                className="ui-select"
-                value={level}
-                onChange={(event) => setLevel(event.target.value as LogLevel | 'ALL')}
-              >
-                {levelOptions.map((item) => (
-                  <option key={item} value={item}>{item}</option>
-                ))}
-              </select>
-              <UiSpace size={4} className="log-quick-filters">
+              <div className="log-quick-filters">
                 {quickFilters.map((item) => (
                   <UiButton
                     key={item.label}
                     variant={search === item.query ? 'primary' : 'default'}
+                    aria-pressed={search === item.query}
                     icon={item.icon}
-                    onClick={() => setSearch(item.query)}
+                    onClick={() => { setSearch(item.query); setIncludeDiagnostics(true) }}
                   >
                     {item.label}
                   </UiButton>
                 ))}
-              </UiSpace>
-              <span className="log-search">
-                <Search size={14} />
-                <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="regex / keyword" />
-              </span>
-            </>
-          )}
-        </UiSpace>
-        {open && (
-          <UiSpace>
-            <UiButton icon={<TriangleAlert size={14} />} onClick={jumpNextError}>
-              下一个错误
-            </UiButton>
-            <UiButton icon={<Download size={14} />} onClick={exportLogs}>
-              导出
-            </UiButton>
-            <UiText secondary>{filtered.length} / {logs.length}</UiText>
-          </UiSpace>
-        )}
-      </header>
-      {open && (
-        <div ref={parentRef} className="log-viewport">
-          <div style={{ height: `${virtualizer.getTotalSize()}px`, position: 'relative' }}>
-            {visibleItems.map((virtualItem) => {
-              const entry = filtered[virtualItem.index]
-              return (
-                <div
-                  className={`log-line log-line-${entry.level.toLowerCase()}`}
-                  key={entry.id}
-                  style={{ transform: `translateY(${virtualItem.start}px)` }}
-                >
-                  <span>{formatLogTime(entry.ts)}</span>
-                  <b style={{ color: channelColor[entry.channel] }}>{entry.channel}</b>
-                  <em>{entry.level}</em>
-                  <span className="log-message" title={entry.msg}>{entry.msg}</span>
-                </div>
-              )
-            })}
+              </div>
+            </div>}
+          </div>
+          <div ref={parentRef} className="log-viewport" onWheel={() => setFollowLatest(false)} onTouchMove={() => setFollowLatest(false)}>
+            {rows.length === 0 && <div className="log-empty">{search ? '没有匹配的日志' : '暂无运行事件'}{!includeDiagnostics && diagnosticCount > 0 ? ` · ${diagnosticCount} 条诊断日志已收起` : ''}</div>}
+            <div className="log-lines" style={{ height: `${virtualizer.getTotalSize()}px`, position: 'relative' }}>
+              {visibleItems.map((virtualItem) => {
+                const row = rows[virtualItem.index]
+                const entry = row.entry
+                return (
+                  <div
+                    className={`log-line log-line-${entry.level.toLowerCase()}`}
+                    key={row.key}
+                    style={{ transform: `translateY(${virtualItem.start}px)` }}
+                  >
+                    <span>{formatLogTime(entry.ts)}</span>
+                    <b style={{ color: channelColor[entry.channel] }}>{entry.channel}</b>
+                    <em>{entry.level}</em>
+                    <span className="log-message" title={entry.msg}>{entry.msg}</span>
+                    <span className="log-repeat" title={`首次 ${formatLogTime(row.firstTs)}；末次 ${formatLogTime(entry.ts)}；导出保留每条记录`}>{row.count > 1 ? `×${row.count}` : ''}</span>
+                  </div>
+                )
+              })}
+            </div>
           </div>
         </div>
       )}

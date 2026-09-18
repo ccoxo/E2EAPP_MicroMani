@@ -27,7 +27,6 @@ export default function RecordPage() {
   const discardRecordEpisode = useTelemetryStore((s) => s.discardRecordEpisode)
   const finishRecordSession = useTelemetryStore((s) => s.finishRecordSession)
   const skipRecordReset = useTelemetryStore((s) => s.skipRecordReset)
-  const tareRecordForceSensors = useTelemetryStore((s) => s.tareRecordForceSensors)
   const toggleRecordClutch = useTelemetryStore((s) => s.toggleRecordClutch)
   const setRecordSpeedMode = useTelemetryStore((s) => s.setRecordSpeedMode)
   const homeRecordArms = useTelemetryStore((s) => s.homeRecordArms)
@@ -83,11 +82,6 @@ export default function RecordPage() {
           setRecordSpeedMode('fine')
           break
 
-        case 't':
-        case 'T':
-          if (phase === 'idle' || phase === 'resetting') tareRecordForceSensors()
-          break
-
         case 'r':
         case 'R':
           if (phase === 'idle' || phase === 'resetting') homeRecordArms()
@@ -109,7 +103,6 @@ export default function RecordPage() {
     handleSkipReset,
     homeRecordArms,
     setRecordSpeedMode,
-    tareRecordForceSensors,
     toggleRecordClutch,
   ])
 

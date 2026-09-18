@@ -98,6 +98,26 @@ describe('设置迁移回归', () => {
     expect(tare).toHaveBeenCalledExactlyOnceWith('right')
   })
 
+  it.each([[12, 0, 200], [400, 400, 400]])(
+    'NI-DAQ 的 %i 个 Tare 样本切回 HKVL 时使用兼容值并保留其余力配置',
+    async (previousSamples, expectedSamples, displayedSamples) => {
+      const force = { ...structuredClone(defaultConfig.force), source: 'nidaq' as const,
+        tareSamples: previousSamples, lowpassCutoffHz: 7.5 }
+      useTelemetryStore.setState((state) => ({ config: { ...state.config, force } }))
+      await show('force-left')
+      const left = within(document.getElementById('force-left')!)
+      expect(left.getByLabelText('Tare 样本')).toHaveValue(previousSamples)
+      fireEvent.change(left.getByLabelText('数据源'), { target: { value: 'hkvl_serial' } })
+      expect(useTelemetryStore.getState().config.force).toEqual({
+        ...force, source: 'hkvl_serial', tareSamples: expectedSamples,
+      })
+      const samples = left.getByLabelText('Tare 样本（200–1000）')
+      expect(samples).toHaveValue(displayedSamples)
+      expect(samples).toHaveAttribute('min', '200')
+      expect(samples).toHaveAttribute('max', '1000')
+    },
+  )
+
   it.each(['resolve', 'reject'] as const)('回原点跨 Tab 防重入，并在 %s 后释放双方按钮', async (outcome) => {
     const request = deferred()
     const returnOrigin = vi.spyOn(api, 'returnMotionOriginSide').mockReturnValueOnce(request.promise).mockResolvedValue({ ok: true })

@@ -10,6 +10,7 @@ import json
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -166,6 +167,9 @@ class LogService:
     def info(self, channel: LogChannel, msg: str) -> LogEntry:
         return self.append(channel, "INFO", msg)
 
+    def debug(self, channel: LogChannel, msg: str) -> LogEntry:
+        return self.append(channel, "DEBUG", msg)
+
     def warning(self, channel: LogChannel, msg: str) -> LogEntry:
         return self.append(channel, "WARNING", msg)
 
@@ -177,3 +181,54 @@ class LogService:
 
     def list_entries(self) -> list[LogEntry]:
         return list(self._entries)
+
+
+@dataclass
+class _PollingFailure:
+    channel: LogChannel
+    message: str
+    last_report_ms: int
+    repeats: int = 0
+    total: int = 1
+
+
+class PollingErrorLog:
+    """仅合并轮询重复错误，保留首次、内容变更、重复次数及恢复记录。"""
+
+    def __init__(self, logs: LogService, *, interval_ms: int = 5000) -> None:
+        self._logs = logs
+        self._interval_ms = interval_ms
+        self._failures: dict[str, _PollingFailure] = {}
+
+    def failed(self, key: str, channel: LogChannel, message: str) -> None:
+        now = self._logs._monotonic_ms()
+        previous = self._failures.get(key)
+        if previous is None or (previous.channel, previous.message) != (channel, message):
+            if previous is not None:
+                self._flush(previous)
+            self._logs.error(channel, message)
+            self._failures[key] = _PollingFailure(channel, message, now)
+            return
+        previous.repeats += 1
+        previous.total += 1
+        if now - previous.last_report_ms >= self._interval_ms:
+            self._flush(previous)
+            previous.last_report_ms = now
+
+    def recovered(self, key: str) -> None:
+        previous = self._failures.pop(key, None)
+        if previous is not None:
+            self._flush(previous)
+            self._logs.info(previous.channel, f"{key} recovered; failures={previous.total}")
+
+    def flush(self) -> None:
+        for failure in self._failures.values():
+            self._flush(failure)
+
+    def _flush(self, failure: _PollingFailure) -> None:
+        if failure.repeats:
+            self._logs.error(
+                failure.channel,
+                f"{failure.message} [repeated={failure.repeats} total={failure.total}]",
+            )
+            failure.repeats = 0

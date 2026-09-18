@@ -98,6 +98,7 @@ export type PreCheckFrameSlice = Pick<
   | 'teleopHands'
   | 'forceLeft'
   | 'forceRight'
+  | 'forceStatus'
   | 'motionEnabled'
   | 'motionAxisEnabled'
 >
@@ -110,6 +111,7 @@ export function preCheckFrameSlice(frame: TelemetryFrame): PreCheckFrameSlice {
     teleopHands: frame.teleopHands,
     forceLeft: frame.forceLeft,
     forceRight: frame.forceRight,
+    forceStatus: frame.forceStatus,
     motionEnabled: frame.motionEnabled,
     motionAxisEnabled: frame.motionAxisEnabled,
   }
@@ -122,6 +124,9 @@ export function preCheckFrameEqual(a: PreCheckFrameSlice, b: PreCheckFrameSlice)
     && a.teleopHands === b.teleopHands
     && a.forceLeft === b.forceLeft
     && a.forceRight === b.forceRight
+    && a.forceStatus?.source === b.forceStatus?.source
+    && a.forceStatus?.calibration?.state === b.forceStatus?.calibration?.state
+    && a.forceStatus?.safety?.latched === b.forceStatus?.safety?.latched
     && a.motionEnabled === b.motionEnabled
     && a.motionAxisEnabled === b.motionAxisEnabled
 }

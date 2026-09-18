@@ -848,7 +848,12 @@ def test_native_teleop_status_diag_log_reports_pulse_update_and_clip(monkeypatch
 
         messages = [entry.msg for entry in logs.list_entries()]
         diag_messages = [message for message in messages if message.startswith("teleop diag left->right")]
-        assert len(diag_messages) == 1
+        assert diag_messages == []
+        assert all(
+            entry.level == "WARNING"
+            for entry in logs.list_entries()
+            if ("event=teleop_status" in entry.msg or "event=teleop_axis_trace" in entry.msg) and "axis=Yaw" in entry.msg
+        )
         event_messages = [
             message
             for message in messages
@@ -887,20 +892,10 @@ def test_native_teleop_status_diag_log_reports_pulse_update_and_clip(monkeypatch
         assert "blockReason=active" in axis_trace
         assert "referenceValid=true" in axis_trace
         assert "inputActive=true" in axis_trace
-        diag = diag_messages[0]
-        assert "axis=Yaw" in diag
-        assert "clip=Yaw" in diag
-        assert "app=[Yaw:0.5]" in diag
-        assert "pulseReq=[Yaw:-333]" in diag
-        assert "pulseApp=[Yaw:-333]" in diag
-        assert "targetPulse=[Yaw:1200]" in diag
-        assert "currentPulse=[Yaw:900]" in diag
-        assert "launchPulse=[Yaw:-333]" in diag
-        assert "movingBefore=[]" in diag
-        assert "moveStarted=[Yaw:1]" in diag
-        assert "updateRet=[Yaw:21]" in diag
-        assert "stopReason=[Yaw:5]" in diag
-        assert "axisIoStatus=[Yaw:4096]" in diag
+        assert "filtered=[Yaw:0.5]" in event
+        assert "launchPulse=[Yaw:-333]" in event
+        assert "movingBefore=[]" in event
+        assert "moveStarted=[Yaw:1]" in event
 
     asyncio.run(run())
 

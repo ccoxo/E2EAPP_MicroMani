@@ -31,6 +31,8 @@ class HalHealth:
     mode: str = "real"
     message: str | None = None
     capabilities: list[str] | None = None
+    # DDS 源样本的有效期；上层缓存不能延长底层健康样本的寿命。
+    source_valid_until_ms: int | None = None
 
 
 class HalClient:

@@ -41,6 +41,8 @@ std::int64_t unixMilliseconds() {
 }  // namespace
 
 struct HkvlForceDriver::Impl {
+  enum class TarePhase { idle, stability, validation };
+
   struct SideState {
     mutable std::mutex mutex;
     std::condition_variable tareCondition;
@@ -62,16 +64,24 @@ struct HkvlForceDriver::Impl {
     std::string error;
     bool tarePending{false};
     bool tareCancelled{false};
-    TareCommitCallback tareCommit;
+    TarePhase tarePhase{TarePhase::idle};
+    std::uint64_t tareGeneration{0};
+    std::uint64_t tareWindowId{0};
     int tareRemaining{0};
-    int tareRequested{0};
-    std::array<double, 6> tareSum{};
+    double tareWindowStartedMs{0.0};
+    double tareFirstReceivedMs{0.0};
+    double tareLastReceivedMs{0.0};
+    std::string tareError;
+    bool discardPartialBeforeNextBatch{false};
+    HkvlSampleAccumulator tareWindow;
+    std::array<double, 6> candidateBias{};
   };
 
   HkvlSerialConfig config;
   SampleCallback callback;
   FailureCallback failureCallback;
   ReadLoop readLoop;
+  ByteReadLoop byteReadLoop;
   WorkerLauncher launcher;
   std::array<SideState, 2> sides;
   std::array<std::thread, 2> workers;
@@ -79,9 +89,11 @@ struct HkvlForceDriver::Impl {
   std::recursive_mutex lifecycleMutex;
   std::atomic<bool> running{false};
   std::atomic_bool failed{false};
+  std::atomic<std::uint64_t> generation{0};
 
   void requestStop() noexcept {
     running.store(false, std::memory_order_release);
+    generation.fetch_add(1, std::memory_order_acq_rel);
     for (auto& state : sides) state.tareCondition.notify_all();
   }
 
@@ -126,10 +138,14 @@ struct HkvlForceDriver::Impl {
     state.error.clear();
     state.tarePending = false;
     state.tareCancelled = false;
-    state.tareCommit = {};
+    state.tarePhase = TarePhase::idle;
+    state.tareGeneration = 0;
+    ++state.tareWindowId;
     state.tareRemaining = 0;
-    state.tareRequested = 0;
-    state.tareSum = {};
+    state.tareError.clear();
+    state.discardPartialBeforeNextBatch = false;
+    state.tareWindow.reset();
+    state.candidateBias = {};
   }
 
   void updateConnection(int side, bool connected, const std::string& error) {
@@ -138,28 +154,51 @@ struct HkvlForceDriver::Impl {
     state.connected = connected;
     state.error = error;
     if (!connected) {
+      // 一次断连即使迅速恢复，也不能继续使用断连前的去皮窗口。
+      if (state.tarePhase != TarePhase::idle) state.tareCancelled = true;
       state.tareCondition.notify_all();
     }
   }
 
   void processBytes(int side, const std::uint8_t* bytes, std::size_t size) {
+    // 同一次读取的帧共享接收时刻，不能因逐帧回调阻塞而被伪装成新时刻。
+    const auto receivedMs = steadyMilliseconds();
+    const auto receivedUnixMs = unixMilliseconds();
     auto& state = sides[side];
+    {
+      std::scoped_lock lock(state.mutex);
+      if (state.discardPartialBeforeNextBatch && receivedMs >= state.tareWindowStartedMs) {
+        // parser 仍仅由读取线程操作；跨窗口半帧不能混入新窗口，累计诊断保留。
+        state.parser.discardBufferedBytes();
+        state.discardPartialBeforeNextBatch = false;
+      }
+    }
     const auto frames = state.parser.feed(bytes, size);
     {
       std::scoped_lock lock(state.mutex);
       state.parserStats = state.parser.stats();
+      if (state.tarePending && receivedMs >= state.tareWindowStartedMs
+          && frames.size() > kHkvlTareMaxBatchFrames) {
+        state.tareError = "HKVL tare receive backlog exceeds 50 frames per batch";
+        state.tareCancelled = true;
+        state.tareCondition.notify_all();
+      }
     }
     for (const auto& frame : frames) {
-      processFrame(side, frame);
+      processFrame(side, frame, receivedMs, receivedUnixMs);
     }
   }
 
-  void processFrame(int side, const HkvlForceFrame& frame) {
+  void processFrame(int side, const HkvlForceFrame& frame,
+      double receivedMs, std::int64_t receivedUnixMs) {
     auto& state = sides[side];
     HkvlDriverSample sample;
     sample.side = side;
-    sample.monotonicMs = steadyMilliseconds();
-    sample.unixMs = unixMilliseconds();
+    sample.monotonicMs = receivedMs;
+    sample.unixMs = receivedUnixMs;
+    // 保留既有滤波的处理间隔；接收时间只用于样本新鲜度和自检窗口。
+    const auto filterMonotonicMs = steadyMilliseconds();
+    std::uint64_t windowId = 0;
 
     {
       std::scoped_lock lock(state.mutex);
@@ -168,11 +207,8 @@ struct HkvlForceDriver::Impl {
       state.error.clear();
       state.raw = frame.values;
 
-      if (state.tarePending) {
-        for (std::size_t axis = 0; axis < state.tareSum.size(); ++axis) {
-          state.tareSum[axis] += frame.values[axis];
-        }
-        --state.tareRemaining;
+      if (state.tarePending && receivedMs >= state.tareWindowStartedMs) {
+        windowId = state.tareWindowId;
       }
 
       for (std::size_t axis = 0; axis < state.tared.size(); ++axis) {
@@ -185,14 +221,14 @@ struct HkvlForceDriver::Impl {
       } else {
         const double dtSec = std::max(
             0.0,
-            (sample.monotonicMs - state.previousFilterMonotonicMs) / 1000.0);
+            (filterMonotonicMs - state.previousFilterMonotonicMs) / 1000.0);
         const double rc = 1.0 / (2.0 * 3.14159265358979323846 * config.lowpassCutoffHz);
         const double alpha = std::clamp(dtSec / (rc + dtSec), 0.0, 1.0);
         for (std::size_t axis = 0; axis < state.filtered.size(); ++axis) {
           state.filtered[axis] += alpha * (state.tared[axis] - state.filtered[axis]);
         }
       }
-      state.previousFilterMonotonicMs = sample.monotonicMs;
+      state.previousFilterMonotonicMs = filterMonotonicMs;
       state.lastSampleMonotonicMs = sample.monotonicMs;
 
       ++state.rateWindowFrames;
@@ -212,24 +248,26 @@ struct HkvlForceDriver::Impl {
     if (callback) {
       callback(sample);
     }
-    // 最后一帧仍使用旧偏置接受力安全检查，通过后才允许提交新零点。
+    // 每帧先用旧偏置接受安全检查；最后一帧回调结束后才允许窗口完成。
     {
       std::scoped_lock lock(state.mutex);
-      if (state.tarePending && state.tareRemaining <= 0) {
-        const auto commit = [&]() {
-          for (std::size_t axis = 0; axis < state.tareBias.size(); ++axis) {
-            state.tareBias[axis] = state.tareSum[axis] / static_cast<double>(state.tareRequested);
+      if (state.tarePending && !state.tareCancelled
+          && windowId == state.tareWindowId
+          && state.tareGeneration == generation.load()
+          && running.load()) {
+        auto values = frame.values;
+        if (state.tarePhase == TarePhase::validation) {
+          for (std::size_t axis = 0; axis < values.size(); ++axis) {
+            values[axis] -= state.candidateBias[axis];
           }
-          state.filterInitialized = false;
-          state.previousFilterMonotonicMs = 0.0;
-        };
-        if (state.tareCommit) {
-          state.tareCancelled = !state.tareCommit(commit);
-        } else {
-          commit();
         }
-        state.tarePending = false;
-        state.tareCondition.notify_all();
+        if (state.tareWindow.sampleCount() == 0) state.tareFirstReceivedMs = receivedMs;
+        state.tareLastReceivedMs = receivedMs;
+        state.tareWindow.add(values);
+        if (--state.tareRemaining <= 0) {
+          state.tarePending = false;
+          state.tareCondition.notify_all();
+        }
       }
     }
   }
@@ -342,9 +380,10 @@ struct HkvlForceDriver::Impl {
   }
 };
 
-HkvlForceDriver::HkvlForceDriver(ReadLoop readLoop, WorkerLauncher launcher)
+HkvlForceDriver::HkvlForceDriver(ReadLoop readLoop, WorkerLauncher launcher, ByteReadLoop byteReadLoop)
     : impl_(std::make_unique<Impl>()) {
   impl_->readLoop = std::move(readLoop);
+  impl_->byteReadLoop = std::move(byteReadLoop);
   impl_->launcher = std::move(launcher);
 }
 
@@ -370,7 +409,15 @@ void HkvlForceDriver::start(
     for (; side < 2 && impl_->running.load(); ++side) {
       impl_->workers[side] = launchWorker(impl_->launcher, [this, side]() {
         runWorkerBoundary([this, side]() {
-          if (impl_->readLoop) impl_->readLoop(side, impl_->callback, impl_->running);
+          if (impl_->byteReadLoop) {
+            impl_->byteReadLoop(side, [this, side](const std::uint8_t* bytes, std::size_t size) {
+              impl_->processBytes(side, bytes, size);
+            }, impl_->running);
+          } else if (impl_->readLoop) {
+            impl_->readLoop(side, [this, side](const HkvlDriverSample& sample) {
+              impl_->processFrame(side, HkvlForceFrame{sample.raw}, steadyMilliseconds(), unixMilliseconds());
+            }, impl_->running);
+          }
           else impl_->runSide(side);
           if (impl_->running.load()) throw std::runtime_error("HKVL reader exited unexpectedly");
         }, [this, side](const char* error) { impl_->reportFailure(side, error); });
@@ -399,69 +446,170 @@ bool HkvlForceDriver::running() const {
   return impl_->running.load(std::memory_order_acquire);
 }
 
-void HkvlForceDriver::tare(
+HkvlTareResult HkvlForceDriver::tare(
     int side,
     int sampleCount,
     std::chrono::milliseconds timeout,
-    TareCommitCallback commitIfAllowed) {
+    TareCommitCallback commitIfAllowed,
+    TareProgressCallback progress) {
   std::scoped_lock tareOperation(impl_->tareMutex);
-  if (!running()) {
-    throw std::runtime_error("HKVL force driver is not running");
-  }
-  if (side < -1 || side >= 2 || sampleCount <= 0) {
+  if (side < -1 || side >= 2 || sampleCount < kHkvlTareMinSamples
+      || sampleCount > kHkvlTareMaxSamples || timeout.count() <= 0
+      || timeout.count() > kHkvlTareWindowTimeoutMs) {
     throw std::invalid_argument("invalid HKVL tare request");
   }
   const int first = side < 0 ? 0 : side;
   const int last = side < 0 ? 1 : side;
+  std::uint64_t generation;
   {
-    std::scoped_lock lock(impl_->sides[0].mutex, impl_->sides[1].mutex);
-    // 双侧先全部预检，避免一侧断连时另一侧留下已启动的去皮窗口。
-    for (int index = first; index <= last; ++index) {
-      if (!impl_->sides[index].connected) {
-        throw std::runtime_error(impl_->sides[index].port + " is not connected");
-      }
+    std::scoped_lock lifecycleLock(impl_->lifecycleMutex);
+    if (!running()) throw std::runtime_error("HKVL force driver is not running");
+    generation = impl_->generation.load();
+  }
+  const auto ensureCurrent = [&]() {
+    if (!running() || impl_->generation.load() != generation) {
+      throw std::runtime_error("HKVL reader stopped during tare");
     }
     if (commitIfAllowed && !commitIfAllowed([]() {})) {
       throw std::runtime_error("HKVL tare cancelled by emergency stop");
     }
+  };
+  const auto cancelCollection = [&]() {
+    std::scoped_lock lock(impl_->sides[0].mutex, impl_->sides[1].mutex);
     for (int index = first; index <= last; ++index) {
       auto& state = impl_->sides[index];
-      state.tarePending = true;
-      state.tareCancelled = false;
-      state.tareCommit = commitIfAllowed;
-      state.tareRemaining = sampleCount;
-      state.tareRequested = sampleCount;
-      state.tareSum = {};
+      // stop/start 已重置的新会话不属于本次操作，不写回旧偏置或取消新窗口。
+      if (state.tareGeneration == generation) {
+        state.tarePending = false;
+        state.tareCancelled = true;
+        state.tarePhase = Impl::TarePhase::idle;
+        state.tareCondition.notify_all();
+      }
     }
-  }
+  };
 
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  try {
+  const auto collect = [&](Impl::TarePhase phase,
+      const std::array<std::array<double, 6>, 2>& candidate) {
+    {
+      std::scoped_lock lock(impl_->sides[0].mutex, impl_->sides[1].mutex);
+      ensureCurrent();
+      // 两侧先全部预检，再同时打开采样窗口。
+      for (int index = first; index <= last; ++index) {
+        const auto& state = impl_->sides[index];
+        if (!state.connected || !state.hasSample) {
+          throw std::runtime_error(state.port + " is not ready");
+        }
+      }
+      for (int index = first; index <= last; ++index) {
+        auto& state = impl_->sides[index];
+        state.tarePending = true;
+        state.tareCancelled = false;
+        state.tarePhase = phase;
+        state.tareGeneration = generation;
+        ++state.tareWindowId;
+        state.tareRemaining = sampleCount;
+        state.tareWindowStartedMs = steadyMilliseconds();
+        state.tareFirstReceivedMs = 0.0;
+        state.tareLastReceivedMs = 0.0;
+        state.tareError.clear();
+        state.discardPartialBeforeNextBatch = true;
+        state.tareWindow.reset();
+        state.candidateBias = candidate[index];
+      }
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     for (int index = first; index <= last; ++index) {
       auto& state = impl_->sides[index];
       std::unique_lock lock(state.mutex);
-      while (state.tarePending && state.connected && running()) {
+      while (state.tarePending && state.connected && !state.tareCancelled) {
         // 即使串口不再来帧，也定期取消被急停失效的窗口。
-        if (commitIfAllowed && !commitIfAllowed([]() {})) {
-          throw std::runtime_error("HKVL tare cancelled by emergency stop");
-        }
+        ensureCurrent();
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) throw std::runtime_error(state.port + " tare timed out");
         state.tareCondition.wait_until(lock, std::min(deadline, now + std::chrono::milliseconds(10)));
       }
-      if (!running()) throw std::runtime_error("HKVL reader stopped during tare");
-      if (state.tareCancelled) throw std::runtime_error("HKVL tare cancelled by emergency stop");
-      if (!state.connected) throw std::runtime_error(state.port + " disconnected during tare");
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw std::runtime_error(state.port + " tare timed out");
+      }
+      ensureCurrent();
+      if (!state.tareError.empty()) throw std::runtime_error(state.tareError);
+      if (!state.connected || state.tareCancelled) {
+        throw std::runtime_error(state.port + " disconnected during tare");
+      }
     }
-  } catch (...) {
+    std::array<HkvlSampleStatistics, 2> statistics{};
+    std::scoped_lock lock(impl_->sides[0].mutex, impl_->sides[1].mutex);
+    ensureCurrent();
+    if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("HKVL tare timed out");
     for (int index = first; index <= last; ++index) {
-      auto& state = impl_->sides[index];
-      std::scoped_lock lock(state.mutex);
-      state.tarePending = false;
-      state.tareCancelled = true;
-      state.tareCommit = {};
-      state.tareCondition.notify_all();
+      const auto& state = impl_->sides[index];
+      if (!state.tareError.empty()) throw std::runtime_error(state.tareError);
+      if (!state.connected || state.tareCancelled) {
+        throw std::runtime_error(state.port + " disconnected during tare");
+      }
+      statistics[index] = state.tareWindow.statistics();
+      if (state.tareLastReceivedMs - state.tareFirstReceivedMs < kHkvlTareMinReceiveSpanMs) {
+        throw std::runtime_error(state.port + " tare receive window must span at least 100 ms");
+      }
     }
+    return statistics;
+  };
+
+  try {
+    if (progress) progress("checking_stability", 10);
+    const auto before = collect(Impl::TarePhase::stability, {});
+    std::array<std::array<double, 6>, 2> candidate{};
+    for (int index = first; index <= last; ++index) {
+      const auto blocker = hkvlTareStabilityBlocker(before[index]);
+      if (!blocker.empty()) {
+        throw std::runtime_error(std::string(index == 0 ? "left " : "right ") + blocker);
+      }
+      candidate[index] = before[index].mean;
+    }
+    if (progress) progress("taring", 50);
+    if (progress) progress("validating", 70);
+    // 残差仅针对候选零点计算；遥测和安全检查始终继续使用已生效的旧零点。
+    const auto after = collect(Impl::TarePhase::validation, candidate);
+    for (int index = first; index <= last; ++index) {
+      const auto blocker = hkvlTareResidualBlocker(after[index]);
+      if (!blocker.empty()) {
+        throw std::runtime_error(std::string(index == 0 ? "left " : "right ") + blocker);
+      }
+    }
+
+    HkvlTareResult result;
+    for (int index = first; index <= last; ++index) {
+      result.sides[index] = HkvlTareSideResult{candidate[index], before[index], after[index]};
+    }
+    {
+      std::scoped_lock lifecycleLock(impl_->lifecycleMutex);
+      std::scoped_lock lock(impl_->sides[0].mutex, impl_->sides[1].mutex);
+      ensureCurrent();
+      for (int index = first; index <= last; ++index) {
+        if (!impl_->sides[index].connected || impl_->sides[index].tareCancelled) {
+          throw std::runtime_error(impl_->sides[index].port + " disconnected during tare");
+        }
+      }
+      const auto commit = [&]() {
+        // 双侧验证全部成功，且安全代际仍有效时，才原子提交两个偏置。
+        for (int index = first; index <= last; ++index) {
+          auto& state = impl_->sides[index];
+          state.tareBias = candidate[index];
+          state.filterInitialized = false;
+          state.previousFilterMonotonicMs = 0.0;
+          state.tarePhase = Impl::TarePhase::idle;
+        }
+      };
+      if (commitIfAllowed) {
+        if (!commitIfAllowed(commit)) throw std::runtime_error("HKVL tare cancelled by emergency stop");
+      } else {
+        commit();
+      }
+    }
+    result.completedAtUnixMs = unixMilliseconds();
+    return result;
+  } catch (...) {
+    cancelCollection();
     throw;
   }
 }
@@ -469,9 +617,9 @@ void HkvlForceDriver::tare(
 HkvlDriverSnapshot HkvlForceDriver::snapshot(
     double nowMonotonicMs) const {
   HkvlDriverSnapshot snapshot;
+  std::scoped_lock lock(impl_->sides[0].mutex, impl_->sides[1].mutex);
   for (int side = 0; side < 2; ++side) {
     const auto& state = impl_->sides[side];
-    std::scoped_lock lock(state.mutex);
     auto& output = snapshot.sides[side];
     output.port = state.port;
     output.connected = state.connected;

@@ -34,6 +34,8 @@ class HalCommandDispatcher {
   std::string handleEmergencyStop();
 
  private:
+  void requireForceMutationSafe(const char* operation);
+
   LTDMCDriver& motion_;
   Omega7Driver& omega_;
   NativeTeleopController& nativeTeleop_;
