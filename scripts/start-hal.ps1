@@ -1,4 +1,4 @@
-# 阅读导航 08｜启动、部署与工具
+﻿# 阅读导航 08｜启动、部署与工具
 # 职责：部署候选 HAL 二进制和依赖 DLL，绑定 HKVL 端口、注入力配置并启动健康检查。
 # 先看：Stop-ProcessTree → Stop-HalRuntimeProcessTrees → Promote-HalCandidate → Copy-RuntimeDllIfNewer。
 # 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
@@ -138,6 +138,18 @@ function Copy-RuntimeDllIfNewer {
   }
 }
 
+function Assert-HalCapabilities {
+  param([object]$Health)
+
+  # 版本号不代表协议能力；旧程序可能使用相同版本号。
+  $missing = @("force_calibration_state_v1", "control_lease_v1" | Where-Object {
+      @($Health.capabilities) -cnotcontains $_
+    })
+  if ($missing.Count -gt 0) {
+    throw "HAL protocol capabilities missing: $($missing -join ', '). Rebuild and deploy both HalServer.exe and JodellGripperWorker.exe from the current branch."
+  }
+}
+
 function Resolve-HkvlBoundPort {
   param(
     [string]$Side,
@@ -171,6 +183,8 @@ $existing = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Sil
   Select-Object -ExpandProperty OwningProcess -First 1
 if ($existing) {
   if (!$Restart) {
+    $health = Invoke-RestMethod "http://127.0.0.1:$Port/health" -TimeoutSec 3
+    Assert-HalCapabilities -Health $health
     Write-Host "HAL already listening on 127.0.0.1:$Port, pid=$existing"
     exit 0
   }
@@ -369,7 +383,9 @@ Start-Sleep -Seconds 2
 
 try {
   $health = Invoke-RestMethod "http://127.0.0.1:$Port/health" -TimeoutSec 3
+  Assert-HalCapabilities -Health $health
 } catch {
+  Stop-ProcessTree -RootPid $process.Id
   throw "HAL started pid=$($process.Id), but /health failed: $($_.Exception.Message)"
 }
 

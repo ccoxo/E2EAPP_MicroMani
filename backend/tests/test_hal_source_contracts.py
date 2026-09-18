@@ -10,6 +10,18 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_native_dds_waits_for_command_and_reply_discovery_before_startup_commands() -> None:
+    source = (REPO_ROOT / "backend/native/appstation_fastdds_transport.cpp").read_text(encoding="utf-8")
+    start = source.split("  void start() {", 1)[1].split("  void close()", 1)[0]
+    assert "commandRequestWriter->get_publication_matched_status" in start
+    assert "emergencyStopWriter->get_publication_matched_status" in start
+    assert "commandReplyReader->get_subscription_matched_status" in start
+    assert "commandMatch.current_count > 0" in start
+    assert "emergencyMatch.current_count > 0" in start
+    assert "replyMatch.current_count > 0" in start
+    assert "std::chrono::steady_clock::now() < discoveryDeadline" in start
+
+
 def frontend_settings_source() -> str:
     """检查设置域的契约，不依赖硬件卡是否仍内联在页面壳层。"""
     views = REPO_ROOT / "frontend" / "src" / "views"
@@ -2374,8 +2386,8 @@ def test_hal_native_workers_and_dds_mapping_share_a_noexcept_failure_exit() -> N
     assert "catch (const std::exception& error)" in listener
     assert "catch (...)" in listener
     assert "reportControlFailure" in listener
-    assert "targetWriter_->write(&sample) != ReturnCode_t::RETCODE_OK" in mapping
-    assert "writer_->write(&sample) != ReturnCode_t::RETCODE_OK" in leader
+    assert "if (!targetWriter_->write(&sample))" in mapping
+    assert "if (!writer_->write(&sample))" in leader
 
 
 def test_hal_force_emergency_callback_failure_blocks_acknowledgement_and_is_visible() -> None:
@@ -2459,7 +2471,8 @@ def test_hal_dds_worker_failures_stop_control_and_do_not_continue_batches() -> N
     assert "nativeTeleop_.reportControlFailure(message);" in failure
     assert "forceRuntime_.recordExternalEmergencyStop" in failure
     assert source.count("if (!running.load()) break;") == 2
-    assert "replyWriter_->write(&reply) != ReturnCode_t::RETCODE_OK" in source
+    assert "if (!replyWriter_->write(&reply))" in source
+    assert "if (!writer->write(&sample))" in source
 
 
 def test_hal_dds_lease_uses_the_emergency_lane_and_regular_commands_expire() -> None:

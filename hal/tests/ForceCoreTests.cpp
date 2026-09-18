@@ -434,8 +434,8 @@ void testMotionAcknowledge() {
 
 void testForceConfigJson() {
   require(appstation::hal::jsonHealth({}, false, "").find(
-      "\"capabilities\":[\"force_calibration_state_v1\"]") != std::string::npos,
-      "health must advertise the implemented startup force calibration contract");
+      "\"capabilities\":[\"force_calibration_state_v1\",\"control_lease_v1\"]") != std::string::npos,
+      "health must advertise the implemented calibration and control lease contracts");
   require(
       appstation::hal::jsonForceRuntimeConfig("{}").source == "hkvl_serial",
       "force config without a source must default to HKVL");

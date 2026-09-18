@@ -430,6 +430,20 @@ struct AppStationFastDdsTransport {
       return;
     }
     readerThread = std::thread([this]() { readLoop(); });
+    // VOLATILE 命令在发现对端前发布会丢失；启动清理不能抢在端点匹配之前。
+    // 有界等待只用于启动，运行中的命令超时与隔离保护保持不变。
+    const auto discoveryDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (running && std::chrono::steady_clock::now() < discoveryDeadline) {
+      eprosima::fastdds::dds::PublicationMatchedStatus commandMatch, emergencyMatch;
+      eprosima::fastdds::dds::SubscriptionMatchedStatus replyMatch;
+      if (commandRequestWriter->get_publication_matched_status(commandMatch) == ReturnCode_t::RETCODE_OK
+          && emergencyStopWriter->get_publication_matched_status(emergencyMatch) == ReturnCode_t::RETCODE_OK
+          && commandReplyReader->get_subscription_matched_status(replyMatch) == ReturnCode_t::RETCODE_OK
+          && commandMatch.current_count > 0 && emergencyMatch.current_count > 0 && replyMatch.current_count > 0) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
   }
 
   void close() {

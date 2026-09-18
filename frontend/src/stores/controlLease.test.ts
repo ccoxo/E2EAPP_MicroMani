@@ -32,11 +32,14 @@ describe('主线程安全挑战与执行侧租约', () => {
     expect(controlLeaseBlockReason(publish.mock.calls.at(-1)![0], time)).toBeNull()
   })
 
-  it('定时器只能过期关闭，不能生成心跳', () => {
+  it('首次握手期间禁止控制，不按运行中心跳期限反复断连', () => {
     create()
     time = 2000
     vi.advanceTimersByTime(2000)
     expect(send).not.toHaveBeenCalled()
+    expect(close).not.toHaveBeenCalled()
+    time = 10_000
+    vi.advanceTimersByTime(8000)
     expect(close).toHaveBeenCalledTimes(1)
     expect(publish.mock.calls.at(-1)![0].status).toBe('expired')
   })
@@ -97,13 +100,54 @@ describe('主线程安全挑战与执行侧租约', () => {
     expect(controlLeaseBlockReason(publish.mock.calls.at(-1)![0], 2500)).toContain('过期')
   })
 
-  it('当前新挑战发出后旧确认不能替代它确认', () => {
+  it('新挑战到达后仍接受未过期的上一条确认，但不延长其原始期限', () => {
     const session = create()
     session.receive(challenge())
     time = 500
     session.receive(challenge('nonce-2'))
     session.receive(confirmation())
-    expect(publish.mock.calls.at(-1)![0].status).toBe('pending')
+    expect(publish.mock.calls.at(-1)![0]).toMatchObject({ status: 'active', expiresAt: 2500 })
+    time = 600
+    session.receive(confirmation('nonce-2'))
+    expect(publish.mock.calls.at(-1)![0].expiresAt).toBe(3000)
+    session.receive(confirmation())
+    expect(publish.mock.calls.at(-1)![0].expiresAt).toBe(3000)
+    expect(close).not.toHaveBeenCalled()
+  })
+
+  it('已过期的旧确认不影响仍新鲜的新确认', () => {
+    const session = create()
+    session.receive(challenge()); session.receive(confirmation())
+    time = 1500
+    session.receive(challenge('nonce-2')); session.receive(confirmation('nonce-2'))
+    time = 2100
+    session.receive(confirmation())
+    expect(close).not.toHaveBeenCalled()
+    expect(publish.mock.calls.at(-1)![0].expiresAt).toBe(4000)
+  })
+
+  it('连续一分钟确认延迟跨过下一次挑战时，健康会话不误过期', () => {
+    const session = create()
+    session.receive(challenge()); session.receive(confirmation())
+    for (let i = 1; i <= 120; i++) {
+      time = i * 500
+      session.receive(challenge(`nonce-${i}`))
+      if (i > 1) {
+        time += 100
+        session.receive(confirmation(`nonce-${i - 1}`))
+      }
+      expect(close).not.toHaveBeenCalled()
+      expect(controlLeaseBlockReason(publish.mock.calls.at(-1)![0], time)).toBeNull()
+    }
+  })
+
+  it('首个挑战延迟到达时可完成握手，未确认前始终拒绝控制', () => {
+    const session = create()
+    expect(controlLeaseBlockReason(undefined, 0)).not.toBeNull()
+    time = 3000
+    session.receive(challenge()); session.receive(confirmation())
+    expect(close).not.toHaveBeenCalled()
+    expect(publish.mock.calls.at(-1)![0]).toMatchObject({ status: 'active', expiresAt: 5500 })
   })
 
   it('即使挑战仍持续，执行侧确认已过期也不能继续回答旧会话', () => {

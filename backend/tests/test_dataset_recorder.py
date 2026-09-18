@@ -313,6 +313,59 @@ def test_dataset_recorder_saves_episode_with_parallel_encoding() -> None:
     assert "save_episode(parallel_encoding=True)" in source
 
 
+@pytest.mark.parametrize("setting", [None, "", "invalid"])
+def test_video_encoder_defaults_to_bounded_threads(monkeypatch, setting) -> None:
+    if setting is None:
+        monkeypatch.delenv("APPSTATION_LEROBOT_ENCODER_THREADS", raising=False)
+    else:
+        monkeypatch.setenv("APPSTATION_LEROBOT_ENCODER_THREADS", setting)
+    recorder = object.__new__(DatasetRecorderService)
+    assert recorder._native_writer_kwargs()["encoder_threads"] == 2
+
+
+def test_writer_rejects_encoder_drop_error_and_does_not_save() -> None:
+    saved = []
+    written = []
+
+    def add_frame(_frame):
+        raise RuntimeError("video encoder dropped frames: {'observation.images.global': 1}")
+
+    dataset = SimpleNamespace(
+        add_frame=add_frame,
+        save_episode=lambda **_kwargs: saved.append(True),
+    )
+    recorder = SimpleNamespace(
+        _episode_index=0,
+        _native_frame_payload=lambda frame: frame,
+        _mark_frame_written=written.append,
+        logs=SimpleNamespace(error=lambda *_args: None),
+    )
+    work_queue = queue.Queue()
+    writer = LeRobotWriterThread(recorder, work_queue)
+    writer._dataset = dataset
+    work_queue.put(dataset_recorder_module.PendingFrame(0, 0, 0.0, {"episode_index": 0}))
+    future = writer.submit("save_episode")
+    work_queue.put(None)
+    writer.start()
+    writer.join(2)
+    assert not writer.is_alive()
+    with pytest.raises(RuntimeError, match="encoder dropped.*global"):
+        future.result()
+    assert written == []
+    assert saved == []
+    dataset.clear_episode_buffer = lambda: None
+    cleared = Future()
+    writer._handle_command(WriterCommand("clear_episode", cleared))
+    assert cleared.result() is None
+    dataset.add_frame = lambda _frame: None
+    writer._write_frame({"episode_index": 0})
+    assert len(written) == 1
+    saved_future = Future()
+    writer._handle_command(WriterCommand("save_episode", saved_future))
+    assert saved_future.result() == 0
+    assert saved == [True]
+
+
 def test_lerobot_writer_keeps_dataset_open_after_saved_episode() -> None:
     class FakeDataset:
         def __init__(self) -> None:
@@ -1500,6 +1553,45 @@ def test_dataset_recorder_collect_frame_uses_timed_buffers() -> None:
     assert "CAMERA_SOURCE_KEYS" in source
 
 
+@pytest.mark.parametrize("source", ["hal", "omega", "force"])
+def test_dataset_sampler_reuses_event_loop_and_closes_it_on_stop(source, monkeypatch) -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    loops = []
+    recorder._session_active = True
+    recorder._sampler_stop_event = Event()
+    recorder._sampler_start_monotonic_s = time.monotonic()
+    recorder._recording_config_snapshot = {"hal": {"mode": "real"}}
+    recorder._source_sample_indices = {}
+    recorder._sample_buffers = {}
+    recorder.logs = SimpleNamespace(warning=lambda *_args: None)
+    recorder._source_sample_rate_hz = lambda *_args: 100.0
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def read_state():
+        loops.append(asyncio.get_running_loop())
+        if len(loops) == 3:
+            recorder._sampler_stop_event.set()
+        return {"sides": {"left": {"healthy": True}, "right": {"healthy": True}}}
+
+    async def timed_source(name, awaitable, target, **_kwargs):
+        return TimedSample(name, target, await awaitable)
+
+    recorder.hal = SimpleNamespace(motion_state=read_state, omega_state=read_state, force_state=read_state)
+    recorder._timed_source = timed_source
+    thread = Thread(target=recorder._sample_source_loop, args=(source,), daemon=True)
+    thread.start()
+    try:
+        thread.join(2.0)
+        assert not thread.is_alive()
+        assert len(loops) == 3
+        assert all(loop is loops[0] for loop in loops)
+        assert loops[0].is_closed()
+        assert len(recorder._sample_buffers[source]) == 3
+    finally:
+        recorder._sampler_stop_event.set()
+        thread.join(1.0)
+
+
 def test_dataset_sampler_pauses_hardware_sampling_between_episodes() -> None:
     recorder = object.__new__(DatasetRecorderService)
     sampled = Event()
@@ -1514,7 +1606,7 @@ def test_dataset_sampler_pauses_hardware_sampling_between_episodes() -> None:
     recorder.logs = SimpleNamespace(warning=lambda *_args: None)
     recorder._source_sample_rate_hz = lambda _source, _config: 100.0
 
-    def sample_once(source: str, _config: dict[str, object], target_s: float) -> TimedSample:
+    def sample_once(source: str, _config: dict[str, object], target_s: float, **_kwargs) -> TimedSample:
         sampled.set()
         return TimedSample(source, target_s, {"ok": True})
 
@@ -1648,6 +1740,37 @@ def test_dataset_recorder_sample_buffer_covers_warmup_delay_jitter_and_lookback(
     )
 
     assert retention == pytest.approx(3.0)
+
+
+def test_sample_history_is_bounded_by_assembly_not_encoded_write_backlog() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._record_fps_hz = 30
+    recorder._force_sample_hz = 200
+    config = default_config()
+    config["storage"]["recordFps"] = 30
+    config["cameras"]["fps"] = 30
+    buffers = recorder._new_sample_buffers(config)
+    expected = (
+        dataset_recorder_module.ASSEMBLY_QUEUE_MAX_FRAMES / 30
+        + dataset_recorder_module.WRITE_QUEUE_PUT_TIMEOUT_S
+        + dataset_recorder_module.ASSEMBLY_QUEUE_PUT_TIMEOUT_S
+        + dataset_recorder_module.RECORDER_HARDWARE_WARMUP_S
+        + dataset_recorder_module.MAX_SAMPLE_JITTER_S
+        + dataset_recorder_module.SAMPLE_LOOKBACK_WINDOW_S
+    )
+    assert buffers["camera_global"].retention_s == pytest.approx(expected)
+    # 模拟长录制：采样历史在窗口填满后保持恒定，并保留组帧积压所需的旧帧。
+    sizes = []
+    for index in range(90 * 30):
+        for source in ("camera_global", "camera_wrist_left", "camera_wrist_right"):
+            buffers[source].append(TimedSample(source, index / 30, index))
+        if index in (30 * 30 - 1, 60 * 30 - 1, 90 * 30 - 1):
+            sizes.append(len(buffers["camera_global"]))
+    assert max(sizes) - min(sizes) <= 1
+    assert max(sizes) <= round(expected * 30) + 1
+    target = 89.0 - dataset_recorder_module.ASSEMBLY_QUEUE_MAX_FRAMES / 30
+    assert buffers["camera_global"].nearest(target, 0.001).value == round(target * 30)
+    assert buffers["camera_global"].nearest(40.0, 0.001) is None
 
 
 def test_dataset_recorder_source_sample_time_uses_source_frequency() -> None:
@@ -1832,6 +1955,26 @@ def test_native_preflight_does_not_import_lerobot_record_script() -> None:
 
     assert "lerobot.scripts.lerobot_record" not in source
     assert "lerobot.datasets.lerobot_dataset" in source
+
+
+def test_native_preflight_keeps_event_loop_responsive(monkeypatch) -> None:
+    async def run_case() -> None:
+        recorder = object.__new__(DatasetRecorderService)
+        heartbeat = Event()
+        observed = []
+
+        def preflight() -> str:
+            observed.append(heartbeat.wait(0.3))
+            return "missing test dependency"
+
+        monkeypatch.setattr(recorder, "_native_recording_requested", lambda: True)
+        monkeypatch.setattr(recorder, "_native_preflight", preflight)
+        asyncio.get_running_loop().call_later(0.02, heartbeat.set)
+        assert not await recorder._try_begin_native_dataset({})
+        assert observed == [True], "依赖预检阻塞了心跳事件循环"
+        assert recorder._native_error == "missing test dependency"
+
+    asyncio.run(run_case())
 
 
 def test_dataset_recorder_falls_back_when_native_lerobot_unavailable(monkeypatch) -> None:

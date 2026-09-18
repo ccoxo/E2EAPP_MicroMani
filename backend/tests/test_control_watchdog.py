@@ -263,6 +263,53 @@ def test_renewal_acknowledges_only_challenges_captured_before_dispatch() -> None
     asyncio.run(exercise())
 
 
+def test_websocket_heartbeats_do_not_wait_for_initial_telemetry(tmp_path, monkeypatch) -> None:
+    from backend.app import create_app
+    from starlette.websockets import WebSocketState
+
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    app = create_app(tmp_path)
+    app.state.telemetry.hardware = None
+
+    async def exercise() -> None:
+        active = asyncio.Event()
+        inbox = asyncio.Queue()
+
+        async def blocked_health():
+            await asyncio.Event().wait()
+
+        class Socket:
+            client_state = WebSocketState.CONNECTED
+
+            async def accept(self):
+                pass
+
+            async def send_json(self, message):
+                if message["type"] == "safety_challenge":
+                    await inbox.put({"type": "safety_heartbeat", "data": message["data"]})
+                if message["type"] == "control_lease" and message["data"]["status"] == "active":
+                    active.set()
+
+            async def receive_json(self):
+                return await inbox.get()
+
+        app.state.hal.health = blocked_health
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", "") == "/ws")
+        task = asyncio.create_task(endpoint(Socket()))
+        try:
+            await asyncio.wait_for(active.wait(), 0.5)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            await app.state.control_watchdog.close()
+            app.state.telemetry.shutdown()
+
+    asyncio.run(exercise())
+
+
 def test_websocket_main_thread_stall_triggers_full_backend_emergency(tmp_path, monkeypatch) -> None:
     from backend.app import create_app
     from starlette.websockets import WebSocketState

@@ -59,6 +59,30 @@ class FakeDdsTransport:
         return self.replies.get(request_id)
 
 
+def test_recording_sources_can_read_concurrently_without_competing_for_two_slots():
+    from threading import Barrier
+
+    async def exercise():
+        transport = FakeDdsTransport()
+        barrier = Barrier(3, timeout=1)
+
+        def get_latest(topic):
+            barrier.wait()
+            return JsonEnvelope(stamp_unix_ms=100_000, stamp_monotonic_ms=456,
+                                source="test", payload_json=json.dumps({"topic": topic}))
+
+        transport.get_latest = get_latest
+        client = DdsHalClient(LogService(emit_startup=False), transport=transport, state_timeout_s=2)
+        try:
+            values = await asyncio.gather(client.motion_state(), client.omega_state(), client.force_state())
+            assert [item["topic"] for item in values] == [TOPIC_HAL_MOTION_STATE, TOPIC_HAL_OMEGA_STATE, TOPIC_HAL_FORCE_STATE]
+        finally:
+            barrier.abort()
+            await client.aclose()
+
+    asyncio.run(exercise())
+
+
 def test_dds_hal_client_reads_health_from_topic_cache() -> None:
     transport = FakeDdsTransport()
     transport.latest[TOPIC_HAL_HEALTH] = JsonEnvelope(

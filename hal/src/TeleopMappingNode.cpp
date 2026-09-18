@@ -407,7 +407,7 @@ struct TeleopMappingNode::Impl {
     if (!enabled || !targetWriter_) return;
     // NativeTeleopController 生成的进程内目标在这里转换为 DDS 线格式。
     auto sample = toSample(target);
-    if (targetWriter_->write(&sample) != ReturnCode_t::RETCODE_OK) {
+    if (!targetWriter_->write(&sample)) {
       throw std::runtime_error("Fast-DDS hardware target publication failed");
     }
   }

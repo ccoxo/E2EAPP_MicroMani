@@ -3228,7 +3228,7 @@ def test_real_record_session_requires_hardware_recognition_before_start(
     client = TestClient(create_app(tmp_path))
     config = client.get("/api/settings").json()
     config["teleop"]["engine"] = "hal_native"
-    assert client.put("/api/settings", json=config).status_code == 200
+    client.app.state.settings.save_config(config)
     start_calls: list[str] = []
     include_gripper_values: list[bool] = []
 
@@ -3238,7 +3238,8 @@ def test_real_record_session_requires_hardware_recognition_before_start(
 
     monkeypatch.setattr(client.app.state.recorder, "start_session", fake_start_session)
 
-    def fake_hardware_status(*, include_gripper: bool = True) -> dict[str, Any]:
+    def fake_hardware_status(*, include_gripper: bool = True, include_pico: bool = True) -> dict[str, Any]:
+        assert include_pico is False
         include_gripper_values.append(include_gripper)
         return {
             "camera": {"ok": False, "message": "cameras not ready"},
@@ -3303,7 +3304,7 @@ def test_native_record_session_rejects_failed_hal_native_gripper_status(
     client = TestClient(create_app(tmp_path))
     config = client.get("/api/settings").json()
     config["teleop"]["engine"] = "hal_native"
-    assert client.put("/api/settings", json=config).status_code == 200
+    client.app.state.settings.save_config(config)
     client.app.state.teleop_mapper._native_status_cache = {
         "running": True,
         "gripperTargets": [8.0, 9.0],
@@ -3319,7 +3320,8 @@ def test_native_record_session_rejects_failed_hal_native_gripper_status(
         start_calls.append("start")
         return {"recording": True}
 
-    def fake_hardware_status(*, include_gripper: bool = True) -> dict[str, Any]:
+    def fake_hardware_status(*, include_gripper: bool = True, include_pico: bool = True) -> dict[str, Any]:
+        assert include_pico is False
         include_gripper_values.append(include_gripper)
         return {
             "camera": {"ok": True, "message": "cameras ready"},

@@ -97,6 +97,11 @@ class DdsHalClient(HalClient):
         self._emergency_lane = BoundedLane("dds-emergency", 1)
         self._lease_lane = BoundedLane("dds-lease", 1)
         self._state_lane = BoundedLane("dds-state", 2)
+        # 录制各源与健康查询并发读取，不能争抢同一对名额；每类仍有界且超时不释放阻塞调用。
+        self._motion_state_lane = BoundedLane("dds-motion-state", 2)
+        self._omega_state_lane = BoundedLane("dds-omega-state", 2)
+        self._force_state_lane = BoundedLane("dds-force-state", 2)
+        self._teleop_state_lane = BoundedLane("dds-teleop-state", 2)
         self._close_lane = BoundedLane("dds-close", 1)
         self._closed = False
         self._control_transport_failed = False
@@ -144,7 +149,7 @@ class DdsHalClient(HalClient):
         if self._control_transport_failed and (not stop_or_read or name == "hal.reconnect"):
             raise RuntimeError("DDS control transport is quarantined after a blocked call; restart required")
         if name == "teleop.native.status":
-            cached_status = await self._state_lane.run(self._read_cached_native_teleop_status, self.state_timeout_s)
+            cached_status = await self._teleop_state_lane.run(self._read_cached_native_teleop_status, self.state_timeout_s)
             if cached_status is not None:
                 return {"mode": "real", "transport": "dds", "command": name, "response": cached_status}
 
@@ -219,23 +224,24 @@ class DdsHalClient(HalClient):
             self.on_control_transport_fault(reason)
 
     async def motion_state(self) -> dict[str, Any]:
-        return await self._state_lane.run(
+        return await self._motion_state_lane.run(
             lambda: self._read_cached_payload(TOPIC_HAL_MOTION_STATE), self.state_timeout_s,
         )
 
     async def omega_state(self) -> dict[str, Any]:
-        return await self._state_lane.run(
+        return await self._omega_state_lane.run(
             lambda: self._read_cached_payload(TOPIC_HAL_OMEGA_STATE), self.state_timeout_s,
         )
 
     async def force_state(self) -> dict[str, Any]:
-        return await self._state_lane.run(
+        return await self._force_state_lane.run(
             lambda: self._read_cached_payload(TOPIC_HAL_FORCE_STATE), self.state_timeout_s,
         )
 
     def close(self) -> None:
         self._closed = True
-        lanes = (self._command_lane, self._emergency_lane, self._lease_lane, self._state_lane)
+        lanes = (self._command_lane, self._emergency_lane, self._lease_lane, self._state_lane,
+                 self._motion_state_lane, self._omega_state_lane, self._force_state_lane, self._teleop_state_lane)
         for lane in lanes:
             lane.close()
         if any(lane.active for lane in lanes):

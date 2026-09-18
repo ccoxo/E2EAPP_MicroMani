@@ -24,13 +24,13 @@ class HardwareService:
         self.gripper = Rs485GripperDriver()
         self.pico = PicoAdbDriver()
 
-    def status(self, *, include_gripper: bool = True) -> dict[str, Any]:
+    def status(self, *, include_gripper: bool = True, include_pico: bool = True) -> dict[str, Any]:
         config = self.settings.get_config()
         camera = self.cameras.probe(config)
         force_source = str(config.get("force", {}).get("source", "hkvl_serial")).lower()
         force = self.force.probe(config) if force_source == "nidaq" else None
         gripper = self.gripper.probe(config) if include_gripper else None
-        pico = self.pico.status(config)
+        pico = self.pico.status(config) if include_pico else None
         return {
             "camera": {
                 "ok": camera.ok,
@@ -56,5 +56,8 @@ class HardwareService:
                 if gripper is not None
                 else {"ok": None, "message": "managed by HAL-native gripper"}
             ),
-            "pico": {"ok": pico.ok, "message": pico.message, "stdout": pico.stdout, "stderr": pico.stderr},
+            "pico": (
+                {"ok": pico.ok, "message": pico.message, "stdout": pico.stdout, "stderr": pico.stderr}
+                if pico is not None else {"ok": None, "message": "not probed"}
+            ),
         }

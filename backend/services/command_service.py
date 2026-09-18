@@ -51,6 +51,8 @@ from backend.services.telemetry_hub import TelemetryHub
 
 AXIS_ORDER = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
 AXIS_LABELS = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
+# 与 LTDMCDriver.cpp 的回工作原点免移动范围一致，避免 HAL 已到位而后端永远拒绝确认。
+WORK_ORIGIN_SETTLED_PULSE_TOLERANCE = 100.0
 MANUAL_AXIS_STEP_LIMIT_PULSE = 100000.0
 MANUAL_TRANSLATION_STEP_LIMIT_UM = 5000.0
 MANUAL_ROTATION_STEP_LIMIT_DEG = 2.0
@@ -156,7 +158,7 @@ class CommandService:
             confirmed = fresh and not state.get("estop_active", False) and isinstance(moving, list) and len(moving) == 12
             for side, target in targets.items():
                 offset = 0 if side == "left" else 6
-                confirmed = confirmed and all(moving[offset + axis] is False and abs(pulses[offset + axis] - target[axis]) <= 1.0 for axis in range(6))
+                confirmed = confirmed and all(moving[offset + axis] is False and abs(pulses[offset + axis] - target[axis]) <= WORK_ORIGIN_SETTLED_PULSE_TOLERANCE for axis in range(6))
             if confirmed:
                 return
             if time.monotonic() >= deadline:

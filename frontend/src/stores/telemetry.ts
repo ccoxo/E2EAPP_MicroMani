@@ -1534,7 +1534,13 @@ startBackend: () => {
         if (!connectionIsCurrent() || get().backendWs !== ws || ws.readyState !== WebSocket.OPEN) throw new Error('控制会话已经断开')
         ws.send(message)
       },
-      close: () => ws.close(),
+      close: (reason) => {
+        try {
+          set((state) => ({ logs: appendLog(state.logs, makeLog('WARNING', `安全租约关闭连接：${reason}`, '[SAFETY]')) }))
+        } finally {
+          ws.close()
+        }
+      },
       publish: (controlLease) => {
         if (!connectionIsCurrent() || get().backendWs !== ws) return
         const invalidated = get().controlLease.status === 'active' && controlLease.status !== 'active'

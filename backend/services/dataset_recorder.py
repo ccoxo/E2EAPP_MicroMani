@@ -30,6 +30,10 @@ from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from typing import Any
 
+from backend.services.recording_diagnostics import RecordingDiagnostics
+from backend.services.process_video_encoder import isolate_dataset_encoder
+from backend.services.recording_gc import RecordingGcScope
+
 from backend.core.config import SettingsService
 from backend.core.data_contract import (
     data_contract_metadata,
@@ -275,12 +279,24 @@ class LeRobotWriterThread:
 
     def _write_frame(self, frame: dict[str, Any]) -> None:
         """将仍属于当前 episode 的帧转换为 native payload 并写入数据集。"""
+        if self._error:
+            return
         if int(frame.get("episode_index", self._recorder._episode_index)) != self._recorder._episode_index:
             return
         if self._dataset is None:
             raise RuntimeError("native LeRobot writer is not open")
         native_frame = self._recorder._native_frame_payload(frame)
+        diagnostic = getattr(self._recorder, "_recording_diagnostics", None)
+        write_started = time.monotonic() if diagnostic is not None else 0.0
         self._dataset.add_frame(native_frame)
+        if diagnostic is not None:
+            encoder = getattr(getattr(self._dataset, "writer", None), "_streaming_encoder", None)
+            diagnostic.emit("write", episode=frame.get("episode_index"), frame=frame.get("frame_index"),
+                            video_s=frame.get("timestamp"), elapsed_ms=(time.monotonic() - write_started) * 1000,
+                            write_queue=self._queue.qsize(),
+                            encoder_queues=getattr(encoder, "queue_depths", None) or
+                            {key: q.qsize() for key, q in getattr(encoder, "_frame_queues", {}).items()},
+                            encoder_drops=dict(getattr(encoder, "_dropped_frames", {})))
         self._recorder._mark_frame_written(frame)
 
     def _native_total_frames(self) -> int:
@@ -400,7 +416,8 @@ class TimedRingBuffer:
                 index = bisect_left([item.monotonic_s for item in samples], sample.monotonic_s)
                 samples.insert(index, sample)
                 self._samples = deque(samples)
-            latest_s = max(item.monotonic_s for item in self._samples)
+            # 缓存始终按时间排序，高频追加无需反复扫描整个历史。
+            latest_s = self._samples[-1].monotonic_s
             self._prune_locked(latest_s - self.retention_s)
             while len(self._samples) > self.maxlen:
                 self._samples.popleft()
@@ -616,6 +633,9 @@ class DatasetRecorderService:
         try:
             await asyncio.to_thread(self._write_appstation_info, dataset_dir, config)
             episode_index = await asyncio.to_thread(self._next_episode_index, dataset_dir)
+            self._recording_gc_scope = RecordingGcScope()
+            # 建立录制时间轴前完成；此处不跨 await，避免取消启动后遗留冻结状态。
+            self._recording_gc_scope.start()
             sample_clock_now_s, schedule_now_s = await self._episode_clock_pair(config)
             async with self._lock:
                 self.safety.check(safety_token)
@@ -810,6 +830,15 @@ class DatasetRecorderService:
         return await asyncio.to_thread(self.status)
 
     async def finish_session(self) -> dict[str, Any]:
+        try:
+            return await self._finish_session()
+        finally:
+            gc_scope = getattr(self, "_recording_gc_scope", None)
+            if gc_scope is not None:
+                gc_scope.close()
+                self._recording_gc_scope = None
+
+    async def _finish_session(self) -> dict[str, Any]:
         """结束当前录制会话，停止采样、组帧、写入和 teleop 任务。"""
         pending = getattr(self, "_interruption_task", None)
         if pending is not None:
@@ -858,6 +887,12 @@ class DatasetRecorderService:
         await run_cleanup("samplers", self._stop_sampler_tasks)
         await run_cleanup("native dataset", self._finalize_native_dataset)
         await run_cleanup("writer", self._stop_writer_task)
+        diagnostic = getattr(self, "_recording_diagnostics", None)
+        if diagnostic is not None:
+            await asyncio.to_thread(diagnostic.close)
+            self._recording_diagnostics = None
+            if diagnostic.error:
+                self.logs.warning("[LEROBOT]", f"recording diagnostics failed: {diagnostic.error}")
         if cleanup_error is not None:
             raise cleanup_error
         self.logs.info("[LEROBOT]", "record session finished")
@@ -1509,7 +1544,9 @@ class DatasetRecorderService:
         fps = max(1, self._record_fps_from_config(config))
         consumer_delay_s = self._positive_ratio(
             storage.get("maxConsumerLatencyS"),
-            WRITE_QUEUE_MAX_FRAMES / fps,
+            # 写入队列中的帧已持有图像引用，不需要采样历史再保留一份同样长的窗口。
+            # 历史只覆盖尚未组装的任务及两级队列的有界等待时间。
+            ASSEMBLY_QUEUE_MAX_FRAMES / fps + ASSEMBLY_QUEUE_PUT_TIMEOUT_S + WRITE_QUEUE_PUT_TIMEOUT_S,
         )
         jitter_s = self._positive_ratio(storage.get("maxSampleJitterS"), MAX_SAMPLE_JITTER_S)
         lookback_s = self._positive_ratio(storage.get("sampleLookbackWindowS"), SAMPLE_LOOKBACK_WINDOW_S)
@@ -1576,7 +1613,8 @@ class DatasetRecorderService:
         if not self._native_recording_requested():
             self._native_error = "native LeRobot disabled by APPSTATION_LEROBOT_NATIVE"
             return False
-        preflight = self._native_preflight()
+        # 首次导入 LeRobot/编码器可能较慢，不能阻塞同一事件循环中的安全心跳。
+        preflight = await asyncio.to_thread(self._native_preflight)
         if preflight:
             self._native_error = preflight
             return False
@@ -1620,6 +1658,12 @@ class DatasetRecorderService:
 
     def _start_sampler_tasks_locked(self) -> None:
         """在持锁状态下启动每个硬件源对应的后台采样线程。"""
+        if (os.environ.get("APPSTATION_RECORDING_DIAGNOSTICS", "0") == "1"
+                and getattr(self, "_recording_diagnostics", None) is None):
+            path = Path(__file__).resolve().parents[1] / "runtime" / f"record-trace-{uuid.uuid4().hex}.jsonl"
+            self._recording_diagnostics = RecordingDiagnostics(path)
+            self._recording_diagnostics.start()
+            self.logs.info("[LEROBOT]", f"recording diagnostics (180s): {path}")
         self._sampler_stop_event.clear()
         for source in SOURCE_KEYS:
             thread = self._sampler_threads.get(source)
@@ -1742,6 +1786,11 @@ class DatasetRecorderService:
 
     def _sample_source_loop(self, source: str) -> None:
         """按源采样频率循环采样硬件数据并写入时间缓存。"""
+        # 每个采样线程复用自己的事件循环，退出时统一释放，避免高频创建 IOCP。
+        with asyncio.Runner() as runner:
+            self._sample_source_loop_with_runner(source, runner)
+
+    def _sample_source_loop_with_runner(self, source: str, runner: asyncio.Runner) -> None:
         # Source samplers run in ordinary threads so slow hardware calls cannot
         # block the asyncio event loop that drives UI commands and status.
         sample_epoch_s = 0.0
@@ -1767,6 +1816,7 @@ class DatasetRecorderService:
                 period_s = 1.0 / rate_hz
                 relative_sample_s = self._source_sample_timestamp_s(source, sample_index, config)
                 next_schedule_s = schedule_epoch_s + relative_sample_s
+                original_schedule_s = next_schedule_s
                 now = time.monotonic()
                 if now > next_schedule_s + period_s:
                     sample_index = max(sample_index, int(math.floor((now - schedule_epoch_s) * rate_hz)))
@@ -1776,7 +1826,15 @@ class DatasetRecorderService:
                     if self._sampler_stop_event.wait(next_schedule_s - now):
                         return
                 target_s = sample_epoch_s + self._source_sample_timestamp_s(source, sample_index, config)
-                sample = self._sample_source_once_sync(source, config, target_s)
+                diagnostic = getattr(self, "_recording_diagnostics", None)
+                read_started = time.monotonic() if diagnostic is not None else 0.0
+                sample = self._sample_source_once_sync(source, config, target_s, runner=runner)
+                read_finished = time.monotonic() if diagnostic is not None else 0.0
+                if diagnostic is not None and (source in CAMERA_KEY_BY_SOURCE or read_finished - original_schedule_s > 0.02):
+                    diagnostic.emit("sample", source=source, episode=self._episode_index,
+                                    sample_index=sample_index, target_s=target_s, capture_s=sample.monotonic_s,
+                                    started_s=read_started, read_ms=(read_finished - read_started) * 1000,
+                                    wake_lateness_ms=max(0, read_started - original_schedule_s) * 1000)
                 if sample_epoch_s != self._sampler_start_monotonic_s:
                     continue
                 self._sample_buffers.setdefault(source, TimedRingBuffer()).append(sample)
@@ -1852,14 +1910,17 @@ class DatasetRecorderService:
                 missing.add(source)
         return missing
 
-    def _sample_source_once_sync(self, source: str, config: dict[str, Any], target_s: float) -> TimedSample:
+    def _sample_source_once_sync(
+        self, source: str, config: dict[str, Any], target_s: float, *, runner: asyncio.Runner | None = None
+    ) -> TimedSample:
         """按源类型执行一次同步采样，并返回带时间戳的样本。"""
+        run = runner.run if runner is not None else asyncio.run
         if source == "hal":
-            return asyncio.run(self._timed_source("hal", self.hal.motion_state(), target_s, record_quality=False))
+            return run(self._timed_source("hal", self.hal.motion_state(), target_s, record_quality=False))
         if source == "omega":
-            return asyncio.run(self._timed_source("omega", self.hal.omega_state(), target_s, record_quality=False))
+            return run(self._timed_source("omega", self.hal.omega_state(), target_s, record_quality=False))
         if source == "force":
-            return self._sample_force_source_sync(config, target_s)
+            return self._sample_force_source_sync(config, target_s, runner=runner)
         if source == "gripper":
             return self._gripper_source_sync(config, target_s, record_quality=False)
         camera = CAMERA_KEY_BY_SOURCE.get(source)
@@ -1867,7 +1928,9 @@ class DatasetRecorderService:
             return self._sample_camera_source_sync(config, camera, target_s)
         return self._fallback_sample(source, target_s, f"{source} unsupported")
 
-    def _sample_force_source_sync(self, config: dict[str, Any], target_s: float) -> TimedSample:
+    def _sample_force_source_sync(
+        self, config: dict[str, Any], target_s: float, *, runner: asyncio.Runner | None = None
+    ) -> TimedSample:
         """同步读取力传感器样本并记录采样耗时和时间戳。"""
         value: Any
         if not self._real_hardware_mode(config):
@@ -1883,7 +1946,8 @@ class DatasetRecorderService:
         source = str(config.get("force", {}).get("source", "hkvl_serial")).lower()
         try:
             if source == "hkvl_serial":
-                value = asyncio.run(self.hal.force_state())
+                run = runner.run if runner is not None else asyncio.run
+                value = run(self.hal.force_state())
                 self._latest_force_state = dict(value)
                 sides = value.get("sides", {}) if isinstance(value, dict) else {}
                 left_status = sides.get("left", {}) if isinstance(sides, dict) else {}
@@ -1987,6 +2051,12 @@ class DatasetRecorderService:
             fallback = self._fallback_sample(source, target_s, sample.message or f"{source} missing")
             sample = replace(sample, value=fallback.value, stale=True)
         self._record_source_quality(sample, target_s, sample.elapsed_ms)
+        diagnostic = getattr(self, "_recording_diagnostics", None)
+        if diagnostic is not None and source in CAMERA_KEY_BY_SOURCE:
+            diagnostic.emit("selected_camera", episode=self._episode_index, source=source,
+                            video_s=(target_s - self._sampler_start_monotonic_s - RECORDER_HARDWARE_WARMUP_S),
+                            target_s=target_s, capture_s=sample.monotonic_s,
+                            stale=sample.stale, cache_used=sample.cache_used)
         return sample
 
     def _fallback_sample(self, source: str, target_s: float, message: str) -> TimedSample:
@@ -2114,8 +2184,16 @@ class DatasetRecorderService:
                     await asyncio.sleep(scheduled_tick - now)
                 if not await self._frame_job_is_current(job):
                     continue
+                diagnostic = getattr(self, "_recording_diagnostics", None)
+                assembly_started = time.monotonic() if diagnostic is not None else 0.0
                 frame = await self._collect_frame(job.target_monotonic_s, frame_index=job.frame_index)
                 capture_tick = time.monotonic()
+                if diagnostic is not None:
+                    diagnostic.emit("assembly", episode=job.episode_index, frame=job.frame_index,
+                                    video_s=frame["timestamp"], target_s=job.target_monotonic_s,
+                                    scheduled_s=scheduled_tick, started_s=assembly_started,
+                                    elapsed_ms=(capture_tick - assembly_started) * 1000,
+                                    assembly_queue=assembly_queue.qsize(), write_queue=self._write_queue.qsize())
                 pending = PendingFrame(
                     episode_index=job.episode_index,
                     frame_index=job.frame_index,
@@ -3083,6 +3161,7 @@ class DatasetRecorderService:
                     **self._native_writer_kwargs(),
                 )
             self._configure_native_chunk_settings(dataset)
+            isolate_dataset_encoder(dataset)
             return dataset
         except Exception as exc:  # noqa: BLE001
             self._native_error = str(exc)
@@ -3194,15 +3273,15 @@ class DatasetRecorderService:
         except ValueError:
             return 180
 
-    def _native_encoder_threads(self) -> int | None:
-        """从环境变量读取视频编码线程数，缺失或非法时交由默认值处理。"""
+    def _native_encoder_threads(self) -> int:
+        """默认每路使用两个编码线程，为相机采样和硬件状态读取保留调度余量。"""
         raw = os.environ.get("APPSTATION_LEROBOT_ENCODER_THREADS", "").strip()
         if not raw:
-            return None
+            return 2
         try:
             return max(1, int(raw))
         except ValueError:
-            return None
+            return 2
 
     def _native_vcodec(self) -> str:
         """读取 native 视频编码器名称，未配置时使用 h264。"""
@@ -3222,6 +3301,7 @@ class DatasetRecorderService:
             **self._native_writer_kwargs(),
         )
         self._configure_native_chunk_settings(dataset)
+        isolate_dataset_encoder(dataset)
         return dataset
 
     def _is_native_dataset_info(self, info: dict[str, Any]) -> bool:

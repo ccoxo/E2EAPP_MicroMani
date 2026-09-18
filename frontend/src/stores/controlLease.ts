@@ -43,8 +43,9 @@ export function createControlLeaseSession(options: LeaseSessionOptions) {
   let stopped = false
   let sessionId: string | null = null
   let lastChallengeAt = now()
-  let currentChallengeTtl = challengeTimeoutMs
-  let response: { challengeId: string; respondedAt: number; deadline: number } | null = null
+  // 首次握手尚无控制权，可等待连接及首个挑战；收到挑战后恢复严格的 2 秒期限。
+  let currentChallengeTtl = 10_000
+  const responses = new Map<string, { respondedAt: number; deadline: number }>()
   let state = initialControlLease()
   let timer: ReturnType<typeof setTimeout> | undefined
   const answered = new Set<string>()
@@ -93,9 +94,16 @@ export function createControlLeaseSession(options: LeaseSessionOptions) {
         sessionId = data.sessionId
         lastChallengeAt = time
         currentChallengeTtl = data.ttlMs
-        response = { challengeId: data.challengeId, respondedAt: time, deadline: time + data.ttlMs }
+        for (const [id, response] of responses) {
+          if (time >= response.deadline) responses.delete(id)
+        }
+        responses.set(data.challengeId, { respondedAt: time, deadline: time + data.ttlMs })
         answered.add(data.challengeId)
-        if (answered.size > 128) answered.delete(answered.values().next().value!)
+        if (answered.size > 128) {
+          const oldest = answered.values().next().value!
+          answered.delete(oldest)
+          responses.delete(oldest)
+        }
         options.send(JSON.stringify({ type: 'safety_heartbeat', data: { sessionId, challengeId: data.challengeId } }))
         if (state.sessionId === null) publish({ ...state, sessionId })
         watchDeadline()
@@ -108,11 +116,16 @@ export function createControlLeaseSession(options: LeaseSessionOptions) {
         return true
       }
       if (data.status !== 'active' || !validTtl(data.ttlMs, executionLeaseTimeoutMs)) throw new Error('执行侧安全租约确认无效')
-      if (!response || data.challengeId !== response.challengeId) return true
-      if (time >= response.deadline) { revoke('执行侧租约确认迟到，旧控制会话已失效'); return true }
+      if (!token(data.challengeId)) throw new Error('执行侧安全租约挑战标识无效')
+      const response = responses.get(data.challengeId)
+      if (!response) return true
+      responses.delete(data.challengeId)
+      if (time >= response.deadline) return true
       // 截止时间从本主线程回答挑战时算起，迟到确认不能延长授权。
       const expiresAt = response.respondedAt + data.ttlMs
       if (expiresAt <= time) { revoke('执行侧安全租约已过期'); return true }
+      // 新挑战与上一条确认可以交错到达；只接受原期限内的确认，旧确认不能回退或延长新租约。
+      if (state.expiresAt !== null && expiresAt <= state.expiresAt) return true
       publish({ required: true, status: 'active', sessionId, expiresAt, reason: '' })
       watchDeadline()
     } catch (error) {

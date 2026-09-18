@@ -231,7 +231,7 @@ struct TeleopLeaderPublisher::Impl {
     sample.stamp_monotonic_ms = monotonicMs();
     sample.source = "hal-master";
     sample.payload_json = payloadJson;
-    if (writer_->write(&sample) != ReturnCode_t::RETCODE_OK) {
+    if (!writer_->write(&sample)) {
       throw std::runtime_error("Fast-DDS leader state publication failed");
     }
   }

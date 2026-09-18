@@ -692,7 +692,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if not bool(omega_status.get("ok", False)):
             failures.append(str(omega_status.get("message") or "Omega.7 devices not recognized"))
 
-        hardware_status = await asyncio.to_thread(hardware.status, include_gripper=False)
+        # 录制不依赖 PICO；ADB 外部脚本不能拖住启动请求并触发控制请求超时。
+        hardware_status = await asyncio.to_thread(hardware.status, include_gripper=False, include_pico=False)
         camera_status = hardware_status.get("camera", {})
         if require_camera and (
             not isinstance(camera_status, dict) or not bool(camera_status.get("ok", False))
@@ -2230,6 +2231,13 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
         app.state.ws_clients.add(client_token)
         try:
+            # 控制心跳独立于首帧组装，设备查询或遥测线程池繁忙不能阻塞握手。
+            if getattr(ws, "query_params", {}).get("mode") != "observe":
+                if control_watchdog.clients:
+                    await ws.close(code=1008, reason="another browser owns control; use ?mode=observe")
+                    return
+                control_session_id = control_watchdog.register(ws.send_json)
+                receive_task = asyncio.create_task(receive_heartbeats(), name="browser-control-heartbeat")
             while True:
                 try:
                     now = time.monotonic()
@@ -2393,12 +2401,6 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     for entry in logs.entries_after(last_log_id):
                         await ws.send_json({"type": "log", "data": entry.model_dump(mode="json")})
                         last_log_id = max(last_log_id, entry.id)
-                    if control_session_id is None and getattr(ws, "query_params", {}).get("mode") != "observe":
-                        if control_watchdog.clients:
-                            await ws.close(code=1008, reason="another browser owns control; use ?mode=observe")
-                            return
-                        control_session_id = control_watchdog.register(ws.send_json)
-                        receive_task = asyncio.create_task(receive_heartbeats(), name="browser-control-heartbeat")
                     await asyncio.sleep(ws_period)
                 except WebSocketDisconnect:
                     return

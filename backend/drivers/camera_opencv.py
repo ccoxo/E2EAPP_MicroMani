@@ -661,19 +661,20 @@ class OpenCVCameraDriver:
                 with frame_lock:
                     frame = self._latest_frames.get(index)
                     latest_at = self._latest_at.get(index)
+                    cached = self._latest_jpegs.get(index)
                     if frame is not None and hasattr(frame, "copy"):
                         frame = frame.copy()
             else:
                 frame = None
                 latest_at = None
+                cached = None
             if frame is not None:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 return CameraFrameSnapshot(rgb, float(latest_at or time.monotonic()))
-            cached = self._latest_jpegs.get(index)
             if cached is not None:
                 return CameraFrameSnapshot(
                     self._decode_jpeg_to_rgb_frame(cv2, cached),
-                    float(self._latest_at.get(index) or time.monotonic()),
+                    float(latest_at or time.monotonic()),
                 )
             event = self._frame_events.get(index)
             if event is None:
@@ -1694,8 +1695,10 @@ class OpenCVCameraDriver:
                     except (TypeError, ValueError):
                         frame_time = time.monotonic()
                     self._record_frame_timestamp(index, frame_time)
-                    self._latest_at[index] = frame_time
-                    self._latest_jpegs[index] = jpeg
+                    # 画面与采集时间必须一起发布，录制不能把旧画面标成下一帧。
+                    with self._frame_locks[index]:
+                        self._latest_at[index] = frame_time
+                        self._latest_jpegs[index] = jpeg
                     self._latest_sequences[index] = int(
                         status.get("sequence") or self._latest_sequences.get(index, 0) + 1
                     )
@@ -1743,8 +1746,8 @@ class OpenCVCameraDriver:
                         consecutive_failures = 0
                         now = time.monotonic()
                         self._record_frame_timestamp(index, now)
-                        self._latest_at[index] = now
                         with frame_lock:
+                            self._latest_at[index] = now
                             self._latest_frames[index] = frame
                         frame_event.set()
                     else:

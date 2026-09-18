@@ -6,9 +6,57 @@
 from __future__ import annotations
 
 import re
+import json
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize("capabilities,accepted", [
+    (None, False),
+    (["force_calibration_state_v1"], False),
+    (["control_lease_v1"], False),
+    (["force_calibration_state_v1", "control_lease_v1"], True),
+])
+def test_hal_startup_rejects_missing_protocol_capabilities(capabilities, accepted, tmp_path):
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if shell is None:
+        pytest.skip("PowerShell is required for startup validation")
+    script = REPO_ROOT / "scripts" / "start-hal.ps1"
+    health = tmp_path / "health.json"
+    health.write_text(json.dumps({"version": "hal-real/0.2", "capabilities": capabilities}), encoding="utf-8")
+    # 只加载 AST 中的校验函数，不执行启动、部署或设备操作。
+    command = f"""
+$ErrorActionPreference = 'Stop'
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('{script.as_posix()}', [ref]$null, [ref]$parseErrors)
+if ($parseErrors.Count) {{ throw ($parseErrors | Out-String) }}
+$fn = $ast.Find({{ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-HalCapabilities' }}, $true)
+if ($null -eq $fn) {{ throw 'missing capability validator' }}
+Invoke-Expression $fn.Extent.Text
+try {{
+  Assert-HalCapabilities -Health (Get-Content -Raw '{health.as_posix()}' | ConvertFrom-Json)
+  Write-Output 'accepted'
+}} catch {{
+  Write-Output $_.Exception.Message
+  exit 2
+}}
+"""
+    result = subprocess.run([shell, "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=15)
+    assert result.returncode == (0 if accepted else 2), result.stdout + result.stderr
+    assert ("accepted" if accepted else "Rebuild and deploy both") in result.stdout
+
+
+def test_hal_startup_validates_existing_and_new_processes():
+    script = (REPO_ROOT / "scripts" / "start-hal.ps1").read_text(encoding="utf-8")
+    existing = script.split("if ($existing) {", 1)[1].split("Promote-HalCandidate -CandidateExe", 1)[0]
+    assert existing.index("Assert-HalCapabilities -Health $health") < existing.index("exit 0")
+    started = script.split("$process = Start-Process", 1)[1]
+    assert "Assert-HalCapabilities -Health $health" in started
 
 
 def test_start_stack_cleans_backend_process_tree_even_without_listening_port() -> None:

@@ -616,7 +616,8 @@ struct HalDdsControlServer::Impl {
 
   void writeReply(HalCommandReplySample& reply) {
     std::scoped_lock lock(replyMutex_);
-    if (replyWriter_->write(&reply) != ReturnCode_t::RETCODE_OK) {
+    // 单参数 write 返回 bool，成功为 true，不能与 RETCODE_OK 比较。
+    if (!replyWriter_->write(&reply)) {
       throw std::runtime_error("Fast-DDS HAL command reply publication failed");
     }
   }
@@ -646,7 +647,7 @@ struct HalDdsControlServer::Impl {
     sample.stamp_monotonic_ms = monotonicMs();
     sample.source = "hal-cpp";
     sample.payload_json = payloadJson;
-    if (writer->write(&sample) != ReturnCode_t::RETCODE_OK) {
+    if (!writer->write(&sample)) {
       throw std::runtime_error("Fast-DDS HAL telemetry publication failed");
     }
   }
