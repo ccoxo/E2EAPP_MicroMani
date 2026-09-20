@@ -177,17 +177,22 @@ class DdsHalClient(HalClient):
             )
             last_request_id = request.request_id
             deadline = time.monotonic() + timeout_s
+            exchange_timing: dict[str, float] = {}
 
             def exchange() -> HalCommandReply | None:
                 # 无队列；线程尚未开始执行就已取消/超时的请求不能迟到发布。
                 if self._closed or time.monotonic() >= deadline:
                     raise RuntimeError("DDS request expired before publication")
                 try:
+                    exchange_timing["started"] = time.monotonic()
                     if name in {"motion.emergency_stop", "control.lease"}:
                         self.transport.publish_emergency_stop(request)
                     else:
                         self.transport.publish_command_request(request)
-                    return self.transport.wait_for_command_reply(request.request_id, timeout_s)
+                    exchange_timing["published"] = time.monotonic()
+                    result = self.transport.wait_for_command_reply(request.request_id, timeout_s)
+                    exchange_timing["returned"] = time.monotonic()
+                    return result
                 except Exception as exc:
                     raise DdsTransportCallError(f"DDS native exchange failed: {name}: {exc}") from exc
 
@@ -199,6 +204,13 @@ class DdsHalClient(HalClient):
                     self._quarantine(f"DDS native control call blocked or cancelled: {name}")
                 raise
             if reply is None:
+                started = exchange_timing["started"]
+                published = exchange_timing["published"]
+                returned = exchange_timing["returned"]
+                self.logs.error("[HAL]", f"DDS reply timeout: command={name} request_id={request.request_id} "
+                                f"publish_ms={(published - started) * 1000:.1f} "
+                                f"wait_ms={(returned - published) * 1000:.1f} "
+                                f"resume_ms={(time.monotonic() - returned) * 1000:.1f}")
                 if control_critical:
                     # 停止请求失去应答也必须停止续租，不能让心跳掩盖急停通道故障。
                     self._quarantine(f"DDS control reply timed out: {name}")

@@ -702,6 +702,7 @@ class DatasetRecorderService:
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
+            self._final_action_status = deepcopy(self.teleop.status())
             self._accepting_frame_jobs = False
             self.telemetry.recording = False
         try:
@@ -734,6 +735,19 @@ class DatasetRecorderService:
         return {"episode": episode, "status": await asyncio.to_thread(self.status)}
 
     async def discard_episode(self) -> dict[str, Any]:
+        if getattr(self, "_discard_in_progress", False):
+            raise RuntimeError("record episode discard is already in progress")
+        self._discard_in_progress = True
+        try:
+            return await self._discard_episode()
+        finally:
+            self._discard_in_progress = False
+
+    def require_discard_complete(self) -> None:
+        if getattr(self, "_discard_in_progress", False):
+            raise RuntimeError("record episode discard is still stopping teleop; wait before returning to origin")
+
+    async def _discard_episode(self) -> dict[str, Any]:
         """丢弃正在录制或刚保存的 episode，并暂停到复位等待。"""
         pending = getattr(self, "_interruption_task", None)
         if pending is not None:
@@ -746,6 +760,7 @@ class DatasetRecorderService:
                 self._recording = False
                 self._accepting_frame_jobs = False
                 self.telemetry.recording = False
+        await self.teleop.stop("recording")
         if was_recording:
             await self._drain_recording_queues()
             if self._native_writer_active():
@@ -761,7 +776,6 @@ class DatasetRecorderService:
             self._enter_reset_pending_locked()
             self._samplers_paused = True
             self.telemetry.recording = False
-        await self.teleop.stop("recording")
         self.logs.warning("[LEROBOT]", f"record episode discarded; waiting for reset episode={self._episode_index:06d}")
         return await asyncio.to_thread(self.status)
 
@@ -2689,6 +2703,7 @@ class DatasetRecorderService:
         schedule_now_s: float | None = None,
     ) -> None:
         """初始化新 episode 的时间轴、缓存、计数器、质量统计和录制状态。"""
+        self._final_action_status = None
         # 每个 episode 独立统计质量指标，保存或丢弃时可以精确回滚。
         schedule_now_s = time.monotonic() if schedule_now_s is None else schedule_now_s
         sample_clock_now_s = schedule_now_s if sample_clock_now_s is None else sample_clock_now_s
@@ -4056,7 +4071,7 @@ class DatasetRecorderService:
 
     def _latest_native_gripper_targets(self, config: dict[str, Any]) -> tuple[float, float] | None:
         """从 native teleop 状态中提取左右夹爪目标值。"""
-        status = self.teleop.status()
+        status = self._recording_action_status()
         native_status = status.get("nativeStatus") if isinstance(status, dict) else None
         if not isinstance(native_status, dict):
             return None
@@ -4097,9 +4112,14 @@ class DatasetRecorderService:
         vector[state_index] = value * 1000.0 if axis_index >= 3 else value
         return vector
 
+    def _recording_action_status(self) -> dict[str, Any]:
+        # 保存时设备先停止；排队尾帧使用停止前快照，避免读到复位目标。
+        snapshot = getattr(self, "_final_action_status", None)
+        return snapshot if snapshot is not None else self.teleop.status()
+
     def _teleop_actions_for_target(self, target_monotonic_s: float | None) -> list[dict[str, Any]]:
         """选择目标时间之前仍新鲜的 teleop 动作列表。"""
-        status = self.teleop.status()
+        status = self._recording_action_status()
         if target_monotonic_s is None:
             last_action = status.get("lastAction")
             if not isinstance(last_action, dict):
@@ -4141,7 +4161,7 @@ class DatasetRecorderService:
 
     def _teleop_action_for_target(self, target_monotonic_s: float | None) -> dict[str, Any] | None:
         """返回不晚于目标时间的最新 teleop 动作。"""
-        status = self.teleop.status()
+        status = self._recording_action_status()
         if target_monotonic_s is None:
             last_action = status.get("lastAction")
             return last_action if isinstance(last_action, dict) else None

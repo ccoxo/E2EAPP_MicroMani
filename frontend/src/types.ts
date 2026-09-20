@@ -323,7 +323,7 @@ export type PicoVisionRotation = 'none' | 'cw90' | 'ccw90' | '180'
 export type Omega7StabilityMode = 'track' | 'hold' | 'off'
 export type TeleopControlMode = 'velocity_admittance' | 'incremental_position'
 
-export type RecorderPhase = 'idle' | 'starting' | 'recording' | 'interrupted' | 'reviewing' | 'resetting' | 'saving' | 'finishing'
+export type RecorderPhase = 'idle' | 'starting' | 'recording' | 'interrupted' | 'reviewing' | 'resetting' | 'saving' | 'discarding' | 'finishing'
 
 export interface EpisodeRecord {
   index: number
@@ -342,6 +342,7 @@ export interface RecordQualityReport extends EpisodeRecord {
 }
 
 export interface RecordSessionState {
+  startError: string | null
   datasetName: string
   task: string
   targetEpisodes: number

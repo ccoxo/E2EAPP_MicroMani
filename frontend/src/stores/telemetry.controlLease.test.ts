@@ -78,6 +78,18 @@ it('控制权冲突后不自动重试抢占', async () => {
   expect(store.getState().controlLease.reason).toContain('另一页面持有控制权')
 })
 
+it('DDS 永久隔离后停止自动重连并保留重启提示', async () => {
+  store.getState().startBackend()
+  const socket = Socket.instances.at(-1)!
+  challenge(socket)
+  socket.emit('control_lease', { sessionId: 's1', status: 'expired', restartRequired: true })
+  await vi.advanceTimersByTimeAsync(16_000)
+  expect(Socket.instances).toHaveLength(1)
+  expect(store.getState().controlLease.reason).toContain('重启后端')
+  store.getState().issueManualAxisMove('left', 'X', 1)
+  expect(commands()).toEqual([])
+})
+
 it('重连后从后端恢复中断片段，不自动新建或结束会话', async () => {
   store.getState().startBackend()
   const socket = Socket.instances.at(-1)!

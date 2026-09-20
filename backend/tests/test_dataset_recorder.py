@@ -808,7 +808,8 @@ def test_dataset_recorder_skip_reset_requires_required_work_origin_side() -> Non
     asyncio.run(run_case())
 
 
-def test_dataset_recorder_discard_pauses_until_reset() -> None:
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_dataset_recorder_discard_pauses_until_reset(stop_fails) -> None:
     async def run_case() -> None:
         recorder = object.__new__(DatasetRecorderService)
         calls: list[str] = []
@@ -826,17 +827,32 @@ def test_dataset_recorder_discard_pauses_until_reset() -> None:
         recorder.logs = SimpleNamespace(warning=lambda *_args: calls.append("log"))
 
         async def drain() -> None:
+            assert calls == ["stop:recording"]
             calls.append("drain")
 
         async def start(_source: str) -> None:
             pytest.fail("discard should not restart teleop")
 
         async def stop(source: str) -> None:
+            with pytest.raises(RuntimeError, match="still stopping teleop"):
+                recorder.require_discard_complete()
+            with pytest.raises(RuntimeError, match="already in progress"):
+                await recorder.discard_episode()
+            assert recorder._reset_pending is False
             calls.append(f"stop:{source}")
+            if stop_fails:
+                raise RuntimeError("stop unconfirmed")
 
         recorder._drain_recording_queues = drain
         recorder.teleop = SimpleNamespace(start=start, stop=stop)
 
+        if stop_fails:
+            with pytest.raises(RuntimeError, match="stop unconfirmed"):
+                await recorder.discard_episode()
+            assert recorder._reset_pending is False
+            assert calls == ["stop:recording"]
+            recorder.require_discard_complete()
+            return
         result = await recorder.discard_episode()
 
         assert result["recording"] is False
@@ -844,7 +860,8 @@ def test_dataset_recorder_discard_pauses_until_reset() -> None:
         assert recorder._reset_pending is True
         assert recorder._samplers_paused is True
         assert recorder.telemetry.recording is False
-        assert calls == ["drain", "stop:recording", "log"]
+        assert calls == ["stop:recording", "drain", "log"]
+        recorder.require_discard_complete()
 
     asyncio.run(run_case())
 
@@ -884,7 +901,7 @@ def test_dataset_recorder_save_drains_queued_assembly_before_closing_episode() -
 
         recorder._drain_recording_queues = drain
         recorder._finalize_episode_locked = finalize
-        recorder.teleop = SimpleNamespace(stop=stop)
+        recorder.teleop = SimpleNamespace(stop=stop, status=lambda: {})
 
         result = await recorder.save_episode()
 
@@ -936,7 +953,7 @@ def test_dataset_recorder_save_persists_episode_metadata_off_event_loop(
         monkeypatch.setattr(dataset_recorder_module.asyncio, "to_thread", fake_to_thread)
         recorder._drain_recording_queues = drain
         recorder._finalize_episode_locked = finalize_episode
-        recorder.teleop = SimpleNamespace(stop=stop)
+        recorder.teleop = SimpleNamespace(stop=stop, status=lambda: {})
         recorder.status = record_status
 
         result = await recorder.save_episode()
@@ -950,6 +967,7 @@ def test_dataset_recorder_save_persists_episode_metadata_off_event_loop(
 def test_dataset_recorder_save_stops_recording_teleop_before_drain() -> None:
     async def run_case() -> None:
         recorder = object.__new__(DatasetRecorderService)
+        live_status = {"nativeStatus": {"gripperTargets": [7.0, 2.22857]}}
         calls: list[str] = []
         recorder._session_active = True
         recorder._recording = True
@@ -964,6 +982,7 @@ def test_dataset_recorder_save_stops_recording_teleop_before_drain() -> None:
 
         async def drain() -> None:
             calls.append("drain")
+            assert recorder._latest_native_gripper_targets({}) == (7.0, 2.22857)
 
         def finalize_episode(*, status: str, deleted: bool) -> dict[str, object]:
             calls.append(f"finalize:{status}:{deleted}")
@@ -971,13 +990,14 @@ def test_dataset_recorder_save_stops_recording_teleop_before_drain() -> None:
 
         async def stop(source: str) -> None:
             calls.append(f"stop:{source}")
+            live_status["nativeStatus"]["gripperTargets"][1] = 1.02
 
         def record_status() -> dict[str, object]:
             return {"recording": recorder._recording}
 
         recorder._drain_recording_queues = drain
         recorder._finalize_episode_locked = finalize_episode
-        recorder.teleop = SimpleNamespace(stop=stop)
+        recorder.teleop = SimpleNamespace(stop=stop, status=lambda: live_status)
         recorder.status = record_status
 
         await recorder.save_episode()
@@ -1019,7 +1039,7 @@ def test_dataset_recorder_discard_marks_saved_episode_off_event_loop(
 
         monkeypatch.setattr(dataset_recorder_module.asyncio, "to_thread", fake_to_thread)
         recorder._mark_saved_episode_deleted_locked = mark_saved_episode_deleted
-        recorder.teleop = SimpleNamespace(stop=stop)
+        recorder.teleop = SimpleNamespace(stop=stop, status=lambda: {})
         recorder.status = record_status
 
         result = await recorder.discard_episode()
@@ -1061,7 +1081,7 @@ def test_dataset_recorder_save_failure_stops_recording_source() -> None:
         recorder._drain_recording_queues = drain
         recorder._save_native_episode = save_native
         recorder._clear_native_episode_buffer = clear_native
-        recorder.teleop = SimpleNamespace(stop=stop)
+        recorder.teleop = SimpleNamespace(stop=stop, status=lambda: {})
 
         with pytest.raises(DatasetSaveError, match="invalid mp4"):
             await recorder.save_episode()

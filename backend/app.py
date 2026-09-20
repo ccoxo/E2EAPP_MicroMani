@@ -1180,6 +1180,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/motion/home_all")
     async def home_all() -> ApiEnvelope:
         try:
+            recorder.require_discard_complete()
             result = await commands.home_all()
             recorder.mark_reset_origin_all_returned()
             return envelope(result)
@@ -1336,6 +1337,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         try:
+            recorder.require_discard_complete()
             result = await commands.return_motion_origin_side(side)
             recorder.mark_reset_origin_returned(side)
             return envelope(result)
@@ -1954,12 +1956,19 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         except ControlLeaseUnavailable as exc:
             raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
+            if "dataset numeric channel order is not compatible" in str(exc):
+                raise HTTPException(status_code=409, detail={"code": "DATASET_CONTRACT_INCOMPATIBLE", "message": str(exc)}) from exc
+            if "dataset directory already contains non-native files" in str(exc):
+                raise HTTPException(status_code=409, detail={"code": "DATASET_DIRECTORY_CONFLICT", "message": str(exc)}) from exc
+            if "Parquet magic bytes not found in footer" in str(exc):
+                raise HTTPException(status_code=409, detail={"code": "DATASET_PARQUET_INVALID", "message": str(exc)}) from exc
             if "native LeRobot dataset is required" in str(exc):
                 raise HTTPException(
                     status_code=503,
                     detail={"code": "NATIVE_DATASET_UNAVAILABLE", "message": str(exc)},
                 ) from exc
-            raise HTTPException(status_code=409, detail={"code": "RECORDING_BUSY", "message": str(exc)}) from exc
+            code = "RECORDING_BUSY" if str(exc) == "record session already active" else "RECORDING_START_FAILED"
+            raise HTTPException(status_code=409, detail={"code": code, "message": str(exc)}) from exc
 
     # 保存当前录制片段。
     @app.post("/api/record/episode/save")

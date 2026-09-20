@@ -24,6 +24,23 @@ async def flush() -> None:
     await asyncio.sleep(0.001)
 
 
+def test_quarantined_transport_tells_browser_restart_is_required() -> None:
+    async def exercise():
+        watchdog, _, hal, _, _ = make_watchdog()
+        messages = []
+        async def send(message):
+            messages.append(message)
+        watchdog.register(send)
+        hal._control_transport_failed = True
+        watchdog.trip("DDS reply timed out")
+        await flush()
+        assert messages[-1]["data"]["restartRequired"] is True
+        with pytest.raises(ControlLeaseUnavailable):
+            watchdog.require_ready()
+        await watchdog.close()
+    asyncio.run(exercise())
+
+
 async def confirm_mock_browser_lease(watchdog: ControlWatchdog) -> str:
     """旧业务测试显式完成租约协议；不覆盖 require_ready 或修改内部确认状态。"""
     watchdog._run = AsyncMock()

@@ -229,6 +229,7 @@ const initialManualState: ManualControlState = {
 }
 
 const initialRecordSession: RecordSessionState = {
+  startError: null,
   datasetName: 'micro_assembly_v1',
   task: 'Assemble ICF target component',
   targetEpisodes: 50,
@@ -1528,13 +1529,15 @@ startBackend: () => {
       return
     }
     backendLeaseSession?.dispose()
+    let transportRestartReason: string | null = null
     const leaseSession = createControlLeaseSession({
       isCurrent: () => connectionIsCurrent() && get().backendWs === ws,
       send: (message) => {
         if (!connectionIsCurrent() || get().backendWs !== ws || ws.readyState !== WebSocket.OPEN) throw new Error('控制会话已经断开')
         ws.send(message)
       },
-      close: (reason) => {
+      close: (reason, restartRequired) => {
+        if (restartRequired) transportRestartReason = reason
         try {
           set((state) => ({ logs: appendLog(state.logs, makeLog('WARNING', `安全租约关闭连接：${reason}`, '[SAFETY]')) }))
         } finally {
@@ -1649,12 +1652,12 @@ startBackend: () => {
       backendConnectionGeneration += 1
       clearPendingBackendFrameFlush()
       motionCommands.invalidate('遥测断连，未获得执行确认')
-      if (event.code === 1008) {
+      if (event.code === 1008 || transportRestartReason !== null) {
         set((state) => ({
           backendWs: null,
           backendReconnectTimer: null,
           controlSafety: interruptedControlSafety(state.controlSafety),
-          controlLease: { ...initialControlLease(), status: 'expired', reason: '另一页面持有控制权；可用 ?mode=observe 打开观察页，或稍后显式重连' },
+          controlLease: { ...initialControlLease(), status: 'expired', reason: transportRestartReason ?? '另一页面持有控制权；可用 ?mode=observe 打开观察页，或稍后显式重连' },
           frame: { ...state.frame, wsOk: false },
           telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
         }))
@@ -1813,6 +1816,7 @@ startRecordSession: (datasetName, task) => {
       recordSession: {
         ...state.recordSession,
         datasetName: nextDatasetName,
+        startError: null,
         task,
         latestQualityReport: null,
         phase: 'starting',
@@ -1892,6 +1896,7 @@ startRecordSession: (datasetName, task) => {
           recordSession: {
             ...state.recordSession,
             phase: 'idle',
+            startError: error instanceof Error ? error.message : String(error),
             phaseStartedAt: null,
             recorderFps: 0,
             recorderFrameCount: 0,
@@ -2001,19 +2006,20 @@ saveRecordEpisode: () => {
             logs: appendLog(state.logs, makeLog('ERROR', `record episode save failed: ${String(error)}`, '[LEROBOT]')),
           }
         })
-        if (finishRecordSessionAfterReview) finishRecordSessionNow(set)
+        // 保存失败时保留会话，不能继续 finalize 丢弃待处理片段。
+        finishRecordSessionAfterReview = false
       })
   },
 
 /** 删除对应数据并同步界面状态。 */
 discardRecordEpisode: () => {
-    void discardRecordEpisodeApi().catch((error) => {
-      set((state) => ({
-        logs: appendLog(state.logs, makeLog('ERROR', `record episode discard failed: ${String(error)}`, '[LEROBOT]')),
-      }))
-    })
-    set((state) => {
-      const record = makeDiscardedEpisodeRecord(state.recordSession)
+    const session = get().recordSession
+    if (!['recording', 'interrupted', 'reviewing'].includes(session.phase)) return
+    const record = makeDiscardedEpisodeRecord(session)
+    set((state) => ({ recording: false, recordSession: { ...state.recordSession,
+      phase: 'discarding', phaseStartedAt: Date.now(), resetPending: false, resetReady: false } }))
+    void discardRecordEpisodeApi().then(() => set((state) => {
+      if (state.recordSession.phase !== 'discarding') return state
       return {
         recording: false,
         recordSession: {
@@ -2034,6 +2040,13 @@ discardRecordEpisode: () => {
         },
         logs: appendLog(state.logs, makeLog('WARNING', `Episode #${record.index} 已丢弃，等待复位`, '[LEROBOT]')),
       }
+    })).catch((error) => {
+      set((state) => ({
+        recordSession: state.recordSession.phase === 'discarding'
+          ? { ...state.recordSession, phase: 'interrupted', resetPending: false, resetReady: false }
+          : state.recordSession,
+        logs: appendLog(state.logs, makeLog('ERROR', `record episode discard failed; pending review: ${String(error)}`, '[LEROBOT]')),
+      }))
     })
   },
 
@@ -2112,6 +2125,12 @@ rejectRecordQualityReport: () => {
 /** 描述当前方法的功能边界。 */
 finishRecordSession: () => {
     const phase = get().recordSession.phase
+    if (phase === 'discarding') return
+    if (phase === 'recording' || phase === 'interrupted') {
+      finishRecordSessionAfterReview = true
+      get().saveRecordEpisode()
+      return
+    }
     if (phase === 'saving' || phase === 'reviewing') {
       finishRecordSessionAfterReview = true
       set((state) => ({
@@ -2226,6 +2245,7 @@ setRecordSpeedMode: (mode) => {
 
 /** 发送或封装对应的后端命令。 */
 homeRecordArms: () => {
+    if (get().recordSession.phase === 'discarding') return
     if (rejectUnsafeControl(get, set)) return
     const generation = get().controlSafety.generation
     if (recordMotionOriginInFlight) {
@@ -2294,6 +2314,7 @@ homeRecordArms: () => {
 
 /** 描述当前方法的功能边界。 */
 returnRecordMotionOrigin: async (side) => {
+    if (get().recordSession.phase === 'discarding') return
     if (rejectUnsafeControl(get, set)) return
     const generation = get().controlSafety.generation
     const operatorLabel = operatorSideLabel(operatorSideForHardwareSide(side))

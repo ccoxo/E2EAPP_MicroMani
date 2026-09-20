@@ -1180,6 +1180,30 @@ describe('AppStation M0 frontend', () => {
     await waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('resetting'))
   })
 
+  it.each([
+    ['DATASET_DIRECTORY_CONFLICT', '同名目录已包含非本应用数据集文件，请更换数据集名称。'],
+    ['DATASET_CONTRACT_INCOMPATIBLE', '同名数据集的数据契约缺失或不兼容，无法续录，请更换数据集名称。'],
+    ['DATASET_PARQUET_INVALID', '已有数据集的 Parquet 文件损坏、不完整或格式无效，无法续录。请更换数据集名称开始新录制，并保留原目录以便排查和恢复。'],
+  ])('shows persistent record start error %s with logs closed and clears it on retry', async (code, message) => {
+    vi.spyOn(api, 'fetchRecordStatus').mockResolvedValue({ active: false, recording: false })
+    vi.spyOn(api, 'putConfig').mockResolvedValue(structuredClone(defaultConfig))
+    const create = vi.spyOn(api, 'createSession').mockRejectedValue(
+      new Error(formatApiErrorMessage(409, { detail: { code, message: 'backend reason' } })),
+    )
+    useTelemetryStore.setState({ logPanelOpen: false })
+    render(<EpisodeControlPanel onStartSession={() => useTelemetryStore.getState().startRecordSession('existing', 'task')} />)
+    fireEvent.click(screen.getByRole('button', { name: '开始采集会话' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(message)
+    expect(useTelemetryStore.getState().recording).toBe(false)
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('idle')
+    expect(screen.getByRole('button', { name: '开始采集会话' })).toBeEnabled()
+    create.mockResolvedValue({ ok: true })
+    fireEvent.click(screen.getByRole('button', { name: '开始采集会话' }))
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    await waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('recording'))
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
   it('starts the UI record timer only after the backend creates the session', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-05-22T00:00:00.000Z'))
@@ -1485,7 +1509,7 @@ describe('AppStation M0 frontend', () => {
     expect(confirmButton).toBeDisabled()
   })
 
-  it('keeps the quality report visible when finish is pressed during saving, then finishes after acceptance', async () => {
+  it.each(['recording', 'saving'])('keeps the quality report visible when finish is pressed during %s, then finishes after acceptance', async (phase) => {
     useTelemetryStore.setState((state) => ({
       recording: true,
       recordSession: {
@@ -1496,7 +1520,7 @@ describe('AppStation M0 frontend', () => {
     }))
 
     act(() => {
-      useTelemetryStore.getState().saveRecordEpisode()
+      if (phase === 'saving') useTelemetryStore.getState().saveRecordEpisode()
       useTelemetryStore.getState().finishRecordSession()
     })
 
@@ -1513,7 +1537,8 @@ describe('AppStation M0 frontend', () => {
     expect(useTelemetryStore.getState().recording).toBe(false)
   })
 
-  it('does not resume recording in the UI when episode save fails after backend stopped recording', async () => {
+  it.each([false, true])('does not resume recording or finalize when episode save fails (finish requested: %s)', async (finishRequested) => {
+    const finishSpy = vi.spyOn(api, 'finishSession')
     vi.spyOn(api, 'saveEpisode').mockRejectedValue(new Error('native LeRobot save_episode failed'))
     vi.spyOn(api, 'fetchRecordStatus').mockResolvedValue({ active: true, recording: false })
     useTelemetryStore.setState((state) => ({
@@ -1529,11 +1554,13 @@ describe('AppStation M0 frontend', () => {
 
     act(() => {
       useTelemetryStore.getState().saveRecordEpisode()
+      if (finishRequested) useTelemetryStore.getState().finishRecordSession()
     })
 
     await waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('resetting'))
     expect(useTelemetryStore.getState().recording).toBe(false)
     expect(useTelemetryStore.getState().recordSession.latestQualityReport).toBeNull()
+    expect(finishSpy).not.toHaveBeenCalled()
   })
 
   it('ignores reset skip unless the record workflow is resetting', async () => {
@@ -1633,12 +1660,17 @@ describe('AppStation M0 frontend', () => {
     await waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('recording'))
   })
 
-  it('pauses for reset after discarding an active record episode', async () => {
-    const discardSpy = vi.spyOn(api, 'discardEpisode').mockResolvedValue({ ok: true, data: {}, ts: Date.now() })
+  it.each([false, true])('waits for discard acknowledgement before reset (failure: %s)', async (failure) => {
+    let completeDiscard!: (value: Awaited<ReturnType<typeof api.discardEpisode>>) => void
+    let failDiscard!: (reason: Error) => void
+    const discardSpy = vi.spyOn(api, 'discardEpisode').mockReturnValue(new Promise((resolve, reject) => { completeDiscard = resolve; failDiscard = reject }))
+    const originSpy = vi.spyOn(api, 'returnMotionOriginSide')
     useTelemetryStore.setState((state) => ({
+      logs: [],
       recording: true,
       recordSession: {
         ...state.recordSession,
+        episodeHistory: [],
         phase: 'recording',
         phaseStartedAt: Date.now() - 1000,
         recorderFrameCount: 12,
@@ -1649,6 +1681,22 @@ describe('AppStation M0 frontend', () => {
     act(() => {
       useTelemetryStore.getState().discardRecordEpisode()
     })
+
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('discarding')
+    useTelemetryStore.getState().discardRecordEpisode()
+    useTelemetryStore.getState().homeRecordArms()
+    await useTelemetryStore.getState().returnRecordMotionOrigin('left')
+    expect(originSpy).not.toHaveBeenCalled()
+    expect(useTelemetryStore.getState().logs.some((log) => log.msg.includes('已丢弃，等待复位'))).toBe(false)
+    if (failure) {
+      failDiscard(new Error('stop failed'))
+      await waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('interrupted'))
+      expect(useTelemetryStore.getState().recordSession.resetPending).toBe(false)
+      expect(useTelemetryStore.getState().recordSession.episodeHistory).toHaveLength(0)
+      return
+    }
+    completeDiscard({ ok: true, data: {}, ts: Date.now() })
+    await waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('resetting'))
 
     const state = useTelemetryStore.getState()
     expect(discardSpy).toHaveBeenCalledTimes(1)

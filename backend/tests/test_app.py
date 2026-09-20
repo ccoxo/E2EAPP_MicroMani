@@ -60,6 +60,28 @@ def create_mock_record_client(tmp_path: Path, monkeypatch: MonkeyPatch) -> TestC
     return TestClient(create_app(tmp_path / "runtime"))
 
 
+@pytest.mark.parametrize("path,method", [
+    ("/api/motion/left/return_origin", "return_motion_origin_side"),
+    ("/api/motion/home_all", "home_all"),
+])
+def test_return_origin_rejects_pending_discard_before_hal_dispatch(tmp_path, monkeypatch, path, method):
+    from unittest.mock import AsyncMock
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    app = create_app(tmp_path / "runtime")
+    app.state.recorder._discard_in_progress = True
+    command = AsyncMock(return_value={"ok": True})
+    monkeypatch.setattr(app.state.commands, method, command)
+    # 不启动应用生命周期和设备线程，只验证路由门闩。
+    client = TestClient(app)
+    response = client.post(path)
+    assert response.status_code == 503
+    assert "discard is still stopping" in response.json()["detail"]["message"]
+    command.assert_not_awaited()
+    app.state.recorder._discard_in_progress = False
+    assert client.post(path).status_code == 200
+    command.assert_awaited_once()
+
+
 def _clear_camera_identities(config: dict) -> None:
     for key in ("globalIdentity", "wristLeftIdentity", "wristRightIdentity"):
         config["cameras"][key] = ""
@@ -3746,6 +3768,26 @@ def test_startup_stops_stale_native_teleop_when_no_logical_hands_connected(
         pass
 
     assert ("teleop.native.stop", {}) in fake_hal.commands
+
+
+@pytest.mark.parametrize(("message", "status", "code"), [
+    ("dataset numeric channel order is not compatible: missing contract", 409, "DATASET_CONTRACT_INCOMPATIBLE"),
+    ("native LeRobot dataset is required; dataset directory already contains non-native files", 409, "DATASET_DIRECTORY_CONFLICT"),
+    ("native LeRobot dataset is required; Parquet magic bytes not found in footer. Either the file is corrupted or this is not a parquet file.", 409, "DATASET_PARQUET_INVALID"),
+    ("record session already active", 409, "RECORDING_BUSY"),
+    ("native LeRobot dataset is required; missing dependency", 503, "NATIVE_DATASET_UNAVAILABLE"),
+    ("unexpected initialization failure", 409, "RECORDING_START_FAILED"),
+])
+def test_record_start_error_codes(tmp_path: Path, monkeypatch: MonkeyPatch, message: str, status: int, code: str) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    with TestClient(create_app(tmp_path)) as client:
+        async def fail_start(_dataset_name: str, _task: str) -> dict[str, Any]:
+            raise RuntimeError(message)
+
+        monkeypatch.setattr(client.app.state.recorder, "start_session", fail_start)
+        response = client.post("/api/record/session/create", json={"dataset_name": "existing", "task": "test"})
+        assert response.status_code == status
+        assert response.json()["detail"] == {"code": code, "message": message}
 
 
 def test_record_session_fails_when_native_lerobot_is_disabled(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

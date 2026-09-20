@@ -196,6 +196,7 @@ class ControlWatchdog:
             "sessionId": client.session_id,
             "challengeId": client.answered_challenge if challenge_id is None else challenge_id,
             "status": status, "ttlMs": self.hal_timeout_ms,
+            "restartRequired": getattr(self.hal, "_control_transport_failed", False) is True,
         }})
 
     async def cycle(self) -> None:

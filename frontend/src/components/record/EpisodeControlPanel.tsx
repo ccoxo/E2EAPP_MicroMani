@@ -25,6 +25,7 @@ const phaseConfig = {
   reviewing: { label: '质检中', color: '#fa8c16', barColor: '#fa8c16' },
   resetting: { label: '复位中', color: '#722ed1', barColor: '#722ed1' },
   saving: { label: '保存中', color: '#1677ff', barColor: '#1677ff' },
+  discarding: { label: '丢弃中，等待遥操作停止', color: '#1677ff', barColor: '#1677ff' },
   finishing: { label: '结束中', color: '#52c41a', barColor: '#52c41a' },
 }
 
@@ -53,6 +54,7 @@ interface EpisodeControlPanelProps {
 /** 渲染当前界面单元，并连接所需数据。 */
 export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPanelProps) {
   const phase = useTelemetryStore((s) => s.recordSession.phase)
+  const startError = useTelemetryStore((s) => s.recordSession.startError)
   const elapsedS = useTelemetryStore((s) => s.recordSession.recorderElapsedS)
   const totalS = useTelemetryStore((s) => s.recordSession.recorderTotalS)
   const episodeTimeS = useTelemetryStore((s) => s.recordSession.episodeTimeS)
@@ -78,7 +80,7 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
   const [pendingOriginSide, setPendingOriginSide] = React.useState<'left' | 'right' | null>(null)
 
   const cfg = phaseConfig[phase]
-  const busy = phase === 'starting' || phase === 'saving' || phase === 'finishing'
+  const busy = phase === 'starting' || phase === 'saving' || phase === 'discarding' || phase === 'finishing'
   const progressTotalS =
     totalS >= 0 ? totalS : phase === 'recording' ? episodeTimeS : phase === 'resetting' ? resetTimeS : -1
   const phasePercent = progressTotalS > 0 ? Math.max(0, Math.min(100, Math.round((elapsedS / progressTotalS) * 100))) : 0
@@ -171,6 +173,12 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
 
       {phase === 'idle' && (
         <div className="record-action-stack">
+          {startError && (
+            <div role="alert" style={{ color: '#cf1322', background: '#fff1f0', border: '1px solid #ffa39e', borderRadius: 4, padding: 8, overflowWrap: 'anywhere' }}>
+              <strong>录制启动失败</strong>
+              <div>{startError}</div>
+            </div>
+          )}
           <UiButton variant="primary" block onClick={onStartSession}>
             开始采集会话
           </UiButton>

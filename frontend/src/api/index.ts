@@ -207,6 +207,9 @@ export interface FineTuneJobApi {
 }
 
 const localizedApiErrorMessages: Record<string, string> = {
+  DATASET_DIRECTORY_CONFLICT: '同名目录已包含非本应用数据集文件，请更换数据集名称。',
+  DATASET_CONTRACT_INCOMPATIBLE: '同名数据集的数据契约缺失或不兼容，无法续录，请更换数据集名称。',
+  DATASET_PARQUET_INVALID: '已有数据集的 Parquet 文件损坏、不完整或格式无效，无法续录。请更换数据集名称开始新录制，并保留原目录以便排查和恢复。',
   RECORDING_BUSY: '录制会话已在运行，请先结束当前会话后再开始新的录制。',
   WORK_ORIGIN_MISSING: '目标硬件臂工作原点未设置，请先在设置页记录工作原点后再连接遥操作。',
 }

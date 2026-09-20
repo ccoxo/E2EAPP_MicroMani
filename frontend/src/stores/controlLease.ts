@@ -24,7 +24,7 @@ interface LeaseSessionOptions {
   isCurrent: () => boolean
   send: (message: string) => void
   publish: (state: ControlLeaseState) => void
-  close: (reason: string) => void
+  close: (reason: string, restartRequired?: boolean) => void
   now?: () => number
 }
 
@@ -55,12 +55,12 @@ export function createControlLeaseSession(options: LeaseSessionOptions) {
     if (timer !== undefined) clearTimeout(timer)
     timer = undefined
   }
-  const revoke = (reason: string) => {
+  const revoke = (reason: string, restartRequired = false) => {
     if (stopped) return
     dispose()
     state = { ...state, status: 'expired', expiresAt: null, reason }
     // 先关闭传输；即使显示订阅抛错，也不能再为执行侧续租。
-    try { options.close(reason) } finally { options.publish(state) }
+    try { options.close(reason, restartRequired) } finally { options.publish(state) }
   }
   const watchDeadline = () => {
     if (timer !== undefined) clearTimeout(timer)
@@ -109,7 +109,11 @@ export function createControlLeaseSession(options: LeaseSessionOptions) {
         watchDeadline()
         return true
       }
-      if (data.status === 'expired') { revoke('执行侧安全租约已失效，控制已暂停'); return true }
+      if (data.status === 'expired') {
+        const restartRequired = data.restartRequired === true
+        revoke(restartRequired ? 'DDS 控制通道已隔离，请停止设备并重启后端，再显式重连和确认安全状态' : '执行侧安全租约已失效，控制已暂停', restartRequired)
+        return true
+      }
       if (data.status === 'pending') {
         publish({ ...state, status: 'pending', expiresAt: null, reason: '等待执行侧安全租约确认' })
         watchDeadline()
