@@ -12,9 +12,11 @@ namespace appstation::hal {
 
 TeleopHardwareTargetExecutor::TeleopHardwareTargetExecutor(
     LTDMCDriver& motion,
+    MotionExecutor& executor,
     ForceControlRuntime& forceRuntime,
     std::function<void(const char*)> failureCallback)
     : motion_(motion),
+      executor_(executor),
       forceRuntime_(forceRuntime), failureCallback_(std::move(failureCallback)) {}
 
 void TeleopHardwareTargetExecutor::reportControlFailure(const char* message) noexcept {
@@ -30,17 +32,10 @@ void TeleopHardwareTargetExecutor::reportControlFailure(const char* message) noe
 }
 
 void TeleopHardwareTargetExecutor::apply(const TeleopHardwareTarget& target) {
-  const auto commandEpoch = motion_.commandEpoch();
   if (motion_.estopActive()
       || target.stampUnixMs <= motion_.lastEmergencyStopUnixMs()) {
     return;
   }
-  // DDS 目标携带的是 min/max 数组，LTDMCDriver 需要 AxisLimit 结构数组。
-  std::array<AxisLimit, 6> limits{};
-  for (size_t i = 0; i < limits.size(); ++i) {
-    limits[i] = AxisLimit{target.softLimitMin[i], target.softLimitMax[i]};
-  }
-
   auto deltas = target.deltas;
   const int sideIndex = target.side == 0 ? 0 : 1;
   const auto compliance = forceRuntime_.complianceCorrection(
@@ -51,22 +46,9 @@ void TeleopHardwareTargetExecutor::apply(const TeleopHardwareTarget& target) {
   deltas[2] += compliance.correctionUm[1];
 
   // Follower 端只做最终落地，不改变 Mapping 端算好的步长、死区、速度和软限位。
-  const auto result = motion_.updateTeleopTargetUi(
-      target.side == 0 ? Side::Left : Side::Right,
-      deltas,
-      target.translationStepLimitPulse,
-      target.rotationStepLimitPulse,
-      target.translationPulseDeadband,
-      target.rotationPulseDeadband,
-      target.enabledAxes,
-      target.syncZeroDeltaTarget,
-      limits,
-      target.translationVelocityUiPerSec,
-      target.rotationVelocityUiPerSec,
-      target.translationStartVelocityUiPerSec,
-      target.rotationStartVelocityUiPerSec,
-      target.accTimeSec,
-      target.decTimeSec, commandEpoch);
+  const auto applied = executor_.applyNative(target, deltas);
+  if (!applied) return;
+  const auto& result = *applied;
   // 按驱动实际应用的位移回写柔顺累计量，避免软限位裁剪后继续累计未执行的修正。
   forceRuntime_.commitCompliance(
       sideIndex,

@@ -215,9 +215,10 @@ std::array<double, 6> omegaPoseToSemantic(const std::array<double, 6>& raw, cons
 
 NativeTeleopController::NativeTeleopController(
     LTDMCDriver& motion,
+    MotionExecutor& executor,
     Omega7Driver& omega,
     JodellGripperDriver& gripper)
-    : motion_(motion), omega_(omega), gripper_(gripper) {
+    : motion_(motion), executor_(executor), omega_(omega), gripper_(gripper) {
   // 默认软限位使用 UI 单位：平移 um，旋转 degree。后端配置会在 configure 中覆盖。
   for (auto& sideLimits : config_.softLimits) {
     sideLimits = {
@@ -405,7 +406,18 @@ void NativeTeleopController::start(bool leftConnected, bool rightConnected,
   if (!motion_.commandEpochAllowed(motionEpoch)) {
     throw std::runtime_error("emergency stop active; acknowledge safety before native teleop start");
   }
-  if (!running_.load() && worker_.joinable()) worker_.join();
+  if (running_.load()) return;
+  if (worker_.joinable()) worker_.join();
+  {
+    std::scoped_lock lock(mutex_);
+    executor_.beginNative(hardwareTargetSequence_, motionEpoch);
+  }
+  // 初始化中途失败不能留下有效的 DDS 执行许可；停止/重启再清理持有的控制权。
+  struct StartPermission {
+    MotionExecutor& executor;
+    bool completed{false};
+    ~StartPermission() { if (!completed) executor.revokeNative(); }
+  } permission{executor_};
   bool gripperTeleopEnabled = false;
   {
     std::scoped_lock lock(mutex_);
@@ -451,10 +463,6 @@ void NativeTeleopController::start(bool leftConnected, bool rightConnected,
   } else {
     stopGripperWorker();
   }
-  if (worker_.joinable()) {
-    if (running_.load()) return;
-    worker_.join();
-  }
   if (!motion_.commandEpochAllowed(motionEpoch)) {
     requestEmergencyStop();
     throw std::runtime_error("native teleop start cancelled by emergency stop");
@@ -474,20 +482,22 @@ void NativeTeleopController::start(bool leftConnected, bool rightConnected,
     requestEmergencyStop();
     throw std::runtime_error("native teleop start cancelled by emergency stop");
   }
+  permission.completed = true;
 }
 
 void NativeTeleopController::stop() {
   std::scoped_lock lifecycleLock(lifecycleMutex_);
   // 先停控制线程，再把两侧 teleop 目标同步到当前位置。
   running_.store(false);
+  executor_.revokeNative();
   // 急停已把 running 清零，但 std::thread 仍需回收才能重启或析构。
   if (worker_.joinable()) worker_.join();
   try {
-    motion_.stopTeleopSide(Side::Left);
-    motion_.stopTeleopSide(Side::Right);
+    executor_.endNative();
   } catch (const std::exception& exc) {
-    std::scoped_lock lock(mutex_);
-      lastError_ = exc.what();
+    reportControlFailure(exc.what());
+  } catch (...) {
+    reportControlFailure("unknown C++ exception while releasing native motion control");
   }
   stopGripperWorker();
   std::scoped_lock lock(mutex_);
@@ -517,6 +527,7 @@ void NativeTeleopController::stop() {
 }
 
 void NativeTeleopController::latchControlStop() noexcept {
+  executor_.revokeNative();
   running_.store(false);
   gripperWorkerRunning_.store(false);
   gripperCv_.notify_all();
@@ -944,7 +955,7 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
     continuousDirection_[sourceIndex] = {};
     continuousStreak_[sourceIndex] = {};
     if (targetActive_[targetIndex]) {
-      motion_.stopTeleopSide(targetSide);
+      executor_.stopNativeSide(targetSide, hardwareTargetSequence_);
       targetActive_[targetIndex] = false;
     }
     return;
@@ -961,7 +972,7 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
     continuousDirection_[sourceIndex] = {};
     continuousStreak_[sourceIndex] = {};
     if (targetActive_[targetIndex]) {
-      motion_.stopTeleopSide(targetSide);
+      executor_.stopNativeSide(targetSide, hardwareTargetSequence_);
       targetActive_[targetIndex] = false;
     }
     return;
@@ -978,7 +989,7 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
     continuousDirection_[sourceIndex] = {};
     continuousStreak_[sourceIndex] = {};
     if (targetActive_[targetIndex]) {
-      motion_.stopTeleopSide(targetSide);
+      executor_.stopNativeSide(targetSide, hardwareTargetSequence_);
       targetActive_[targetIndex] = false;
     }
     return;
@@ -1027,30 +1038,30 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
   }
 
   const auto limits = effectiveSoftLimits(targetSide, targetIndex);
+  TeleopHardwareTarget target;
+  target.sequence = ++hardwareTargetSequence_;
+  target.stampUnixMs = static_cast<std::uint64_t>(unixTimeMs());
+  target.stampMonotonicMs = static_cast<std::uint64_t>(monotonicSeconds() * 1000.0);
+  target.side = targetSide == Side::Left ? 0 : 1;
+  target.deltas = deltas;
+  target.translationStepLimitPulse = config_.translationStepLimitPulse;
+  target.rotationStepLimitPulse = config_.rotationStepLimitPulse;
+  target.translationPulseDeadband = config_.translationPulseDeadband;
+  target.rotationPulseDeadband = config_.rotationPulseDeadband;
+  target.enabledAxes = config_.enabledAxes[targetIndex];
+  target.syncZeroDeltaTarget = true;
+  for (size_t i = 0; i < limits.size(); ++i) {
+    target.softLimitMin[i] = limits[i].min;
+    target.softLimitMax[i] = limits[i].max;
+  }
+  target.translationVelocityUiPerSec = config_.translationMaxVelocityUmS;
+  target.rotationVelocityUiPerSec = config_.rotationMaxVelocityDegS;
+  target.translationStartVelocityUiPerSec = config_.translationStartVelocityUmS;
+  target.rotationStartVelocityUiPerSec = config_.rotationStartVelocityDegS;
+  target.accTimeSec = config_.accTimeSec;
+  target.decTimeSec = config_.decTimeSec;
+  if (!running_.load() || !motion_.commandEpochAllowed(motionEpoch)) return;
   if (hardwareTargetPublisher_) {
-    TeleopHardwareTarget target;
-    target.sequence = ++hardwareTargetSequence_;
-    target.stampUnixMs = static_cast<std::uint64_t>(unixTimeMs());
-    target.stampMonotonicMs = static_cast<std::uint64_t>(monotonicSeconds() * 1000.0);
-    target.side = targetSide == Side::Left ? 0 : 1;
-    target.deltas = deltas;
-    target.translationStepLimitPulse = config_.translationStepLimitPulse;
-    target.rotationStepLimitPulse = config_.rotationStepLimitPulse;
-    target.translationPulseDeadband = config_.translationPulseDeadband;
-    target.rotationPulseDeadband = config_.rotationPulseDeadband;
-    target.enabledAxes = config_.enabledAxes[targetIndex];
-    target.syncZeroDeltaTarget = true;
-    for (size_t i = 0; i < limits.size(); ++i) {
-      target.softLimitMin[i] = limits[i].min;
-      target.softLimitMax[i] = limits[i].max;
-    }
-    target.translationVelocityUiPerSec = config_.translationMaxVelocityUmS;
-    target.rotationVelocityUiPerSec = config_.rotationMaxVelocityDegS;
-    target.translationStartVelocityUiPerSec = config_.translationStartVelocityUmS;
-    target.rotationStartVelocityUiPerSec = config_.rotationStartVelocityDegS;
-    target.accTimeSec = config_.accTimeSec;
-    target.decTimeSec = config_.decTimeSec;
-    if (!running_.load() || !motion_.commandEpochAllowed(motionEpoch)) return;
     hardwareTargetPublisher_(target);
     recordPublishedTargetActionUnlocked(sourceSide, target, sourceIndex);
     targetActive_[targetIndex] = true;
@@ -1061,22 +1072,9 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
     return;
   }
 
-  const auto result = motion_.updateTeleopTargetUi(
-      targetSide,
-      deltas,
-      config_.translationStepLimitPulse,
-      config_.rotationStepLimitPulse,
-      config_.translationPulseDeadband,
-      config_.rotationPulseDeadband,
-      config_.enabledAxes[targetIndex],
-      true,
-      limits,
-      config_.translationMaxVelocityUmS,
-      config_.rotationMaxVelocityDegS,
-      config_.translationStartVelocityUmS,
-      config_.rotationStartVelocityDegS,
-      config_.accTimeSec,
-      config_.decTimeSec, motionEpoch);
+  const auto applied = executor_.applyNative(target, target.deltas);
+  if (!applied) return;
+  const auto& result = *applied;
   // 只要成功下发一帧 motion，就标记目标侧处于 teleop 活跃状态。
   targetActive_[targetIndex] = true;
   setBlockerUnlocked(sourceIndex, "active", "");
@@ -1095,7 +1093,7 @@ void NativeTeleopController::syncIncrementalZeroDeltaUnlocked(
   const std::string& message) {
   // 增量模式输入归零时主动 stop，把从端保持在当前位置并重置主手参考。
   if (targetActive_[targetIndex]) {
-    motion_.stopTeleopSide(targetSide);
+    executor_.stopNativeSide(targetSide, hardwareTargetSequence_);
     targetActive_[targetIndex] = false;
     recordZeroStopActionUnlocked(sourceSide, targetSide);
   }
@@ -1370,7 +1368,7 @@ bool NativeTeleopController::suppressIncrementalRotationSpikeUnlocked(
     lastOutputDeltaUi_[sourceIndex] = {};
     lastRawDelta_[sourceIndex][axisIndex] = rawDelta;
     if (targetActive_[targetIndex]) {
-      motion_.stopTeleopSide(targetSide);
+      executor_.stopNativeSide(targetSide, hardwareTargetSequence_);
       targetActive_[targetIndex] = false;
       recordZeroStopActionUnlocked(sourceSide, targetSide);
     }

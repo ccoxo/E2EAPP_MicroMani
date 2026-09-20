@@ -7,11 +7,11 @@
 #pragma once
 
 #include <memory>
-#include <string>
+#include "Omega7Driver.h"
 
 namespace appstation::hal {
 
-// Master/Leader 侧 DDS 发布器：把 Omega 双手状态以 JSON envelope 发布给 Mapping 节点。
+// Master/Leader 侧 DDS 发布器：把 Omega 双手状态以固定布局样本 发布给 Mapping 节点。
 class TeleopLeaderPublisher {
  public:
   TeleopLeaderPublisher();
@@ -21,7 +21,7 @@ class TeleopLeaderPublisher {
   TeleopLeaderPublisher& operator=(const TeleopLeaderPublisher&) = delete;
 
   bool enabled() const;
-  void publishJson(const std::string& payloadJson);
+  void publish(const std::array<Omega7State, 2>& hands);
 
  private:
   struct Impl;

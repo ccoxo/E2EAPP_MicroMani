@@ -1,3 +1,4 @@
+#include "OfflineMotion.h"
 #include "EmergencyStopState.h"
 #include "ForceControlRuntime.h"
 #include "HalCommandDispatcher.h"
@@ -78,9 +79,11 @@ void testRejectedMotionAcknowledgementKeepsForceLatch() {
 
 void testNativeStopRestartAndGripperGate() {
   LTDMCDriver motion;
+  MotionExecutor motionExecutor(motion);
   Omega7Driver omega;
   JodellGripperDriver gripper;
-  NativeTeleopController teleop(motion, omega, gripper);
+  MotionExecutorTestAccess::initialize(motion);
+  NativeTeleopController teleop(motion, motionExecutor, omega, gripper);
   // 不初始化硬件、不打开夹爪 worker；这里只验证控制线程生命周期。
   for (int i = 0; i < 10; ++i) {
     teleop.start(false, false);
@@ -124,8 +127,9 @@ void testNativeStopRestartAndGripperGate() {
 
 void testFollowerDiscardsPreStopTarget() {
   LTDMCDriver motion;
+  MotionExecutor motionExecutor(motion);
   ForceControlRuntime force([]() {}, []() {});
-  TeleopHardwareTargetExecutor executor(motion, force);
+  TeleopHardwareTargetExecutor executor(motion, motionExecutor, force);
   TeleopHardwareTarget oldTarget{};
   motion.emergencyStop();
   oldTarget.stampUnixMs = motion.lastEmergencyStopUnixMs();
@@ -159,9 +163,10 @@ void testOmegaForceGate() {
 
 void testInvalidMotionNumbersRejectedBeforeDeviceAccess() {
   LTDMCDriver motion;
+  MotionExecutor motionExecutor(motion);
   Omega7Driver omega;
   JodellGripperDriver gripper;
-  NativeTeleopController teleop(motion, omega, gripper);
+  NativeTeleopController teleop(motion, motionExecutor, omega, gripper);
   const auto rejectedAsInvalid = [](auto command) {
     try { command(); }
     catch (const std::runtime_error& error) {
@@ -191,12 +196,14 @@ void testInvalidMotionNumbersRejectedBeforeDeviceAccess() {
 
 void testAcknowledgementCannotOvertakeForceStopBookkeeping() {
   LTDMCDriver motion;
+  MotionExecutor motionExecutor(motion);
   Omega7Driver omega;
   JodellGripperDriver gripper;
-  NativeTeleopController teleop(motion, omega, gripper);
+  NativeTeleopController teleop(motion, motionExecutor, omega, gripper);
   ForceControlRuntime force([]() {}, []() {});
+  ForceControlRuntimeTestAccess::markCalibrationReady(force);
   const auto started = std::chrono::steady_clock::now();
-  HalCommandDispatcher dispatcher(motion, omega, teleop, force, started);
+  HalCommandDispatcher dispatcher(motion, motionExecutor, omega, teleop, force, started);
   std::promise<void> forceLockHeld;
   std::promise<void> releaseForceLock;
   auto release = releaseForceLock.get_future();
@@ -224,43 +231,33 @@ void testAcknowledgementCannotOvertakeForceStopBookkeeping() {
       "acknowledgement must not overtake the force bookkeeping part of an emergency stop");
 }
 
-void testTareIsRejectedBeforeDriverAccessWhileLatched() {
+void testTareHonorsCancellationBeforeDriverAccess() {
   LTDMCDriver motion;
-  Omega7Driver omega;
-  JodellGripperDriver gripper;
-  NativeTeleopController teleop(motion, omega, gripper);
   ForceControlRuntime force([]() {}, []() {});
   ForceRuntimeConfig config;
   config.source = "hkvl_serial";
   config.safety.watchdogMs = 1000.0;
   force.configure(config, 0.0);
   bool rejected = false;
-  try { force.tare(-1, 200); }
+  try { force.tare(-1, 200, []() { return false; }); }
   catch (const std::runtime_error& error) {
-    rejected = std::string(error.what()).find("latched") != std::string::npos;
+    rejected = std::string(error.what()).find("cancelled by emergency stop") != std::string::npos;
   }
-  require(rejected, "latched Tare must be refused before reaching the unstarted serial driver");
+  require(rejected, "cancelled Tare must be refused before reaching the unstarted serial driver");
   force.acceptSample(0, {}, {}, 1.0, 1);
   force.acceptSample(1, {}, {}, 1.0, 1);
   force.acceptSample(0, {}, {}, 501.0, 501);
   force.acceptSample(1, {}, {}, 501.0, 501);
+  ForceControlRuntimeTestAccess::markCalibrationReady(force);
   force.acknowledgeEmergencyStop(501.0);
   require(!force.safetyLatched(), "test setup should release the force latch using safe samples");
   motion.emergencyStop();
-  const auto started = std::chrono::steady_clock::now();
-  HalCommandDispatcher dispatcher(motion, omega, teleop, force, started);
-  rejected = false;
-  try { dispatcher.handle("force.tare", "{\"side\":\"all\",\"samples\":200}"); }
-  catch (const std::runtime_error& error) {
-    rejected = std::string(error.what()).find("emergency stop") != std::string::npos;
-  }
-  require(rejected, "motion stop alone must block Tare at the dispatcher even when force latch is clear");
   const auto oldEpoch = motion.commandEpoch();
   motion.acknowledgeEmergencyStop();
   rejected = false;
   try { force.tare(-1, 200, [&]() { return motion.commandEpochAllowed(oldEpoch); }); }
   catch (const std::runtime_error& error) {
-    rejected = std::string(error.what()).find("latched") != std::string::npos;
+    rejected = std::string(error.what()).find("cancelled by emergency stop") != std::string::npos;
   }
   require(rejected, "an old Tare request must remain invalid after acknowledgement");
 }
@@ -276,7 +273,7 @@ int main() {
     testOmegaForceGate();
     testInvalidMotionNumbersRejectedBeforeDeviceAccess();
     testAcknowledgementCannotOvertakeForceStopBookkeeping();
-    testTareIsRejectedBeforeDriverAccessWhileLatched();
+    testTareHonorsCancellationBeforeDriverAccess();
     std::cout << "EmergencyStopTests passed (9 cases, including 200 concurrent stop/ack races)\n";
     return 0;
   } catch (const std::exception& error) {

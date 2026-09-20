@@ -25,6 +25,20 @@ module appstation {
     string error;
   };
 
+  // 固定布局的高频控制状态；诊断文本最多 255 字节并以零结尾。
+  struct TeleopLeaderHandV2 {
+    uint64 flags;
+    double pose[6];
+    double gripper_gap;
+    int64 read_timestamp_ms;
+    char last_read_error[256];
+  };
+  struct TeleopLeaderStateV2 {
+    uint64 stamp_unix_ms;
+    uint64 stamp_monotonic_ms;
+    TeleopLeaderHandV2 hands[2];
+  };
+
   struct TeleopHardwareTarget {
     uint64 sequence;
     uint64 stamp_unix_ms;

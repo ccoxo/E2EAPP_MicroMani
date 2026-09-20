@@ -1487,6 +1487,23 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
   return result;
 }
 
+void LTDMCDriver::requireSideStopped(Side side) {
+  std::scoped_lock lock(mutex_);
+  ensureInitialized();
+#if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
+  if (!dmcCheckDone) throw std::runtime_error("motion completion query unavailable");
+  for (int i = 0; i < 6; ++i) {
+    if (dmcCheckDone(cardForSide(side), static_cast<unsigned short>(physicalAxis(side, static_cast<SemanticAxis>(i)))) != 1)
+      throw std::runtime_error("motion side is still moving; stop or wait before switching controller");
+  }
+#else
+  for (int i = 0; i < 6; ++i) {
+    if (cachedState_.axes[stateIndex(side, static_cast<SemanticAxis>(i))].moving)
+      throw std::runtime_error("motion side is still moving; stop or wait before switching controller");
+  }
+#endif
+}
+
 void LTDMCDriver::stopTeleopSide(Side side) {
   const auto stopEpoch = commandEpoch();
   std::scoped_lock lock(mutex_);

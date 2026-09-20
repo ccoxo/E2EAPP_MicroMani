@@ -8,16 +8,18 @@
 
 #include "ForceControlRuntime.h"
 #include "LTDMCDriver.h"
+#include "MotionExecutor.h"
 #include "TeleopDdsTypes.h"
 
 namespace appstation::hal {
 
-// 把 DDS 硬件目标转换成 LTDMCDriver 的 teleop target 更新调用。
-// 这个类不订阅 DDS，也不做映射计算，只守住最终写硬件的边界。
+// 给 DDS 硬件目标叠加柔顺修正，再交给共享 MotionExecutor 仲裁和执行。
+// 不订阅 DDS、不直接写运动驱动；保留柔顺实际应用量的回写职责。
 class TeleopHardwareTargetExecutor {
  public:
   TeleopHardwareTargetExecutor(
       LTDMCDriver& motion,
+      MotionExecutor& executor,
       ForceControlRuntime& forceRuntime,
       std::function<void(const char*)> failureCallback = {});
 
@@ -26,6 +28,7 @@ class TeleopHardwareTargetExecutor {
 
  private:
   LTDMCDriver& motion_;
+  MotionExecutor& executor_;
   ForceControlRuntime& forceRuntime_;
   std::function<void(const char*)> failureCallback_;
 };

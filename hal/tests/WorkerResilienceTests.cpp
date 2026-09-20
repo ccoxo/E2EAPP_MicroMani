@@ -167,12 +167,13 @@ void testForceMonitorCreationFailure() {
 
 void testFollowerFailureBoundary(bool standard) {
   LTDMCDriver motion;
+  MotionExecutor motionExecutor(motion);
   ForceControlRuntime force([]() {}, []() {});
   ForceRuntimeConfig config;
   config.source = "hkvl_serial";
   force.configure(config, 0);
   std::atomic_int additionalStops{0};
-  TeleopHardwareTargetExecutor executor(motion, force, [&](const char*) { ++additionalStops; throw 20; });
+  TeleopHardwareTargetExecutor executor(motion, motionExecutor, force, [&](const char*) { ++additionalStops; throw 20; });
   std::thread worker([&]() {
     runWorkerBoundary([&]() { injectedFailure(standard); }, [&](const char* message) { executor.reportControlFailure(message); });
   });

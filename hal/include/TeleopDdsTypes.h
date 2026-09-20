@@ -18,7 +18,8 @@ struct TeleopHardwareTarget {
   std::uint64_t stampUnixMs{0};
   std::uint64_t stampMonotonicMs{0};
   int side{0};
-  // 六轴增量按 X/Y/Z/Roll/Pitch/Yaw 排列，单位保持为底层运动控制使用的 pulse。
+  // 六轴增量按 X/Y/Z/Roll/Pitch/Yaw 排列，使用 UI 单位：平移 um、旋转 degree。
+  // 下方步长上限和死区仍使用 pulse；统一执行器交给驱动完成单位转换。
   std::array<double, 6> deltas{};
   double translationStepLimitPulse{0.0};
   double rotationStepLimitPulse{0.0};

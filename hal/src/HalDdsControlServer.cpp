@@ -27,7 +27,7 @@
 #include <fastdds/dds/topic/TopicDataType.hpp>
 #include <fastdds/dds/topic/TypeSupport.hpp>
 #include <fastdds/rtps/common/SerializedPayload.h>
-#include <fastdds/rtps/transport/UDPv4TransportDescriptor.h>
+#include "LocalDdsTransport.h"
 #include <fastrtps/types/TypesBase.h>
 
 #include <algorithm>
@@ -360,13 +360,7 @@ struct HalDdsControlServer::Impl {
     DomainParticipantQos participantQos;
     check(DomainParticipantFactory::get_instance()->get_default_participant_qos(participantQos), "get participant qos");
     participantQos.name("AppStationHalDdsControlServer");
-    if (!envBoolValue("APPSTATION_DDS_LAN_DISCOVERY", false)) {
-      // 默认只在本机发现 DDS 实体，避免现场工作站把控制面广播到局域网。
-      auto udp = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
-      udp->interfaceWhiteList.push_back("127.0.0.1");
-      participantQos.transport().use_builtin_transports = false;
-      participantQos.transport().user_transports.push_back(udp);
-    }
+    appstation::dds::configureLocalTransport(participantQos);
 
     participant = DomainParticipantFactory::get_instance()->create_participant(
         static_cast<eprosima::fastdds::dds::DomainId_t>(domainId),

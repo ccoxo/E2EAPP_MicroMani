@@ -12,17 +12,19 @@
 
 #include "ForceControlRuntime.h"
 #include "LTDMCDriver.h"
+#include "MotionExecutor.h"
 #include "NativeTeleopController.h"
 #include "Omega7Driver.h"
 
 namespace appstation::hal {
 
 // 统一分发 HAL 命令名，供 HTTP 和 DDS 两种传输层复用同一套语义。
-// 这里只做参数解析与驱动调用编排，不拥有硬件对象生命周期。
+// 负责参数解析和服务编排；普通运动统一交给执行器，急停保留独立驱动路径。
 class HalCommandDispatcher {
  public:
   HalCommandDispatcher(
       LTDMCDriver& motion,
+      MotionExecutor& executor,
       Omega7Driver& omega,
       NativeTeleopController& nativeTeleop,
       ForceControlRuntime& forceRuntime,
@@ -37,6 +39,7 @@ class HalCommandDispatcher {
   void requireForceMutationSafe(const char* operation);
 
   LTDMCDriver& motion_;
+  MotionExecutor& executor_;
   Omega7Driver& omega_;
   NativeTeleopController& nativeTeleop_;
   ForceControlRuntime& forceRuntime_;

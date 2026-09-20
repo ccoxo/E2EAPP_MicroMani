@@ -46,6 +46,8 @@ class LTDMCDriver {
   std::int64_t lastEmergencyStopUnixMs() const;
   // 回工作原点前的安全检查，急停未清除时直接拒绝运动。
   void ensureMotionReturnAllowed() const;
+  // 控制源交接使用新鲜硬件状态，不能用可能过期的遥测缓存批准接管。
+  void requireSideStopped(Side side);
   // 按侧打开/关闭伺服；enabledAxes 允许只作用于部分语义轴。
   std::string enableSide(Side side, bool enabled = true);
   std::string enableSide(Side side, bool enabled, const std::array<bool, 6>& enabledAxes,
@@ -99,6 +101,7 @@ class LTDMCDriver {
 
  private:
   friend struct ForceTareDispatcherTestAccess;
+  friend struct MotionExecutorTestAccess;
 
   void ensureInitialized() const;
   void throwIfEstopActive() const;

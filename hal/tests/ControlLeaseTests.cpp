@@ -105,12 +105,16 @@ std::string payload(std::int64_t issuedAt, int sequence = 1) {
 
 void testDispatcherRejectsStaleAndMalformedLease() {
   LTDMCDriver motion;
+  MotionExecutor motionExecutor(motion);
   Omega7Driver omega;
   JodellGripperDriver gripper;
-  NativeTeleopController native(motion, omega, gripper);
+  NativeTeleopController native(motion, motionExecutor, omega, gripper);
   ForceControlRuntime force([] {}, [] {});
+  ForceRuntimeConfig forceConfig;
+  forceConfig.source = "nidaq";
+  force.configure(forceConfig, 0.0);
   const auto started = std::chrono::steady_clock::now();
-  HalCommandDispatcher dispatcher(motion, omega, native, force, started);
+  HalCommandDispatcher dispatcher(motion, motionExecutor, omega, native, force, started);
   motion.requireControlLease();
   const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::system_clock::now().time_since_epoch()).count();

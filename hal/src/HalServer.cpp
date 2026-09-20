@@ -45,7 +45,8 @@ int runHalServer() {
   const bool swapHands = envBoolValue("APPSTATION_OMEGA7_SWAP_HANDS", false);
   omega.initialize(leftOpenId, rightOpenId, swapHands);
 
-  NativeTeleopController nativeTeleop(motion, omega, gripper);
+  MotionExecutor motionExecutor(motion);
+  NativeTeleopController nativeTeleop(motion, motionExecutor, omega, gripper);
   ForceControlRuntime forceRuntime(
       [&motion, &nativeTeleop, &omega]() {
         motion.latchEmergencyStop();
@@ -84,6 +85,7 @@ int runHalServer() {
 
   HalCommandDispatcher commandDispatcher(
       motion,
+      motionExecutor,
       omega,
       nativeTeleop,
       forceRuntime,
@@ -101,7 +103,7 @@ int runHalServer() {
       started);
   TeleopLeaderPublisher leaderPublisher;
   TeleopMappingNode teleopMapping(nativeTeleop);
-  TeleopHardwareTargetExecutor teleopExecutor(motion, forceRuntime, [&motion, &nativeTeleop](const char* error) {
+  TeleopHardwareTargetExecutor teleopExecutor(motion, motionExecutor, forceRuntime, [&motion, &nativeTeleop](const char* error) {
     motion.failControlLease();
     nativeTeleop.reportControlFailure(error);
   });
@@ -151,7 +153,7 @@ int runHalServer() {
   if (useDdsTeleop) {
     // DDS follower 模式把主手状态、映射计算、硬件目标执行拆成三个边界，便于分布式部署。
     nativeTeleop.setLeaderStatePublisher([&leaderPublisher](const std::array<Omega7State, 2>& hands) {
-      leaderPublisher.publishJson(jsonOmegaState(hands));
+      leaderPublisher.publish(hands);
     });
     nativeTeleop.setHardwareTargetPublisher([&teleopMapping](const TeleopHardwareTarget& target) {
       teleopMapping.publishHardwareTarget(target);

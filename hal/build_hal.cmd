@@ -79,6 +79,9 @@ cl %CXX_FLAGS% /c "%SRC%\JodellGripperDriver.cpp" /Fo"JodellGripperDriver.next.o
 echo Compiling MotionControlThread.cpp ...
 cl %CXX_FLAGS% /c "%SRC%\MotionControlThread.cpp" /Fo"MotionControlThread.next.obj" || goto :err
 
+echo Compiling MotionExecutor.cpp ...
+cl %CXX_FLAGS% /c "%SRC%\MotionExecutor.cpp" /Fo"MotionExecutor.next.obj" || goto :err
+
 echo Compiling NativeTeleopController.cpp ...
 cl %CXX_FLAGS% /c "%SRC%\NativeTeleopController.cpp" /Fo"NativeTeleopController.next.obj" || goto :err
 
@@ -118,7 +121,7 @@ cl %CXX_FLAGS% /c "%SRC%\JodellGripperWorker.cpp" /Fo"JodellGripperWorker.next.o
 rem HalServer links motion, master-hand, gripper, the Winsock HTTP boundary, and optional Fast-DDS.
 echo Linking HalServer.next.exe ...
 link /nologo /OUT:"HalServer.next.exe" ^
-  HalServer.next.obj HalJson.next.obj HalCommandDispatcher.next.obj HalDdsControlServer.next.obj HalHttpServer.next.obj TeleopLeaderPublisher.next.obj TeleopMappingNode.next.obj TeleopHardwareTargetExecutor.next.obj TeleopFollowerTargetSubscriber.next.obj HkvlForceProtocol.next.obj HkvlForceDriver.next.obj ForceSafetyLatch.next.obj ForceComplianceController.next.obj ForceControlRuntime.next.obj LTDMCDriver.next.obj JodellGripperDriver.next.obj MotionControlThread.next.obj NativeTeleopController.next.obj Omega7Driver.next.obj ^
+  HalServer.next.obj HalJson.next.obj HalCommandDispatcher.next.obj HalDdsControlServer.next.obj HalHttpServer.next.obj TeleopLeaderPublisher.next.obj TeleopMappingNode.next.obj TeleopHardwareTargetExecutor.next.obj TeleopFollowerTargetSubscriber.next.obj HkvlForceProtocol.next.obj HkvlForceDriver.next.obj ForceSafetyLatch.next.obj ForceComplianceController.next.obj ForceControlRuntime.next.obj LTDMCDriver.next.obj JodellGripperDriver.next.obj MotionControlThread.next.obj MotionExecutor.next.obj NativeTeleopController.next.obj Omega7Driver.next.obj ^
   /LIBPATH:"%FASTDDS_ROOT%\Lib" ws2_32.lib iphlpapi.lib "%FASTDDS_ROOT%\Lib\fastrtps-2.14.lib" "%FASTDDS_ROOT%\Lib\fastcdr-2.2.lib" "%FASTDDS_ROOT%\Lib\foonathan_memory-0.7.3.lib" ^
   || goto :err
 

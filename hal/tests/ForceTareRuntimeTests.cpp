@@ -283,10 +283,11 @@ struct DispatcherFixture {
   LTDMCDriver motion;
   Omega7Driver omega;
   JodellGripperDriver gripper;
-  NativeTeleopController native{motion, omega, gripper};
+  MotionExecutor motionExecutor{motion};
+  NativeTeleopController native{motion, motionExecutor, omega, gripper};
   ForceControlRuntime force;
   std::chrono::steady_clock::time_point started{std::chrono::steady_clock::now()};
-  HalCommandDispatcher dispatcher{motion, omega, native, force, started};
+  HalCommandDispatcher dispatcher{motion, motionExecutor, omega, native, force, started};
 
   DispatcherFixture() : force([this]() {
     // 与 HalServer 的全局急停回调使用相同的两次 motion trip 顺序。

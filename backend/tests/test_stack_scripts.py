@@ -244,18 +244,11 @@ def test_start_stack_preserves_existing_dds_domain_for_backend_after_hal_start()
     )
 
 
-def test_start_stack_preserves_existing_dds_lan_discovery_for_backend_after_hal_start() -> None:
-    script = (REPO_ROOT / "scripts" / "start-stack.ps1").read_text(encoding="utf-8")
-    after_hal_start = script.split('start-hal.ps1") -Restart', 1)[1]
-
-    assert (
-        'if (-not $env:APPSTATION_DDS_LAN_DISCOVERY) { $env:APPSTATION_DDS_LAN_DISCOVERY = "0" }'
-        in after_hal_start
-    )
-    assert '$env:APPSTATION_DDS_LAN_DISCOVERY = "0"' not in after_hal_start.replace(
-        'if (-not $env:APPSTATION_DDS_LAN_DISCOVERY) { $env:APPSTATION_DDS_LAN_DISCOVERY = "0" }',
-        "",
-    )
+def test_stack_scripts_use_local_dds_without_lan_switch() -> None:
+    for name in ("start-stack.ps1", "start-hal.ps1", "start-stack-dds.ps1"):
+        script = (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
+        assert "APPSTATION_DDS_LAN_DISCOVERY" not in script
+        assert "$LanDiscovery" not in script
 
 
 def test_launch_app_forwards_hal_port_to_initial_start_and_restart() -> None:
@@ -349,7 +342,7 @@ def test_start_dds_stack_enables_hal_direct_dds_without_python_sidecar() -> None
     assert 'APPSTATION_HAL_DDS_ENABLED = "1"' in script
     assert 'APPSTATION_HAL_TRANSPORT = "dds"' in script
     assert 'APPSTATION_DDS_DOMAIN_ID = "$DomainId"' in script
-    assert 'APPSTATION_DDS_LAN_DISCOVERY = if ($LanDiscovery) { "1" } else { "0" }' in script
+    assert 'ddsTransport = "shared_memory"' in script
     assert "backend.hal_client." + "dds_" + "bridge_runner" not in script
     assert "ddsBridgePid" not in script
     assert "backend.app:create_app" in script

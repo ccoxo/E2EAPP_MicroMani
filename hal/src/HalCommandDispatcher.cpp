@@ -17,11 +17,13 @@ namespace appstation::hal {
 
 HalCommandDispatcher::HalCommandDispatcher(
     LTDMCDriver& motion,
+    MotionExecutor& executor,
     Omega7Driver& omega,
     NativeTeleopController& nativeTeleop,
     ForceControlRuntime& forceRuntime,
     const std::chrono::steady_clock::time_point& started)
     : motion_(motion),
+      executor_(executor),
       omega_(omega),
       nativeTeleop_(nativeTeleop),
       forceRuntime_(forceRuntime),
@@ -209,7 +211,7 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     const auto enabledAxes = jsonHomeAllEnabledAxes(bodyText);
     nativeTeleop_.stop();
     ensureCurrentMotionCommand();
-    motion_.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes, commandEpoch);
+    executor_.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes, commandEpoch);
     return "{\"ok\":true}";
   }
   if (name == "motion.home_origin_side") {
@@ -218,22 +220,22 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     const auto enabledAxes = jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled);
     nativeTeleop_.stop();
     ensureCurrentMotionCommand();
-    motion_.homeOriginSide(side, jsonSideWorkOriginPulse(bodyText), enabledAxes, commandEpoch);
+    executor_.homeOriginSide(side, jsonSideWorkOriginPulse(bodyText), enabledAxes, commandEpoch);
     return "{\"ok\":true}";
   }
   if (name == "motion.enable_side") {
     const auto side = parseSide(jsonStringValue(bodyText, "side"));
-    const auto message = motion_.enableSide(side, true, jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled), commandEpoch);
+    const auto message = executor_.enableSide(side, true, jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled), commandEpoch);
     return "{\"ok\":true,\"message\":\"" + jsonEscape(message) + "\"}";
   }
   if (name == "motion.disable_side") {
     const auto side = parseSide(jsonStringValue(bodyText, "side"));
-    const auto message = motion_.enableSide(side, false);
+    const auto message = executor_.enableSide(side, false, kAllAxesEnabled, commandEpoch);
     return "{\"ok\":true,\"message\":\"" + jsonEscape(message) + "\"}";
   }
   if (name == "motion.home_side") {
     const auto side = parseSide(jsonStringValue(bodyText, "side"));
-    motion_.homeSide(side, jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled), commandEpoch);
+    executor_.homeSide(side, jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled), commandEpoch);
     return "{\"ok\":true}";
   }
   if (name == "motion.manual_axis_move") {
@@ -245,7 +247,7 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     const auto startVelocity = jsonNumberValue(bodyText, "startVelocityUiPerSec", 0);
     const auto accTime = jsonNumberValue(bodyText, "accTimeSec", 0);
     const auto decTime = jsonNumberValue(bodyText, "decTimeSec", 0);
-    motion_.moveRelativeUi(
+    executor_.moveRelativeUi(
         side,
         axis,
         step * (direction >= 0 ? 1.0 : -1.0),
@@ -264,27 +266,32 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
         jsonNumberValue(bodyText, "Roll", 0.0),
         jsonNumberValue(bodyText, "Pitch", 0.0),
         jsonNumberValue(bodyText, "Yaw", 0.0)};
-    const auto result = motion_.updateTeleopTargetUi(
-        side,
-        deltas,
-        jsonNumberValue(bodyText, "translationStepLimitPulse", 0.0),
-        jsonNumberValue(bodyText, "rotationStepLimitPulse", 0.0),
-        jsonNumberValue(bodyText, "translationPulseDeadband", 0.0),
-        jsonNumberValue(bodyText, "rotationPulseDeadband", 0.0),
-        jsonTeleopEnabledAxes(bodyText),
-        jsonBoolValue(bodyText, "syncZeroDeltaTarget", false),
-        jsonTeleopSoftLimits(bodyText),
-        jsonNumberValue(bodyText, "translationVelocityUiPerSec", 0.0),
-        jsonNumberValue(bodyText, "rotationVelocityUiPerSec", 0.0),
-        jsonNumberValue(bodyText, "translationStartVelocityUiPerSec", 0.0),
-        jsonNumberValue(bodyText, "rotationStartVelocityUiPerSec", 0.0),
-        jsonNumberValue(bodyText, "accTimeSec", 0.0),
-        jsonNumberValue(bodyText, "decTimeSec", 0.0), commandEpoch);
+    TeleopHardwareTarget target;
+    target.side = side == Side::Left ? 0 : 1;
+    target.deltas = deltas;
+    target.translationStepLimitPulse = jsonNumberValue(bodyText, "translationStepLimitPulse", 0.0);
+    target.rotationStepLimitPulse = jsonNumberValue(bodyText, "rotationStepLimitPulse", 0.0);
+    target.translationPulseDeadband = jsonNumberValue(bodyText, "translationPulseDeadband", 0.0);
+    target.rotationPulseDeadband = jsonNumberValue(bodyText, "rotationPulseDeadband", 0.0);
+    target.enabledAxes = jsonTeleopEnabledAxes(bodyText);
+    target.syncZeroDeltaTarget = jsonBoolValue(bodyText, "syncZeroDeltaTarget", false);
+    const auto limits = jsonTeleopSoftLimits(bodyText);
+    for (std::size_t i = 0; i < limits.size(); ++i) {
+      target.softLimitMin[i] = limits[i].min;
+      target.softLimitMax[i] = limits[i].max;
+    }
+    target.translationVelocityUiPerSec = jsonNumberValue(bodyText, "translationVelocityUiPerSec", 0.0);
+    target.rotationVelocityUiPerSec = jsonNumberValue(bodyText, "rotationVelocityUiPerSec", 0.0);
+    target.translationStartVelocityUiPerSec = jsonNumberValue(bodyText, "translationStartVelocityUiPerSec", 0.0);
+    target.rotationStartVelocityUiPerSec = jsonNumberValue(bodyText, "rotationStartVelocityUiPerSec", 0.0);
+    target.accTimeSec = jsonNumberValue(bodyText, "accTimeSec", 0.0);
+    target.decTimeSec = jsonNumberValue(bodyText, "decTimeSec", 0.0);
+    const auto result = executor_.applyExternal(target, commandEpoch);
     return jsonTeleopTargetUpdateResult(side, result);
   }
   if (name == "motion.teleop_stop_side") {
     const auto side = parseSide(jsonStringValue(bodyText, "side"));
-    motion_.stopTeleopSide(side);
+    executor_.stopSide(side);
     return "{\"ok\":true}";
   }
   throw std::runtime_error("unknown HAL command: " + name);

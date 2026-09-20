@@ -22,6 +22,7 @@ add_library(appstation_hal_core
   src/JodellGripperDriver.cpp
   src/LTDMCDriver.cpp
   src/MotionControlThread.cpp
+  src/MotionExecutor.cpp
   src/NativeTeleopController.cpp
   src/Omega7Driver.cpp
 )
@@ -45,6 +46,8 @@ add_executable(HalServer
   include/HalHttpServer.h
   include/HalJson.h
   include/TeleopDdsTypes.h
+  include/TeleopDdsPlainTypes.h
+  include/LocalDdsTransport.h
   include/TeleopFollowerTargetSubscriber.h
   include/TeleopHardwareTargetExecutor.h
   include/TeleopLeaderPublisher.h
@@ -89,4 +92,40 @@ add_executable(JodellGripperWorker src/JodellGripperWorker.cpp)
 target_link_libraries(JodellGripperWorker PRIVATE appstation_hal_core)
 if(MSVC)
   target_compile_options(JodellGripperWorker PRIVATE /utf-8)
+endif()
+
+# 离线仲裁回归必须关闭设备 SDK，避免测试程序访问真实设备。
+include(CTest)
+if(BUILD_TESTING AND APPSTATION_ENABLE_DDS)
+  # 仅使用合成样本，不链接硬件驱动或访问设备。
+  add_executable(TeleopDdsZeroCopyTests tests/TeleopDdsZeroCopyTests.cpp)
+  target_compile_features(TeleopDdsZeroCopyTests PRIVATE cxx_std_20)
+  target_compile_definitions(TeleopDdsZeroCopyTests PRIVATE EPROSIMA_ALL_DYN_LINK)
+  target_include_directories(TeleopDdsZeroCopyTests PRIVATE include
+    "${APPSTATION_FASTDDS_ROOT}/include/fastrtps"
+    "${APPSTATION_FASTDDS_ROOT}/include/fastcdr")
+  target_link_libraries(TeleopDdsZeroCopyTests PRIVATE
+    "${APPSTATION_FASTDDS_ROOT}/Lib/fastrtps-2.14.lib"
+    "${APPSTATION_FASTDDS_ROOT}/Lib/fastcdr-2.2.lib")
+  if(MSVC)
+    target_compile_options(TeleopDdsZeroCopyTests PRIVATE /utf-8)
+    set_property(TARGET TeleopDdsZeroCopyTests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+  endif()
+  foreach(mode RANGE 0 3)
+    add_test(NAME TeleopDdsZeroCopyTests_${mode} COMMAND TeleopDdsZeroCopyTests ${mode})
+    set_tests_properties(TeleopDdsZeroCopyTests_${mode} PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
+  endforeach()
+endif()
+if(BUILD_TESTING AND NOT APPSTATION_ENABLE_VENDOR_SDKS)
+  add_executable(MotionExecutorTests
+    tests/MotionExecutorTests.cpp
+    src/HalCommandDispatcher.cpp
+    src/HalJson.cpp
+  )
+  target_link_libraries(MotionExecutorTests PRIVATE appstation_hal_core)
+  if(MSVC)
+    target_compile_options(MotionExecutorTests PRIVATE /utf-8)
+  endif()
+  add_test(NAME MotionExecutorTests COMMAND MotionExecutorTests)
+  set_tests_properties(MotionExecutorTests PROPERTIES TIMEOUT 30)
 endif()

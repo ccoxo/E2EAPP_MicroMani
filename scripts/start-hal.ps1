@@ -369,7 +369,6 @@ $env:APPSTATION_FORCE_CONFIG_JSON = $forceRuntimeConfig | ConvertTo-Json -Compre
 $env:APPSTATION_HAL_PORT = "$Port"
 $env:APPSTATION_HAL_DDS_ENABLED = "1"
 if (-not $env:APPSTATION_DDS_DOMAIN_ID) { $env:APPSTATION_DDS_DOMAIN_ID = "42" }
-if (-not $env:APPSTATION_DDS_LAN_DISCOVERY) { $env:APPSTATION_DDS_LAN_DISCOVERY = "0" }
 $env:APPSTATION_JODELL_WORKER_EXE = "$workerRuntimeExe"
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 $process = Start-Process `

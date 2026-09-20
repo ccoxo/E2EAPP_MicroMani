@@ -21,16 +21,14 @@
 #include <fastdds/dds/topic/TopicDataType.hpp>
 #include <fastdds/dds/topic/TypeSupport.hpp>
 #include <fastdds/rtps/common/SerializedPayload.h>
-#include <fastdds/rtps/transport/UDPv4TransportDescriptor.h>
+#include "../../hal/include/LocalDdsTransport.h"
 #include <fastrtps/types/TypesBase.h>
 
 #include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
-#include <cctype>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -115,18 +113,6 @@ struct HalCommandReplySample {
   std::string result_json;
   std::string error;
 };
-
-bool envBoolValue(const char* key, bool fallback) {
-  const char* raw = std::getenv(key);
-  if (!raw || !*raw) {
-    return fallback;
-  }
-  std::string value(raw);
-  for (char& ch : value) {
-    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-  }
-  return value == "1" || value == "true" || value == "yes" || value == "on";
-}
 
 std::uint32_t stringPayloadSize(const std::string& value) {
   return static_cast<std::uint32_t>(value.size() + 8);
@@ -365,13 +351,7 @@ struct AppStationFastDdsTransport {
     DomainParticipantQos participantQos;
     check(DomainParticipantFactory::get_instance()->get_default_participant_qos(participantQos), "get_default_participant_qos");
     participantQos.name("AppStationBackendFastDds");
-    // 默认 localhost-only，和 HAL C++ participant 保持相同安全边界。
-    if (!envBoolValue("APPSTATION_DDS_LAN_DISCOVERY", false)) {
-      auto udp = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
-      udp->interfaceWhiteList.push_back("127.0.0.1");
-      participantQos.transport().use_builtin_transports = false;
-      participantQos.transport().user_transports.push_back(udp);
-    }
+    appstation::dds::configureLocalTransport(participantQos);
 
     participant = DomainParticipantFactory::get_instance()->create_participant(
         static_cast<eprosima::fastdds::dds::DomainId_t>(domainId),

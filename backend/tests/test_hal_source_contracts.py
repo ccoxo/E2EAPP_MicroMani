@@ -10,6 +10,25 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_motion_writes_share_one_executor_and_keep_emergency_independent() -> None:
+    sources = REPO_ROOT / "hal" / "src"
+    for name in ("HalCommandDispatcher.cpp", "NativeTeleopController.cpp", "TeleopHardwareTargetExecutor.cpp"):
+        source = (sources / name).read_text(encoding="utf-8")
+        for method in ("moveRelativeUi", "updateTeleopTargetUi", "homeAll", "homeOriginSide", "homeSide", "enableSide", "stopTeleopSide"):
+            assert f"motion_.{method}(" not in source
+    server = (sources / "HalServer.cpp").read_text(encoding="utf-8")
+    assert server.count("MotionExecutor motionExecutor(motion);") == 1
+    executor = (sources / "MotionExecutor.cpp").read_text(encoding="utf-8")
+    assert "motion_.requireSideStopped(side);" in executor
+    dispatcher = (sources / "HalCommandDispatcher.cpp").read_text(encoding="utf-8")
+    emergency = dispatcher.split("std::string HalCommandDispatcher::handleEmergencyStop()", 1)[1].split(
+        "void HalCommandDispatcher::requireForceMutationSafe", 1
+    )[0]
+    assert "motion_.latchEmergencyStop();" in emergency
+    assert "motion_.emergencyStop();" in emergency
+    assert "executor_." not in emergency
+
+
 def test_native_dds_waits_for_command_and_reply_discovery_before_startup_commands() -> None:
     source = (REPO_ROOT / "backend/native/appstation_fastdds_transport.cpp").read_text(encoding="utf-8")
     start = source.split("  void start() {", 1)[1].split("  void close()", 1)[0]
@@ -115,10 +134,10 @@ def test_hal_home_all_requires_work_origin_payload() -> None:
     normalized = " ".join(command_source.split())
 
     assert "const auto enabledAxes = jsonHomeAllEnabledAxes(bodyText);" in normalized
-    assert "motion_.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes, commandEpoch)" in normalized
+    assert "executor_.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes, commandEpoch)" in normalized
     assert "jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled)" in normalized
-    assert "motion_.enableSide(side, true, jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled), commandEpoch)" in normalized
-    assert "motion_.homeSide(side, jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled), commandEpoch)" in normalized
+    assert "executor_.enableSide(side, true, jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled), commandEpoch)" in normalized
+    assert "executor_.homeSide(side, jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled), commandEpoch)" in normalized
     assert "home_all requires leftPulse[6] work origin payload" in json_source
     assert "home_all requires rightPulse[6] work origin payload" in json_source
     assert "home_origin_side requires pulse[6] work origin payload" in json_source
@@ -425,10 +444,10 @@ def test_hal_server_wires_three_layer_teleop_dds_without_bridge() -> None:
     assert "teleopMapping.start()" in server_source
     assert "followerSubscriber.start()" in server_source
     assert "HalFastDdsBridge" not in server_source
-    assert "AppStation.Teleop.LeaderState" in leader_source
-    assert "AppStation.Teleop.LeaderState" in mapping_source
-    assert "AppStation.Teleop.HardwareTarget" in mapping_source
-    assert "AppStation.Teleop.HardwareTarget" in follower_source
+    assert "dds::kLeaderTopic" in leader_source
+    assert "dds::kLeaderTopic" in mapping_source
+    assert "dds::kTargetTopic" in mapping_source
+    assert "dds::kTargetTopic" in follower_source
 
 
 def test_hal_direct_dds_control_server_replaces_backend_http_control_plane() -> None:
@@ -605,12 +624,12 @@ def test_fastdds_teleop_shadow_topics_and_standard_hardware_target_contract() ->
     assert "class TeleopLeaderPublisher" in leader_publisher
     assert "class TeleopFollowerTargetSubscriber" in follower_subscriber
     assert "HalFastDdsBridge" not in server_source
-    assert "AppStation.Teleop.HardwareTarget" in mapping_source
+    assert "dds::kTargetTopic" in mapping_source
     assert "appstation_fastdds_publish_teleop_hardware_target" not in native_source
     assert "loan_sample" not in native_source
     assert "discard_loan" not in native_source
     assert "publishTeleopHardwareTargetSharedMemory" not in native_source
-    assert "targetWriter_->write(&sample)" in mapping_source
+    assert "dds::publish<TeleopHardwareTarget>" in mapping_source
 
     assert "TeleopLeaderPublisher leaderPublisher" in server_source
     assert "TeleopFollowerTargetSubscriber followerSubscriber" in server_source
@@ -684,21 +703,21 @@ def test_hal_teleop_dds_is_driven_by_native_master_loop_and_target_messages() ->
     native_header = (REPO_ROOT / "hal" / "include" / "NativeTeleopController.h").read_text(encoding="utf-8")
     native_source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
 
-    assert "AppStation.Teleop.LeaderState" in leader_source
-    assert "writer_->write(&sample)" in leader_source
-    assert "AppStation.Teleop.LeaderState" in mapping_source
-    assert "AppStation.Teleop.HardwareTarget" in mapping_source
+    assert "dds::kLeaderTopic" in leader_source
+    assert "dds::publish<dds::LeaderState>" in leader_source
+    assert "dds::kLeaderTopic" in mapping_source
+    assert "dds::kTargetTopic" in mapping_source
     assert "DataReaderListener" in mapping_source
     assert "on_data_available" in mapping_source
     assert "wait_for_unread_message" not in mapping_source
     assert "nativeTeleop_.processLeaderState" in mapping_source
     assert "publishHardwareTarget" in mapping_source
-    assert "AppStation.Teleop.HardwareTarget" in follower_source
+    assert "dds::kTargetTopic" in follower_source
     assert "DataReaderListener" in follower_source
     assert "on_data_available" in follower_source
     assert "wait_for_unread_message" not in follower_source
     assert "executor_.apply(target)" in follower_source
-    assert "motion_.updateTeleopTargetUi(" in executor_source
+    assert "executor_.applyNative(target, deltas)" in executor_source
 
     assert "using LeaderStatePublisher" in native_header
     assert "void setLeaderStatePublisher" in native_header
@@ -850,7 +869,7 @@ def test_hal_manual_axis_move_dispatches_card0_yaw_without_special_rejection() -
         1,
     )[0]
     assert "Card 0 Yaw motion axis is disabled by safety policy" not in branch
-    assert "motion_.moveRelativeUi(" in branch
+    assert "executor_.moveRelativeUi(" in branch
 
 
 def test_ltdmc_driver_has_no_permanent_card0_yaw_gate() -> None:
@@ -931,8 +950,8 @@ def test_hal_native_teleop_controller_is_wired_to_server_and_build() -> None:
 
     assert "class NativeTeleopController" in header
     assert "velocity_admittance" in source
-    assert "updateTeleopTargetUi" in source
-    assert "stopTeleopSide" in source
+    assert "executor_.applyNative" in source
+    assert "executor_.stopNativeSide" in source
     assert "setGravityCompensation" in source
     assert "forceOutputEnabled" in source
 
@@ -1196,7 +1215,7 @@ def test_hal_direct_work_origin_home_rejects_estop_before_enable_or_motion() -> 
     for branch in (home_all_branch, home_side_branch):
         assert "motion_.ensureMotionReturnAllowed();" in branch
         assert branch.index("motion_.ensureMotionReturnAllowed();") < branch.index("nativeTeleop_.stop();")
-        assert branch.index("motion_.ensureMotionReturnAllowed();") < branch.index("motion_.home")
+        assert branch.index("motion_.ensureMotionReturnAllowed();") < branch.index("executor_.home")
     for body in (home_all_body, home_side_body):
         assert "ensureMotionReturnAllowed();" in body
 
@@ -1316,11 +1335,11 @@ def test_hal_native_incremental_zero_delta_stops_active_target_like_icf_incremen
         "std::array<double, 6> NativeTeleopController::velocityDeltasUi",
         1,
     )[0]
-    assert "motion_.stopTeleopSide(targetSide);" in sync_body
+    assert "executor_.stopNativeSide(targetSide, hardwareTargetSequence_);" in sync_body
     assert "targetActive_[targetIndex] = false;" in sync_body
     assert "recordZeroStopActionUnlocked(sourceSide, targetSide);" in sync_body
     assert "referencePose_[sourceIndex] = semanticPose" in sync_body
-    assert "motion_.updateTeleopTargetUi(" not in sync_body
+    assert "executor_.applyNative(" not in sync_body
 
 
 def test_hal_native_incremental_motion_updates_target_then_advances_reference() -> None:
@@ -1329,22 +1348,23 @@ def test_hal_native_incremental_motion_updates_target_then_advances_reference() 
         "void NativeTeleopController::syncIncrementalZeroDeltaUnlocked(",
         1,
     )[0]
-    active_branch = body.split("const auto result = motion_.updateTeleopTargetUi(", 1)[1].split(
+    active_branch = body.split("const auto applied = executor_.applyNative(", 1)[1].split(
         "}\n\nvoid NativeTeleopController::syncIncrementalZeroDeltaUnlocked(",
         1,
     )[0]
     normalized = " ".join(active_branch.split())
 
-    assert "targetSide," in active_branch
-    assert "deltas," in active_branch
-    assert "config_.translationStepLimitPulse," in active_branch
-    assert "config_.rotationStepLimitPulse," in active_branch
-    assert "config_.translationPulseDeadband," in active_branch
-    assert "config_.rotationPulseDeadband," in active_branch
-    assert "config_.enabledAxes[targetIndex]," in active_branch
-    assert "true," in active_branch
+    assert "target, target.deltas" in active_branch
+    assert "if (!applied) return;" in active_branch
+    assert "const auto& result = *applied;" in active_branch
+    for field in ("translationStepLimitPulse", "rotationStepLimitPulse",
+                  "translationPulseDeadband", "rotationPulseDeadband"):
+        assert f"target.{field} = config_.{field};" in body
+    assert "target.enabledAxes = config_.enabledAxes[targetIndex];" in body
+    assert "target.syncZeroDeltaTarget = true;" in body
+    assert "target.softLimitMin[i] = limits[i].min;" in body
+    assert "target.softLimitMax[i] = limits[i].max;" in body
     assert "const auto limits = effectiveSoftLimits(targetSide, targetIndex);" in body
-    assert "limits," in active_branch
     assert "targetActive_[targetIndex] = true;" in active_branch
     assert "recordActionUnlocked(sourceSide, targetSide, result);" in active_branch
     assert (
@@ -1447,7 +1467,7 @@ def test_hal_native_incremental_below_threshold_input_stops_active_target_like_i
         1,
     )[0]
     no_motion_branch = body.split("if (!hasMotion(deltas)) {", 1)[1].split(
-        "\n  }\n\n  const auto result = motion_.updateTeleopTargetUi(",
+        "\n  }\n\n  const auto applied = executor_.applyNative(",
         1,
     )[0]
 
@@ -1589,7 +1609,7 @@ def test_hal_native_dds_target_publish_records_action_history() -> None:
     header = (REPO_ROOT / "hal" / "include" / "NativeTeleopController.h").read_text(encoding="utf-8")
     source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
     tick_body = source.split("if (hardwareTargetPublisher_) {", 1)[1].split(
-        "const auto result = motion_.updateTeleopTargetUi(",
+        "const auto applied = executor_.applyNative(",
         1,
     )[0]
     record_marker = "void NativeTeleopController::recordPublishedTargetActionUnlocked("
@@ -1698,12 +1718,12 @@ def test_hal_native_incremental_rotation_spike_recaptures_reference_before_motio
     assert "constexpr double kIncrementalRotationSpikeGuardDeg = 5.0;" in source
     assert "suppressIncrementalRotationSpikeUnlocked(" in tick_body
     assert tick_body.index("suppressIncrementalRotationSpikeUnlocked(") < tick_body.index(
-        "motion_.updateTeleopTargetUi("
+        "executor_.applyNative("
     )
     assert "axisIndex = 3" in guard_body
     assert "std::abs(rawDelta) <= kIncrementalRotationSpikeGuardDeg" in guard_body
     assert "referencePose_[sourceIndex] = semanticPose;" in guard_body
-    assert "motion_.stopTeleopSide(targetSide);" in guard_body
+    assert "executor_.stopNativeSide(targetSide, hardwareTargetSequence_);" in guard_body
     assert "targetActive_[targetIndex] = false;" in guard_body
     assert (
         'setBlockerUnlocked(sourceIndex, "blocked", '
@@ -1764,10 +1784,10 @@ def test_hal_native_zero_increment_hard_stops_active_target() -> None:
     )[0]
 
     assert "if (targetActive_[targetIndex]) {" in body
-    assert "motion_.stopTeleopSide(targetSide);" in body
+    assert "executor_.stopNativeSide(targetSide, hardwareTargetSequence_);" in body
     assert "targetActive_[targetIndex] = false;" in body
     assert "recordZeroStopActionUnlocked(sourceSide, targetSide);" in body
-    assert "motion_.updateTeleopTargetUi(" not in body
+    assert "executor_.applyNative(" not in body
 
 
 def test_ltdmc_native_teleop_reattaches_moving_axis_without_reprofiling_busy_axis() -> None:
@@ -2386,8 +2406,8 @@ def test_hal_native_workers_and_dds_mapping_share_a_noexcept_failure_exit() -> N
     assert "catch (const std::exception& error)" in listener
     assert "catch (...)" in listener
     assert "reportControlFailure" in listener
-    assert "if (!targetWriter_->write(&sample))" in mapping
-    assert "if (!writer_->write(&sample))" in leader
+    assert "dds::publish<TeleopHardwareTarget>" in mapping
+    assert "dds::publish<dds::LeaderState>" in leader
 
 
 def test_hal_force_emergency_callback_failure_blocks_acknowledgement_and_is_visible() -> None:
@@ -2516,3 +2536,49 @@ def test_hal_server_accepts_commands_after_assembly_and_unwinds_in_dependency_or
     main = server.split("int main()", 1)[1]
     assert "try { return runHalServer(); }" in main
     assert "catch (const std::exception& error)" in main and "catch (...)" in main
+
+
+def test_teleop_plain_dds_contract_and_loan_failure_cleanup() -> None:
+    plain = (REPO_ROOT / "hal/include/TeleopDdsPlainTypes.h").read_text(encoding="utf-8")
+    idl = (REPO_ROOT / "hal/dds/appstation_hal.idl").read_text(encoding="utf-8")
+    server = (REPO_ROOT / "hal/src/HalServer.cpp").read_text(encoding="utf-8")
+    assert 'kLeaderTopic = "AppStation.Teleop.LeaderState.V2"' in plain
+    assert 'kTargetTopic = "AppStation.Teleop.HardwareTarget"' in plain
+    assert "struct TeleopLeaderStateV2" in idl
+    assert 'qos.data_sharing().on("")' in plain
+    assert "writer.loan_sample(raw)" in plain
+    assert "if (!writer.write(raw)) throw" in plain
+    assert "writer.discard_loan(raw)" in plain
+    assert "reader_.return_loan(samples, infos)" in plain
+    assert plain.count("reader_.is_sample_valid(&samples[i], &infos[i])") == 2
+    assert "leaderPublisher.publish(hands)" in server
+    assert "leaderPublisher.publishJson" not in server
+
+
+def test_all_dds_participants_use_shared_memory_only() -> None:
+    config = (REPO_ROOT / "hal/include/LocalDdsTransport.h").read_text(encoding="utf-8")
+    assert "SharedMemTransportDescriptor" in config
+    assert "use_builtin_transports = false" in config
+    assert "user_transports.clear()" in config
+    for path in (
+        "hal/src/HalDdsControlServer.cpp", "hal/src/TeleopLeaderPublisher.cpp",
+        "hal/src/TeleopMappingNode.cpp", "hal/src/TeleopFollowerTargetSubscriber.cpp",
+        "backend/native/appstation_fastdds_transport.cpp",
+    ):
+        source = (REPO_ROOT / path).read_text(encoding="utf-8")
+        assert "appstation::dds::configureLocalTransport(participantQos)" in source
+        assert "UDPv4TransportDescriptor" not in source
+        assert "APPSTATION_DDS_LAN_DISCOVERY" not in source
+
+
+def test_no_network_transport_implementation_remains_in_project_dds_code() -> None:
+    files = list((REPO_ROOT / "hal/src").glob("*.cpp"))
+    files += list((REPO_ROOT / "hal/include").glob("*.h"))
+    files += list((REPO_ROOT / "hal/tests").glob("*.cpp"))
+    files += list((REPO_ROOT / "backend/native").glob("*.cpp"))
+    for path in files:
+        source = path.read_text(encoding="utf-8-sig")
+        for descriptor in ("UDPv4TransportDescriptor", "UDPv6TransportDescriptor",
+                           "TCPv4TransportDescriptor", "TCPv6TransportDescriptor"):
+            assert descriptor not in source, str(path)
+        assert "APPSTATION_DDS_LAN_DISCOVERY" not in source, str(path)

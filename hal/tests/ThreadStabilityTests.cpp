@@ -1,3 +1,4 @@
+#include "OfflineMotion.h"
 #include "ForceControlRuntime.h"
 #include "HttpConnectionWorkers.h"
 #include "JodellGripperDriver.h"
@@ -21,9 +22,11 @@ void require(bool value, const char* message) {
 
 void testPublisherFailureStopsControl(bool standardException) {
   LTDMCDriver motion;
+  MotionExecutor motionExecutor(motion);
   Omega7Driver omega;
   JodellGripperDriver gripper;
-  NativeTeleopController teleop(motion, omega, gripper);
+  MotionExecutorTestAccess::initialize(motion);
+  NativeTeleopController teleop(motion, motionExecutor, omega, gripper);
   std::atomic_int calls{0};
   teleop.setLeaderStatePublisher([&](const auto&) {
     calls.fetch_add(1);

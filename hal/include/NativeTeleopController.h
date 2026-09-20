@@ -19,6 +19,7 @@
 #include "HalTypes.h"
 #include "JodellGripperDriver.h"
 #include "LTDMCDriver.h"
+#include "MotionExecutor.h"
 #include "Omega7Driver.h"
 #include "TeleopDdsTypes.h"
 
@@ -182,7 +183,7 @@ class NativeTeleopController {
   using LeaderStatePublisher = std::function<void(const std::array<Omega7State, 2>&)>;
   using HardwareTargetPublisher = std::function<void(const TeleopHardwareTarget&)>;
 
-  NativeTeleopController(LTDMCDriver& motion, Omega7Driver& omega, JodellGripperDriver& gripper);
+  NativeTeleopController(LTDMCDriver& motion, MotionExecutor& executor, Omega7Driver& omega, JodellGripperDriver& gripper);
   ~NativeTeleopController();
 
   void configure(const NativeTeleopConfig& config,
@@ -304,6 +305,7 @@ class NativeTeleopController {
 
   // 底层驱动由外部构造并保证生命周期覆盖控制器。
   LTDMCDriver& motion_;
+  MotionExecutor& executor_;
   Omega7Driver& omega_;
   JodellGripperDriver& gripper_;
   // mutex_ 保护 teleop 配置、引用位姿、诊断状态和动作历史；夹爪队列使用单独 mutex。
