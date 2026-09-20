@@ -62,6 +62,7 @@ def test_three_camera_encoding_is_complete_and_can_start_next_episode(tmp_path):
                 assert float(frames[-1].pts * frames[-1].time_base) == pytest.approx(29 / 30)
                 assert frames[-1].to_ndarray().mean() > 50
                 assert stats is not None
+                np.testing.assert_allclose(stats["std"], np.std(np.arange(30, dtype=float) * 5), rtol=1e-6)
     finally:
         encoder.close()
     assert not encoder._process.is_alive()
@@ -141,6 +142,29 @@ def test_dataset_writer_saves_process_encoded_videos_and_stats(tmp_path):
     for path in videos:
         with av.open(str(path)) as container:
             assert sum(1 for _ in container.decode(video=0)) == 12
+    from backend.services.video_statistics import decoded_video_statistics
+    from scripts.recompute_video_statistics import repair
+    import json
+    source = tmp_path / "dataset"
+    original = {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+    with av.open(str(videos[0])) as container:
+        pixels = np.concatenate([f.to_ndarray(format="rgb24").reshape(-1, 3)
+                                 for f in container.decode(video=0)]) / 255
+    stats = decoded_video_statistics(videos[0], 0, 12 / 30, 12)
+    np.testing.assert_allclose(stats["std"].ravel(), pixels.std(axis=0), atol=1e-10)
+    with pytest.raises(ValueError, match="frame count mismatch"):
+        decoded_video_statistics(videos[0], 0, 12 / 30, 13)
+    destination = repair(source, tmp_path / "repaired")
+    for relative, content in original.items():
+        assert (source / relative).read_bytes() == content
+        if relative.parts[0] in ("data", "videos"):
+            assert (destination / relative).read_bytes() == content
+    repaired_stats = json.loads((destination / "meta/stats.json").read_text())
+    old_stats = json.loads(original[next(p for p in original if p.as_posix() == "meta/stats.json")])
+    assert repaired_stats["observation.state"] == old_stats["observation.state"]
+    assert np.asarray(repaired_stats[keys[0]]["std"]).min() > 0.1
+    with pytest.raises(ValueError, match="输出必须"):
+        repair(source, destination)
 
 
 def test_finish_failure_restores_gc_scope():

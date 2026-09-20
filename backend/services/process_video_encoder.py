@@ -11,8 +11,15 @@ class _WorkerError(RuntimeError):
 
 def _worker(commands, replies, options):
     encoder = None
+    original_statistics = None
     try:
         from lerobot.datasets.video_utils import StreamingVideoEncoder
+        from lerobot.datasets import compute_stats
+        from backend.services.video_statistics import FloatVideoStatistics
+
+        # 仅替换独立编码进程内的统计实现，不修改安装目录和后端全局状态。
+        original_statistics = compute_stats.RunningQuantileStats
+        compute_stats.RunningQuantileStats = FloatVideoStatistics
 
         encoder = StreamingVideoEncoder(**options)
         replies.send({"ok": True})
@@ -39,6 +46,8 @@ def _worker(commands, replies, options):
     finally:
         if encoder is not None:
             encoder.close()
+        if original_statistics is not None:
+            compute_stats.RunningQuantileStats = original_statistics
         replies.close()
         commands.close()
 
