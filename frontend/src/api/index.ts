@@ -58,6 +58,7 @@ export function installControlCommandTimeoutHandler(handler: (reason: string) =>
 }
 
 function commandRequiresSafetyClear(path: string, body: unknown): boolean {
+  if (/^\/api\/datasets\/[^/]+\/episodes\/[^/]+\/replay\/start$/.test(path)) return true
   if (/^\/api\/motion\/(?:(left|right)\/)?origin\/(capture|restore_previous|clear)$/.test(path)) return true
   if (/^\/api\/(sensors\/tare|force\/(left|right)\/tare)$/.test(path)) return true
   if (/^\/api\/motion\/(manual_axis_move|home_all|(left|right)\/(enable_all|home|return_origin))$/.test(path)) return true

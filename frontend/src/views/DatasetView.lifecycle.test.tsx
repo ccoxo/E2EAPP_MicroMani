@@ -21,7 +21,10 @@ function deferred<T>() {
 beforeEach(() => {
   vi.spyOn(api, 'fetchDatasets').mockResolvedValue(structuredClone(datasets))
   vi.spyOn(window, 'confirm').mockReturnValue(true)
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{}', { status: 503 })))
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) =>
+    url.endsWith('/api/replay/status')
+      ? new Response(JSON.stringify({ data: { active: false, phase: 'idle', frame: 0, totalFrames: 0 } }))
+      : new Response('{}', { status: 503 })))
 })
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 

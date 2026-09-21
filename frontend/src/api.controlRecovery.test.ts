@@ -47,3 +47,16 @@ it('原点修改经过门闩，右侧 Yaw 未知不能以聚合使能代替', as
     left: Array(6).fill(true), right: [true, true, true, true, true, null],
   })).toBe(false)
 })
+
+it('真机回放开始经过控制门闩，停止始终允许发送', async () => {
+  vi.resetModules()
+  vi.stubEnv('MODE', 'development')
+  const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })))
+  vi.stubGlobal('fetch', fetcher)
+  const api = await import('./api')
+  api.installControlCommandGuard(() => '未确认控制租约')
+  await expect(api.postCommand('/api/datasets/local/episodes/episode_000001/replay/start', { confirmMotion: true })).rejects.toThrow('未确认控制租约')
+  expect(fetcher).not.toHaveBeenCalled()
+  await api.postCommand('/api/replay/stop', {})
+  expect(fetcher).toHaveBeenCalledOnce()
+})

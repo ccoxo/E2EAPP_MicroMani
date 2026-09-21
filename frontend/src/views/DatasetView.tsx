@@ -20,6 +20,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { CameraPreview } from '../components/CameraPreview'
+import { DatasetReplayPanel } from '../components/DatasetReplayPanel'
 import {
   apiBase,
   createDatasetApi,
@@ -929,6 +930,7 @@ const openHubUpload = () => {
                 </div>
               </section>
 
+              <DatasetReplayPanel key={`${selectedDataset.id}/${selectedEpisode.id}`} datasetId={selectedDataset.id} episodeId={selectedEpisode.id} />
               <section className="panel-surface checklist-grid">
                 {[
                   selectedEpisode.warnings.length === 0 ? '视频文件完整' : selectedEpisode.warnings[0],

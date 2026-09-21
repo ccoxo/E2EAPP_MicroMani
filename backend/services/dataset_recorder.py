@@ -1217,6 +1217,35 @@ class DatasetRecorderService:
             raise FileNotFoundError(episode_id)
         return {"episode": self._episode_for_api(dataset_dir, dataset_id, episode)}
 
+    def load_replay_episode(self, dataset_id: str, episode_id: str) -> dict[str, Any]:
+        """读取完整动作列；不复用抽样、补零或跳过坏帧的预览路径。"""
+        dataset_dir = self._dataset_path(dataset_id)
+        info = self._read_json(dataset_dir / "meta" / "info.json")
+        app_info = self._read_json(dataset_dir / "meta" / "appstation_info.json")
+        validate_data_contract(app_info.get("dataContract") or info.get("dataContract"))
+        if not self._is_native_dataset(dataset_dir, info):
+            raise ValueError("真机回放仅支持具有完整契约的 native LeRobot 数据集")
+        episode = next((item for item in self._visible_episodes_for_dataset(dataset_dir, info)
+                        if str(item.get("id")) == episode_id), None)
+        if episode is None:
+            raise FileNotFoundError(episode_id)
+        if episode.get("status") in {"discarded", "deleted"}:
+            raise ValueError("不能回放已丢弃的片段")
+        import pyarrow.dataset as ds
+
+        files = sorted((dataset_dir / "data").glob("chunk-*/*.parquet"))
+        if not files:
+            raise ValueError("没有完整的动作数据文件")
+        table = ds.dataset([str(path) for path in files], format="parquet").to_table(
+            columns=["episode_index", "frame_index", "timestamp", "action", "observation.state"],
+            filter=ds.field("episode_index") == int(episode["episodeIndex"]),
+        ).sort_by("frame_index")
+        rows = table.to_pylist()
+        if not rows or len(rows) != int(episode["frames"]):
+            raise ValueError("片段帧数与数据文件不一致")
+        return {"episode": episode, "rows": rows, "fps": info.get("fps"),
+                "dataContract": app_info.get("dataContract") or info.get("dataContract")}
+
     def split_dataset(self, dataset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """按给定比例生成 train/val/test episode 划分并写入 splits.json。"""
         dataset_dir = self._dataset_path(dataset_id)

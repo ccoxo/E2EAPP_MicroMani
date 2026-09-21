@@ -51,6 +51,7 @@ from backend.services.command_service import (
     normalize_motion_axis_enabled,
 )
 from backend.services.dataset_recorder import DatasetSaveError
+from backend.services.dataset_replay import DatasetReplayService
 from backend.services.control_watchdog import ControlLeaseUnavailable, ControlWatchdog
 from backend.services.gripper_backend import native_teleop_enabled
 from backend.services.pico_network import PicoNetworkDetectionError, detect_pico_network
@@ -438,6 +439,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     recorder = svc.recorder
     stability = svc.stability
     policy = svc.policy
+    replay = DatasetReplayService(svc)
+    commands.set_origin_mutation_lock_checker(lambda: recorder.origin_mutation_locked() or replay.active)
     emit_session_start_log(logs, settings, startup_config)
     emit_axis_config_snapshot_logs(logs, settings, startup_config)
 
@@ -453,6 +456,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     app.state.recorder = recorder
     app.state.stability = stability
     app.state.policy = policy
+    app.state.replay = replay
     app.state.ws_clients = set()
     app.state.shutdown_task = None
     app.state.teleop_background_tasks = set()
@@ -806,6 +810,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
     @app.on_event("shutdown")
     async def shutdown_runtime_services() -> None:
+        try:
+            await replay.stop()
+        except Exception as exc:
+            logs.error("[HAL]", f"shutdown replay stop unconfirmed: {exc}")
         await control_watchdog.close()
         try:
             record_status = await asyncio.to_thread(recorder.status)
@@ -2038,6 +2046,30 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         return envelope(await asyncio.to_thread(recorder.status))
 
     # 列出数据集。
+    @app.get("/api/replay/status")
+    async def replay_status() -> ApiEnvelope:
+        return envelope(replay.status())
+
+    @app.post("/api/replay/stop")
+    async def replay_stop() -> ApiEnvelope:
+        return envelope(await replay.stop())
+
+    @app.post("/api/datasets/{dataset_id}/episodes/{episode_id}/replay/inspect")
+    async def replay_inspect(dataset_id: str, episode_id: str) -> ApiEnvelope:
+        try:
+            return envelope(await replay.inspect(dataset_id, episode_id))
+        except (ValueError, RuntimeError, FileNotFoundError) as exc:
+            raise HTTPException(409, detail={"code": "REPLAY_REJECTED", "message": str(exc)}) from exc
+
+    @app.post("/api/datasets/{dataset_id}/episodes/{episode_id}/replay/start")
+    async def replay_start(dataset_id: str, episode_id: str, payload: dict[str, Any]) -> ApiEnvelope:
+        if payload.get("confirmMotion") is not True:
+            raise HTTPException(400, detail={"code": "REPLAY_CONFIRM_REQUIRED", "message": "请确认起点对齐及真机运动"})
+        try:
+            return envelope(await replay.start(dataset_id, episode_id, float(payload.get("speed", .25))))
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise HTTPException(409, detail={"code": "REPLAY_REJECTED", "message": str(exc)}) from exc
+
     @app.get("/api/datasets")
     async def list_datasets() -> ApiEnvelope:
         datasets = await asyncio.to_thread(recorder.list_datasets)
