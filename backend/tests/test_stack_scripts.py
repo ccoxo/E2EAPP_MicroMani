@@ -16,6 +16,25 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_start_app_cmd_runs_without_command_errors(tmp_path):
+    shell = shutil.which("cmd")
+    if shell is None:
+        pytest.skip("Windows cmd is required for launcher validation")
+    shutil.copyfile(REPO_ROOT / "Start-App.cmd", tmp_path / "Start-App.cmd")
+    (tmp_path / "scripts").mkdir()
+    # 替代服务入口，验证批处理解析而不启动硬件。
+    (tmp_path / "scripts" / "launch-app.ps1").write_text(
+        "Write-Output 'launcher-test-ok'", encoding="ascii"
+    )
+    result = subprocess.run(
+        [shell, "/d", "/c", "chcp 936 >nul & Start-App.cmd"], cwd=tmp_path,
+        input=b"\r\n", capture_output=True, timeout=15,
+    )
+    assert result.returncode == 0
+    assert b"launcher-test-ok" in result.stdout
+    assert result.stderr == b"", result.stderr
+
+
 @pytest.mark.parametrize("capabilities,accepted", [
     (None, False),
     (["force_calibration_state_v1"], False),
