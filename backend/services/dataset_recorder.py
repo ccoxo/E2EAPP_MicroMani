@@ -139,6 +139,17 @@ MAX_SAMPLE_JITTER_S = 0.10
 SAMPLE_LOOKBACK_WINDOW_S = 0.10
 ALIGNMENT_DELAY_S = 0.100
 SETTLE_TIMEOUT_MS = 20.0
+# 采集质量报告的“建议”阈值来自当前固定 A→B 数据基线；原始告警仍单独保留，便于后续再校准。
+QUALITY_LATE_REVIEW_RATE = 0.05
+QUALITY_LATE_RERECORD_RATE = 0.10
+QUALITY_CAMERA_REVIEW_RATE = 0.02
+QUALITY_CAMERA_RERECORD_RATE = 0.05
+QUALITY_ORIGIN_REVIEW_UM = 500.0
+QUALITY_ORIGIN_RERECORD_UM = 1000.0
+QUALITY_GRIPPER_ACTION_MIN_MM = 25.0
+QUALITY_GRIPPER_STATE_REVIEW_MM = 25.0
+QUALITY_GRIPPER_STATE_RERECORD_MM = 24.0
+QUALITY_ACTIVE_TRANSLATION_RANGE_UM = 500.0
 ACTION_STALE_S = 1.0
 HAL_NATIVE_SAMPLE_HZ = 1000.0
 OMEGA_NATIVE_SAMPLE_HZ = 100.0
@@ -2651,10 +2662,106 @@ class DatasetRecorderService:
         return native_frame
 
     def _mark_frame_written(self, frame: dict[str, Any]) -> None:
-        """记录写线程已落盘帧数，并更新左右最大力值。"""
+        """记录写线程已落盘帧数，并更新左右最大力值与训练质量摘要。"""
+        self._track_training_quality_frame(frame)
         self._episode_frames += 1
         self._max_force_left = max(self._max_force_left, self._force_norm(frame["observation.force_left"]))
         self._max_force_right = max(self._max_force_right, self._force_norm(frame["observation.force_right"]))
+
+    def _reset_training_quality_tracking(self) -> None:
+        """初始化不影响训练数据本身的首尾状态与动作范围统计。"""
+        self._quality_first_state: list[float] | None = None
+        self._quality_first_action: list[float] | None = None
+        self._quality_last_state: list[float] | None = None
+        self._quality_last_action: list[float] | None = None
+        self._quality_action_min = [math.inf] * 14
+        self._quality_action_max = [-math.inf] * 14
+        self._quality_first_second_gripper_min = [math.inf, math.inf]
+
+    def _quality_vector(self, value: Any) -> list[float] | None:
+        """把 state/action 安全转成 14 维有限 float，用于质量统计而不改写原帧。"""
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().tolist()
+        elif hasattr(value, "tolist"):
+            value = value.tolist()
+        if not isinstance(value, (list, tuple)) or len(value) < 14:
+            return None
+        try:
+            result = [float(item) for item in value[:14]]
+        except (TypeError, ValueError):
+            return None
+        return result if all(math.isfinite(item) for item in result) else None
+
+    def _track_training_quality_frame(self, frame: dict[str, Any]) -> None:
+        """只维护轻量首尾/范围统计；不读取视频、不阻塞写线程。"""
+        state = self._quality_vector(frame.get("observation.state"))
+        action = self._quality_vector(frame.get("action"))
+        if state is None or action is None:
+            return
+        if getattr(self, "_quality_first_state", None) is None:
+            self._quality_first_state = list(state)
+            self._quality_first_action = list(action)
+        self._quality_last_state = list(state)
+        self._quality_last_action = list(action)
+        if not hasattr(self, "_quality_action_min"):
+            self._reset_training_quality_tracking()
+            self._quality_first_state = list(state)
+            self._quality_first_action = list(action)
+            self._quality_last_state = list(state)
+            self._quality_last_action = list(action)
+        for index, value in enumerate(action):
+            self._quality_action_min[index] = min(self._quality_action_min[index], value)
+            self._quality_action_max[index] = max(self._quality_action_max[index], value)
+        if self._episode_frames < max(1, int(getattr(self, "_record_fps_hz", 30))):
+            for slot, index in enumerate((6, 13)):
+                self._quality_first_second_gripper_min[slot] = min(
+                    self._quality_first_second_gripper_min[slot], action[index]
+                )
+
+    def _training_quality_summary(self) -> dict[str, Any]:
+        """生成面向模仿学习的数据起止条件摘要；左右沿用数据集 operator side 语义。"""
+        first_state = getattr(self, "_quality_first_state", None)
+        first_action = getattr(self, "_quality_first_action", None)
+        last_state = getattr(self, "_quality_last_state", None)
+        last_action = getattr(self, "_quality_last_action", None)
+        action_min = getattr(self, "_quality_action_min", None)
+        action_max = getattr(self, "_quality_action_max", None)
+        if not all(isinstance(value, list) and len(value) >= 14 for value in (
+            first_state, first_action, last_state, last_action, action_min, action_max
+        )):
+            return {}
+
+        sides: dict[str, Any] = {}
+        active_sides: list[str] = []
+        first_second = getattr(self, "_quality_first_second_gripper_min", [math.inf, math.inf])
+        for slot, (side, base, hardware_side) in enumerate((("left", 0, "right"), ("right", 7, "left"))):
+            translation_ranges = [action_max[base + axis] - action_min[base + axis] for axis in range(3)]
+            max_translation_range = max(translation_ranges)
+            if max_translation_range >= QUALITY_ACTIVE_TRANSLATION_RANGE_UM:
+                active_sides.append(side)
+            gripper_index = base + 6
+            start_translation_norm = math.sqrt(sum(first_state[base + axis] ** 2 for axis in range(3)))
+            start_rotation_max = max(abs(first_state[base + axis]) for axis in range(3, 6))
+            first_second_min = first_second[slot] if slot < len(first_second) else math.inf
+            sides[side] = {
+                "hardwareSide": hardware_side,
+                "startTranslationNormUm": round(start_translation_norm, 3),
+                "startRotationMaxMdeg": round(start_rotation_max, 3),
+                "startStateGripperMm": round(first_state[gripper_index], 3),
+                "startActionGripperMm": round(first_action[gripper_index], 3),
+                "firstSecondMinActionGripperMm": round(first_second_min, 3) if math.isfinite(first_second_min) else None,
+                "endStateGripperMm": round(last_state[gripper_index], 3),
+                "endActionGripperMm": round(last_action[gripper_index], 3),
+                "translationRangeUm": [round(value, 3) for value in translation_ranges],
+                "maxTranslationRangeUm": round(max_translation_range, 3),
+                "actionGripperMinMm": round(action_min[gripper_index], 3),
+                "actionGripperMaxMm": round(action_max[gripper_index], 3),
+            }
+        return {
+            "version": "appstation.record_training_quality.v1",
+            "activeDatasetSides": active_sides,
+            "sides": sides,
+        }
 
     def _recording_motion_positions(
         self,
@@ -2741,6 +2848,7 @@ class DatasetRecorderService:
         self._last_native_gripper_sample = None
         self._max_force_left = 0.0
         self._max_force_right = 0.0
+        self._reset_training_quality_tracking()
         if not self._native_writer_active():
             raise DatasetSaveError(self._native_required_message())
         self._episode_force_calibration = self._force_calibration_snapshot(self._recording_config())
@@ -2761,6 +2869,7 @@ class DatasetRecorderService:
         skew = self._skew_stats()
         source_skew = self._source_skew_stats()
         config_snapshot = self._recording_config()
+        training_quality = self._training_quality_summary()
         # 每个 episode 独立统计质量指标，保存或丢弃时可以精确回滚。
         episode = {
             "id": episode_id,
@@ -2793,10 +2902,12 @@ class DatasetRecorderService:
             "maxForceLeft": round(self._max_force_left, 6),
             "maxForceRight": round(self._max_force_right, 6),
             "warnings": self._quality_warnings(),
+            "trainingQuality": training_quality,
             "motionOrigin": self._episode_motion_origin_snapshot(config_snapshot),
             "motionCalibration": self._motion_calibration_snapshot(config_snapshot),
             "forceCalibration": deepcopy(getattr(self, "_episode_force_calibration", {})),
         }
+        episode["qualityAssessment"] = self._quality_assessment(episode)
         episodes = self._read_episodes(dataset_dir)
         episodes = [item for item in episodes if str(item.get("id")) != episode_id]
         episodes.append(episode)
@@ -3499,6 +3610,11 @@ class DatasetRecorderService:
             "staleCounts": episode.get("staleCounts", {}),
             "cacheCounts": episode.get("cacheCounts", {}),
             "sourceMaxSkewMs": episode.get("sourceMaxSkewMs", {}),
+            "maxSkewMs": float(episode.get("maxSkewMs", 0.0)),
+            "cameraMinFps": episode.get("cameraMinFps", {}),
+            "cameraWorkerFallbacks": episode.get("cameraWorkerFallbacks", []),
+            "trainingQuality": episode.get("trainingQuality", {}),
+            "qualityAssessment": episode.get("qualityAssessment", {}),
             "maxForceLeft": float(episode.get("maxForceLeft", 0.0)),
             "maxForceRight": float(episode.get("maxForceRight", 0.0)),
             "motionOrigin": episode.get("motionOrigin", {}),
@@ -3946,6 +4062,115 @@ class DatasetRecorderService:
         drops_raw = episode.get("cameraDrops", {})
         drops = sum(int(value) for value in drops_raw.values()) if isinstance(drops_raw, dict) else 0
         return max(40, min(99, 96 - late * 2 - drops * 3))
+
+    def _quality_assessment(self, episode: dict[str, Any]) -> dict[str, Any]:
+        """把底层录制统计压缩成接受/复核/重录三级建议，不隐藏原始 warnings。"""
+        rank = {"accept": 0, "review": 1, "rerecord": 2}
+        recommendation = "accept"
+        reasons: list[dict[str, str]] = []
+
+        def add(level: str, code: str, message: str) -> None:
+            nonlocal recommendation
+            if rank[level] > rank[recommendation]:
+                recommendation = level
+            reasons.append({"severity": level, "code": code, "message": message})
+
+        frames = max(1, int(episode.get("frames", 0) or 0))
+        late_frames = max(0, int(episode.get("lateFrames", 0) or 0))
+        late_rate = late_frames / frames
+        if late_rate >= QUALITY_LATE_RERECORD_RATE:
+            add("rerecord", "late_frames", f"迟帧率 {late_rate:.1%}，明显高于当前基线")
+        elif late_rate >= QUALITY_LATE_REVIEW_RATE:
+            add("review", "late_frames", f"迟帧率 {late_rate:.1%}，建议复核录制调度")
+
+        drops_raw = episode.get("cameraDrops", {})
+        drops = drops_raw if isinstance(drops_raw, dict) else {}
+        camera_drop_rates: dict[str, float] = {}
+        for camera in CAMERA_KEYS:
+            count = max(0, int(drops.get(camera, 0) or 0))
+            rate = count / frames
+            camera_drop_rates[camera] = round(rate, 6)
+            if rate >= QUALITY_CAMERA_RERECORD_RATE:
+                add("rerecord", f"camera_{camera}", f"{camera} 相机异常率 {rate:.1%}")
+            elif rate >= QUALITY_CAMERA_REVIEW_RATE:
+                add("review", f"camera_{camera}", f"{camera} 相机异常率 {rate:.1%}")
+
+        worker_fallbacks = episode.get("cameraWorkerFallbacks", [])
+        if isinstance(worker_fallbacks, list):
+            for camera in worker_fallbacks:
+                add("rerecord", "camera_worker_fallback", f"{camera} 相机进入 fallback")
+        camera_min_fps = episode.get("cameraMinFps", {})
+        if isinstance(camera_min_fps, dict):
+            for camera, raw_fps in camera_min_fps.items():
+                try:
+                    fps = float(raw_fps)
+                except (TypeError, ValueError):
+                    continue
+                if fps < 20.0:
+                    add("rerecord", "camera_low_fps", f"{camera} 最低帧率仅 {fps:.1f} Hz")
+                elif fps < 25.0:
+                    add("review", "camera_low_fps", f"{camera} 最低帧率 {fps:.1f} Hz")
+
+        max_skew_ms = self._float_or_zero(episode.get("maxSkewMs", 0.0))
+        if max_skew_ms >= 300.0:
+            add("review", "max_skew", f"出现 {max_skew_ms:.0f} ms 的较大瞬时时序偏差")
+        if max(self._float_or_zero(episode.get("maxForceLeft")), self._float_or_zero(episode.get("maxForceRight"))) > 4.0:
+            add("review", "force_peak", "力觉峰值超过 4 N，请确认是否发生碰撞或异常接触")
+
+        warnings = episode.get("warnings", [])
+        if isinstance(warnings, list):
+            for warning in warnings:
+                text = str(warning).lower()
+                if "consecutive failures" in text:
+                    add("rerecord", "source_failures", "采样源出现连续失败")
+                    break
+
+        training = episode.get("trainingQuality", {})
+        if isinstance(training, dict) and training:
+            active_sides = training.get("activeDatasetSides", [])
+            sides = training.get("sides", {})
+            if not isinstance(active_sides, list):
+                active_sides = []
+            if not active_sides:
+                add("review", "active_side_unknown", "未识别出明显活动侧，请确认本条是否完整执行任务")
+            if isinstance(sides, dict):
+                for side in active_sides:
+                    metrics = sides.get(side, {})
+                    if not isinstance(metrics, dict):
+                        continue
+                    hardware_side = str(metrics.get("hardwareSide", ""))
+                    label = f"操作者{side} / 硬件{hardware_side}" if hardware_side else f"操作者{side}"
+                    origin_error = self._float_or_zero(metrics.get("startTranslationNormUm"))
+                    if origin_error > QUALITY_ORIGIN_RERECORD_UM:
+                        add("rerecord", "start_origin", f"{label} 起点偏离工作原点 {origin_error / 1000.0:.2f} mm")
+                    elif origin_error > QUALITY_ORIGIN_REVIEW_UM:
+                        add("review", "start_origin", f"{label} 起点偏离工作原点 {origin_error / 1000.0:.2f} mm")
+
+                    start_action = self._float_or_zero(metrics.get("startActionGripperMm"))
+                    start_state = self._float_or_zero(metrics.get("startStateGripperMm"))
+                    first_second = metrics.get("firstSecondMinActionGripperMm")
+                    end_action = self._float_or_zero(metrics.get("endActionGripperMm"))
+                    end_state = self._float_or_zero(metrics.get("endStateGripperMm"))
+                    if start_action < QUALITY_GRIPPER_ACTION_MIN_MM:
+                        add("rerecord", "start_gripper_action", f"{label} 起始夹爪目标仅 {start_action:.2f} mm，当前协议要求接近 26 mm")
+                    if start_state < QUALITY_GRIPPER_STATE_RERECORD_MM:
+                        add("rerecord", "start_gripper_state", f"{label} 起始夹爪反馈仅 {start_state:.2f} mm")
+                    elif start_state < QUALITY_GRIPPER_STATE_REVIEW_MM:
+                        add("review", "start_gripper_state", f"{label} 起始夹爪反馈 {start_state:.2f} mm，尚未完全张开")
+                    if isinstance(first_second, (int, float)) and math.isfinite(float(first_second)) and float(first_second) < QUALITY_GRIPPER_STATE_RERECORD_MM:
+                        add("review", "early_gripper_change", f"{label} 前 1 秒夹爪目标最低 {float(first_second):.2f} mm")
+                    if end_action < QUALITY_GRIPPER_ACTION_MIN_MM:
+                        add("review", "end_gripper_action", f"{label} 保存时夹爪目标仅 {end_action:.2f} mm")
+                    if end_state < QUALITY_GRIPPER_STATE_RERECORD_MM:
+                        add("review", "end_gripper_state", f"{label} 保存时夹爪反馈仅 {end_state:.2f} mm")
+
+        return {
+            "version": "appstation.record_quality_assessment.v1",
+            "recommendation": recommendation,
+            "reasons": reasons,
+            "lateRate": round(late_rate, 6),
+            "cameraDropRates": camera_drop_rates,
+        }
 
     def _quality_warnings(self) -> list[str]:
         """汇总当前 episode 的迟到、偏差、陈旧、缓存和相机丢帧告警。"""

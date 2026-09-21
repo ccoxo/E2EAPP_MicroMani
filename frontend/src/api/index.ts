@@ -21,6 +21,8 @@ import type {
   MotionWorkOriginOffsetConfig,
   ParameterSnapshot,
   ParameterSnapshotScope,
+  RecordQualityAssessment,
+  RecordTrainingQuality,
 } from '../types'
 
 export const apiBase = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:18082'
@@ -632,7 +634,12 @@ export interface RecordEpisodeSaveApi {
   maxForceLeft?: number
   maxForceRight?: number
   cameraDrops?: Partial<Record<'global' | 'wrist_left' | 'wrist_right', number>>
+  cameraMinFps?: Partial<Record<'global' | 'wrist_left' | 'wrist_right', number>>
+  cameraWorkerFallbacks?: string[]
+  maxSkewMs?: number
   warnings?: string[]
+  trainingQuality?: RecordTrainingQuality
+  qualityAssessment?: RecordQualityAssessment
 }
 
 export interface SaveEpisodeResponse {

@@ -336,9 +336,49 @@ export interface EpisodeRecord {
   cameraDrops: { global: number; wristLeft: number; wristRight: number }
 }
 
+export interface RecordTrainingQualitySide {
+  hardwareSide?: 'left' | 'right'
+  startTranslationNormUm?: number
+  startRotationMaxMdeg?: number
+  startStateGripperMm?: number
+  startActionGripperMm?: number
+  firstSecondMinActionGripperMm?: number | null
+  endStateGripperMm?: number
+  endActionGripperMm?: number
+  translationRangeUm?: number[]
+  maxTranslationRangeUm?: number
+  actionGripperMinMm?: number
+  actionGripperMaxMm?: number
+}
+
+export interface RecordTrainingQuality {
+  version?: string
+  activeDatasetSides?: Array<'left' | 'right'>
+  sides?: Partial<Record<'left' | 'right', RecordTrainingQualitySide>>
+}
+
+export interface RecordQualityReason {
+  severity: 'accept' | 'review' | 'rerecord'
+  code: string
+  message: string
+}
+
+export interface RecordQualityAssessment {
+  version?: string
+  recommendation: 'accept' | 'review' | 'rerecord'
+  reasons: RecordQualityReason[]
+  lateRate?: number
+  cameraDropRates?: Partial<Record<'global' | 'wrist_left' | 'wrist_right', number>>
+}
+
 export interface RecordQualityReport extends EpisodeRecord {
   warnings: string[]
   passed: boolean
+  maxSkewMs?: number
+  cameraMinFps?: Partial<Record<'global' | 'wrist_left' | 'wrist_right', number>>
+  cameraWorkerFallbacks?: string[]
+  trainingQuality?: RecordTrainingQuality
+  qualityAssessment?: RecordQualityAssessment
 }
 
 export interface RecordSessionState {

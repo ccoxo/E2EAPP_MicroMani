@@ -1835,6 +1835,114 @@ def test_dataset_recorder_timed_source_records_timeout_drop() -> None:
     assert recorder._source_fail_streaks["hal"] == 1
 
 
+def test_dataset_recorder_training_quality_tracks_active_side_and_gripper_protocol() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._episode_frames = 0
+    recorder._record_fps_hz = 30
+    recorder._max_force_left = 0.0
+    recorder._max_force_right = 0.0
+    recorder._reset_training_quality_tracking()
+
+    for frame_index in range(60):
+        state = [0.0] * 14
+        action = [0.0] * 14
+        state[7] = 100.0 + frame_index * 200.0
+        action[7] = 100.0 + frame_index * 200.0
+        state[6] = action[6] = 12.0
+        state[13] = 26.0
+        action[13] = 26.0 if frame_index < 30 else 1.02
+        recorder._mark_frame_written({
+            "observation.state": state,
+            "action": action,
+            "observation.force_left": [0.0] * 6,
+            "observation.force_right": [0.0] * 6,
+        })
+
+    summary = recorder._training_quality_summary()
+
+    assert summary["activeDatasetSides"] == ["right"]
+    right = summary["sides"]["right"]
+    assert right["hardwareSide"] == "left"
+    assert right["startTranslationNormUm"] == 100.0
+    assert right["startStateGripperMm"] == 26.0
+    assert right["startActionGripperMm"] == 26.0
+    assert right["firstSecondMinActionGripperMm"] == 26.0
+    assert right["actionGripperMinMm"] == 1.02
+    assert right["maxTranslationRangeUm"] == 11800.0
+
+
+def _quality_episode_for_assessment(*, frames: int = 600, late: int = 20, right_start_action: float = 26.0) -> dict[str, object]:
+    return {
+        "frames": frames,
+        "lateFrames": late,
+        "cameraDrops": {"global": 2, "wrist_left": 2, "wrist_right": 2},
+        "cameraMinFps": {"global": 29.8, "wrist_left": 29.8, "wrist_right": 29.8},
+        "cameraWorkerFallbacks": [],
+        "maxSkewMs": 100.0,
+        "maxForceLeft": 0.1,
+        "maxForceRight": 1.0,
+        "warnings": ["force stale: 150", "max skew: 100.0ms"],
+        "trainingQuality": {
+            "activeDatasetSides": ["right"],
+            "sides": {
+                "right": {
+                    "hardwareSide": "left",
+                    "startTranslationNormUm": 120.0,
+                    "startStateGripperMm": 26.0,
+                    "startActionGripperMm": right_start_action,
+                    "firstSecondMinActionGripperMm": 26.0,
+                    "endStateGripperMm": 26.0,
+                    "endActionGripperMm": 26.0,
+                }
+            },
+        },
+    }
+
+
+def test_dataset_recorder_quality_assessment_accepts_clean_current_baseline() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+
+    assessment = recorder._quality_assessment(_quality_episode_for_assessment())
+
+    assert assessment["recommendation"] == "accept"
+    assert assessment["lateRate"] == pytest.approx(20 / 600, abs=1e-6)
+    assert assessment["reasons"] == []
+
+
+def test_dataset_recorder_quality_assessment_reviews_local_camera_anomaly() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    episode = _quality_episode_for_assessment(frames=623, late=29)
+    episode["cameraDrops"] = {"global": 13, "wrist_left": 5, "wrist_right": 8}
+
+    assessment = recorder._quality_assessment(episode)
+
+    assert assessment["recommendation"] == "review"
+    assert any(reason["code"] == "camera_global" for reason in assessment["reasons"])
+
+
+@pytest.mark.parametrize(
+    ("frames", "late", "start_action", "expected_code"),
+    [
+        (664, 159, 26.0, "late_frames"),
+        (661, 9, 21.263, "start_gripper_action"),
+    ],
+)
+def test_dataset_recorder_quality_assessment_recommends_rerecord_for_known_bad_patterns(
+    frames: int,
+    late: int,
+    start_action: float,
+    expected_code: str,
+) -> None:
+    recorder = object.__new__(DatasetRecorderService)
+
+    assessment = recorder._quality_assessment(
+        _quality_episode_for_assessment(frames=frames, late=late, right_start_action=start_action)
+    )
+
+    assert assessment["recommendation"] == "rerecord"
+    assert any(reason["code"] == expected_code for reason in assessment["reasons"])
+
+
 def test_dataset_recorder_quality_warnings_summarize_source_latency() -> None:
     recorder = object.__new__(DatasetRecorderService)
     recorder._episode_late_frames = 0
