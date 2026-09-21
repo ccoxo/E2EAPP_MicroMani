@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <cmath>
 #include <exception>
+#include <limits>
 
 namespace appstation::hal {
 
@@ -173,13 +174,24 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
   if (name == "teleop.native.status") {
     return nativeTeleop_.statusJson();
   }
-  if (name == "teleop.native.gripper_command" || name == "gripper.command") {
+  if (name == "gripper.prepare_replay") {
     ensureCurrentMotionCommand();
     const auto config = jsonNativeTeleopConfig(bodyText);
-    nativeTeleop_.configureGripper(config.gripper);
-    nativeTeleop_.configureGripperProtection(
-        config.gripperIcfTargetProtectionEnabled,
-        config.gripperIcfTargetMinGapMm);
+    nativeTeleop_.prepareReplayGripper(config.gripper, commandEpoch);
+    nativeTeleop_.configureGripperProtection(config.gripperIcfTargetProtectionEnabled, config.gripperIcfTargetMinGapMm);
+    return "{\"ok\":true}";
+  }
+  if (name == "teleop.native.gripper_command" || name == "gripper.command" || name == "gripper.replay_target") {
+    ensureCurrentMotionCommand();
+    const auto config = jsonNativeTeleopConfig(bodyText);
+    if (name == "gripper.replay_target") {
+      if (!nativeTeleop_.replayGripperReady()) throw std::runtime_error("replay gripper sampling is not ready");
+    } else {
+      nativeTeleop_.configureGripper(config.gripper);
+      nativeTeleop_.configureGripperProtection(
+          config.gripperIcfTargetProtectionEnabled,
+          config.gripperIcfTargetMinGapMm);
+    }
     const auto side = parseSide(jsonStringValue(bodyText, "side"));
     const auto targetMm = jsonNumberValue(bodyText, "targetMm", 0.0);
     const auto effectiveTargetMm = effectiveGripperTargetMm(config, targetMm);
@@ -257,15 +269,17 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
         decTime, commandEpoch);
     return "{\"ok\":true}";
   }
-  if (name == "motion.teleop_target_update") {
+  if (name == "motion.teleop_target_update" || name == "motion.replay_absolute_target") {
     const auto side = parseSide(jsonStringValue(bodyText, "side"));
+    const double missing = name == "motion.replay_absolute_target"
+        ? std::numeric_limits<double>::quiet_NaN() : 0.0;
     const std::array<double, 6> deltas{
-        jsonNumberValue(bodyText, "X", 0.0),
-        jsonNumberValue(bodyText, "Y", 0.0),
-        jsonNumberValue(bodyText, "Z", 0.0),
-        jsonNumberValue(bodyText, "Roll", 0.0),
-        jsonNumberValue(bodyText, "Pitch", 0.0),
-        jsonNumberValue(bodyText, "Yaw", 0.0)};
+        jsonNumberValue(bodyText, "X", missing),
+        jsonNumberValue(bodyText, "Y", missing),
+        jsonNumberValue(bodyText, "Z", missing),
+        jsonNumberValue(bodyText, "Roll", missing),
+        jsonNumberValue(bodyText, "Pitch", missing),
+        jsonNumberValue(bodyText, "Yaw", missing)};
     TeleopHardwareTarget target;
     target.side = side == Side::Left ? 0 : 1;
     target.deltas = deltas;
@@ -286,7 +300,7 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     target.rotationStartVelocityUiPerSec = jsonNumberValue(bodyText, "rotationStartVelocityUiPerSec", 0.0);
     target.accTimeSec = jsonNumberValue(bodyText, "accTimeSec", 0.0);
     target.decTimeSec = jsonNumberValue(bodyText, "decTimeSec", 0.0);
-    const auto result = executor_.applyExternal(target, commandEpoch);
+    const auto result = executor_.applyExternal(target, commandEpoch, name == "motion.replay_absolute_target");
     return jsonTeleopTargetUpdateResult(side, result);
   }
   if (name == "motion.teleop_stop_side") {

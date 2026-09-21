@@ -28,6 +28,7 @@ HAL_COMMANDS: dict[str, HalCommandSpec] = {
     "motion.home_side": HalCommandSpec("POST", "/motion/home_side"),
     "motion.manual_axis_move": HalCommandSpec("POST", "/motion/manual_axis_move"),
     "motion.teleop_target_update": HalCommandSpec("POST", "/motion/teleop_target_update"),
+    "motion.replay_absolute_target": HalCommandSpec("POST", "/motion/replay_absolute_target"),
     "motion.teleop_stop_side": HalCommandSpec("POST", "/motion/teleop_stop_side"),
     "omega7.gravity_compensation": HalCommandSpec("POST", "/omega7/gravity_compensation"),
     "omega7.zero_force_feedback": HalCommandSpec("POST", "/omega7/zero_force_feedback"),
@@ -39,6 +40,8 @@ HAL_COMMANDS: dict[str, HalCommandSpec] = {
     "teleop.native.status": HalCommandSpec("GET", "/teleop/native/status"),
     "teleop.native.gripper_command": HalCommandSpec("POST", "/teleop/native/gripper_command"),
     "gripper.command": HalCommandSpec("POST", "/gripper/command"),
+    "gripper.prepare_replay": HalCommandSpec("POST", "/gripper/prepare_replay"),
+    "gripper.replay_target": HalCommandSpec("POST", "/gripper/replay_target"),
 }
 
 _LONG_RUNNING_COMMANDS = {"motion.home_all", "motion.home_origin_side", "motion.home_side"}
@@ -70,7 +73,7 @@ def command_request_policy(name: str, timeout_s: float, *, long_timeout_s: float
 
 
 def hal_command_payload(name: str, payload: dict[str, Any]) -> dict[str, Any]:
-    if name != "motion.teleop_target_update":
+    if name not in {"motion.teleop_target_update", "motion.replay_absolute_target"}:
         return payload
     deltas = payload.get("deltas")
     if not isinstance(deltas, dict):

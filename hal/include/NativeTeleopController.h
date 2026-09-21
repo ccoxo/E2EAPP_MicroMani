@@ -189,6 +189,8 @@ class NativeTeleopController {
   void configure(const NativeTeleopConfig& config,
       std::optional<std::uint64_t> expectedEpoch = std::nullopt);
   void configureGripper(const JodellGripperConfig& config);
+  void prepareReplayGripper(const JodellGripperConfig& config, std::uint64_t epoch);
+  bool replayGripperReady() const { return !running_.load() && gripperWorkerRunning_.load(); }
   // 运行时更新夹爪保护，主要给后端配置热更新使用。
   void configureGripperProtection(bool enabled, double minGapMm);
   // leftConnected/rightConnected 是逻辑主手连接状态，用于在部分连接时只启动可用通道。
@@ -361,6 +363,8 @@ class NativeTeleopController {
   std::array<bool, 2> gripperLastCommandOk_{{false, false}};
   std::array<std::string, 2> gripperLastMessage_{};
   std::array<std::int64_t, 2> gripperLastCommandTs_{{0, 0}};
+  std::array<std::int64_t, 2> gripperPositionSampleTs_{{0, 0}};
+  std::array<bool, 2> gripperPositionOk_{{false, false}};
   std::mutex gripperMutex_;
   std::condition_variable gripperCv_;
   std::thread gripperWorker_;

@@ -2,6 +2,7 @@
 #include "HalCommandDispatcher.h"
 
 #include <chrono>
+#include <cmath>
 #include <future>
 #include <iostream>
 #include <stdexcept>
@@ -217,8 +218,26 @@ void emergencyCancelsCommandAlreadyAdmittedBeforeDriverAccess() {
 }
 }
 
+void replayAbsoluteTargetsDoNotAccumulate() {
+  Fixture f;
+  auto target = f.target(1);
+  target.enabledAxes.fill(true);
+  target.deltas[0] = 2;
+  const auto first = f.executor.applyExternal(target, f.epoch(), true);
+  require(first.targetUi[0] > 0, "absolute target did not move the simulated axis");
+  const auto repeated = f.executor.applyExternal(target, f.epoch(), true);
+  require(std::abs(first.targetUi[0] - repeated.targetUi[0]) < 0.001,
+      "repeated absolute target accumulated displacement");
+  target.deltas[0] = -1;
+  const auto reverse = f.executor.applyExternal(target, f.epoch(), true);
+  require(reverse.targetUi[0] <= first.targetUi[0], "absolute reverse moved forward");
+  f.motion.emergencyStop();
+  rejects([&] { f.executor.applyExternal(target, f.epoch(), true); });
+}
+
 int main() {
   try {
+    replayAbsoluteTargetsDoNotAccumulate();
     nativeExcludesOtherSources();
     externalOwnershipIsPerSide();
     lateAndDuplicateNativeTargetsAreDiscarded();
@@ -230,7 +249,7 @@ int main() {
     revokeRejectsAlreadyWaitingFollower();
     dispatcherEmergencyBypassesBothExecutionAndDriverLocks();
     emergencyCancelsCommandAlreadyAdmittedBeforeDriverAccess();
-    std::cout << "MotionExecutorTests passed (11 cases, offline)\n";
+    std::cout << "MotionExecutorTests passed (12 cases, offline)\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "MotionExecutorTests failed: " << error.what() << '\n';

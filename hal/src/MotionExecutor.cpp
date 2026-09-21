@@ -77,18 +77,18 @@ std::optional<TeleopTargetUpdateResult> MotionExecutor::applyNative(
   return apply(target, deltas, epoch_);
 }
 
-TeleopTargetUpdateResult MotionExecutor::applyExternal(const TeleopHardwareTarget& target, std::uint64_t epoch) {
+TeleopTargetUpdateResult MotionExecutor::applyExternal(const TeleopHardwareTarget& target, std::uint64_t epoch, bool absoluteTarget) {
   const auto side = targetSide(target);
   std::unique_lock lock(mutex_, std::try_to_lock);
   if (!lock.owns_lock()) throw std::runtime_error("motion executor busy; request was not queued");
   refresh(epoch);
   requireAvailable(side, MotionOwner::External);
   owners_[index(side)] = MotionOwner::External;
-  return apply(target, target.deltas, epoch);
+  return apply(target, target.deltas, epoch, absoluteTarget);
 }
 
 TeleopTargetUpdateResult MotionExecutor::apply(const TeleopHardwareTarget& target,
-    const std::array<double, 6>& deltas, std::uint64_t epoch) {
+    const std::array<double, 6>& deltas, std::uint64_t epoch, bool absoluteTarget) {
   std::array<AxisLimit, 6> limits{};
   for (std::size_t i = 0; i < limits.size(); ++i) limits[i] = {target.softLimitMin[i], target.softLimitMax[i]};
   return motion_.updateTeleopTargetUi(targetSide(target), deltas,
@@ -97,7 +97,7 @@ TeleopTargetUpdateResult MotionExecutor::apply(const TeleopHardwareTarget& targe
       target.enabledAxes, target.syncZeroDeltaTarget, limits,
       target.translationVelocityUiPerSec, target.rotationVelocityUiPerSec,
       target.translationStartVelocityUiPerSec, target.rotationStartVelocityUiPerSec,
-      target.accTimeSec, target.decTimeSec, epoch);
+      target.accTimeSec, target.decTimeSec, epoch, absoluteTarget);
 }
 
 std::string MotionExecutor::enableSide(Side side, bool enabled, const std::array<bool, 6>& axes,

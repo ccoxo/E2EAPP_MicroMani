@@ -377,6 +377,23 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config,
       [&]() { return motion_.commandEpochAllowed(motionEpoch); });
 }
 
+void NativeTeleopController::prepareReplayGripper(const JodellGripperConfig& config, std::uint64_t epoch) {
+  if (running() || !motion_.commandEpochAllowed(epoch)) {
+    throw std::runtime_error("replay gripper preparation blocked by teleop or safety stop");
+  }
+  configureGripper(config);
+  {
+    std::scoped_lock lock(mutex_);
+    gripperPositionOk_ = {false, false};
+    gripperPositionSampleTs_ = {0, 0};
+  }
+  startGripperWorker();
+  if (!motion_.commandEpochAllowed(epoch)) {
+    requestEmergencyStop();
+    throw std::runtime_error("replay gripper preparation cancelled by safety stop");
+  }
+}
+
 void NativeTeleopController::configureGripper(const JodellGripperConfig& config) {
   {
     std::scoped_lock lock(mutex_);
@@ -671,13 +688,15 @@ void NativeTeleopController::gripperLoop() {
 }
 
 void NativeTeleopController::sampleGripperPosition(Side side) {
-  // 周期性采样夹爪位置，用于 statusJson 展示，不参与运动控制闭环。
+  // 周期性采样供状态显示及回放到位判断；失败不能刷新成功采样时间。
   std::string message;
   const bool ok = gripper_.readPositionMm(side, &message);
   const int index = sideIndex(side);
   std::scoped_lock lock(mutex_);
   gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);
   gripperLastCommandOk_[index] = ok;
+  gripperPositionOk_[index] = ok;
+  if (ok) gripperPositionSampleTs_[index] = unixTimeMs();
   if (!message.empty()) {
     gripperLastMessage_[index] = message;
   }
@@ -840,6 +859,8 @@ std::string NativeTeleopController::statusJson() const {
   out
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[0]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[0]
+      << ",\"positionSampleTs\":" << gripperPositionSampleTs_[0]
+      << ",\"positionOk\":" << (gripperPositionOk_[0] ? "true" : "false")
       << "},\"right\":{\"ok\":" << (gripperLastCommandOk_[1] ? "true" : "false")
       << ",\"targetMm\":" << gripperTargetsMm_[1];
   appendGripperSourceDiagnostics(1);
@@ -852,6 +873,8 @@ std::string NativeTeleopController::statusJson() const {
   out
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[1]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[1]
+      << ",\"positionSampleTs\":" << gripperPositionSampleTs_[1]
+      << ",\"positionOk\":" << (gripperPositionOk_[1] ? "true" : "false")
       << "}}";
   out << ",\"gravityCompensation\":["
       << (config_.leftGravityCompensation ? "true" : "false") << ","

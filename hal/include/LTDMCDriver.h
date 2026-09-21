@@ -95,7 +95,8 @@ class LTDMCDriver {
       double rotationStartVelocityUiPerSec = 0.0,
       double accTimeSec = 0.0,
       double decTimeSec = 0.0,
-      std::optional<std::uint64_t> expectedEpoch = std::nullopt);
+      std::optional<std::uint64_t> expectedEpoch = std::nullopt,
+      bool absoluteTarget = false);
   // 停止某一侧 teleop 相关运动，并清空该侧目标缓存。
   void stopTeleopSide(Side side);
 

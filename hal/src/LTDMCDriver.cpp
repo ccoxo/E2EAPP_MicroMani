@@ -1241,7 +1241,8 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
     double rotationStartVelocityUiPerSec,
     double accTimeSec,
     double decTimeSec,
-    std::optional<std::uint64_t> expectedEpoch) {
+    std::optional<std::uint64_t> expectedEpoch,
+    bool absoluteTarget) {
   for (const auto value : {translationStepPulse, rotationStepPulse, translationPulseDeadband,
       rotationPulseDeadband, translationVelocityUiPerSec, rotationVelocityUiPerSec,
       translationStartVelocityUiPerSec, rotationStartVelocityUiPerSec, accTimeSec, decTimeSec}) {
@@ -1296,15 +1297,6 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
     }
     const auto stepLimitPulse = rotation ? rotationStepPulse : translationStepPulse;
     const auto pulseDeadband = rotation ? rotationPulseDeadband : translationPulseDeadband;
-    const auto requestedDeltaPulse = checkedMotionPulse(uiToPulse(delta, side, axis));
-    const auto deadbandedDeltaPulse =
-        std::abs(requestedDeltaPulse) <= checkedMotionPulse(pulseDeadband) ? 0 : requestedDeltaPulse;
-    // deadband 后再做单帧限幅，先去抖再保护步长。
-    const auto deltaPulse = clampPulseStep(deadbandedDeltaPulse, stepLimitPulse);
-    result.requestedDeltaPulse[axisIndex] = static_cast<double>(requestedDeltaPulse);
-    if (deltaPulse != requestedDeltaPulse) {
-      result.clipped[axisIndex] = true;
-    }
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
     const bool moving = dmcCheckDone(card, axisNo) == 0;
@@ -1330,6 +1322,15 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
       }
     }
 #endif
+    const auto requestedDeltaPulse = checkedMotionPulse(uiToPulse(delta, side, axis) - (absoluteTarget ? actualPulse : 0.0));
+    const auto deadbandedDeltaPulse =
+        std::abs(requestedDeltaPulse) <= checkedMotionPulse(pulseDeadband) ? 0 : requestedDeltaPulse;
+    // deadband 后再做单帧限幅，先去抖再保护步长。
+    const auto deltaPulse = clampPulseStep(deadbandedDeltaPulse, stepLimitPulse);
+    result.requestedDeltaPulse[axisIndex] = static_cast<double>(requestedDeltaPulse);
+    if (deltaPulse != requestedDeltaPulse) {
+      result.clipped[axisIndex] = true;
+    }
     result.currentPulse[axisIndex] = actualPulse;
     result.movingBefore[axisIndex] = moving;
     if (deltaPulse == 0) {
@@ -1378,7 +1379,7 @@ TeleopTargetUpdateResult LTDMCDriver::updateTeleopTargetUi(
         signOfPulseDelta(activeTargetLead) != 0
         && signOfPulseDelta(deltaPulse) != 0
         && signOfPulseDelta(activeTargetLead) != signOfPulseDelta(deltaPulse);
-    const auto targetBasePulse = teleopTargetActive_[index] && !reversingTargetLead
+    const auto targetBasePulse = !absoluteTarget && teleopTargetActive_[index] && !reversingTargetLead
         ? teleopTargetPulse_[index] : actualPulse;
     const auto targetLeadPulse = maxTeleopTargetLeadPulse(
         deltaPulse,

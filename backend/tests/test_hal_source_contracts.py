@@ -1225,7 +1225,7 @@ def test_hal_native_gripper_manual_endpoint_uses_native_controller_queue() -> No
     protocol = (REPO_ROOT / "backend" / "hal_client" / "protocol.py").read_text(encoding="utf-8")
     gripper_backend = (REPO_ROOT / "backend" / "services" / "gripper_backend.py").read_text(encoding="utf-8")
     controller_header = (REPO_ROOT / "hal" / "include" / "NativeTeleopController.h").read_text(encoding="utf-8")
-    branch = dispatcher.split('if (name == "teleop.native.gripper_command" || name == "gripper.command")', 1)[1].split(
+    branch = dispatcher.split('if (name == "teleop.native.gripper_command" || name == "gripper.command" || name == "gripper.replay_target")', 1)[1].split(
         'if (name == "motion.emergency_stop")',
         1,
     )[0]
@@ -1819,7 +1819,7 @@ def test_ltdmc_native_teleop_accumulates_active_target_with_bounded_lead() -> No
     assert "double clampTeleopTargetLead(" in source
     assert "const bool reversingTargetLead =" in body
     assert (
-        "const auto targetBasePulse = teleopTargetActive_[index] && !reversingTargetLead "
+        "const auto targetBasePulse = !absoluteTarget && teleopTargetActive_[index] && !reversingTargetLead "
         "? teleopTargetPulse_[index] : actualPulse;"
         in normalized
     )

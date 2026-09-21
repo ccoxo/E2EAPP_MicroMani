@@ -23,7 +23,7 @@ class MotionExecutor {
   void stopNativeSide(Side side, std::uint64_t sequenceFloor);
   std::optional<TeleopTargetUpdateResult> applyNative(
       const TeleopHardwareTarget& target, const std::array<double, 6>& deltas);
-  TeleopTargetUpdateResult applyExternal(const TeleopHardwareTarget& target, std::uint64_t epoch);
+  TeleopTargetUpdateResult applyExternal(const TeleopHardwareTarget& target, std::uint64_t epoch, bool absoluteTarget = false);
 
   std::string enableSide(Side side, bool enabled, const std::array<bool, 6>& axes,
       std::uint64_t epoch);
@@ -42,7 +42,7 @@ class MotionExecutor {
   void refresh(std::uint64_t epoch);
   void requireAvailable(Side side, MotionOwner requested);
   TeleopTargetUpdateResult apply(const TeleopHardwareTarget& target,
-      const std::array<double, 6>& deltas, std::uint64_t epoch);
+      const std::array<double, 6>& deltas, std::uint64_t epoch, bool absoluteTarget = false);
   static std::size_t index(Side side) { return side == Side::Left ? 0 : 1; }
   static Side targetSide(const TeleopHardwareTarget& target);
 

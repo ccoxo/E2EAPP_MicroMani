@@ -28,6 +28,7 @@ def test_shared_hal_command_protocol_covers_existing_real_hal_commands() -> None
         "motion.home_side": ("POST", "/motion/home_side"),
         "motion.manual_axis_move": ("POST", "/motion/manual_axis_move"),
         "motion.teleop_target_update": ("POST", "/motion/teleop_target_update"),
+        "motion.replay_absolute_target": ("POST", "/motion/replay_absolute_target"),
         "motion.teleop_stop_side": ("POST", "/motion/teleop_stop_side"),
         "omega7.gravity_compensation": ("POST", "/omega7/gravity_compensation"),
         "omega7.zero_force_feedback": ("POST", "/omega7/zero_force_feedback"),
@@ -39,6 +40,8 @@ def test_shared_hal_command_protocol_covers_existing_real_hal_commands() -> None
         "teleop.native.status": ("GET", "/teleop/native/status"),
         "teleop.native.gripper_command": ("POST", "/teleop/native/gripper_command"),
         "gripper.command": ("POST", "/gripper/command"),
+        "gripper.prepare_replay": ("POST", "/gripper/prepare_replay"),
+        "gripper.replay_target": ("POST", "/gripper/replay_target"),
     }
 
     assert set(HAL_COMMANDS) == set(expected_paths)
