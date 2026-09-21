@@ -140,6 +140,7 @@ struct NativeTeleopConfig {
   // 夹爪 teleop 配置。主手开口单位为 mm，最终会映射到 Jodell 目标行程。
   JodellGripperConfig gripper{};
   bool gripperTeleopEnabled{false};
+  std::array<bool, 2> gripperParticipating{true, true};
   std::array<double, 2> gripperGapMinMm{{0.0, 0.0}};
   std::array<double, 2> gripperGapMaxMm{{25.0, 25.0}};
   std::array<bool, 2> gripperGapInvert{{false, false}};
@@ -189,7 +190,8 @@ class NativeTeleopController {
   void configure(const NativeTeleopConfig& config,
       std::optional<std::uint64_t> expectedEpoch = std::nullopt);
   void configureGripper(const JodellGripperConfig& config);
-  void prepareReplayGripper(const JodellGripperConfig& config, std::uint64_t epoch);
+  void prepareReplayGripper(const JodellGripperConfig& config, std::uint64_t epoch,
+      const std::array<bool, 2>& participating);
   bool replayGripperReady() const { return !running_.load() && gripperWorkerRunning_.load(); }
   // 运行时更新夹爪保护，主要给后端配置热更新使用。
   void configureGripperProtection(bool enabled, double minGapMm);

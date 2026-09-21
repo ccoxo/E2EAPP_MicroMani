@@ -1,3 +1,4 @@
+import type { Participation } from '../types'
 /*
  * 阅读导航 02｜前端契约与状态
  * 职责：Zustand 全局状态中枢；处理配置保存队列、WebSocket、遥测节流、手动控制与录制状态。
@@ -121,7 +122,7 @@ function normalizedRecordResetSides(value: unknown, fallback: RecordResetSide[])
   return sides.length > 0 ? Array.from(new Set(sides)) : fallback.slice()
 }
 function returnedRecordResetState(session: RecordSessionState, side: RecordResetSide) {
-  const required = normalizedRecordResetSides(session.resetRequiredSides, defaultRecordResetRequiredSides)
+  const required = session.participation ? session.participation.arms.map((side) => side === 'left' ? 'right' : 'left') : normalizedRecordResetSides(session.resetRequiredSides, defaultRecordResetRequiredSides)
   const returned = normalizedRecordResetSides(session.resetReturnedSides, [])
   if (!returned.includes(side)) returned.push(side)
   return {
@@ -400,6 +401,7 @@ interface TelemetryStore {
   discardEpisode: () => void
   setRecordDatasetName: (name: string) => void
   setRecordTask: (task: string) => void
+  setRecordParticipation: (value: Participation) => void
   setRecordTargetEpisodes: (n: number) => void
   setRecordEpisodeTimes: (episodeS: number, resetS: number) => void
   startRecordSession: (datasetName: string, task: string) => void
@@ -883,6 +885,7 @@ function recordSessionFromStatus(
     recorderTotalS: state.recordSession.episodeTimeS,
     resetPending,
     resetRequiredSides,
+    participation: status.participation ?? state.recordSession.participation,
     resetReturnedSides,
     resetReady: Boolean(status.resetReady),
   }
@@ -1766,6 +1769,8 @@ setRecordDatasetName: (name) =>
     })),
 
 /** 设置当前流程的对应状态。 */
+setRecordParticipation: (participation) => set((state) => state.recordSession.phase === 'idle' ? ({ recordSession: { ...state.recordSession, participation, resetRequiredSides: participation.arms.map((side) => side === 'left' ? 'right' : 'left') } }) : {}),
+
 setRecordTask: (task) =>
     set((state) => ({
       recordSession: {
@@ -1851,7 +1856,7 @@ startRecordSession: (datasetName, task) => {
       }
       await queueConfigSave(get().config)
       assertControlGeneration(get, generation)
-      const createResponse = await createRecordSessionApi(nextDatasetName, task)
+      const createResponse = await createRecordSessionApi(nextDatasetName, task, get().recordSession.participation)
       assertControlGeneration(get, generation)
       set((state) => {
         const now = Date.now()
@@ -2251,10 +2256,9 @@ homeRecordArms: () => {
       return
     }
     const snapshot = get()
-    const requiredSides = normalizedRecordResetSides(
-      snapshot.recordSession.resetRequiredSides,
-      defaultRecordResetRequiredSides,
-    )
+    const requiredSides: RecordResetSide[] = snapshot.recordSession.participation
+      ? snapshot.recordSession.participation.arms.map((side) => side === 'left' ? 'right' : 'left')
+      : normalizedRecordResetSides(snapshot.recordSession.resetRequiredSides, defaultRecordResetRequiredSides)
     const blockedSide = requiredSides.find(
       (side) => !motionSideReturnOriginReady(side, snapshot.frame.motionEnabled, snapshot.frame.motionAxisEnabled),
     )

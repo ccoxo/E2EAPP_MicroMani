@@ -65,6 +65,7 @@ interface ReviewCamera {
 }
 
 interface ReviewEpisode {
+  participation?: DatasetEpisodeApi['participation']
   id: string
   name: string
   task: string
@@ -192,6 +193,7 @@ function episodeFromApi(episode: DatasetEpisodeApi): ReviewEpisode {
     maxForceRight: episode.maxForceRight,
     featureSummary: episode.featureSummary ?? episode.features,
     cameraResolutions: episode.cameraResolutions,
+    participation: episode.participation,
   }
 }
 
@@ -999,7 +1001,7 @@ const openHubUpload = () => {
                 </div>
               </section>
 
-              <DatasetReplayPanel key={`${selectedDataset.id}/${selectedEpisode.id}`} datasetId={selectedDataset.id} episodeId={selectedEpisode.id} />
+              <DatasetReplayPanel key={`${selectedDataset.id}/${selectedEpisode.id}`} datasetId={selectedDataset.id} episodeId={selectedEpisode.id} recordedParticipation={selectedEpisode.participation} />
               <section className="panel-surface checklist-grid">
                 {[
                   selectedEpisode.warnings.length === 0 ? '视频文件完整' : selectedEpisode.warnings[0],

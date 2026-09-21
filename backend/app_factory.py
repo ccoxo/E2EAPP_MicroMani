@@ -73,6 +73,7 @@ def create_services(
     )
     recorder = DatasetRecorderService(settings, hardware, hal, telemetry, logs, teleop_mapper, safety=safety)
     safety.on_emergency = recorder.interrupt_for_safety
+    teleop_mapper.recording_participation = lambda: recorder._participation if (recorder._session_active or recorder._session_starting) else None
     recorder.validate_start_origin = lambda: commands.validate_record_origin(recorder._reset_required_sides_locked())
     # 把录制器的原点锁定条件接入命令服务，避免录制过程中更换坐标基准。
     commands.set_origin_mutation_lock_checker(recorder.origin_mutation_locked)

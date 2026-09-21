@@ -798,6 +798,8 @@ appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& bo
       static_cast<int>(jsonNumberValue(body, "continuousMicroConfirmTicks", config.continuousMicroConfirmTicks));
 
   config.gripperTeleopEnabled = jsonBoolValue(body, "gripperTeleopEnabled", config.gripperTeleopEnabled);
+  config.gripperParticipating[0] = jsonBoolValue(body, "leftGripperParticipating", true);
+  config.gripperParticipating[1] = jsonBoolValue(body, "rightGripperParticipating", true);
   config.gripper.ports[0] = jsonStringValueOr(body, "leftPort", "COM8");
   config.gripper.ports[1] = jsonStringValueOr(body, "rightPort", "COM9");
   config.gripper.slaveIds[0] = static_cast<int>(jsonNumberValue(body, "leftSlaveId", 10));

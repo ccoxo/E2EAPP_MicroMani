@@ -27,6 +27,9 @@
 .dataset-replay-confirm span span { display: block; margin-top: 3px; font-size: 12px; line-height: 1.6; color: var(--color-text-secondary); }
 .dataset-replay-confirm.is-confirmed { border-color: var(--color-primary-border); background: var(--color-primary-light); }
 .dataset-replay-status { display: flex; justify-content: space-between; gap: 12px; margin-top: 16px; font-size: 12px; }
+.dataset-replay-timing { padding: 10px 14px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-bg-muted); font-size: 12px; line-height: 1.7; }
+.dataset-replay-timing p { margin: 3px 0; }
+.dataset-replay-timing p + p { color: var(--color-text-secondary); }
 .dataset-replay-summary { margin-left: 12px; color: var(--color-text-secondary); }
 .dataset-replay-frames { white-space: nowrap; font-variant-numeric: tabular-nums; font-weight: 600; }
 .dataset-replay-frames span { color: var(--color-text-muted); font-weight: 400; }
@@ -5690,3 +5693,9 @@ select {
   border-radius: var(--radius-md);
   background: var(--color-bg-muted);
 }
+
+.participation-selector { display: flex; flex-wrap: wrap; gap: 16px; border: 1px solid var(--color-border); border-radius: 8px; padding: 10px 12px; margin: 12px 0; font-size: 12px; }
+.participation-selector legend { color: var(--color-text-secondary); padding: 0 5px; }
+.participation-selector > div { display: flex; gap: 12px; }
+.participation-selector label { display: inline-flex; align-items: center; gap: 5px; }
+.participation-selector input { accent-color: var(--color-primary); }

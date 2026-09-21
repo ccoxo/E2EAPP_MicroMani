@@ -19,6 +19,8 @@ from collections import deque
 from contextvars import ContextVar
 from typing import Any, Literal
 
+from backend.core.motion_profile import teleop_motion_profile
+from backend.core.participation import scoped_config
 from backend.core.config import SettingsService
 from backend.core.defaults import ICF_KINEMATICS_DEFAULTS, ICF_TELEOP_DEFAULTS
 from backend.core.logging import LogService, now_ms
@@ -84,7 +86,8 @@ class TeleopMappingService:
     async def _get_config_async(self) -> dict[str, Any]:
         if self.settings is None:
             return {}
-        return await asyncio.to_thread(self.settings.get_config)
+        config = await asyncio.to_thread(self.settings.get_config)
+        return self._recording_scope(config)
 
     @motion_operation()
     async def start(
@@ -1273,7 +1276,12 @@ class TeleopMappingService:
         sample_hz = min(max(sample_hz, 1.0), 60.0)
         return 1.0 / sample_hz
 
+    def _recording_scope(self, config):
+        selected = getattr(self, "recording_participation", lambda: None)()
+        return scoped_config(config, selected) if selected else config
+
     def _native_payload(self, config: dict[str, Any]) -> dict[str, Any]:
+        config = self._recording_scope(config)
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
         gripper_teleop = teleop.get("gripperTeleop", {}) if isinstance(teleop.get("gripperTeleop"), dict) else {}
@@ -1426,6 +1434,8 @@ class TeleopMappingService:
             "motionProfileAccSec": self._motion_profile_acc_sec(config),
             "motionProfileDecSec": self._motion_profile_dec_sec(config),
             "gripperTeleopEnabled": self._native_gripper_teleop_enabled(config),
+            "leftGripperParticipating": bool(teleop.get("leftGripperParticipating", True)),
+            "rightGripperParticipating": bool(teleop.get("rightGripperParticipating", True)),
             "leftPort": str(gripper.get("leftPort", "COM8")),
             "rightPort": str(gripper.get("rightPort", "COM9")),
             "leftSlaveId": int(gripper.get("leftSlaveId", 10)),
@@ -1518,48 +1528,16 @@ class TeleopMappingService:
         )
 
     def _translation_start_velocity_um_s(self, config: dict[str, Any]) -> float:
-        return max(
-            0.0,
-            float(
-                config.get("teleop", {}).get(
-                    "translationStartVelocityUmS",
-                    ICF_TELEOP_DEFAULTS["translationStartVelocityUmS"],
-                )
-            ),
-        )
+        return teleop_motion_profile(config)["translationStartVelocityUmS"]
 
     def _translation_max_velocity_um_s(self, config: dict[str, Any]) -> float:
-        return max(
-            1.0,
-            float(
-                config.get("teleop", {}).get(
-                    "translationMaxVelocityUmS",
-                    ICF_TELEOP_DEFAULTS["translationMaxVelocityUmS"],
-                )
-            ),
-        )
+        return teleop_motion_profile(config)["translationMaxVelocityUmS"]
 
     def _rotation_start_velocity_deg_s(self, config: dict[str, Any]) -> float:
-        return max(
-            0.0,
-            float(
-                config.get("teleop", {}).get(
-                    "rotationStartVelocityDegS",
-                    ICF_TELEOP_DEFAULTS["rotationStartVelocityDegS"],
-                )
-            ),
-        )
+        return teleop_motion_profile(config)["rotationStartVelocityDegS"]
 
     def _rotation_max_velocity_deg_s(self, config: dict[str, Any]) -> float:
-        return max(
-            1.0,
-            float(
-                config.get("teleop", {}).get(
-                    "rotationMaxVelocityDegS",
-                    ICF_TELEOP_DEFAULTS["rotationMaxVelocityDegS"],
-                )
-            ),
-        )
+        return teleop_motion_profile(config)["rotationMaxVelocityDegS"]
 
     def _continuous_increment_mode(self, config: dict[str, Any]) -> bool:
         return bool(
@@ -1629,16 +1607,10 @@ class TeleopMappingService:
         )
 
     def _motion_profile_acc_sec(self, config: dict[str, Any]) -> float:
-        return max(
-            0.001,
-            float(config.get("teleop", {}).get("motionProfileAccSec", ICF_TELEOP_DEFAULTS["motionProfileAccSec"])),
-        )
+        return teleop_motion_profile(config)["motionProfileAccSec"]
 
     def _motion_profile_dec_sec(self, config: dict[str, Any]) -> float:
-        return max(
-            0.001,
-            float(config.get("teleop", {}).get("motionProfileDecSec", ICF_TELEOP_DEFAULTS["motionProfileDecSec"])),
-        )
+        return teleop_motion_profile(config)["motionProfileDecSec"]
 
     def _incremental_translation_min_effective_delta(self, config: dict[str, Any]) -> float:
         teleop = config.get("teleop", {})

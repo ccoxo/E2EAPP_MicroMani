@@ -260,7 +260,12 @@ def test_dataset_recorder_episode_origin_uses_recording_config_snapshot(tmp_path
     recorder._max_force_right = 0.0
     recorder._native_writer_active = lambda: True
 
+    recorder._participation = {"version": "appstation.participation.v1", "arms": ["left"], "grippers": []}
     episode = recorder._finalize_episode_locked(status="review", deleted=False)
+    saved = recorder._read_episodes(dataset_dir)[0]
+    assert saved["participation"] == recorder._participation
+    assert saved["actionMask"] == [True] * 6 + [False] * 8
+    assert saved["observationMask"] == saved["actionMask"]
 
     assert episode["motionOrigin"]["leftPulse"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
     assert episode["motionOrigin"]["rightPulse"] == [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]

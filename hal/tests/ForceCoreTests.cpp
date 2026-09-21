@@ -434,7 +434,7 @@ void testMotionAcknowledge() {
 
 void testForceConfigJson() {
   require(appstation::hal::jsonHealth({}, false, "").find(
-      "\"capabilities\":[\"force_calibration_state_v1\",\"control_lease_v1\",\"replay_absolute_target_v1\"]") != std::string::npos,
+      "\"capabilities\":[\"force_calibration_state_v1\",\"control_lease_v1\",\"replay_absolute_target_v1\",\"record_participation_v1\"]") != std::string::npos,
       "health must advertise the implemented calibration and control lease contracts");
   require(
       appstation::hal::jsonForceRuntimeConfig("{}").source == "hkvl_serial",
@@ -476,6 +476,8 @@ void testForceConfigJson() {
 
 int main() {
   try {
+    const auto participation = appstation::hal::jsonNativeTeleopConfig(R"({"leftGripperParticipating":false,"rightGripperParticipating":true})");
+    require(!participation.gripperParticipating[0] && participation.gripperParticipating[1], "gripper participation JSON mismatch");
     testParser();
     testOfficialHkvlSafetyDefaults();
     testOfficialHkvlHardwareSidePorts();

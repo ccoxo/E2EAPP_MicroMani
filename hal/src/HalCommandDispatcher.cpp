@@ -177,7 +177,7 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
   if (name == "gripper.prepare_replay") {
     ensureCurrentMotionCommand();
     const auto config = jsonNativeTeleopConfig(bodyText);
-    nativeTeleop_.prepareReplayGripper(config.gripper, commandEpoch);
+    nativeTeleop_.prepareReplayGripper(config.gripper, commandEpoch, config.gripperParticipating);
     nativeTeleop_.configureGripperProtection(config.gripperIcfTargetProtectionEnabled, config.gripperIcfTargetMinGapMm);
     return "{\"ok\":true}";
   }

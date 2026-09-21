@@ -43,13 +43,21 @@ function diagnosticReady(diagnostics: DiagnosticItem[], key: string) {
   return diagnostics.find((item) => item.key === key)?.status === 'ok'
 }
 /** 计算对应的业务值或展示值。 */
-function teleopHandsReady(frame: Pick<PreCheckFrame, 'teleopHands'>) {
+function teleopHandsReady(frame: Pick<PreCheckFrame, 'teleopHands'>, session?: RecordSessionState) {
+  if (session?.participation) {
+    const swap = useTelemetryStore.getState().config.teleop.swapTeleopChannels
+    return session.participation.arms.length > 0 && session.participation.arms.every((side) => {
+      const source = swap ? side : side === 'left' ? 'right' : 'left'
+      return frame.teleopHands.some((hand) => hand.side === source && hand.connected && hand.lastReadOk)
+    })
+  }
   const requiredHands = frame.teleopHands.filter(
     (hand) => !hand.message.toLowerCase().includes('logical teleop hand disconnected'),
   )
   return requiredHands.length > 0 && requiredHands.every((hand) => hand.connected && hand.lastReadOk)
 }
 function requiredResetSides(recordSession: RecordSessionState) {
+  if (recordSession.participation) return recordSession.participation.arms.map((side) => side === 'left' ? 'right' as const : 'left' as const)
   return recordSession.resetRequiredSides.length > 0 ? recordSession.resetRequiredSides : ['left' as const]
 }
 function requiredMotionReturnReady(frame: Pick<PreCheckFrame, 'motionEnabled' | 'motionAxisEnabled'>, recordSession: RecordSessionState) {
@@ -71,16 +79,16 @@ function cameraWarnings(frame: Pick<PreCheckFrame, 'cameras'>) {
 const STEPS: StepDef[] = [
   {
     title: '硬件连接',
-    description: '确认 HAL、WebSocket、相机、Omega.7 和夹爪串口均可识别。',
+    description: '确认 HAL、WebSocket、相机和参与侧主手就绪；所选夹爪由后端校验。',
     autoCheck: true,
     check: (frame, _recordSession, diagnostics, telemetryLink) =>
       telemetryLink.state === 'live' &&
       frame.halOk &&
       frame.wsOk &&
       frame.cameras.every((camera) => camera.health === 'ok') &&
-      diagnosticReady(diagnostics, 'omega7') &&
-      teleopHandsReady(frame) &&
-      diagnosticReady(diagnostics, 'gripper'),
+      (Boolean(_recordSession.participation) || diagnosticReady(diagnostics, 'omega7')) &&
+      teleopHandsReady(frame, _recordSession) &&
+      (Boolean(_recordSession.participation) || diagnosticReady(diagnostics, 'gripper')),
     reasons: (frame, _recordSession, diagnostics, telemetryLink) => {
       const items: string[] = []
       if (telemetryLink.state !== 'live') items.push('遥测链路未就绪')
@@ -88,9 +96,9 @@ const STEPS: StepDef[] = [
       if (!frame.wsOk) items.push('WebSocket 中断')
       const badCameras = frame.cameras.filter((c) => c.health !== 'ok').map((c) => c.label)
       if (badCameras.length) items.push(`相机异常：${badCameras.join('、')}`)
-      if (!diagnosticReady(diagnostics, 'omega7')) items.push('Omega.7 诊断未通过')
-      if (!teleopHandsReady(frame)) items.push('主手未全部连上或读数未恢复')
-      if (!diagnosticReady(diagnostics, 'gripper')) items.push('夹爪串口诊断未通过')
+      if (!_recordSession.participation && !diagnosticReady(diagnostics, 'omega7')) items.push('Omega.7 诊断未通过')
+      if (!teleopHandsReady(frame, _recordSession)) items.push('参与侧主手未连接或读数未恢复')
+      if (!_recordSession.participation && !diagnosticReady(diagnostics, 'gripper')) items.push('夹爪串口诊断未通过')
       return items
     },
   },

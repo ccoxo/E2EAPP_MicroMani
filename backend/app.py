@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.websockets import WebSocketState
 
 from backend.app_factory import create_services
+from backend.core.participation import participation, hardware_sides, source_sides
 from backend.core.config import SettingsService
 from backend.core.data_contract import (
     data_contract_metadata,
@@ -681,6 +682,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         *,
         require_camera: bool,
         require_gripper: bool = True,
+        selected: dict | None = None,
     ) -> None:
         config = await get_config_async()
         hal_health = await hal.health()
@@ -693,7 +695,13 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             failures.append("HAL motion controller ltdmc_ok=false")
 
         omega_status = await omega7_serial_status(config, hal_health)
-        if not bool(omega_status.get("ok", False)):
+        if selected:
+            hands = omega_status.get("hands", [])
+            for side in source_sides(config, selected):
+                hand = next((h for h in hands if h.get("side") == side), {})
+                if not hand.get("connected") or not hand.get("lastReadOk"):
+                    failures.append(f"参与采集的 {side} 主手不可用")
+        elif not bool(omega_status.get("ok", False)):
             failures.append(str(omega_status.get("message") or "Omega.7 devices not recognized"))
 
         # 录制不依赖 PICO；ADB 外部脚本不能拖住启动请求并触发控制请求超时。
@@ -707,7 +715,11 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             )
         if require_gripper:
             gripper_status = await gripper_router.status(config)
-            if not isinstance(gripper_status, dict) or not bool(gripper_status.get("ok", False)):
+            if selected:
+                sides = gripper_status.get("sides", {})
+                if any(sides.get(side, {}).get("ok") is False for side in hardware_sides(selected, "grippers")):
+                    failures.append("参与采集的夹爪状态异常")
+            elif not isinstance(gripper_status, dict) or not bool(gripper_status.get("ok", False)):
                 failures.append(
                     str(
                         gripper_status.get("message")
@@ -1956,14 +1968,15 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         dataset_name = payload.get("dataset_name", "dataset")
         task = payload.get("task", "")
         try:
-            await require_hardware_recognized("record", require_camera=True)
+            selected = participation(payload["participation"]) if payload.get("participation") is not None else None
+            await require_hardware_recognized("record", require_camera=True, require_gripper=bool(selected["grippers"]) if selected else True, selected=selected)
             if await native_teleop_enabled_async():
                 await stop_aux_native_teleop_sources("record session create")
-            result = await recorder.start_session(str(dataset_name), str(task))
+            result = await recorder.start_session(str(dataset_name), str(task), selected) if selected else await recorder.start_session(str(dataset_name), str(task))
             return envelope(result)
         except ControlLeaseUnavailable as exc:
             raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
-        except RuntimeError as exc:
+        except (ValueError, RuntimeError) as exc:
             if "dataset numeric channel order is not compatible" in str(exc):
                 raise HTTPException(status_code=409, detail={"code": "DATASET_CONTRACT_INCOMPATIBLE", "message": str(exc)}) from exc
             if "dataset directory already contains non-native files" in str(exc):
@@ -2055,10 +2068,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         return envelope(await replay.stop())
 
     @app.post("/api/datasets/{dataset_id}/episodes/{episode_id}/replay/inspect")
-    async def replay_inspect(dataset_id: str, episode_id: str) -> ApiEnvelope:
+    async def replay_inspect(dataset_id: str, episode_id: str, payload: dict[str, Any] | None = None) -> ApiEnvelope:
         try:
-            return envelope(await replay.inspect(dataset_id, episode_id))
-        except (ValueError, RuntimeError, FileNotFoundError) as exc:
+            return envelope(await replay.inspect(dataset_id, episode_id, (payload or {}).get("participation"), float((payload or {}).get("speed", .25))))
+        except (TypeError, ValueError, RuntimeError, FileNotFoundError) as exc:
             raise HTTPException(409, detail={"code": "REPLAY_REJECTED", "message": str(exc)}) from exc
 
     @app.post("/api/datasets/{dataset_id}/episodes/{episode_id}/replay/start")
@@ -2066,7 +2079,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if payload.get("confirmMotion") is not True:
             raise HTTPException(400, detail={"code": "REPLAY_CONFIRM_REQUIRED", "message": "请确认起点对齐及真机运动"})
         try:
-            return envelope(await replay.start(dataset_id, episode_id, float(payload.get("speed", .25))))
+            return envelope(await replay.start(dataset_id, episode_id, float(payload.get("speed", .25)), payload.get("participation")))
         except (TypeError, ValueError, RuntimeError) as exc:
             raise HTTPException(409, detail={"code": "REPLAY_REJECTED", "message": str(exc)}) from exc
 

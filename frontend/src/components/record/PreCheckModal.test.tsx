@@ -66,6 +66,7 @@ function makeReadyForRecordPrecheck() {
     },
     recordSession: {
       ...state.recordSession,
+      participation: undefined,
       forceTareActive: false,
     },
   }))
@@ -248,4 +249,18 @@ describe('PreCheckModal', () => {
     if (!returnButton) throw new Error('return-origin button not found')
     expect(returnButton).toBeEnabled()
   })
+})
+
+it('single operator-left participation only returns hardware right and ignores the unused master', async () => {
+  makeReadyForRecordPrecheck()
+  const home = vi.spyOn(api, 'returnMotionOriginSide').mockResolvedValue({} as never)
+  useTelemetryStore.setState((state) => ({
+    recordSession: { ...state.recordSession, participation: { version: 'appstation.participation.v1', arms: ['left'], grippers: [] }, resetReturnedSides: [] },
+    frame: { ...state.frame, motionEnabled: { left: false, right: true }, motionAxisEnabled: { left: [false, false, false, false, false, false], right: [true, true, true, true, true, true] },
+      teleopHands: state.frame.teleopHands.map((hand) => ({ ...hand, connected: hand.side === 'left', lastReadOk: hand.side === 'left' })) },
+  }))
+  renderPreCheck()
+  fireEvent.click(screen.getByRole('button', { name: '自动回工作原点' }))
+  await vi.waitFor(() => expect(home).toHaveBeenCalledWith('right'))
+  expect(home).not.toHaveBeenCalledWith('left')
 })

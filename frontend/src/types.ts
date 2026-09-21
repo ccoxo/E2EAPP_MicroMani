@@ -381,7 +381,14 @@ export interface RecordQualityReport extends EpisodeRecord {
   qualityAssessment?: RecordQualityAssessment
 }
 
+export interface Participation {
+  version: 'appstation.participation.v1'
+  arms: Array<'left' | 'right'>
+  grippers: Array<'left' | 'right'>
+}
+
 export interface RecordSessionState {
+  participation?: Participation
   startError: string | null
   datasetName: string
   task: string
@@ -464,6 +471,7 @@ export interface DatasetEpisodeMotionCalibrationApi {
 }
 
 export interface DatasetEpisodeApi {
+  participation?: Participation | null
   id: string
   name: string
   task: string

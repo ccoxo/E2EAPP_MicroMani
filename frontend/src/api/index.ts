@@ -1,3 +1,4 @@
+import type { Participation } from '../types'
 /*
  * 阅读导航 02｜前端契约与状态
  * 职责：封装后端 HTTP 请求、错误信息、相机 URL 与页面生命周期命令。
@@ -593,10 +594,11 @@ export async function gripperCommand(side: ManualControlSide, command: ManualGri
 
 // 说明当前代码块的功能用途。
 /** 描述当前方法的功能边界。 */
-export const createSession = (datasetName: string, task: string) =>
-  postCommand('/record/session/create', { dataset_name: datasetName, task }) as Promise<RecordSessionCommandResponse>
+export const createSession = (datasetName: string, task: string, participation?: Participation) =>
+  postCommand('/record/session/create', { dataset_name: datasetName, task, ...(participation ? { participation } : {}) }) as Promise<RecordSessionCommandResponse>
 
 export interface RecordStatusApi {
+  participation?: Participation
   safetyInterrupted?: boolean
   active?: boolean
   recording?: boolean

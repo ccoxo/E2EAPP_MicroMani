@@ -377,13 +377,15 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config,
       [&]() { return motion_.commandEpochAllowed(motionEpoch); });
 }
 
-void NativeTeleopController::prepareReplayGripper(const JodellGripperConfig& config, std::uint64_t epoch) {
+void NativeTeleopController::prepareReplayGripper(const JodellGripperConfig& config, std::uint64_t epoch,
+    const std::array<bool, 2>& participating) {
   if (running() || !motion_.commandEpochAllowed(epoch)) {
     throw std::runtime_error("replay gripper preparation blocked by teleop or safety stop");
   }
   configureGripper(config);
   {
     std::scoped_lock lock(mutex_);
+    config_.gripperParticipating = participating;
     gripperPositionOk_ = {false, false};
     gripperPositionSampleTs_ = {0, 0};
   }
@@ -681,8 +683,13 @@ void NativeTeleopController::gripperLoop() {
       }
     }
     if (shouldSample) {
-      sampleGripperPosition(Side::Left);
-      sampleGripperPosition(Side::Right);
+      std::array<bool, 2> participating;
+      {
+        std::scoped_lock lock(mutex_);
+        participating = config_.gripperParticipating;
+      }
+      if (participating[0]) sampleGripperPosition(Side::Left);
+      if (participating[1]) sampleGripperPosition(Side::Right);
     }
   }
 }
@@ -1626,6 +1633,7 @@ void NativeTeleopController::tickGrippers(const std::array<Omega7State, 2>& hand
   }
   const auto now = std::chrono::steady_clock::now();
   for (int targetIndex = 0; targetIndex < 2; ++targetIndex) {
+    if (!config_.gripperParticipating[targetIndex]) continue;
     // gripperSourceHand is indexed by target hardware side; defaults follow operator-to-hardware mapping.
     const int sourceIndex = gripperSourceIndex(targetIndex);
     const auto& hand = hands[sourceIndex];

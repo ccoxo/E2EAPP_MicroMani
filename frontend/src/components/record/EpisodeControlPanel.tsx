@@ -1,3 +1,5 @@
+import type { Participation } from '../../types'
+import { ParticipationSelector } from '../ParticipationSelector'
 /*
  * 阅读导航 01｜入口与界面
  * 职责：提供录制会话、episode 保存/丢弃及复位流程的主要操作入口。
@@ -53,6 +55,8 @@ interface EpisodeControlPanelProps {
 }
 /** 渲染当前界面单元，并连接所需数据。 */
 export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPanelProps) {
+  const participation: Participation = useTelemetryStore((s) => s.recordSession.participation) ?? { version: 'appstation.participation.v1', arms: [], grippers: [] }
+  const setParticipation = useTelemetryStore((s) => s.setRecordParticipation)
   const phase = useTelemetryStore((s) => s.recordSession.phase)
   const startError = useTelemetryStore((s) => s.recordSession.startError)
   const elapsedS = useTelemetryStore((s) => s.recordSession.recorderElapsedS)
@@ -127,6 +131,7 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
         />
       </label>
 
+      <ParticipationSelector value={participation} onChange={setParticipation} disabled={phase !== 'idle'} />
       <hr className="ui-divider" />
 
       <div className="record-episode-progress-head">
@@ -179,7 +184,7 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
               <div>{startError}</div>
             </div>
           )}
-          <UiButton variant="primary" block onClick={onStartSession}>
+          <UiButton variant="primary" block disabled={!participation.arms.length} onClick={onStartSession}>
             开始采集会话
           </UiButton>
         </div>

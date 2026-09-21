@@ -1152,6 +1152,7 @@ describe('AppStation M0 frontend', () => {
     await waitFor(() => {
       expect(screen.getByText('开始采集会话')).toBeInTheDocument()
     })
+    fireEvent.click(screen.getByRole('checkbox', { name: '右臂' }))
     fireEvent.click(screen.getByText('开始采集会话').closest('button')!)
 
     expect(screen.getByText('采集会话开始前硬件检查')).toBeInTheDocument()
@@ -1188,6 +1189,8 @@ describe('AppStation M0 frontend', () => {
     )
     useTelemetryStore.setState({ logPanelOpen: false })
     render(<EpisodeControlPanel onStartSession={() => useTelemetryStore.getState().startRecordSession('existing', 'task')} />)
+    expect(screen.getByRole('button', { name: '开始采集会话' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('checkbox', { name: '右臂' }))
     fireEvent.click(screen.getByRole('button', { name: '开始采集会话' }))
     expect(await screen.findByRole('alert')).toHaveTextContent(message)
     expect(useTelemetryStore.getState().recording).toBe(false)
@@ -1214,7 +1217,7 @@ describe('AppStation M0 frontend', () => {
     useTelemetryStore.getState().startRecordSession('micro_assembly_v1', 'Assemble ICF target component')
 
     await vi.waitFor(() =>
-      expect(createSessionSpy).toHaveBeenCalledWith('micro_assembly_v1', 'Assemble ICF target component'),
+      expect(createSessionSpy).toHaveBeenCalledWith('micro_assembly_v1', 'Assemble ICF target component', undefined),
     )
     expect(useTelemetryStore.getState().recording).toBe(false)
     expect(useTelemetryStore.getState().recordSession.phase).toBe('starting')
@@ -1372,7 +1375,7 @@ describe('AppStation M0 frontend', () => {
     await Promise.resolve()
     await Promise.resolve()
 
-    expect(createSessionSpy).toHaveBeenCalledWith('micro_assembly_v1', 'Assemble ICF target component')
+    expect(createSessionSpy).toHaveBeenCalledWith('micro_assembly_v1', 'Assemble ICF target component', undefined)
   })
 
   it('aligns the UI record timer to the backend recorder elapsed time', async () => {
@@ -1423,7 +1426,7 @@ describe('AppStation M0 frontend', () => {
     ).toBe(true)
   })
 
-  it('blocks record precheck until Omega.7 and gripper diagnostics are recognized', async () => {
+  it('blocks record precheck until selected Omega.7 hands are ready', async () => {
     window.history.pushState({}, '', '/record')
     useTelemetryStore.setState((state) => ({
       telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
@@ -1433,6 +1436,8 @@ describe('AppStation M0 frontend', () => {
     }))
 
     await renderApp()
+    fireEvent.click(screen.getByRole('checkbox', { name: '左臂' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: '右臂' }))
     fireEvent.click(document.querySelector<HTMLButtonElement>('.record-action-stack button')!)
 
     const confirmButton = screen.getByRole('button', { name: '确认开始' })
@@ -1495,6 +1500,8 @@ describe('AppStation M0 frontend', () => {
     }))
 
     await renderApp()
+    fireEvent.click(screen.getByRole('checkbox', { name: '左臂' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: '右臂' }))
     fireEvent.click(document.querySelector<HTMLButtonElement>('.record-action-stack button')!)
 
     const confirmButton = screen.getByRole('button', { name: '确认开始' })

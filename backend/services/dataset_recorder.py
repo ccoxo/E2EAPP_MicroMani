@@ -1,4 +1,4 @@
-﻿# 阅读导航 04｜后端业务与采集
+# 阅读导航 04｜后端业务与采集
 # 职责：管理录制会话和 episode；按时间戳组帧、排队写入 LeRobot，并提供数据集管理接口。
 # 先看：DatasetRecorderService → FrameAssembler → TimedRingBuffer → LeRobotWriterThread。
 # 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
@@ -34,6 +34,7 @@ from backend.services.recording_diagnostics import RecordingDiagnostics
 from backend.services.process_video_encoder import isolate_dataset_encoder
 from backend.services.recording_gc import RecordingGcScope
 
+from backend.core.participation import participation, action_mask, hardware_sides, source_sides, scoped_config
 from backend.core.config import SettingsService
 from backend.core.data_contract import (
     data_contract_metadata,
@@ -367,11 +368,20 @@ class FrameAssembler:
         force_sample = recorder._aligned_sample("force", target_monotonic_s)
         gripper_sample = recorder._aligned_sample("gripper", target_monotonic_s)
         recorder._aligned_sample("omega", target_monotonic_s)
+        selected = getattr(recorder, "_participation", None)
+        if selected and recorder._real_hardware_mode(config):
+            required = [hal_sample] + ([gripper_sample] if selected["grippers"] else [])
+            if any(not sample.ok or sample.stale for sample in required):
+                raise RuntimeError("参与采集设备反馈无效，拒绝写入伪造观测")
+
         motion_state = hal_sample.value if hal_sample.ok and isinstance(hal_sample.value, dict) else {}
         raw_positions = motion_state.get("positions") if isinstance(motion_state, dict) else None
         if isinstance(raw_positions, list) and len(raw_positions) == 12:
             motion_positions = [float(value) for value in raw_positions]
         raw_pulses = motion_state.get("pulses") if isinstance(motion_state, dict) else None
+        if selected and recorder._real_hardware_mode(config):
+            if not isinstance(raw_pulses, list) or len(raw_pulses) != 12 or any(not math.isfinite(float(v)) for v in raw_pulses):
+                raise RuntimeError("参与采集的运动反馈缺失或非法")
         if isinstance(raw_pulses, list) and len(raw_pulses) == 12:
             motion_pulses = [float(value) for value in raw_pulses]
             recorder._remember_motion_pulses(motion_pulses)
@@ -386,6 +396,8 @@ class FrameAssembler:
             else list(recorder.telemetry.gripper_positions)
         )
         observation_state = recorder._compose_observation_state(motion_positions, gripper_positions)
+        if selected:
+            observation_state = [v if active else 0. for v, active in zip(observation_state, action_mask(selected))]
         image_payload: dict[str, Any] = {}
         for camera, source in CAMERA_SOURCE_KEYS.items():
             feature_key = CAMERA_FEATURE_KEYS[camera]
@@ -403,7 +415,9 @@ class FrameAssembler:
             "observation.pulses": recording_motion_pulses,
             "observation.force_left": force_right,
             "observation.force_right": force_left,
-            "action": recorder._latest_action_vector(observation_state, config, target_monotonic_s),
+            "action": [v if active else 0. for v, active in zip(
+                recorder._latest_action_vector(observation_state, config, target_monotonic_s),
+                action_mask(selected) if selected else [True] * 14)],
             "images": image_payload,
         }
 
@@ -555,6 +569,7 @@ class DatasetRecorderService:
         self._latest_force_state: dict[str, Any] = {}
         self._episode_force_calibration: dict[str, Any] = {}
         self._recording_config_snapshot: dict[str, Any] = {}
+        self._participation = None
         self._last_motion_pulses = [0.0] * 12
         self._source_sample_indices: dict[str, int] = {key: 0 for key in SOURCE_KEYS}
         self._sample_buffers: dict[str, TimedRingBuffer] = self._new_sample_buffers({})
@@ -569,21 +584,37 @@ class DatasetRecorderService:
 
     # 会话入口：从这里沿准备数据集、启动采样/遥操作及异常清理阅读，再看 save_episode 和 finish_session。
     @motion_operation()
-    async def start_session(self, dataset_name: str, task: str) -> dict[str, Any]:
+    async def start_session(self, dataset_name: str, task: str, selected=None) -> dict[str, Any]:
         """创建录制会话，初始化 native 写入路径、采样线程和组帧任务。"""
         safety_token = self.safety.capture()
         self.safety.check(safety_token)
-        validator = getattr(self, "validate_start_origin", None)
-        if validator is not None:
-            await validator()
         async with self._lock:
             if self._session_active or self._session_starting:
                 raise RuntimeError("record session already active")
+            self._participation = participation(selected) if selected is not None else None
+            if self._participation:
+                self._reset_required_sides = set(hardware_sides(self._participation))
             self._session_starting = True
             self._safety_interrupted = False
 
         try:
+            validator = getattr(self, "validate_start_origin", None)
+            if validator is not None:
+                await validator()
             config = await asyncio.to_thread(self.settings.get_config)
+            if self._participation:
+                for side in source_sides(config, self._participation):
+                    if not config["teleop"].get(f"{side}Connected"):
+                        raise RuntimeError("请先连接参与采集侧的遥操作")
+                if self._participation["grippers"] and not config["teleop"].get("gripperTeleop", {}).get("enabled"):
+                    raise RuntimeError("请先开启参与夹爪的示教映射")
+                for side in hardware_sides(self._participation, "grippers"):
+                    if not config["gripper"].get(f"{side}Enabled"):
+                        raise RuntimeError("请先启用参与采集的夹爪")
+                health = await self.hal.health()
+                if self._real_hardware_mode(config) and "record_participation_v1" not in (health.capabilities or []):
+                    raise RuntimeError("HAL 不支持参与侧隔离，请部署配套 HAL 后采集")
+                config = scoped_config(config, self._participation)
             next_dataset_name = dataset_name.strip() or "micro_assembly_v1"
             next_dataset_id = self._safe_id(next_dataset_name)
             next_task = task.strip() or "unspecified task"
@@ -602,7 +633,7 @@ class DatasetRecorderService:
                 self._session_id = f"session-{now_ms()}"
                 self._last_saved_episode = None
                 self._reset_pending = False
-                self._reset_required_sides = {"left"}
+                self._reset_required_sides = set(hardware_sides(self._participation)) if getattr(self, "_participation", None) else {"left"}
                 self._reset_returned_sides = set()
                 self._record_fps_hz = self._record_fps_from_config(config)
                 self._force_sample_hz = self._force_sample_hz_from_config(config)
@@ -944,7 +975,7 @@ class DatasetRecorderService:
 
     def _enter_reset_pending_locked(self) -> None:
         self._reset_pending = True
-        self._reset_required_sides = {"left"}
+        self._reset_required_sides = set(hardware_sides(self._participation)) if getattr(self, "_participation", None) else {"left"}
         self._reset_returned_sides = set()
 
     def mark_reset_origin_returned(self, side: str) -> None:
@@ -968,6 +999,7 @@ class DatasetRecorderService:
         return {
             "session": self._session_id,
             "datasetId": self._dataset_id,
+            "participation": deepcopy(getattr(self, "_participation", None)),
             "datasetName": self._dataset_name,
             "task": self._task,
             "active": self._session_active,
@@ -2284,6 +2316,11 @@ class DatasetRecorderService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
+                if getattr(self, "_participation", None):
+                    async with self._lock:
+                        self._stop_recording_for_backpressure_locked(str(exc))
+                        self._safety_interrupted = True
+                    await self.teleop.stop("recording")
                 self.logs.error("[LEROBOT]", f"frame assembler recovered: {exc}")
                 await asyncio.sleep(0.05)
             finally:
@@ -2372,6 +2409,9 @@ class DatasetRecorderService:
         record_quality: bool = True,
     ) -> SourceSample:
         """同步读取夹爪位置，优先使用 native teleop 缓存并记录陈旧状态。"""
+        selected = getattr(self, "_participation", None)
+        if selected and not selected["grippers"]:
+            return SourceSample("gripper", target_monotonic_s, [0., 0.], True, "masked inactive grippers", target_monotonic_s=target_monotonic_s)
         native_sample = self._latest_native_gripper_sample(config)
         if native_sample is not None:
             native_positions, sampled_at = native_sample
@@ -2391,6 +2431,8 @@ class DatasetRecorderService:
             if record_quality:
                 self._record_source_quality(sample, target_monotonic_s, 0.0)
             return sample
+        if selected and self._using_real_hal_native_teleop(config):
+            raise RuntimeError("参与采集的夹爪反馈缺失")
         if self._using_real_hal_native_teleop(config):
             cached_sample = getattr(self, "_last_native_gripper_sample", None)
             if cached_sample is not None:
@@ -2467,6 +2509,20 @@ class DatasetRecorderService:
         grippers = native_status.get("grippers")
         if not isinstance(grippers, dict):
             return None
+        selected = getattr(self, "_participation", None)
+        if selected:
+            values = []
+            for side in ("left", "right"):
+                if side not in hardware_sides(selected, "grippers"):
+                    values.append(0.)
+                    continue
+                detail = grippers.get(side, {})
+                gap = self._coerce_float(detail.get("positionMm"))
+                age = time.time() * 1000 - float(detail.get("positionSampleTs", 0))
+                if gap is None or gap < 0 or detail.get("positionOk") is not True or not 0 <= age <= 1000:
+                    raise RuntimeError(f"参与采集的 {side} 夹爪反馈无效或过期")
+                values.append(gap)
+            return tuple(values), self._source_sample_monotonic(native_status, 0.0)
         left = grippers.get("left")
         right = grippers.get("right")
         if not isinstance(left, dict) or not isinstance(right, dict):
@@ -2949,6 +3005,9 @@ class DatasetRecorderService:
             "maxForceRight": round(self._max_force_right, 6),
             "warnings": self._quality_warnings(),
             "trainingQuality": training_quality,
+            "participation": deepcopy(getattr(self, "_participation", None)),
+            "actionMask": action_mask(self._participation) if getattr(self, "_participation", None) else None,
+            "observationMask": action_mask(self._participation) if getattr(self, "_participation", None) else None,
             "motionOrigin": self._episode_motion_origin_snapshot(config_snapshot),
             "motionCalibration": self._motion_calibration_snapshot(config_snapshot),
             "forceCalibration": deepcopy(getattr(self, "_episode_force_calibration", {})),
@@ -3663,6 +3722,9 @@ class DatasetRecorderService:
             "qualityAssessment": episode.get("qualityAssessment", {}),
             "maxForceLeft": float(episode.get("maxForceLeft", 0.0)),
             "maxForceRight": float(episode.get("maxForceRight", 0.0)),
+            "participation": deepcopy(episode.get("participation")),
+            "actionMask": episode.get("actionMask"),
+            "observationMask": episode.get("observationMask"),
             "motionOrigin": episode.get("motionOrigin", {}),
             "motionCalibration": episode.get("motionCalibration", {}),
             "forceCalibration": deepcopy(episode.get("forceCalibration", {})),
