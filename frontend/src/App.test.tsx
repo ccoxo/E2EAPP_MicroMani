@@ -175,8 +175,6 @@ describe('AppStation M0 frontend', () => {
     class MockWebSocket {
       static OPEN = 1
       readyState = 1
-      private challengeSeq = 0
-      private challengeTimer: ReturnType<typeof setInterval>
       static instances: MockWebSocket[] = []
       readonly url: string
       onopen: ((event: Event) => void) | null = null
@@ -186,21 +184,19 @@ describe('AppStation M0 frontend', () => {
       constructor(url: string) {
         this.url = url
         MockWebSocket.instances.push(this)
-        window.setTimeout(() => this.onopen?.(new Event('open')), 0)
-        this.challengeTimer = setInterval(() => {
-          this.onmessage?.({ data: JSON.stringify({ type: 'safety_challenge', data: { sessionId: 'frame-test', challengeId: `n${++this.challengeSeq}`, ttlMs: 2000 } }) } as MessageEvent)
-        }, 500)
+        window.setTimeout(() => {
+          this.onopen?.(new Event('open'))
+          this.onmessage?.({ data: JSON.stringify({ type: 'control_lease', data: {
+            sessionId: 'frame-test', status: 'active', renewalOwner: 'backend',
+          } }) } as MessageEvent)
+        }, 0)
       }
 
       close() {
-        clearInterval(this.challengeTimer)
         this.onclose?.({ code: 1000 } as CloseEvent)
       }
 
-      send(message: string) {
-        const { data } = JSON.parse(message)
-        this.onmessage?.({ data: JSON.stringify({ type: 'control_lease', data: { ...data, status: 'active', ttlMs: 2500 } }) } as MessageEvent)
-      }
+      send() {}
 
       emitTelemetry(frame: TelemetryFrame) {
         this.onmessage?.({ data: JSON.stringify({ type: 'telemetry', data: frame }) } as MessageEvent)

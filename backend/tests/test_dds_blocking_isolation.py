@@ -12,6 +12,62 @@ from backend.hal_client.dds_types import HalCommandReply
 from backend.tests.test_hal_dds_client import FakeDdsTransport
 
 
+@pytest.mark.parametrize("failure", ["publish", "reply", "native_error", "cancelled"])
+def test_lease_failure_preserves_stage_and_original_error(failure) -> None:
+    async def exercise() -> None:
+        release = Event()
+        entered = Event()
+        transport = FakeDdsTransport()
+        logs = Mock()
+        client = DdsHalClient(logs, transport=transport, reply_timeout_s=0.01)
+        fault = Mock()
+        client.on_control_transport_fault = fault
+
+        def publish(request):
+            transport.emergency_requests.append(request)
+            if failure == "native_error":
+                raise RuntimeError("native writer failed")
+            if failure == "publish":
+                entered.set()
+                release.wait(2)
+
+        def wait(_request_id, _timeout):
+            entered.set()
+            release.wait(2)
+            return None
+
+        transport.publish_emergency_stop = publish
+        transport.wait_for_command_reply = wait
+        task = asyncio.create_task(client.command("control.lease", {}))
+        try:
+            if failure == "cancelled":
+                while not entered.is_set():
+                    await asyncio.sleep(0.001)
+                task.cancel()
+            with pytest.raises(asyncio.CancelledError if failure == "cancelled" else RuntimeError):
+                await task
+            reason = fault.call_args.args[0]
+            assert f"stage={'publish' if failure in {'publish', 'native_error'} else 'reply'}" in reason
+            expected_type = {"native_error": "DdsTransportCallError", "cancelled": "CancelledError"}.get(failure, "BlockingCallTimeout")
+            assert f"exception={expected_type}" in reason
+            assert f"request_id={transport.emergency_requests[0].request_id}" in reason
+            assert "elapsed_ms=" in reason
+            if failure == "native_error":
+                assert "native writer failed" in reason
+            logs.error.assert_called_with("[HAL]", reason)
+            with pytest.raises(RuntimeError, match="quarantined"):
+                await client.command("control.lease", {})
+        finally:
+            release.set()
+            for _ in range(100):
+                if client._lease_lane.active == 0:
+                    break
+                await asyncio.sleep(0.005)
+            await client.aclose()
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("blocked_stage", ["publish", "reply"])
 def test_blocked_command_capacity_does_not_queue_or_block_emergency_and_lease(blocked_stage) -> None:
     async def exercise() -> None:

@@ -2256,14 +2256,11 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         receive_task: asyncio.Task[None] | None = None
         interruption_reported = False
 
-        async def receive_heartbeats() -> None:
+        async def receive_control_connection() -> None:
             try:
                 while True:
-                    message = await ws.receive_json()
-                    if isinstance(message, dict) and message.get("type") == "safety_heartbeat":
-                        data = message.get("data")
-                        if isinstance(data, dict) and control_session_id is not None:
-                            control_watchdog.respond(control_session_id, data)
+                    # 只监听真实断开，不要求页面主线程定时应答。
+                    await ws.receive_json()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -2272,13 +2269,13 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
         app.state.ws_clients.add(client_token)
         try:
-            # 控制心跳独立于首帧组装，设备查询或遥测线程池繁忙不能阻塞握手。
+            # HAL 续租独立于页面和遥测组帧，控制连接仍保持单一所有者。
             if getattr(ws, "query_params", {}).get("mode") != "observe":
                 if control_watchdog.clients:
                     await ws.close(code=1008, reason="another browser owns control; use ?mode=observe")
                     return
                 control_session_id = control_watchdog.register(ws.send_json)
-                receive_task = asyncio.create_task(receive_heartbeats(), name="browser-control-heartbeat")
+                receive_task = asyncio.create_task(receive_control_connection(), name="browser-control-connection")
             while True:
                 try:
                     now = time.monotonic()

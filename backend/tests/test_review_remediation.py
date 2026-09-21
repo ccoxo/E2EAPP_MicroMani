@@ -21,13 +21,12 @@ def test_expired_open_socket_does_not_block_new_owner_or_revoke_it_later():
     async def exercise():
         watchdog, now, hal, invalidate, _stop = make_watchdog()
         old = await confirm_mock_browser_lease(watchdog)
-        now[0] = 2.1
-        await watchdog.cycle()
+        watchdog.trip("HAL control lease renewal failed")
         assert not watchdog.clients
         new = await confirm_mock_browser_lease(watchdog)
         watchdog.remove(old)
-        assert not watchdog.respond(old, {"sessionId": old, "challengeId": "late"})
-        assert not watchdog.respond(new, {"sessionId": new, "challengeId": ""})
+        assert old not in watchdog.clients
+        assert new in watchdog.clients
         watchdog.require_ready()
         assert invalidate.call_count == 1
         assert hal.command.await_count == 2

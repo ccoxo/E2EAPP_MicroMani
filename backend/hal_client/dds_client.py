@@ -199,9 +199,21 @@ class DdsHalClient(HalClient):
             # publish 与 wait 都可能在原生绑定中阻塞；不得占用事件循环或公共 executor。
             try:
                 reply = await lane.run(exchange, timeout_s + 0.05)
-            except (BlockingCallTimeout, DdsTransportCallError, asyncio.CancelledError):
+            except (BlockingCallTimeout, DdsTransportCallError, asyncio.CancelledError) as exc:
+                # 保留首次故障现场，区分线程未启动、发布阻塞、等待应答与事件循环恢复延迟。
+                observed = time.monotonic()
+                timing = dict(exchange_timing)
+                stage = ("resume" if "returned" in timing else "reply" if "published" in timing
+                         else "publish" if "started" in timing else "dispatch")
+                elapsed_ms = (observed - (deadline - timeout_s)) * 1000
+                stage_ms = (observed - timing.get("returned", timing.get("published", timing.get("started", deadline - timeout_s)))) * 1000
+                reason = (f"DDS native control call blocked or cancelled: {name}; "
+                          f"exception={type(exc).__name__} stage={stage} request_id={request.request_id} "
+                          f"elapsed_ms={elapsed_ms:.1f} stage_ms={stage_ms:.1f} "
+                          f"lane_timeout_ms={(timeout_s + 0.05) * 1000:.1f} detail={exc}")
+                self.logs.error("[HAL]", reason)
                 if control_critical:
-                    self._quarantine(f"DDS native control call blocked or cancelled: {name}")
+                    self._quarantine(reason)
                 raise
             if reply is None:
                 started = exchange_timing["started"]

@@ -1532,10 +1532,6 @@ startBackend: () => {
     let transportRestartReason: string | null = null
     const leaseSession = createControlLeaseSession({
       isCurrent: () => connectionIsCurrent() && get().backendWs === ws,
-      send: (message) => {
-        if (!connectionIsCurrent() || get().backendWs !== ws || ws.readyState !== WebSocket.OPEN) throw new Error('控制会话已经断开')
-        ws.send(message)
-      },
       close: (reason, restartRequired) => {
         if (restartRequired) transportRestartReason = reason
         try {

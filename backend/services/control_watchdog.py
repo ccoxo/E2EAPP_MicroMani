@@ -16,14 +16,8 @@ request_control_session: ContextVar[str | None] = ContextVar("request_control_se
 class BrowserLease:
     session_id: str
     send: Callable[[dict[str, Any]], Awaitable[None]]
-    connected_at: float
-    challenge_id: str = ""
-    challenge_deadline: float = 0.0
-    last_challenge_at: float = float("-inf")
-    last_response_at: float | None = None
-    answered_challenge: str = ""
-    leased_challenge: str = ""
     expired: bool = False
+    announced: bool = False
     sending: asyncio.Task[None] | None = None
     pending_messages: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -33,7 +27,7 @@ class ControlLeaseUnavailable(RuntimeError):
 
 
 class ControlWatchdog:
-    """主线程应答驱动的执行租约；不依赖遥测组帧或默认线程池。"""
+    """后端独立维护 HAL 执行租约，浏览器仅持有连接会话。"""
 
     def __init__(
         self,
@@ -43,8 +37,7 @@ class ControlWatchdog:
         emergency_stop: Callable[[], Awaitable[Any]],
         *,
         clock: Callable[[], float] = time.monotonic,
-        challenge_interval_s: float = 0.5,
-        browser_timeout_s: float = 2.0,
+        renew_interval_s: float = 0.5,
         hal_timeout_ms: int = 2500,
     ) -> None:
         self.hal = hal
@@ -52,8 +45,7 @@ class ControlWatchdog:
         self.invalidate = invalidate
         self.emergency_stop = emergency_stop
         self.clock = clock
-        self.challenge_interval_s = challenge_interval_s
-        self.browser_timeout_s = browser_timeout_s
+        self.renew_interval_s = renew_interval_s
         self.hal_timeout_ms = hal_timeout_ms
         self.session_id = uuid.uuid4().hex
         self.clients: dict[str, BrowserLease] = {}
@@ -76,10 +68,10 @@ class ControlWatchdog:
         if session is not None and session not in self.clients:
             raise ControlLeaseUnavailable("request does not own the current browser control session")
         if (
-            self._closed or self._tripped or not self._healthy(now)
+            self._closed or self._tripped or not self._healthy()
             or self._confirmed_until <= now or self._confirmed_generation != self._generation
         ):
-            raise ControlLeaseUnavailable("fresh browser heartbeat and confirmed HAL control lease are required")
+            raise ControlLeaseUnavailable("connected browser session and confirmed HAL control lease are required")
 
     def require_ack_ready(self) -> None:
         self.require_ready()
@@ -96,7 +88,7 @@ class ControlWatchdog:
             raise ControlLeaseUnavailable("another browser already owns control; use observer mode")
         session_id = uuid.uuid4().hex
         self.last_browser_session = session_id
-        self.clients[session_id] = BrowserLease(session_id, send, self.clock())
+        self.clients[session_id] = BrowserLease(session_id, send)
         self._generation += 1
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run(), name="control-watchdog")
@@ -111,25 +103,6 @@ class ControlWatchdog:
         if not client.expired:
             self.trip("browser WebSocket disconnected")
 
-    def respond(self, session_id: str, payload: dict[str, Any]) -> bool:
-        client = self.clients.get(session_id)
-        if client is None or client.expired:
-            return False
-        if not client.challenge_id or payload.get("sessionId") != session_id or payload.get("challengeId") != client.challenge_id:
-            return False
-        now = self.clock()
-        last_alive = client.last_response_at if client.last_response_at is not None else client.connected_at
-        if (
-            not client.challenge_id or now >= client.challenge_deadline
-            or now - last_alive >= self.browser_timeout_s
-        ):
-            self.trip("browser challenge response expired")
-            return False
-        client.last_response_at = now
-        client.answered_challenge = client.challenge_id
-        client.challenge_id = ""
-        return True
-
     def trip(self, reason: str) -> None:
         self._generation += 1
         self._confirmed_until = 0.0
@@ -137,7 +110,7 @@ class ControlWatchdog:
         for client in self.clients.values():
             client.expired = True
             self._send_status(client, "expired")
-        # 旧会话不再参与健康判定，迟到断开/应答不能影响新会话。
+        # 旧会话不再参与健康判定，迟到断开/回复不能影响新会话。
         self.clients.clear()
         if self._tripped:
             return
@@ -162,67 +135,44 @@ class ControlWatchdog:
                     return
                 await asyncio.sleep(0.1)
 
-    def _healthy(self, now: float) -> bool:
-        return bool(self.clients) and all(
-            not client.expired and client.last_response_at is not None
-            and now - client.last_response_at < self.browser_timeout_s
-            for client in self.clients.values()
-        )
+    def _healthy(self) -> bool:
+        return bool(self.clients) and all(not client.expired for client in self.clients.values())
 
     def _send(self, client: BrowserLease, message: dict[str, Any]) -> None:
         client.pending_messages[message["type"]] = message
         if client.sending is not None and not client.sending.done():
-            return  # 最多合并一条挑战和一条状态，禁止慢客户端积累无界队列。
+            return  # 只保留最新会话状态，禁止慢客户端积累无界队列。
 
         async def send() -> None:
             try:
                 while client.pending_messages:
                     key = next(iter(client.pending_messages))
                     current = client.pending_messages.pop(key)
-                    await asyncio.wait_for(client.send(current), 0.5)
+                    await client.send(current)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 client.pending_messages.clear()
                 if self.clients.get(client.session_id) is client and not client.expired:
-                    self.trip(f"browser heartbeat send failed: {exc}")
+                    self.trip(f"browser connection send failed: {type(exc).__name__}: {exc}")
 
         client.sending = asyncio.create_task(send(), name="control-watchdog-send")
         self._send_tasks.add(client.sending)
         client.sending.add_done_callback(self._send_tasks.discard)
 
-    def _send_status(self, client: BrowserLease, status: str, challenge_id: str | None = None) -> None:
+    def _send_status(self, client: BrowserLease, status: str) -> None:
         self._send(client, {"type": "control_lease", "data": {
             "sessionId": client.session_id,
-            "challengeId": client.answered_challenge if challenge_id is None else challenge_id,
+            "renewalOwner": "backend",
             "status": status, "ttlMs": self.hal_timeout_ms,
             "restartRequired": getattr(self.hal, "_control_transport_failed", False) is True,
         }})
 
     async def cycle(self) -> None:
         now = self.clock()
-        for client in list(self.clients.values()):
-            last_alive = client.last_response_at if client.last_response_at is not None else client.connected_at
-            if not client.expired and now - last_alive >= self.browser_timeout_s:
-                self.trip("browser main thread heartbeat timed out")
-                break
-            if client.expired:
-                continue
-            if not client.challenge_id and now - client.last_challenge_at >= self.challenge_interval_s:
-                client.challenge_id = uuid.uuid4().hex
-                client.last_challenge_at = now
-                client.challenge_deadline = now + self.browser_timeout_s
-                self._send(client, {"type": "safety_challenge", "data": {
-                    "sessionId": client.session_id, "challengeId": client.challenge_id,
-                    "ttlMs": int(self.browser_timeout_s * 1000),
-                }})
-        if not self._healthy(now) or now < self._next_renew_at:
-            return
-        if any(client.answered_challenge == client.leased_challenge for client in self.clients.values()):
-            # 每次 HAL 续租必须消费新的主线程应答，不能靠旧的仍未过期应答续命。
+        if not self._healthy() or now < self._next_renew_at:
             return
         generation = self._generation
-        renewing_challenges = {key: client.answered_challenge for key, client in self.clients.items()}
         self._sequence += 1
         try:
             result = await asyncio.wait_for(self.hal.command("control.lease", {
@@ -237,17 +187,18 @@ class ControlWatchdog:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self.trip(f"HAL control lease renewal failed: {exc}")
+            self.trip(f"HAL control lease renewal failed: {type(exc).__name__}: {exc}")
             return
-        if generation != self._generation or not self._healthy(self.clock()):
+        if generation != self._generation or not self._healthy():
             return
-        self._next_renew_at = self.clock() + self.challenge_interval_s
+        self._next_renew_at = self.clock() + self.renew_interval_s
         self._confirmed_until = now + self.hal_timeout_ms / 1000.0
         self._confirmed_generation = generation
         self._tripped = False
         for client in self.clients.values():
-            client.leased_challenge = renewing_challenges[client.session_id]
-            self._send_status(client, "active", client.leased_challenge)
+            if not client.announced:
+                client.announced = True
+                self._send_status(client, "active")
 
     async def _run(self) -> None:
         try:

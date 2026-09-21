@@ -18,8 +18,6 @@ class MockWebSocket {
   static sessionCount = 0
   readyState = 1
   private sessionId = `motion-test-${++MockWebSocket.sessionCount}`
-  private challengeSequence = 0
-  private challengeTimer: ReturnType<typeof setInterval>
   private openTimer: ReturnType<typeof setTimeout>
   onopen: (() => void) | null = null
   onmessage: ((event: MessageEvent) => void) | null = null
@@ -27,24 +25,17 @@ class MockWebSocket {
   onclose: ((event: CloseEvent) => void) | null = null
   constructor() {
     MockWebSocket.current = this
-    this.openTimer = setTimeout(() => { this.onopen?.(); this.challenge() }, 0)
-    this.challengeTimer = setInterval(() => this.challenge(), 500)
+    this.openTimer = setTimeout(() => { this.onopen?.(); this.confirmSession() }, 0)
   }
-  private challenge() {
-    this.onmessage?.({ data: JSON.stringify({ type: 'safety_challenge', data: {
-      sessionId: this.sessionId, challengeId: `n${++this.challengeSequence}`, ttlMs: 2000,
-    } }) } as MessageEvent)
-  }
-  send(message: string) {
-    const { data } = JSON.parse(message)
+  private confirmSession() {
     if (MockWebSocket.confirmLeases) this.onmessage?.({ data: JSON.stringify({ type: 'control_lease', data: {
-      ...data, status: 'active', ttlMs: 2500,
+      sessionId: this.sessionId, status: 'active', renewalOwner: 'backend',
     } }) } as MessageEvent)
   }
+  send() {}
   close() {
     this.readyState = 3
     clearTimeout(this.openTimer)
-    clearInterval(this.challengeTimer)
     this.onclose?.({ code: 1000 } as CloseEvent)
   }
   emit(frame: TelemetryFrame) {

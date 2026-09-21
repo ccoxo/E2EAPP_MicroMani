@@ -42,7 +42,7 @@ def test_quarantined_transport_tells_browser_restart_is_required() -> None:
 
 
 async def confirm_mock_browser_lease(watchdog: ControlWatchdog) -> str:
-    """旧业务测试显式完成租约协议；不覆盖 require_ready 或修改内部确认状态。"""
+    """旧业务测试显式完成执行侧确认；不覆盖 require_ready 或修改内部确认状态。"""
     watchdog._run = AsyncMock()
     messages = []
 
@@ -50,11 +50,6 @@ async def confirm_mock_browser_lease(watchdog: ControlWatchdog) -> str:
         messages.append(message)
 
     session = watchdog.register(send)
-    await watchdog.cycle()
-    await flush()
-    assert watchdog.respond(session, messages[-1]["data"])
-    with pytest.raises(ControlLeaseUnavailable):
-        watchdog.require_ready()
     await watchdog.cycle()
     await flush()
     watchdog.require_ready()
@@ -78,71 +73,8 @@ def test_ack_readiness_requires_confirmed_current_session_and_rejects_trip_befor
     asyncio.run(exercise())
 
 
-def test_late_response_cannot_revive_browser_before_monitor_checks_timeout() -> None:
-    async def exercise() -> None:
-        watchdog, now, _hal, invalidate, _stop = make_watchdog()
-        session = await confirm_mock_browser_lease(watchdog)
-        try:
-            now[0] = 0.5
-            await watchdog.cycle()
-            client = watchdog.clients[session]
-            assert client.challenge_deadline == 2.5
-            now[0] = 2.01
-            # 模拟 monitor 正在等待 HAL：尚未运行下一次 cycle，迟到回应也必须拒绝。
-            assert not watchdog.respond(session, {"sessionId": session, "challengeId": client.challenge_id})
-            invalidate.assert_called_once()
-            with pytest.raises(ControlLeaseUnavailable):
-                watchdog.require_ready()
-        finally:
-            await watchdog.close()
-
-    asyncio.run(exercise())
 
 
-def test_lease_requires_new_matching_main_thread_response_for_every_renewal() -> None:
-    async def exercise() -> None:
-        watchdog, now, hal, invalidate, stop = make_watchdog()
-        messages = []
-
-        async def send(message):
-            messages.append(message)
-
-        session = watchdog.register(send)
-        try:
-            await watchdog.cycle()
-            await flush()
-            first = messages[-1]["data"]
-            hal.command.assert_not_called()
-            assert not watchdog.respond(session, {**first, "challengeId": "wrong"})
-            assert watchdog.respond(session, first)
-            await watchdog.cycle()
-            await flush()
-            assert messages[-1]["type"] == "control_lease"
-            assert messages[-1]["data"]["status"] == "active"
-            assert messages[-1]["data"]["challengeId"] == first["challengeId"]
-            assert hal.command.call_count == 1
-            payload = hal.command.call_args.args[1]
-            assert payload["timeoutMs"] == 2500 and payload["sequence"] == 1
-            assert payload["issuedAtUnixMs"] > 0
-
-            now[0] = 0.5
-            await watchdog.cycle()
-            await flush()
-            second = messages[-1]["data"]
-            assert second["challengeId"] != first["challengeId"]
-            assert not watchdog.respond(session, first)
-            assert hal.command.call_count == 1
-            now[0] = 2.01
-            await watchdog.cycle()
-            await flush()
-            invalidate.assert_called_once()
-            stop.assert_awaited_once()
-            assert not watchdog.respond(session, second)
-            assert hal.command.call_count == 1
-        finally:
-            await watchdog.close()
-
-    asyncio.run(exercise())
 
 
 def test_second_controller_is_rejected_and_owner_disconnect_trips_control() -> None:
@@ -162,7 +94,6 @@ def test_second_controller_is_rejected_and_owner_disconnect_trips_control() -> N
         try:
             await watchdog.cycle()
             await flush()
-            assert watchdog.respond(first, messages[0][-1]["data"])
             await watchdog.cycle()
             await flush()
             assert hal.command.call_count == 1
@@ -189,9 +120,6 @@ def test_hal_renewal_failure_never_reports_active_or_automatically_acknowledges(
 
         session = watchdog.register(send)
         try:
-            await watchdog.cycle()
-            await flush()
-            watchdog.respond(session, messages[-1]["data"])
             hal.command.side_effect = RuntimeError("lease transport unavailable")
             await watchdog.cycle()
             await flush()
@@ -221,9 +149,6 @@ def test_late_successful_renewal_cannot_reactivate_disconnected_session() -> Non
 
         session = watchdog.register(send)
         try:
-            await watchdog.cycle()
-            await flush()
-            watchdog.respond(session, messages[-1]["data"])
             hal.command.side_effect = delayed_renew
             pending = asyncio.create_task(watchdog.cycle())
             await entered.wait()
@@ -240,47 +165,9 @@ def test_late_successful_renewal_cannot_reactivate_disconnected_session() -> Non
     asyncio.run(exercise())
 
 
-def test_renewal_acknowledges_only_challenges_captured_before_dispatch() -> None:
-    async def exercise() -> None:
-        watchdog, now, hal, _invalidate, _stop = make_watchdog()
-        messages = []
-        entered, release = asyncio.Event(), asyncio.Event()
-
-        async def send(message):
-            messages.append(message)
-
-        async def delayed_renew(*_args):
-            entered.set()
-            await release.wait()
-            return {"response": {"ok": True, "leaseFresh": True}}
-
-        session = watchdog.register(send)
-        try:
-            await watchdog.cycle()
-            await flush()
-            first = messages[-1]["data"]
-            assert watchdog.respond(session, first)
-            now[0] = 0.5
-            hal.command.side_effect = delayed_renew
-            pending = asyncio.create_task(watchdog.cycle())
-            await entered.wait()
-            await flush()
-            second = messages[-1]["data"]
-            assert second["challengeId"] != first["challengeId"]
-            assert watchdog.respond(session, second)
-            release.set()
-            await pending
-            await flush()
-            assert messages[-1]["data"]["challengeId"] == first["challengeId"]
-            assert watchdog.clients[session].leased_challenge == first["challengeId"]
-            assert watchdog.clients[session].answered_challenge == second["challengeId"]
-        finally:
-            await watchdog.close()
-
-    asyncio.run(exercise())
 
 
-def test_websocket_heartbeats_do_not_wait_for_initial_telemetry(tmp_path, monkeypatch) -> None:
+def test_websocket_control_session_does_not_wait_for_initial_telemetry(tmp_path, monkeypatch) -> None:
     from backend.app import create_app
     from starlette.websockets import WebSocketState
 
@@ -302,8 +189,6 @@ def test_websocket_heartbeats_do_not_wait_for_initial_telemetry(tmp_path, monkey
                 pass
 
             async def send_json(self, message):
-                if message["type"] == "safety_challenge":
-                    await inbox.put({"type": "safety_heartbeat", "data": message["data"]})
                 if message["type"] == "control_lease" and message["data"]["status"] == "active":
                     active.set()
 
@@ -327,7 +212,7 @@ def test_websocket_heartbeats_do_not_wait_for_initial_telemetry(tmp_path, monkey
     asyncio.run(exercise())
 
 
-def test_websocket_main_thread_stall_triggers_full_backend_emergency(tmp_path, monkeypatch) -> None:
+def test_websocket_without_browser_heartbeats_keeps_hal_lease(tmp_path, monkeypatch) -> None:
     from backend.app import create_app
     from starlette.websockets import WebSocketState
 
@@ -336,13 +221,11 @@ def test_websocket_main_thread_stall_triggers_full_backend_emergency(tmp_path, m
     app = create_app(tmp_path)
     app.state.telemetry.hardware = None
     watchdog = app.state.control_watchdog
-    watchdog.challenge_interval_s = 0.01
-    watchdog.browser_timeout_s = 0.12
+    watchdog.renew_interval_s = 0.01
 
     async def exercise() -> None:
         inbox = asyncio.Queue()
         active, stopped = asyncio.Event(), asyncio.Event()
-        responds = [True]
         original_command = app.state.hal.command
 
         async def command(name, payload=None):
@@ -357,8 +240,6 @@ def test_websocket_main_thread_stall_triggers_full_backend_emergency(tmp_path, m
                 pass
 
             async def send_json(self, message):
-                if message["type"] == "safety_challenge" and responds[0]:
-                    await inbox.put({"type": "safety_heartbeat", "data": message["data"]})
                 if message["type"] == "control_lease" and message["data"]["status"] == "active":
                     active.set()
 
@@ -370,10 +251,9 @@ def test_websocket_main_thread_stall_triggers_full_backend_emergency(tmp_path, m
         task = asyncio.create_task(endpoint(Socket()))
         try:
             await asyncio.wait_for(active.wait(), 1)
-            responds[0] = False
-            await asyncio.wait_for(stopped.wait(), 1)
-            assert app.state.commands.safety.latched
-            assert not app.state.policy.auto_status()["running"]
+            await asyncio.sleep(0.2)
+            assert not stopped.is_set()
+            watchdog.require_ready()
         finally:
             task.cancel()
             try:
@@ -419,8 +299,6 @@ def test_app_websocket_lease_confirmation_allows_ack_and_disconnect_blocks_it(tm
             async def send_json(self, message):
                 if self.client_state != WebSocketState.CONNECTED:
                     raise WebSocketDisconnect()
-                if message["type"] == "safety_challenge":
-                    await inbox.put({"type": "safety_heartbeat", "data": message["data"]})
                 if message["type"] == "control_lease" and message["data"]["status"] == "active":
                     active.set()
 
@@ -507,4 +385,51 @@ def test_ack_response_after_lease_loss_does_not_clear_backend_latch(tmp_path, mo
             await watchdog.close()
             app.state.telemetry.shutdown()
 
+    asyncio.run(exercise())
+
+
+def test_backend_renews_without_any_browser_response():
+    async def exercise():
+        watchdog, now, hal, invalidate, stop = make_watchdog()
+        messages = []
+        async def send(message):
+            messages.append(message)
+        watchdog.register(send)
+        try:
+            for tick in range(121):
+                now[0] = tick * 0.5
+                await watchdog.cycle()
+                watchdog.require_ready()
+                await flush()
+            assert hal.command.await_count == 121
+            assert len(messages) == 1
+            assert messages[0]["data"]["renewalOwner"] == "backend"
+            invalidate.assert_not_called()
+            stop.assert_not_awaited()
+        finally:
+            await watchdog.close()
+    asyncio.run(exercise())
+
+
+def test_slow_browser_send_does_not_block_renewal_and_is_cancelled_on_close():
+    async def exercise():
+        watchdog, now, hal, invalidate, _stop = make_watchdog()
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def send(message):
+            entered.set()
+            await release.wait()
+        watchdog.register(send)
+        try:
+            await watchdog.cycle()
+            await entered.wait()
+            await asyncio.sleep(0.55)
+            now[0] = 1
+            await watchdog.cycle()
+            watchdog.require_ready()
+            assert hal.command.await_count == 2
+            invalidate.assert_not_called()
+            assert len(watchdog._send_tasks) == 1
+        finally:
+            await watchdog.close()
+        assert not watchdog._send_tasks
     asyncio.run(exercise())

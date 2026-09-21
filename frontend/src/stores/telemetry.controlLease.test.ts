@@ -20,11 +20,8 @@ class Socket {
   emit(type: string, data: unknown) { this.onmessage?.({ data: JSON.stringify({ type, data }) }) }
 }
 
-function challenge(socket: Socket, id = 'n1') {
-  socket.emit('safety_challenge', { sessionId: 's1', challengeId: id, ttlMs: 2000 })
-}
-function confirm(socket: Socket, status = 'active', id = 'n1') {
-  socket.emit('control_lease', { sessionId: 's1', challengeId: id, status, ttlMs: 2500 })
+function confirm(socket: Socket, status = 'active') {
+  socket.emit('control_lease', { sessionId: 's1', status, renewalOwner: 'backend' })
 }
 async function live(socket: Socket, patch: Partial<TelemetryFrame> = {}) {
   socket.emit('telemetry', { ...store.getState().frame, wsOk: true, halOk: true, timestamp: Date.now(),
@@ -81,7 +78,6 @@ it('控制权冲突后不自动重试抢占', async () => {
 it('DDS 永久隔离后停止自动重连并保留重启提示', async () => {
   store.getState().startBackend()
   const socket = Socket.instances.at(-1)!
-  challenge(socket)
   socket.emit('control_lease', { sessionId: 's1', status: 'expired', restartRequired: true })
   await vi.advanceTimersByTimeAsync(16_000)
   expect(Socket.instances).toHaveLength(1)
@@ -100,13 +96,10 @@ it('重连后从后端恢复中断片段，不自动新建或结束会话', asyn
 })
 
 describe('真实前端控制租约（HTTP 与 WS 均为离线替身）', () => {
-  it('新鲜遥测不足以允许运动，必须收到同一挑战的执行侧租约确认', async () => {
+  it('新鲜遥测不足以允许运动，必须收到后端执行侧连接确认', async () => {
     store.getState().startBackend()
     const socket = Socket.instances.at(-1)!
     await live(socket)
-    store.getState().issueManualAxisMove('left', 'X', 1)
-    expect(commands()).toEqual([])
-    challenge(socket)
     store.getState().issueManualAxisMove('left', 'X', 1)
     expect(commands()).toEqual([])
     confirm(socket)
@@ -120,7 +113,7 @@ describe('真实前端控制租约（HTTP 与 WS 均为离线替身）', () => {
     await live(socket, { forceStatus: { safety: { latched: true, canAcknowledge: true } } })
     store.getState().acknowledgeSafety()
     expect(commands()).toEqual([])
-    challenge(socket); confirm(socket)
+    confirm(socket)
     expect(commands()).toEqual([])
     store.getState().acknowledgeSafety()
     expect(commands()).toEqual(['/api/motion/safety/acknowledge'])
@@ -129,7 +122,7 @@ describe('真实前端控制租约（HTTP 与 WS 均为离线替身）', () => {
   it('租约转 pending 立即撤销启动权并取消旧控制流程，但仍可断使能', async () => {
     store.getState().startBackend()
     const socket = Socket.instances.at(-1)!
-    await live(socket); challenge(socket); confirm(socket)
+    await live(socket); confirm(socket)
     const generation = store.getState().controlSafety.generation
     confirm(socket, 'pending')
     expect(store.getState().controlSafety.generation).toBeGreaterThan(generation)
@@ -139,35 +132,35 @@ describe('真实前端控制租约（HTTP 与 WS 均为离线替身）', () => {
     expect(commands()).toEqual(['/api/motion/left/disable_all'])
   })
 
-  it('WS error 后的旧挑战和正常遥测都不能复活旧连接', async () => {
+  it('WS error 后的旧确认和正常遥测都不能复活旧连接', async () => {
     store.getState().startBackend()
     const socket = Socket.instances.at(-1)!
-    await live(socket); challenge(socket); confirm(socket)
+    await live(socket); confirm(socket)
     socket.onerror?.()
-    challenge(socket, 'n2'); confirm(socket, 'active', 'n2')
+    confirm(socket)
     await live(socket)
-    expect(socket.send).toHaveBeenCalledTimes(1)
+    expect(socket.send).not.toHaveBeenCalled()
     expect(store.getState().controlLease.status).toBe('expired')
     expect(store.getState().telemetryLink.state).toBe('offline')
   })
 
-  it('暂停后积压挑战不能续租，关闭旧WS并保持控制拒绝', async () => {
+  it('页面暂停不关闭连接，正常遥测恢复后仍可操作', async () => {
     store.getState().startBackend()
     const socket = Socket.instances.at(-1)!
-    await live(socket); challenge(socket); confirm(socket)
-    time = 2100
-    challenge(socket, 'n2')
-    expect(socket.close).toHaveBeenCalledTimes(1)
-    expect(socket.send).toHaveBeenCalledTimes(1)
-    expect(store.getState().controlLease.status).toBe('expired')
+    await live(socket); confirm(socket)
+    time = 60_000
+    await live(socket)
+    expect(socket.close).not.toHaveBeenCalled()
+    expect(socket.send).not.toHaveBeenCalled()
+    expect(store.getState().controlLease.status).toBe('active')
     store.getState().issueManualAxisMove('left', 'X', 1)
-    expect(commands()).toEqual([])
+    expect(commands()).toEqual(['/api/motion/manual_axis_move'])
   })
 
   it('即使显示订阅抛错，撤销动作也先关闭 WS 并写入拒绝控制状态', async () => {
     store.getState().startBackend()
     const socket = Socket.instances.at(-1)!
-    await live(socket); challenge(socket); confirm(socket)
+    await live(socket); confirm(socket)
     const unsubscribe = store.subscribe(() => { throw new Error('显示故障') })
     expect(() => store.getState().revokeControlLease('显示故障')).toThrow('显示故障')
     unsubscribe()

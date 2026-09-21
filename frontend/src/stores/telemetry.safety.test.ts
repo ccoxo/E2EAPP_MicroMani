@@ -35,8 +35,7 @@ async function connect() {
   store.getState().startBackend()
   await settle()
   const socket = OfflineSocket.instances.at(-1)!
-  socket.onmessage?.({ data: JSON.stringify({ type: 'safety_challenge', data: { sessionId: 'safety-test', challengeId: 'n1', ttlMs: 2000 } }) })
-  socket.onmessage?.({ data: JSON.stringify({ type: 'control_lease', data: { sessionId: 'safety-test', challengeId: 'n1', status: 'active', ttlMs: 2500 } }) })
+  socket.onmessage?.({ data: JSON.stringify({ type: 'control_lease', data: { sessionId: 'safety-test', renewalOwner: 'backend', status: 'active' } }) })
   socket.emit(liveFrame())
   await vi.advanceTimersByTimeAsync(100)
   return socket
