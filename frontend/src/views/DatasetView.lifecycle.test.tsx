@@ -136,3 +136,104 @@ describe('真实数据集页面的请求结果归属', () => {
     expect(browser.getByRole('button', { name: /Episode 1/ })).toBeInTheDocument()
   })
 })
+
+
+async function mountPreview() {
+  const items = datasets.map((dataset) => ({ ...dataset, episodes: [{ ...episode, frames: 4,
+    samples: [0, 1, 2, 3].map((frame) => ({ ...episode.samples![0], frame, images: {
+      global: `/api/${dataset.id}/global/${frame}`, wrist_left: `/api/${dataset.id}/left/${frame}`,
+      wrist_right: `/api/${dataset.id}/right/${frame}`,
+    } })),
+  }] }))
+  vi.mocked(api.fetchDatasets).mockResolvedValue(items)
+  const browser = await mount()
+  await waitFor(() => expect(document.querySelectorAll('.dataset-video-image').length).toBeGreaterThanOrEqual(3))
+  return browser
+}
+const previewImages = (frame: number, dataset = 'A') => Array.from(document.querySelectorAll<HTMLImageElement>('.dataset-video-image'))
+  .filter((image) => image.src.includes(`/api/${dataset}/`) && image.src.endsWith(`/${frame}`))
+const visibleImages = () => Array.from(document.querySelectorAll<HTMLImageElement>('.dataset-video-image'))
+  .filter((image) => image.style.visibility === 'visible')
+const slider = () => document.querySelector<HTMLInputElement>('.dataset-frame-slider')!
+async function loadGroup(frame: number, dataset = 'A') {
+  await act(async () => { for (const image of previewImages(frame, dataset)) fireEvent.load(image) })
+}
+async function tick() { await act(async () => { await new Promise((resolve) => setTimeout(resolve, 100)) }) }
+
+it('预加载下一组三路，慢加载保持旧画面，解码完成后原节点一起显示', async () => {
+  await mountPreview()
+  expect(previewImages(1)).toHaveLength(3)
+  await loadGroup(0)
+  expect(visibleImages()).toHaveLength(3)
+  const oldImages = visibleImages()
+  const incoming = previewImages(1)
+  let finishDecode!: () => void
+  incoming[2].decode = vi.fn(() => new Promise<void>((resolve) => { finishDecode = resolve }))
+  fireEvent.click(screen.getByRole('button', { name: /^播放$/ }))
+  await tick()
+  expect(slider().value).toBe('0')
+  expect(visibleImages()).toEqual(oldImages)
+  expect(screen.queryByText('正在加载画面…')).not.toBeInTheDocument()
+  await loadGroup(1)
+  await tick()
+  expect(slider().value).toBe('0')
+  expect(visibleImages()).toEqual(oldImages)
+  await act(async () => finishDecode())
+  await waitFor(() => expect(slider().value).toBe('1'))
+  expect(visibleImages()).toEqual(incoming)
+  expect(document.querySelectorAll('.dataset-video-image').length).toBeLessThanOrEqual(9)
+})
+
+it('预加载失败保留当前画面和进度，跳转新位置可继续', async () => {
+  await mountPreview()
+  await loadGroup(0)
+  const previous = visibleImages()
+  fireEvent.error(previewImages(1)[0])
+  fireEvent.click(screen.getByRole('button', { name: /^播放$/ }))
+  await tick()
+  expect(slider().value).toBe('0')
+  expect(visibleImages()).toEqual(previous)
+  expect(screen.getByText(/图片加载失败/)).toBeInTheDocument()
+  fireEvent.change(slider(), { target: { value: '3' } })
+  await loadGroup(3)
+  await waitFor(() => expect(slider().value).toBe('3'))
+  expect(visibleImages()).toHaveLength(3)
+  expect(visibleImages().every((image) => image.src.endsWith('/3'))).toBe(true)
+})
+
+it('切换数据集后迟到解码不恢复旧画面，卸载后不更新', async () => {
+  const browser = await mountPreview()
+  await loadGroup(0)
+  const old = previewImages(1)[0]
+  let finish!: () => void
+  old.decode = vi.fn(() => new Promise<void>((resolve) => { finish = resolve }))
+  fireEvent.load(old)
+  fireEvent.click(browser.getByRole('button', { name: /Dataset B/ }))
+  expect(visibleImages()).toHaveLength(0)
+  await act(async () => finish())
+  await loadGroup(0, 'B')
+  expect(visibleImages()).toHaveLength(3)
+  expect(visibleImages().every((image) => image.src.includes('/api/B/'))).toBe(true)
+  const pending = previewImages(1, 'B')[0]
+  let finishUnmounted!: () => void
+  pending.decode = vi.fn(() => new Promise<void>((resolve) => { finishUnmounted = resolve }))
+  fireEvent.load(pending)
+  cleanup()
+  await act(async () => finishUnmounted())
+  expect(document.querySelectorAll('.dataset-video-image')).toHaveLength(0)
+})
+
+
+it('等待下一组时暂停，不被迟到加载推进；再次播放使用已预加载图片', async () => {
+  await mountPreview()
+  await loadGroup(0)
+  fireEvent.click(screen.getByRole('button', { name: /^播放$/ }))
+  await tick()
+  fireEvent.click(screen.getByRole('button', { name: /^暂停$/ }))
+  await loadGroup(1)
+  await tick()
+  expect(slider().value).toBe('0')
+  fireEvent.click(screen.getByRole('button', { name: /^播放$/ }))
+  await waitFor(() => expect(slider().value).toBe('1'))
+  expect(visibleImages()).toHaveLength(3)
+})

@@ -1564,7 +1564,7 @@ class DatasetRecorderService:
         try:
             dataset = self._open_native_dataset_for_read(dataset_id, dataset_dir, LeRobotDataset)
         except Exception:
-            return self._native_video_frame_to_jpeg(dataset_dir, camera, frame)
+            return self._native_video_frame_to_jpeg(dataset_dir, episode, camera, frame)
         absolute_index = int(episode.get("datasetFromIndex") or 0) + max(0, int(frame))
         if absolute_index >= len(dataset):
             raise FileNotFoundError(str(frame))
@@ -1572,13 +1572,30 @@ class DatasetRecorderService:
         image = item.get(CAMERA_FEATURE_KEYS[camera])
         return self._encode_rgb_tensor_to_jpeg(image, np)
 
-    def _native_video_frame_to_jpeg(self, dataset_dir: Path, camera: str, frame: int) -> bytes:
+    def _native_video_frame_to_jpeg(self, dataset_dir: Path, episode: dict[str, Any], camera: str, frame: int) -> bytes:
+        """按 episode 的视频分片和时间偏移定位，缺少映射时拒绝显示其他片段。"""
+        if frame < 0 or frame >= int(episode.get("frames", 0)):
+            raise FileNotFoundError(str(frame))
+        pq = importlib.import_module("pyarrow.parquet")
         feature_key = CAMERA_FEATURE_KEYS[camera]
-        video_dir = dataset_dir / "videos" / feature_key
-        videos = sorted(video_dir.glob("chunk-*/*.mp4"))
-        if not videos:
-            raise FileNotFoundError(camera)
-        return self._decode_video_frame_to_jpeg(videos[0], frame)
+        prefix = f"videos/{feature_key}"
+        for meta_path in sorted((dataset_dir / "meta" / "episodes").glob("chunk-*/file-*.parquet")):
+            for row in pq.read_table(meta_path).to_pylist():
+                if row.get("episode_index") != episode.get("episodeIndex"):
+                    continue
+                try:
+                    chunk = int(row[f"{prefix}/chunk_index"])
+                    file_index = int(row[f"{prefix}/file_index"])
+                    start = float(row[f"{prefix}/from_timestamp"])
+                    stop = float(row[f"{prefix}/to_timestamp"])
+                    fps = float(episode["fps"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise FileNotFoundError("episode video mapping missing") from exc
+                if not all(math.isfinite(value) for value in (start, stop, fps)) or fps <= 0 or start < 0 or start + frame / fps >= stop:
+                    raise FileNotFoundError("episode video timestamp out of range")
+                path = dataset_dir / "videos" / feature_key / f"chunk-{chunk:03d}" / f"file-{file_index:03d}.mp4"
+                return self._decode_video_frame_to_jpeg(path, round(start * fps) + frame)
+        raise FileNotFoundError("episode video mapping missing")
 
     # 内部说明。
     def _new_sample_buffers(self, config: dict[str, Any]) -> dict[str, TimedRingBuffer]:

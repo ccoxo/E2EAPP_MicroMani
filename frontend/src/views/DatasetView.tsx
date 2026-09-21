@@ -309,9 +309,12 @@ function currentSample(episode: ReviewEpisode, frameIndex: number) {
   if (episode.samples.length === 0) {
     return { frame: 0, leftJoints: [0, 0, 0, 0, 0, 0], rightJoints: [0, 0, 0, 0, 0, 0], forceLeft: [0, 0, 0, 0, 0, 0], forceRight: [0, 0, 0, 0, 0, 0] }
   }
-  const ratio = frameIndex / Math.max(1, episode.frames - 1)
-  const sampleIndex = clampFrame(ratio * (episode.samples.length - 1), episode.samples.length)
-  return episode.samples[sampleIndex] ?? episode.samples[0]
+  let selected = episode.samples[0]
+  for (const sample of episode.samples) {
+    if (sample.frame > frameIndex) break
+    selected = sample
+  }
+  return selected
 }
 
 /** 渲染当前界面单元，并连接所需数据。 */
@@ -319,7 +322,13 @@ function DatasetVideoPane({
   camera,
   episode,
   frameIndex,
+  imageUrls,
+  ready,
+  onImageState,
 }: {
+  imageUrls: string[]
+  ready: boolean
+  onImageState: (url: string, state: 'loaded' | 'error') => void
   camera: ReviewCamera
   episode: ReviewEpisode
   frameIndex: number
@@ -338,15 +347,28 @@ function DatasetVideoPane({
         <UiTag>{camera.resolution}</UiTag>
       </div>
       <div className="dataset-video-frame" style={{ aspectRatio: camera.aspectRatio }}>
-        {imageUrl ? (
-          <img className="dataset-video-image" src={imageUrl} alt={`${camera.label} frame ${sample.frame + 1}`} />
-        ) : (
-          <>
-            <div className="dataset-video-grid-overlay" />
-            <div className="dataset-video-target" style={{ left: `${50 + markerX}%`, top: `${50 + markerY}%` }} />
-            <div className="dataset-video-center">{camera.model}</div>
-          </>
-        )}
+        {imageUrls.map((url) => (
+          <img key={url} className="dataset-video-image" src={url}
+            style={{ visibility: ready && url === imageUrl ? 'visible' : 'hidden' }}
+            aria-hidden={!ready || url !== imageUrl}
+            onLoad={async (event) => {
+              const image = event.currentTarget
+              try {
+                if (image.decode) await image.decode()
+                if (image.isConnected) onImageState(url, 'loaded')
+              } catch {
+                if (image.isConnected) onImageState(url, 'error')
+              }
+            }}
+            onError={() => onImageState(url, 'error')}
+            alt={url === imageUrl ? `${camera.label} frame ${sample.frame + 1}` : ''} />
+        ))}
+        {!imageUrl && <>
+          <div className="dataset-video-grid-overlay" />
+          <div className="dataset-video-target" style={{ left: `${50 + markerX}%`, top: `${50 + markerY}%` }} />
+          <div className="dataset-video-center">{camera.model}</div>
+        </>}
+        {imageUrl && !ready && <div className="dataset-video-center" role="status">正在加载画面…</div>}
         <div className="dataset-video-caption">
           Frame {frameIndex + 1}/{episode.frames}
         </div>
@@ -466,6 +488,8 @@ export function DatasetView() {
   const [selectedDatasetId, setSelectedDatasetId] = useState('micro_assembly_v1')
   const [selectedEpisodeId, setSelectedEpisodeId] = useState<string | null>(null)
   const [frameIndex, setFrameIndex] = useState(0)
+  const [requestedFrame, setRequestedFrame] = useState(0)
+  const [imageStates, setImageStates] = useState<Record<string, 'loaded' | 'error'>>({})
   const [playing, setPlaying] = useState(false)
   const [playbackRate, setPlaybackRate] = useState(1)
   const [serverDatasets, setServerDatasets] = useState<ReviewDataset[]>([])
@@ -582,18 +606,56 @@ export function DatasetView() {
     return () => { cancelled = true }
   }, [detailDatasetId, detailEpisodeId, needsEpisodeDetail, refreshToken])
 
+  const previewScope = `${detailDatasetId}:${detailEpisodeId}`
+  const previewScopeRef = useRef(previewScope)
+  previewScopeRef.current = previewScope
   useEffect(() => {
-    if (!playing || !selectedEpisode) return
-    const timer = window.setInterval(() => {
-      setFrameIndex((current) => (current >= selectedEpisode.frames - 1 ? 0 : current + 1))
+    setFrameIndex(0)
+    setRequestedFrame(0)
+    setImageStates({})
+    setPlaying(false)
+  }, [previewScope])
+
+  const imageUrlsAt = (frame: number) => selectedEpisode ? selectedCameras.map((camera) => {
+    const path = currentSample(selectedEpisode, frame).images?.[camera.key]
+    return path?.startsWith('/api/') ? `${apiBase}${path}` : path
+  }) : []
+  const previewUrls = imageUrlsAt(frameIndex)
+  const requestedUrls = imageUrlsAt(requestedFrame)
+  // 只保留当前、请求目标及下一组样本；预加载节点切换为可见时不重新创建图片。
+  const nextSampleFrame = selectedEpisode?.samples.find((sample) => sample.frame > requestedFrame)?.frame ?? 0
+  const nextUrls = imageUrlsAt(nextSampleFrame)
+  const bufferedUrls = selectedCameras.map((_, index) =>
+    [...new Set([previewUrls[index], requestedUrls[index], nextUrls[index]].filter((url): url is string => Boolean(url)))])
+  const activeUrls = new Set(bufferedUrls.flat())
+  const activeUrlsRef = useRef(activeUrls)
+  activeUrlsRef.current = activeUrls
+  const onImageState = (url: string, state: 'loaded' | 'error') => {
+    if (previewScopeRef.current !== previewScope || !activeUrlsRef.current.has(url)) return
+    setImageStates((current) => ({
+      ...Object.fromEntries(Object.entries(current).filter(([key]) => activeUrlsRef.current.has(key))), [url]: state,
+    }))
+  }
+  const previewReady = previewUrls.every((url) => !url || imageStates[url] === 'loaded')
+  const requestedReady = requestedUrls.every((url) => !url || imageStates[url] === 'loaded')
+  const previewError = requestedUrls.some((url) => url && imageStates[url] === 'error')
+  useEffect(() => {
+    if (requestedReady) setFrameIndex(requestedFrame)
+  }, [requestedReady, requestedFrame])
+  useEffect(() => {
+    if (!playing || !selectedEpisode || !previewReady || frameIndex !== requestedFrame) return
+    const timer = window.setTimeout(() => {
+      setRequestedFrame(frameIndex >= selectedEpisode.frames - 1 ? 0 : frameIndex + 1)
     }, Math.max(40, 1000 / (selectedEpisode.fps * playbackRate)))
-    return () => window.clearInterval(timer)
-  }, [playing, playbackRate, selectedEpisode])
+    return () => window.clearTimeout(timer)
+  }, [playing, playbackRate, selectedEpisode, previewReady, frameIndex, requestedFrame])
 
     /** 选择当前复核流程需要的数据。 */
 const chooseEpisode = (episodeId: string) => {
     setSelectedEpisodeId(episodeId)
     setFrameIndex(0)
+    setRequestedFrame(0)
+    setImageStates({})
     setPlaying(false)
   }
 
@@ -602,6 +664,8 @@ const chooseDataset = (datasetId: string) => {
     setSelectedDatasetId(datasetId)
     setSelectedEpisodeId(null)
     setFrameIndex(0)
+    setRequestedFrame(0)
+    setImageStates({})
     setPlaying(false)
   }
 
@@ -887,7 +951,9 @@ const openHubUpload = () => {
                 <div className="dataset-cockpit-grid">
                   <div className="dataset-video-grid">
                     {selectedCameras.map((camera) => (
-                      <DatasetVideoPane camera={camera} episode={selectedEpisode} frameIndex={frameIndex} key={camera.key} />
+                      <DatasetVideoPane camera={camera} episode={selectedEpisode} frameIndex={frameIndex} key={`${selectedDataset.id}:${selectedEpisode.id}:${camera.key}`}
+                        imageUrls={bufferedUrls[selectedCameras.indexOf(camera)]} ready={previewReady}
+                        onImageState={onImageState} />
                     ))}
                   </div>
                   <section className="dataset-quality-grid">
@@ -897,14 +963,17 @@ const openHubUpload = () => {
                     <ForcePanel title="右力传感器实时曲线" side="right" episode={selectedEpisode} frameIndex={frameIndex} />
                   </section>
                 </div>
+                {previewError && <div className="ui-alert ui-alert-warning" role="alert">
+                  图片加载失败，已保留当前画面；请重新选择片段或跳转位置重试。
+                </div>}
                 <div className="dataset-player-controls">
-                  <UiButton icon={playing ? <Pause size={15} /> : <Play size={15} />} onClick={() => setPlaying((value) => !value)}>
+                  <UiButton icon={playing ? <Pause size={15} /> : <Play size={15} />} onClick={() => { if (playing) setRequestedFrame(frameIndex); setPlaying((value) => !value) }}>
                     {playing ? '暂停' : '播放'}
                   </UiButton>
-                  <UiButton icon={<Rewind size={15} />} onClick={() => setFrameIndex((value) => clampFrame(value - 30, selectedEpisode.frames))}>
+                  <UiButton icon={<Rewind size={15} />} onClick={() => setRequestedFrame(clampFrame(frameIndex - 30, selectedEpisode.frames))}>
                     回退
                   </UiButton>
-                  <UiButton icon={<FastForward size={15} />} onClick={() => setFrameIndex((value) => clampFrame(value + 30, selectedEpisode.frames))}>
+                  <UiButton icon={<FastForward size={15} />} onClick={() => setRequestedFrame(clampFrame(frameIndex + 30, selectedEpisode.frames))}>
                     快进
                   </UiButton>
                   <UiSegmented
@@ -922,7 +991,7 @@ const openHubUpload = () => {
                     min={0}
                     max={selectedEpisode.frames - 1}
                     value={frameIndex}
-                    onChange={(event) => setFrameIndex(clampFrame(Number(event.target.value), selectedEpisode.frames))}
+                    onChange={(event) => setRequestedFrame(clampFrame(Number(event.target.value), selectedEpisode.frames))}
                   />
                   <UiText secondary>
                     {(frameIndex / selectedEpisode.fps).toFixed(2)}s / {selectedEpisode.durationS.toFixed(2)}s
