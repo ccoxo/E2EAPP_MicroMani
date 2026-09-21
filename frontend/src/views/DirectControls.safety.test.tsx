@@ -26,6 +26,7 @@ function blockControls() {
 
 beforeEach(() => {
   const config = structuredClone(defaultConfig)
+  config.motion.homeReference.rightAxisConfirmed = [true, true, true, true, true, true]
   config.motion.origin = { ...config.motion.origin, valid: true, leftValid: true, rightValid: true }
   config.teleop = { ...config.teleop, leftConnected: false, leftGravityCompensation: false, leftForceFeedback: false }
   useTelemetryStore.setState({
@@ -151,9 +152,11 @@ describe('直接 API 页面入口的安全约束', () => {
   })
 
   it('HOME 确认弹窗打开后急停，确认回调重新检查门闩', async () => {
-    const home = vi.spyOn(api, 'homeMotionSide').mockResolvedValue({ ok: true })
+    const home = vi.spyOn(api, 'returnHardwareReferenceSide').mockResolvedValue({ ok: true })
     const { injectLog, requestComparison } = renderMotionCard()
-    fireEvent.click(screen.getByRole('button', { name: '回硬件零点' }))
+    fireEvent.click(screen.getByRole('button', { name: '返回机械参考点' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Pitch' }))
+    fireEvent.click(screen.getByRole('button', { name: '审阅返回动作' }))
     const comparison = requestComparison.mock.calls[0][0]
     await act(async () => {
       blockControls()
@@ -161,8 +164,8 @@ describe('直接 API 页面入口的安全约束', () => {
     })
 
     expect(home).not.toHaveBeenCalled()
-    expect(screen.getByRole('button', { name: '回硬件零点' })).toBeDisabled()
-    expect(injectLog).toHaveBeenCalledWith('WARNING', expect.stringContaining('回硬件零点受阻'), '[HAL]')
+    expect(screen.getByRole('button', { name: '返回机械参考点' })).toBeDisabled()
+    expect(injectLog).toHaveBeenCalledWith('WARNING', expect.stringContaining('返回机械参考点受阻'), '[HAL]')
   })
 
   it('急停后主手回原点、连接和重力补偿启用均受阻', () => {
@@ -212,4 +215,79 @@ describe('直接 API 页面入口的安全约束', () => {
     expect(updateConfig).not.toHaveBeenCalled()
     expect(injectLog).toHaveBeenCalledWith('WARNING', expect.stringContaining('主手连接确认已取消'), '[HAL]')
   })
+})
+
+
+describe('机械参考点选轴', () => {
+  it('默认不选轴，机械寻零可全选六轴且只在确认后发送', async () => {
+    const home = vi.spyOn(api, 'homeMotionSide').mockResolvedValue({ ok: true })
+    vi.spyOn(api, 'fetchMotionOrigin').mockResolvedValue({ ok: true })
+    const { requestComparison } = renderMotionCard()
+    fireEvent.click(screen.getByRole('button', { name: '机械寻零' }))
+    expect(screen.getByRole('button', { name: '审阅寻零动作' })).toBeDisabled()
+    for (const axis of ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']) expect(screen.getByRole('checkbox', { name: axis })).not.toBeChecked()
+    fireEvent.click(screen.getByRole('button', { name: '全选六轴' }))
+    fireEvent.click(screen.getByRole('button', { name: '审阅寻零动作' }))
+    expect(home).not.toHaveBeenCalled()
+    await act(async () => { await requestComparison.mock.calls[0][0].onConfirm() })
+    expect(home).toHaveBeenCalledExactlyOnceWith('right', ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'])
+    expect(screen.getByRole('status', { name: '左臂原点操作状态' })).toHaveTextContent('机械寻零完成')
+  })
+
+  it('只返回选择的旋转轴，不附带 XYZ 或启动机械寻零', async () => {
+    const move = vi.spyOn(api, 'returnHardwareReferenceSide').mockResolvedValue({ ok: true })
+    const home = vi.spyOn(api, 'homeMotionSide').mockResolvedValue({ ok: true })
+    const { requestComparison } = renderMotionCard()
+    fireEvent.click(screen.getByRole('button', { name: '返回机械参考点' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Roll' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Pitch' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Yaw' }))
+    fireEvent.click(screen.getByRole('button', { name: '审阅返回动作' }))
+    await act(async () => { await requestComparison.mock.calls[0][0].onConfirm() })
+    expect(move).toHaveBeenCalledExactlyOnceWith('right', ['Roll', 'Pitch', 'Yaw'])
+    expect(home).not.toHaveBeenCalled()
+  })
+
+  it('任一所选轴待确认时拒绝返回，允许改为重新寻零', () => {
+    useTelemetryStore.getState().config.motion.homeReference.rightAxisConfirmed = [false, false, false, true, true, true]
+    const move = vi.spyOn(api, 'returnHardwareReferenceSide')
+    const { requestComparison } = renderMotionCard()
+    fireEvent.click(screen.getByRole('button', { name: '返回机械参考点' }))
+    fireEvent.click(screen.getByRole('button', { name: '全选六轴' }))
+    expect(screen.getByRole('button', { name: '审阅返回动作' })).toBeDisabled()
+    expect(screen.getByText('待确认的所选轴：X、Y、Z')).toBeInTheDocument()
+    expect(requestComparison).not.toHaveBeenCalled()
+    expect(move).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: '机械寻零' }))
+    expect(screen.getByRole('button', { name: '审阅寻零动作' })).toBeDisabled()
+  })
+
+  it('寻零请求失败时显示失败并重新读取确认状态', async () => {
+    vi.spyOn(api, 'homeMotionSide').mockRejectedValue(new Error('homing interrupted'))
+    const fetch = vi.spyOn(api, 'fetchMotionOrigin').mockResolvedValue({ ok: true })
+    const { requestComparison } = renderMotionCard()
+    fireEvent.click(screen.getByRole('button', { name: '机械寻零' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Pitch' }))
+    fireEvent.click(screen.getByRole('button', { name: '审阅寻零动作' }))
+    await act(async () => { await requestComparison.mock.calls[0][0].onConfirm() })
+    expect(fetch).toHaveBeenCalled()
+    expect(screen.getByRole('status', { name: '左臂原点操作状态' })).toHaveTextContent('失败')
+    expect(screen.queryByText('机械寻零完成')).not.toBeInTheDocument()
+  })
+})
+
+
+it('寻零进行中急停，迟到的成功应答不能显示完成', async () => {
+  let finish!: (response: api.MotionOriginResponse) => void
+  vi.spyOn(api, 'homeMotionSide').mockImplementation(() => new Promise((resolve) => { finish = resolve }))
+  vi.spyOn(api, 'fetchMotionOrigin').mockResolvedValue({ ok: true })
+  const { requestComparison } = renderMotionCard()
+  fireEvent.click(screen.getByRole('button', { name: '机械寻零' }))
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Pitch' }))
+  fireEvent.click(screen.getByRole('button', { name: '审阅寻零动作' }))
+  let pending: unknown
+  await act(async () => { pending = requestComparison.mock.calls[0][0].onConfirm() })
+  expect(screen.getByRole('status', { name: '左臂原点操作状态' })).toHaveTextContent('正在寻零：Pitch')
+  await act(async () => { blockControls(); finish({ ok: true }); await pending })
+  expect(screen.getByRole('status', { name: '左臂原点操作状态' })).toHaveTextContent('失败')
 })

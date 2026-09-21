@@ -62,7 +62,7 @@ class FakeTelemetry:
     def home_all(self) -> None:
         return None
 
-    def home_side(self, side: str) -> None:
+    def home_side(self, side: str, enabled_axes: list[bool] | None = None) -> None:
         _ = side
 
     def set_motion_axis_enabled(self, side: str, values: list[bool | None]) -> None:

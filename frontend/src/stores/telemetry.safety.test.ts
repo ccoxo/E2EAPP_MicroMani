@@ -264,7 +264,8 @@ describe('真实 HTTP 分支的急停保护（全部网络隔离）', () => {
   it('直接调用 API 也不能绕过保护，但停止与断开仍能发送', async () => {
     store.getState().triggerEmergencyStop()
     await respond(0)
-    await expect(api.homeMotionSide('left')).rejects.toThrow('急停')
+    await expect(api.homeMotionSide('left', ['Roll'])).rejects.toThrow('急停')
+    await expect(api.returnHardwareReferenceSide('left', ['Roll'])).rejects.toThrow('急停')
     await expect(api.connectTeleopHand('left')).rejects.toThrow('急停')
     await expect(api.queueAutoAction({})).rejects.toThrow('急停')
     await expect(api.dispatchNextAutoAction()).rejects.toThrow('急停')
@@ -272,5 +273,15 @@ describe('真实 HTTP 分支的急停保护（全部网络隔离）', () => {
     await respond(1)
     await stopped
     expect(requests).toHaveLength(2)
+  })
+
+  it('返回硬件标定零点等待期间拒绝重复回零，且不使用普通10秒超时', async () => {
+    const pending = api.returnHardwareReferenceSide('right', ['Roll'])
+    expect(requests[0].path).toBe('/api/motion/right/return_home_reference')
+    await expect(api.returnHardwareReferenceSide('left', ['Roll'])).rejects.toThrow('已有回原点操作')
+    await vi.advanceTimersByTimeAsync(11_000)
+    expect(requests).toHaveLength(1)
+    await respond(0)
+    await expect(pending).resolves.toBeTruthy()
   })
 })

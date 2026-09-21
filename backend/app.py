@@ -39,6 +39,7 @@ from backend.core.schemas import (
     AppConfig,
     GripperCommandRequest,
     ManualAxisMoveRequest,
+    HardwareHomeRequest,
     SettingsCommandRequest,
     SnapshotCreateRequest,
     SnapshotScope,
@@ -1338,13 +1339,26 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             logs.error("[HAL]", f"stop_motion_side failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
 
-    # 指定侧运动轴执行回零。
-    @app.post("/api/motion/{side}/home")
-    async def home_motion_side(side: str) -> ApiEnvelope:
+    # 日常返回已标定硬件零点；不启动机械寻零或改写标定。
+    @app.post("/api/motion/{side}/return_home_reference")
+    async def return_hardware_reference_side(side: str, request: HardwareHomeRequest) -> ApiEnvelope:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         try:
-            return envelope(await commands.home_motion_side(side))
+            return envelope(await commands.return_hardware_reference_side(side, request.axes))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
+        except RuntimeError as exc:
+            logs.error("[HAL]", f"return_hardware_reference_side failed: {exc}")
+            raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
+
+    # 维护用机械寻零：可能沿固定方向绕圈；日常按钮不能调用此入口。
+    @app.post("/api/motion/{side}/home")
+    async def home_motion_side(side: str, request: HardwareHomeRequest) -> ApiEnvelope:
+        if side not in {"left", "right"}:
+            raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
+        try:
+            return envelope(await commands.home_motion_side(side, request.axes))
         except ControlLeaseUnavailable as exc:
             raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:

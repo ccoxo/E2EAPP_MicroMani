@@ -140,13 +140,13 @@ void MotionExecutor::homeAll(const std::array<double, 12>& origin,
 }
 
 void MotionExecutor::homeOriginSide(Side side, const std::array<double, 6>& origin,
-    const std::array<bool, 6>& axes, std::uint64_t epoch) {
+    const std::array<bool, 6>& axes, std::uint64_t epoch, bool hardwareReferenceReturn) {
   std::unique_lock lock(mutex_, std::try_to_lock);
   if (!lock.owns_lock()) throw std::runtime_error("motion executor busy; request was not queued");
   refresh(epoch);
   requireAvailable(side, MotionOwner::Homing);
   owners_[index(side)] = MotionOwner::Homing;
-  motion_.homeOriginSide(side, origin, axes, epoch);
+  motion_.homeOriginSide(side, origin, axes, epoch, hardwareReferenceReturn);
 }
 
 void MotionExecutor::moveRelativeUi(Side side, SemanticAxis axis, double delta, double velocity,

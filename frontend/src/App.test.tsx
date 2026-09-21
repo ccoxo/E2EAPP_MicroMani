@@ -2150,21 +2150,26 @@ describe('AppStation M0 frontend', () => {
     expect(within(dialog).getByText('确认记录工作原点')).toBeInTheDocument()
   }, 10000)
 
-  it('uses no-write hardware home from the motion card home action', async () => {
+  it('returns to saved hardware reference without mechanical seeking from the motion card', async () => {
     window.history.pushState({}, '', '/settings#motion-left')
+    useTelemetryStore.getState().config.motion.homeReference.rightAxisConfirmed = [true, true, true, true, true, true]
     const homeSpy = vi.spyOn(api, 'homeMotionSide').mockResolvedValue({ ok: true })
+    const returnSpy = vi.spyOn(api, 'returnHardwareReferenceSide').mockResolvedValue({ ok: true })
     const captureSpy = vi.spyOn(api, 'captureMotionOrigin').mockResolvedValue({ ok: true })
 
     await renderApp()
     const leftCard = document.querySelector<HTMLElement>('#motion-left')
     expect(leftCard).toBeTruthy()
 
-    await waitFor(() => expect(within(leftCard!).getByText('回硬件零点').closest('button')).toBeEnabled())
-    fireEvent.click(within(leftCard!).getByText('回硬件零点').closest('button')!)
-    const dialog = (await screen.findByText('左臂回硬件零点')).closest('[role="dialog"]') as HTMLElement
-    fireEvent.click(within(dialog).getByText('确认回硬件零点').closest('button')!)
+    await waitFor(() => expect(within(leftCard!).getByText('返回机械参考点').closest('button')).toBeEnabled())
+    fireEvent.click(within(leftCard!).getByText('返回机械参考点').closest('button')!)
+    fireEvent.click(within(leftCard!).getByRole('button', { name: '全选六轴' }))
+    fireEvent.click(within(leftCard!).getByRole('button', { name: '审阅返回动作' }))
+    const dialog = (await screen.findByText('左臂返回机械参考点')).closest('[role="dialog"]') as HTMLElement
+    fireEvent.click(within(dialog).getByText('确认返回机械参考点').closest('button')!)
 
-    await waitFor(() => expect(homeSpy).toHaveBeenCalledWith('right'))
+    await waitFor(() => expect(returnSpy).toHaveBeenCalledWith('right', ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']))
+    expect(homeSpy).not.toHaveBeenCalled()
     expect(captureSpy).not.toHaveBeenCalled()
   }, 10000)
 
@@ -2466,7 +2471,7 @@ describe('AppStation M0 frontend', () => {
     window.history.pushState({}, '', '/settings#motion-left')
     await renderApp()
     expect(screen.getAllByText('记录工作原点')).toHaveLength(2)
-    expect(screen.getAllByText('回硬件零点')).toHaveLength(2)
+    expect(screen.getAllByText('返回机械参考点')).toHaveLength(2)
     expect(screen.getByText('恢复上个工作原点')).toBeInTheDocument()
     expect(screen.queryByText('设为采集零点')).not.toBeInTheDocument()
     expect(screen.queryByText('清除零点')).not.toBeInTheDocument()

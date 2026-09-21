@@ -1612,6 +1612,10 @@ def test_hardware_status_reports_omega7_and_gripper_serial_identity(
 def test_motion_side_enable_and_home_routes(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     client = TestClient(create_app(tmp_path))
+    from backend.tests.test_control_watchdog import confirm_mock_browser_lease
+    session = asyncio.run(confirm_mock_browser_lease(client.app.state.control_watchdog))
+    client.headers["X-Control-Session"] = session
+    asyncio.run(client.app.state.hal.command("motion.acknowledge_estop", {}))
     config = client.app.state.settings.get_config()
     config["motion"]["leftSoftLimits"] = _wide_motion_soft_limits()
     config["motion"]["rightSoftLimits"] = _wide_motion_soft_limits()
@@ -1626,7 +1630,7 @@ def test_motion_side_enable_and_home_routes(tmp_path: Path, monkeypatch: MonkeyP
     assert state["enabled"][:6] == [True] * 6
     assert state["enabled"][6:] == [False] * 6
 
-    home_response = client.post("/api/motion/right/home")
+    home_response = client.post("/api/motion/right/home", json={"axes": ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]})
     assert home_response.status_code == 200
     assert home_response.json()["data"]["command"] == "motion.home_side"
 
@@ -2253,11 +2257,15 @@ def test_home_motion_side_refreshes_home_reference_and_shifts_work_origin(
                 "pulses": new_left_ref + [0.0] * 6,
                 "enabled": [True] * 12,
                 "estop_active": False,
+                "moving": [False] * 12,
+                "timestamp_ms": time.time_ns() // 1_000_000,
             }
 
         async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
+            if name == "control.lease":
+                return {"response": {"ok": True, "leaseFresh": True}}
             self.commands.append((name, payload or {}))
-            return {"command": name, "payload": payload or {}}
+            return {"command": name, "payload": payload or {}, "response": {"homeCompleted": True}}
 
     fake_hal = FakeHal()
     monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: fake_hal)
@@ -2288,7 +2296,10 @@ def test_home_motion_side_refreshes_home_reference_and_shifts_work_origin(
     baseline = settings.get_config()
     left_soft_limits_before = json.loads(json.dumps(baseline["motion"]["leftSoftLimits"]))
 
-    response = client.post("/api/motion/left/home")
+    from backend.tests.test_control_watchdog import confirm_mock_browser_lease
+    session = asyncio.run(confirm_mock_browser_lease(client.app.state.control_watchdog))
+    response = client.post("/api/motion/left/home", json={"axes": ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]},
+                           headers={"X-Control-Session": session})
 
     assert response.status_code == 200
     assert response.json()["data"]["command"] == "motion.home_side"

@@ -66,6 +66,7 @@ using DmcSetHomeMode =
     short(__stdcall*)(unsigned short, unsigned short, unsigned short, double, unsigned short, unsigned short);
 using DmcSetHomePinLogic = short(__stdcall*)(unsigned short, unsigned short, unsigned short, double);
 using DmcHomeMove = short(__stdcall*)(unsigned short, unsigned short);
+using DmcGetHomeResult = short(__stdcall*)(unsigned short, unsigned short, unsigned short*);
 using DmcWriteSevonPin = short(__stdcall*)(unsigned short, unsigned short, unsigned short);
 using DmcReadSevonPin = short(__stdcall*)(unsigned short, unsigned short);
 using DmcAxisIoStatus = unsigned long(__stdcall*)(unsigned short, unsigned short);
@@ -86,6 +87,7 @@ DmcSetElMode dmcSetElMode = nullptr;
 DmcSetHomeMode dmcSetHomeMode = nullptr;
 DmcSetHomePinLogic dmcSetHomePinLogic = nullptr;
 DmcHomeMove dmcHomeMove = nullptr;
+DmcGetHomeResult dmcGetHomeResult = nullptr;
 DmcWriteSevonPin dmcWriteSevonPin = nullptr;
 DmcReadSevonPin dmcReadSevonPin = nullptr;
 DmcAxisIoStatus dmcAxisIoStatus = nullptr;
@@ -475,6 +477,7 @@ bool LTDMCDriver::initialize() {
   dmcSetHomeMode = reinterpret_cast<DmcSetHomeMode>(GetProcAddress(ltdmcModule, "dmc_set_homemode"));
   dmcSetHomePinLogic = reinterpret_cast<DmcSetHomePinLogic>(GetProcAddress(ltdmcModule, "dmc_set_home_pin_logic"));
   dmcHomeMove = reinterpret_cast<DmcHomeMove>(GetProcAddress(ltdmcModule, "dmc_home_move"));
+  dmcGetHomeResult = reinterpret_cast<DmcGetHomeResult>(GetProcAddress(ltdmcModule, "dmc_get_home_result"));
   dmcWriteSevonPin = reinterpret_cast<DmcWriteSevonPin>(GetProcAddress(ltdmcModule, "dmc_write_sevon_pin"));
   dmcReadSevonPin = reinterpret_cast<DmcReadSevonPin>(GetProcAddress(ltdmcModule, "dmc_read_sevon_pin"));
   dmcAxisIoStatus = reinterpret_cast<DmcAxisIoStatus>(GetProcAddress(ltdmcModule, "dmc_axis_io_status"));
@@ -845,12 +848,16 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bo
 void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes,
     std::optional<std::uint64_t> expectedEpoch) {
   const auto estopSequenceAtStart = expectedEpoch.value_or(commandEpoch());
-  std::scoped_lock lock(mutex_);
+  std::unique_lock lock(mutex_);
   ensureInitialized();
   throwIfEstopActive();
   checkMotionCommand(estopSequenceAtStart);
+  if (std::none_of(enabledAxes.begin(), enabledAxes.end(), [](bool enabled) { return enabled; })) {
+    throw std::runtime_error("hardware home requires at least one selected axis");
+  }
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
-  if (!dmcHomeMove || !dmcSetPulseOutmode || !dmcSetElMode || !dmcSetHomeMode || !dmcSetHomePinLogic) {
+  if (!dmcHomeMove || !dmcGetHomeResult || !dmcCheckDone || !dmcGetPosition || !dmcStop
+      || !dmcSetPulseOutmode || !dmcSetElMode || !dmcSetHomeMode || !dmcSetHomePinLogic) {
     throw std::runtime_error("required LTDMC home exports missing");
   }
   // 回机械原点前重新配置脉冲、限位和原点模式，保证控制卡处于预期状态。
@@ -863,54 +870,102 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes,
       continue;
     }
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
-    if (dmcCheckDone(card, axisNo) == 0) {
+    if (!axisMotionEnabled(side, axis)) {
+      throw std::runtime_error("hardware home axis is not servo-enabled");
+    }
+    if (dmcCheckDone(card, axisNo) != 1) {
       // homing 不与现有运动叠加，必须等轴空闲。
       throw std::runtime_error(dmcAxisFailureMessage("axis busy before dmc_home_move", -1, card, axisNo));
     }
   }
-  for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-    checkMotionCommand(estopSequenceAtStart);
-    const auto axis = static_cast<SemanticAxis>(axisIndex);
-    if (!enabledAxes[axisIndex]) {
-      continue;
+  std::array<long, 6> beforePulses{};
+  try {
+    for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+      checkMotionCommand(estopSequenceAtStart);
+      const auto axis = static_cast<SemanticAxis>(axisIndex);
+      if (!enabledAxes[axisIndex]) {
+        continue;
+      }
+      const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
+      const auto beforePulse = dmcGetPosition ? dmcGetPosition(card, axisNo) : static_cast<long>(pulse_[stateIndex(side, axis)]);
+      beforePulses[axisIndex] = beforePulse;
+      const auto beforeUi = pulseToUi(static_cast<double>(beforePulse), side, axis);
+      logHardwareHomeDiagnostic(
+          "home_start",
+          side,
+          axis,
+          card,
+          axisNo,
+          kHomeDirection,
+          beforePulse,
+          beforeUi,
+          enabledAxes,
+          beforePulse,
+          beforeUi,
+          0);
+      checkMotionCommand(estopSequenceAtStart);
+      const auto ret = dmcHomeMove(card, axisNo);
+      checkMotionCommand(estopSequenceAtStart);
+      if (ret != 0) {
+        throw std::runtime_error(dmcAxisFailureMessage("dmc_home_move", ret, card, axisNo));
+      }
     }
-    const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
-    const auto beforePulse = dmcGetPosition ? dmcGetPosition(card, axisNo) : static_cast<long>(pulse_[stateIndex(side, axis)]);
-    const auto beforeUi = pulseToUi(static_cast<double>(beforePulse), side, axis);
-    logHardwareHomeDiagnostic(
-        "home_start",
-        side,
-        axis,
-        card,
-        axisNo,
-        kHomeDirection,
-        beforePulse,
-        beforeUi,
-        enabledAxes,
-        beforePulse,
-        beforeUi,
-        0);
-    checkMotionCommand(estopSequenceAtStart);
-    const auto ret = dmcHomeMove(card, axisNo);
-    checkMotionCommand(estopSequenceAtStart);
-    const auto afterPulse = dmcGetPosition ? dmcGetPosition(card, axisNo) : static_cast<long>(pulse_[stateIndex(side, axis)]);
-    const auto afterUi = pulseToUi(static_cast<double>(afterPulse), side, axis);
-    logHardwareHomeDiagnostic(
-        "home_done",
-        side,
-        axis,
-        card,
-        axisNo,
-        kHomeDirection,
-        beforePulse,
-        beforeUi,
-        enabledAxes,
-        afterPulse,
-        afterUi,
-        ret);
-    if (ret != 0) {
-      throw std::runtime_error(dmcAxisFailureMessage("dmc_home_move", ret, card, axisNo));
+    // SDK 启动成功不代表寻零成功；未完成、异常停止和超时均不能写入原点。
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (true) {
+      checkMotionCommand(estopSequenceAtStart);
+      bool allHomed = true;
+      for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+        if (!enabledAxes[axisIndex]) continue;
+        const auto axisNo = static_cast<unsigned short>(physicalAxis(side, static_cast<SemanticAxis>(axisIndex)));
+        unsigned short homed = 0;
+        const auto ret = dmcGetHomeResult(card, axisNo, &homed);
+        if (ret != 0 || homed > 1) {
+          throw std::runtime_error(dmcAxisFailureMessage("dmc_get_home_result", ret, card, axisNo));
+        }
+        const auto done = dmcCheckDone(card, axisNo);
+        if (done != 0 && done != 1) {
+          throw std::runtime_error(dmcAxisFailureMessage("dmc_check_done", done, card, axisNo));
+        }
+        allHomed = allHomed && homed == 1 && done == 1;
+      }
+      checkMotionCommand(estopSequenceAtStart);
+      if (allHomed) break;
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw std::runtime_error("hardware home completion timeout");
+      }
+      // 允许状态线程读取真实位置，避免整个寻零期间重复发布旧的停止状态。
+      lock.unlock();
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      lock.lock();
     }
+    for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+      if (!enabledAxes[axisIndex]) continue;
+      const auto axis = static_cast<SemanticAxis>(axisIndex);
+      const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
+      const auto beforePulse = beforePulses[axisIndex];
+      const auto beforeUi = pulseToUi(static_cast<double>(beforePulse), side, axis);
+      const auto afterPulse = dmcGetPosition ? dmcGetPosition(card, axisNo) : static_cast<long>(pulse_[stateIndex(side, axis)]);
+      pulse_[stateIndex(side, axis)] = afterPulse;
+      const auto afterUi = pulseToUi(static_cast<double>(afterPulse), side, axis);
+      logHardwareHomeDiagnostic(
+          "home_done",
+          side,
+          axis,
+          card,
+          axisNo,
+          kHomeDirection,
+          beforePulse,
+          beforeUi,
+          enabledAxes,
+          afterPulse,
+          afterUi,
+          0);
+    }
+  } catch (...) {
+    // 某轴启动失败时其余轴也可能已经在运动；必须停机，不能仅返回错误。
+    emergencyStop();
+    throw;
   }
 #endif
   checkMotionCommand(estopSequenceAtStart);
@@ -1041,7 +1096,11 @@ void LTDMCDriver::homeOriginSide(
     Side side,
     const std::array<double, 6>& workOriginPulse,
     const std::array<bool, 6>& enabledAxes,
-    std::optional<std::uint64_t> expectedEpoch) {
+    std::optional<std::uint64_t> expectedEpoch,
+    bool hardwareReferenceReturn) {
+  if (hardwareReferenceReturn && std::none_of(enabledAxes.begin(), enabledAxes.end(), [](bool enabled) { return enabled; })) {
+    throw std::runtime_error("hardware reference return requires at least one selected axis");
+  }
   for (const auto pulse : workOriginPulse) checkedMotionPulse(pulse);
   const auto estopSequenceAtStart = expectedEpoch.value_or(commandEpoch());
   std::scoped_lock lock(mutex_);
@@ -1075,50 +1134,78 @@ void LTDMCDriver::homeOriginSide(
     homeAxes[homeAxisCount++] = {card, axisNo};
   }
   waitForAxesDone(homeAxes, homeAxisCount, "home_origin_side pre-move", 3000, [&]() { checkMotionCommand(estopSequenceAtStart); });
-  for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-    checkMotionCommand(estopSequenceAtStart);
-    const auto axis = static_cast<SemanticAxis>(axisIndex);
-    if (!enabledAxes[axisIndex]) {
-      continue;
+  if (hardwareReferenceReturn) {
+    // 在启动任何轴前校验全部旋转轴，防止其他五轴先动而旋转轴跨圈返回。
+    for (int axisIndex = 3; axisIndex < 6; ++axisIndex) {
+      if (!enabledAxes[axisIndex]) continue;
+      const auto axis = static_cast<SemanticAxis>(axisIndex);
+      const auto currentPulse = dmcGetPosition(card, static_cast<unsigned short>(physicalAxis(side, axis)));
+      const auto deltaUi = pulseToUi(workOriginPulse[axisIndex] - currentPulse, side, axis);
+      if (!std::isfinite(deltaUi) || std::abs(deltaUi) > 180.0) {
+        throw std::runtime_error("hardware reference return exceeds 180 degrees; verify calibration");
+      }
     }
-    const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
-    const auto index = stateIndex(side, axis);
-    const auto targetPulse = checkedMotionPulse(workOriginPulse[axisIndex]);
-    const auto currentPulse = dmcGetPosition(card, axisNo);
-    const auto deltaPulse = checkedMotionPulse(static_cast<double>(targetPulse) - currentPulse);
-    const auto rotation = isRotation(axis);
-    const auto maxVelocityPulse =
-        velocityToPulsePerSec(side, axis, rotation ? kRotationMaxVelocityUi : kTranslationMaxVelocityUi);
-    const auto startVelocityPulse =
-        velocityToPulsePerSec(side, axis, rotation ? kRotationStartVelocityUi : kTranslationStartVelocityUi);
-    const auto retProfile =
-        dmcSetProfile(card, axisNo, startVelocityPulse, maxVelocityPulse, kRampSec, kRampSec, 0.0);
-    if (retProfile != 0) {
-      throw std::runtime_error(dmcFailureMessage("dmc_set_profile", retProfile, card, axisNo, deltaPulse));
-    }
-    if (dmcSetSProfile) {
-      dmcSetSProfile(card, axisNo, 0, 0.0);
-    }
-    checkMotionCommand(estopSequenceAtStart);
-    startWorkOriginMoveOrThrow(card, axisNo, targetPulse, deltaPulse, currentPulse, [&]() { checkMotionCommand(estopSequenceAtStart); });
-    checkMotionCommand(estopSequenceAtStart);
-    pulse_[index] = static_cast<double>(targetPulse);
-    teleopTargetActive_[index] = false;
   }
-  publishStateSnapshotLocked();
-  waitForAxesDone(homeAxes, homeAxisCount, "home_origin_side", 60000, [&]() { checkMotionCommand(estopSequenceAtStart); });
-  if (dmcGetPosition) {
+  try {
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
       checkMotionCommand(estopSequenceAtStart);
       const auto axis = static_cast<SemanticAxis>(axisIndex);
+      if (!enabledAxes[axisIndex]) {
+        continue;
+      }
       const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
       const auto index = stateIndex(side, axis);
-      pulse_[index] = static_cast<double>(dmcGetPosition(card, axisNo));
-      teleopTargetPulse_[index] = pulse_[index];
+      const auto targetPulse = checkedMotionPulse(workOriginPulse[axisIndex]);
+      const auto currentPulse = dmcGetPosition(card, axisNo);
+      const auto deltaPulse = checkedMotionPulse(static_cast<double>(targetPulse) - currentPulse);
+      const auto rotation = isRotation(axis);
+      const auto maxVelocityPulse =
+          velocityToPulsePerSec(side, axis, rotation ? kRotationMaxVelocityUi : kTranslationMaxVelocityUi);
+      const auto startVelocityPulse =
+          velocityToPulsePerSec(side, axis, rotation ? kRotationStartVelocityUi : kTranslationStartVelocityUi);
+      const auto retProfile =
+          dmcSetProfile(card, axisNo, startVelocityPulse, maxVelocityPulse, kRampSec, kRampSec, 0.0);
+      if (retProfile != 0) {
+        throw std::runtime_error(dmcFailureMessage("dmc_set_profile", retProfile, card, axisNo, deltaPulse));
+      }
+      if (dmcSetSProfile) {
+        dmcSetSProfile(card, axisNo, 0, 0.0);
+      }
+      checkMotionCommand(estopSequenceAtStart);
+      startWorkOriginMoveOrThrow(card, axisNo, targetPulse, deltaPulse, currentPulse, [&]() { checkMotionCommand(estopSequenceAtStart); });
+      checkMotionCommand(estopSequenceAtStart);
+      pulse_[index] = static_cast<double>(targetPulse);
       teleopTargetActive_[index] = false;
     }
+    publishStateSnapshotLocked();
+    waitForAxesDone(homeAxes, homeAxisCount, "home_origin_side", 60000, [&]() { checkMotionCommand(estopSequenceAtStart); });
+    if (dmcGetPosition) {
+      for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+        checkMotionCommand(estopSequenceAtStart);
+        const auto axis = static_cast<SemanticAxis>(axisIndex);
+        const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
+        const auto index = stateIndex(side, axis);
+        pulse_[index] = static_cast<double>(dmcGetPosition(card, axisNo));
+        teleopTargetPulse_[index] = pulse_[index];
+        teleopTargetActive_[index] = false;
+      }
+    }
+  } catch (...) {
+    // 已启动的轴不能在后续轴失败、超时或取消后继续运行。
+    if (hardwareReferenceReturn) emergencyStop();
+    throw;
   }
 #else
+  if (hardwareReferenceReturn) {
+    for (int axisIndex = 3; axisIndex < 6; ++axisIndex) {
+      if (!enabledAxes[axisIndex]) continue;
+      const auto axis = static_cast<SemanticAxis>(axisIndex);
+      const auto deltaUi = pulseToUi(workOriginPulse[axisIndex] - pulse_[stateIndex(side, axis)], side, axis);
+      if (!std::isfinite(deltaUi) || std::abs(deltaUi) > 180.0) {
+        throw std::runtime_error("hardware reference return exceeds 180 degrees; verify calibration");
+      }
+    }
+  }
   for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
     checkMotionCommand(estopSequenceAtStart);
     const auto axis = static_cast<SemanticAxis>(axisIndex);

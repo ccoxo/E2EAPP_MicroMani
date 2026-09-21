@@ -23,6 +23,7 @@ def test_shared_hal_command_protocol_covers_existing_real_hal_commands() -> None
         "motion.acknowledge_estop": ("POST", "/motion/acknowledge_estop"),
         "motion.home_all": ("POST", "/motion/home_all"),
         "motion.home_origin_side": ("POST", "/motion/home_origin_side"),
+        "motion.return_home_reference": ("POST", "/motion/return_home_reference"),
         "motion.enable_side": ("POST", "/motion/enable_side"),
         "motion.disable_side": ("POST", "/motion/disable_side"),
         "motion.home_side": ("POST", "/motion/home_side"),
@@ -78,6 +79,7 @@ def test_hal_command_request_policy_keeps_home_commands_long_running() -> None:
     assert command_request_policy("motion.emergency_stop", 5.0) == (5.0, 2)
     assert command_request_policy("motion.home_all", 5.0) == (75.0, 1)
     assert command_request_policy("motion.home_origin_side", 5.0) == (75.0, 1)
+    assert command_request_policy("motion.return_home_reference", 5.0) == (75.0, 1)
     assert command_request_policy("motion.home_side", 80.0) == (80.0, 1)
 
 

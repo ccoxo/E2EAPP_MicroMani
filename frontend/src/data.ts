@@ -514,6 +514,8 @@ export const defaultConfig: AppConfig = {
       valid: true,
       leftValid: true,
       rightValid: true,
+      leftAxisConfirmed: [false, false, false, false, false, false],
+      rightAxisConfirmed: [false, false, false, false, false, false],
       leftPulse: [100000, 0, -35179, 64833, 64839, -2947],
       rightPulse: [-233, -19221, 593101, 4427, -81110, -180],
       updatedAt: 1778586070000,

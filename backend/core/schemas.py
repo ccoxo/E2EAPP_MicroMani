@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 ConnectionState = Literal["ok", "warn", "error", "checking", "pending"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
@@ -188,6 +188,18 @@ class SnapshotCreateRequest(BaseModel):
     scope: SnapshotScope
     name: str
     config: dict[str, Any] | MotionCardSnapshotConfig | None = None
+
+
+class HardwareHomeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    axes: list[ManualAxis] = Field(min_length=1, max_length=6)
+
+    @field_validator("axes")
+    @classmethod
+    def unique_axes(cls, axes: list[ManualAxis]) -> list[ManualAxis]:
+        if len(set(axes)) != len(axes):
+            raise ValueError("hardware home axes must be unique")
+        return axes
 
 
 class ManualAxisMoveRequest(BaseModel):

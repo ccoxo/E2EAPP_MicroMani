@@ -32,7 +32,7 @@ class MotionExecutor {
   void homeAll(const std::array<double, 12>& origin,
       const std::array<std::array<bool, 6>, 2>& axes, std::uint64_t epoch);
   void homeOriginSide(Side side, const std::array<double, 6>& origin,
-      const std::array<bool, 6>& axes, std::uint64_t epoch);
+      const std::array<bool, 6>& axes, std::uint64_t epoch, bool hardwareReferenceReturn = false);
   void moveRelativeUi(Side side, SemanticAxis axis, double delta, double velocity,
       double startVelocity, double acc, double dec, std::uint64_t epoch);
   std::array<MotionOwner, 2> owners();

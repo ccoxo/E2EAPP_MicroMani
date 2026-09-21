@@ -118,9 +118,11 @@ class TestHalClient(HalClient):
                 self.motion_enabled[side] = True
         if name == "motion.home_all":
             self._pulses = list(payload["leftPulse"]) + list(payload["rightPulse"])
-        if name == "motion.home_origin_side":
+        if name in {"motion.home_origin_side", "motion.return_home_reference"}:
             offset = 0 if payload["side"] == "left" else 6
-            self._pulses[offset:offset + 6] = list(payload["pulse"])
+            for index, enabled in enumerate(payload.get("enabledAxes", [True] * 6)):
+                if enabled:
+                    self._pulses[offset + index] = payload["pulse"][index]
         if name == "motion.disable_side":
             side = str((payload or {}).get("side", ""))
             if side in self.motion_enabled:

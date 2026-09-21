@@ -65,7 +65,8 @@ class LTDMCDriver {
       Side side,
       const std::array<double, 6>& workOriginPulse,
       const std::array<bool, 6>& enabledAxes,
-      std::optional<std::uint64_t> expectedEpoch = std::nullopt);
+      std::optional<std::uint64_t> expectedEpoch = std::nullopt,
+      bool hardwareReferenceReturn = false);
   // maxVelocityUiPerSec/startVelocityUiPerSec 使用语义 UI 单位：
   // 平移轴是 um/s，旋转轴是 deg/s；传入 <=0 时使用内置保守默认值。
   void moveRelativeUi(

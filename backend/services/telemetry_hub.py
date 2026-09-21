@@ -255,10 +255,11 @@ class TelemetryHub:
         self.axis_offsets = [0.0] * 12
         self.estop_active = False
 
-    def home_side(self, side: str) -> None:
+    def home_side(self, side: str, enabled_axes: list[bool] | None = None) -> None:
         start = 0 if side == "left" else 6
         for idx in range(start, start + 6):
-            self.axis_offsets[idx] = 0.0
+            if enabled_axes is None or enabled_axes[idx - start]:
+                self.axis_offsets[idx] = 0.0
         self.estop_active = False
 
     def set_motion_enabled(self, side: str, enabled: bool | None) -> None:

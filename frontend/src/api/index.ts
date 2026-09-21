@@ -62,7 +62,7 @@ function commandRequiresSafetyClear(path: string, body: unknown): boolean {
   if (/^\/api\/datasets\/[^/]+\/episodes\/[^/]+\/replay\/start$/.test(path)) return true
   if (/^\/api\/motion\/(?:(left|right)\/)?origin\/(capture|restore_previous|clear)$/.test(path)) return true
   if (/^\/api\/(sensors\/tare|force\/(left|right)\/tare)$/.test(path)) return true
-  if (/^\/api\/motion\/(manual_axis_move|home_all|(left|right)\/(enable_all|home|return_origin))$/.test(path)) return true
+  if (/^\/api\/motion\/(manual_axis_move|home_all|(left|right)\/(enable_all|home|return_origin|return_home_reference))$/.test(path)) return true
   if (/^\/api\/gripper\/(left|right)\/command$/.test(path)) {
     const command = body && typeof body === 'object' && 'command' in body ? body.command : undefined
     return command !== 'stop' && command !== 'disable'
@@ -312,12 +312,12 @@ export async function postCommand(path: string, body?: unknown) {
   const blocked = isConfirmedForceSelfCheck(apiPath, body) ? forceSelfCheckBlockedReason()
     : commandRequiresSafetyClear(apiPath, body) ? controlCommandBlockedReason() : null
   if (blocked) throw new Error(blocked)
-  const returningOrigin = /\/motion\/(home_all|(left|right)\/(home|return_origin))$/.test(apiPath)
+  const returningOrigin = /\/motion\/(home_all|(left|right)\/(home|return_origin|return_home_reference))$/.test(apiPath)
   if (returningOrigin && returnOriginPending) throw new Error('已有回原点操作进行中，请等待设备确认')
   if (mockMode) return { ok: true, path, body, ts: Date.now() }
   if (returningOrigin) returnOriginPending = true
   const controller = new AbortController()
-  const timeoutMs = /\/motion\/(home_all|(left|right)\/(home|return_origin))$/.test(apiPath)
+  const timeoutMs = /\/motion\/(home_all|(left|right)\/(home|return_origin|return_home_reference))$/.test(apiPath)
     ? 80_000
     : /\/cameras\/wrists\/(identify|bind)$/.test(apiPath) ? 60_000 : 10_000
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -524,9 +524,12 @@ export const disableMotionSide = (side: ManualControlSide) =>
 /** 停止对应流程。 */
 export const stopMotionSide = (side: ManualControlSide) =>
   postCommand(`/motion/${side}/stop`)
-/** 发送或封装对应的后端命令。 */
-export const homeMotionSide = (side: ManualControlSide) =>
-  postCommand(`/motion/${side}/home`)
+/** 维护用机械寻零，可能绕圈；必须显式指定轴，日常返回使用 returnHardwareReferenceSide。 */
+export const homeMotionSide = (side: ManualControlSide, axes: ManualControlAxis[]) =>
+  postCommand(`/motion/${side}/home`, { axes }) as Promise<MotionOriginResponse>
+
+export const returnHardwareReferenceSide = (side: ManualControlSide, axes: ManualControlAxis[]) =>
+  postCommand(`/motion/${side}/return_home_reference`, { axes })
 /** 发送或封装对应的后端命令。 */
 export const returnMotionOriginSide = (side: ManualControlSide) =>
   postCommand(`/motion/${side}/return_origin`)

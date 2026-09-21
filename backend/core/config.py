@@ -173,6 +173,12 @@ def _ensure_home_reference_model(config: dict[str, Any], has_current_home_refere
             side_reference_valid = _side_valid(origin, side)
             side_offset_valid = side_reference_valid
         next_reference[pulse_key] = side_reference
+        # 历史整侧 valid 不能证明每轴确实完成寻零；只迁移显式逐轴确认。
+        raw_confirmed = reference.get(f"{side}AxisConfirmed")
+        confirmed = ([value is True for value in raw_confirmed]
+                     if isinstance(raw_confirmed, list) and len(raw_confirmed) == 6 else [False] * 6)
+        next_reference[f"{side}AxisConfirmed"] = confirmed
+        # 旧 valid 仅保留给既有偏移/限位计算；返回权限单独检查 AxisConfirmed。
         next_reference[valid_key] = side_reference_valid
         next_offset[delta_key] = side_offset
         next_offset[valid_key] = side_offset_valid
@@ -495,6 +501,7 @@ class SettingsService:
         source: str = "ui",
         op_id: str | None = None,
         before_commit: Callable[[], None] | None = None,
+        home_reference_update: bool = False,
     ) -> dict[str, Any]:
         old_config: dict[str, Any] = {}
         if self.config_path.exists():
@@ -513,6 +520,18 @@ class SettingsService:
                 isinstance(raw_motion, dict)
                 and raw_motion.get("homeReferenceVersion") == ICF_HOME_REFERENCE_VERSION,
             )
+            if not home_reference_update:
+                # 普通设置保存/旧快照不能伪造或恢复寻零完成标记；改目标脉冲则撤销确认。
+                previous = old_config.get("motion", {}).get("homeReference", {})
+                reference = config["motion"]["homeReference"]
+                for side in ("left", "right"):
+                    old_flags = previous.get(f"{side}AxisConfirmed", [])
+                    old_pulses = previous.get(f"{side}Pulse", [])
+                    reference[f"{side}AxisConfirmed"] = [
+                        index < len(old_flags) and old_flags[index] is True
+                        and index < len(old_pulses) and old_pulses[index] == reference[f"{side}Pulse"][index]
+                        for index in range(6)
+                    ]
         validate_force_config(config)
         validated = AppConfig.model_validate(config).model_dump(mode="json")
         old_hash = stable_config_hash(old_config) if old_config else "-"

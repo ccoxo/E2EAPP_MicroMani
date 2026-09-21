@@ -137,7 +137,7 @@ def test_hal_home_all_requires_work_origin_payload() -> None:
     assert "executor_.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes, commandEpoch)" in normalized
     assert "jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled)" in normalized
     assert "executor_.enableSide(side, true, jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled), commandEpoch)" in normalized
-    assert "executor_.homeSide(side, jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled), commandEpoch)" in normalized
+    assert "executor_.homeSide(side, jsonBoolArray6(bodyText, \"enabledAxes\", {}), commandEpoch)" in normalized
     assert "home_all requires leftPulse[6] work origin payload" in json_source
     assert "home_all requires rightPulse[6] work origin payload" in json_source
     assert "home_origin_side requires pulse[6] work origin payload" in json_source
@@ -795,10 +795,10 @@ def test_hal_home_origin_does_not_auto_enable_participating_axes() -> None:
     source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
     dispatcher = (REPO_ROOT / "hal" / "src" / "HalCommandDispatcher.cpp").read_text(encoding="utf-8")
     home_all_branch = dispatcher.split('if (name == "motion.home_all")', 1)[1].split(
-        'if (name == "motion.home_origin_side")',
+        'if (name == "motion.home_origin_side" || name == "motion.return_home_reference")',
         1,
     )[0]
-    home_side_branch = dispatcher.split('if (name == "motion.home_origin_side")', 1)[1].split(
+    home_side_branch = dispatcher.split('if (name == "motion.home_origin_side" || name == "motion.return_home_reference")', 1)[1].split(
         'if (name == "motion.enable_side")',
         1,
     )[0]
@@ -980,10 +980,10 @@ def test_hal_native_home_stops_controller_and_waits_for_motion_done() -> None:
     dispatcher = (REPO_ROOT / "hal" / "src" / "HalCommandDispatcher.cpp").read_text(encoding="utf-8")
     motion = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
     home_all_branch = dispatcher.split('if (name == "motion.home_all")', 1)[1].split(
-        'if (name == "motion.home_origin_side")',
+        'if (name == "motion.home_origin_side" || name == "motion.return_home_reference")',
         1,
     )[0]
-    home_side_branch = dispatcher.split('if (name == "motion.home_origin_side")', 1)[1].split(
+    home_side_branch = dispatcher.split('if (name == "motion.home_origin_side" || name == "motion.return_home_reference")', 1)[1].split(
         'if (name == "motion.enable_side")',
         1,
     )[0]
@@ -992,7 +992,7 @@ def test_hal_native_home_stops_controller_and_waits_for_motion_done() -> None:
     assert "nativeTeleop_.stop();" in home_side_branch
     assert "const auto enabledAxes = jsonHomeAllEnabledAxes(bodyText);" in home_all_branch
     assert "motion_.enableHomeAxes" not in home_all_branch
-    assert "const auto enabledAxes = jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled);" in home_side_branch
+    assert "referenceReturn ? std::array<bool, 6>{} : kAllAxesEnabled" in home_side_branch
     assert "motion_.enableHomeAxes" not in home_side_branch
     assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_all pre-move\", 3000, [&]() { checkMotionCommand(estopSequenceAtStart); })" in motion
     assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_all\", 60000, [&]() { checkMotionCommand(estopSequenceAtStart); })" in motion
@@ -1190,10 +1190,10 @@ def test_hal_direct_work_origin_home_rejects_estop_before_enable_or_motion() -> 
     motion = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
     dispatcher = (REPO_ROOT / "hal" / "src" / "HalCommandDispatcher.cpp").read_text(encoding="utf-8")
     home_all_branch = dispatcher.split('if (name == "motion.home_all")', 1)[1].split(
-        'if (name == "motion.home_origin_side")',
+        'if (name == "motion.home_origin_side" || name == "motion.return_home_reference")',
         1,
     )[0]
-    home_side_branch = dispatcher.split('if (name == "motion.home_origin_side")', 1)[1].split(
+    home_side_branch = dispatcher.split('if (name == "motion.home_origin_side" || name == "motion.return_home_reference")', 1)[1].split(
         'if (name == "motion.enable_side")',
         1,
     )[0]

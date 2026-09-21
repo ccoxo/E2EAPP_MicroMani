@@ -18,6 +18,13 @@ for %%T in (MotionExecutorTests EmergencyStopTests ControlLeaseTests ThreadStabi
   call :run_test %%T
   if errorlevel 1 set TEST_RESULT=1
 )
+rem 此测试注入 SDK 函数指针，不加载 vendor DLL 或连接设备。
+cl %FLAGS% "%HAL_ROOT%\tests\HardwareHomingTests.cpp" /Fe"HardwareHomingTests.exe" || goto :failed
+call :run_test HardwareHomingTests
+if errorlevel 1 set TEST_RESULT=1
+cl %FLAGS% "%HAL_ROOT%\tests\HardwareReferenceReturnTests.cpp" /Fe"HardwareReferenceReturnTests.exe" || goto :failed
+call :run_test HardwareReferenceReturnTests
+if errorlevel 1 set TEST_RESULT=1
 popd
 exit /b %TEST_RESULT%
 :failed

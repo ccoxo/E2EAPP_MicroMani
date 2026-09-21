@@ -4,7 +4,9 @@
  */
 import {
   captureMotionOrigin,
+  fetchMotionOrigin,
   homeMotionSide,
+  returnHardwareReferenceSide,
   restorePreviousMotionOrigin,
   type MotionOriginCaptureDrift,
   type MotionPreviousRestoreStatus,
@@ -40,12 +42,15 @@ import type {
   ArmMotionProfile,
   ArmSoftLimitConfig,
   LogEntry,
+  ManualControlAxis,
   MotionOriginConfig,
   ParameterSnapshotScope,
   RotationWorkLimitSideConfig,
 } from '../../types'
 import { HardwareConfigCard, MetricBox, commandLog, type PendingComparison } from './shared'
 import { formatSnapshotTime } from './motionHelpers'
+
+const REFERENCE_AXES: ManualControlAxis[] = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']
 
 const TRANSLATION_SOFT_LIMIT_DISABLED_MIN = -1000000000
 const TRANSLATION_SOFT_LIMIT_DISABLED_MAX = 1000000000
@@ -478,7 +483,19 @@ export function MotionCard({
         : '仅当前侧工作原点已记录'
       : '当前侧工作原点未记录'
   const originUpdatedText = motionOrigin.updatedAt > 0 ? `最后更新 ${formatSnapshotTime(motionOrigin.updatedAt)}` : originScopeText
-  const [pendingMotionAction, setPendingMotionAction] = useState<'home' | null>(null)
+  const [pendingMotionAction, setPendingMotionAction] = useState<'return' | 'seek' | null>(null)
+  const [referenceAction, setReferenceAction] = useState<'return' | 'seek' | null>(null)
+  const [selectedAxes, setSelectedAxes] = useState<ManualControlAxis[]>([])
+  const [referenceStatus, setReferenceStatus] = useState('')
+  const reference = config.motion.homeReference
+  const confirmedAxes = reference[hardwareSide === 'left' ? 'leftAxisConfirmed' : 'rightAxisConfirmed'] ?? []
+  const referencePulses = reference[hardwareSide === 'left' ? 'leftPulse' : 'rightPulse']
+  const unconfirmedSelection = selectedAxes.filter((axis) => confirmedAxes[REFERENCE_AXES.indexOf(axis)] !== true)
+  const openReferenceAction = (action: 'return' | 'seek') => {
+    setReferenceAction(action)
+    setSelectedAxes([])
+    setReferenceStatus('')
+  }
   const [pendingOriginAction, setPendingOriginAction] = useState<'capture' | 'restore' | null>(null)
   const motionEnable = useMotionEnable(hardwareSide)
   const controlBlockReason = useTelemetryStore((state) => controlSafetyBlockReason(state))
@@ -498,19 +515,67 @@ export function MotionCard({
         : '备份待校验'
   const previousRestoreMessage = previousRestoreAvailable ? previousRestoreStatus?.message : ''
  /** 处理对应的用户交互。 */
- const handleHome = async () => {
+ // 服务端反馈只同步页面，不能经 updateConfig 再写回配置覆盖新的寻零结果。
+ const syncMotionState = (patch: Pick<AppConfig, 'motion'>) => {
+    useTelemetryStore.setState((state) => ({ config: { ...state.config, ...patch } }))
+  }
+ const handleReferenceAction = async (action: 'return' | 'seek', axes: ManualControlAxis[]) => {
+    const label = action === 'seek' ? '机械寻零' : '返回机械参考点'
     const reason = controlSafetyBlockReason(useTelemetryStore.getState())
     if (reason) {
-      injectLog('WARNING', `${operatorLabel}回硬件零点受阻：${reason}`, '[HAL]')
+      injectLog('WARNING', `${operatorLabel}${label}受阻：${reason}`, '[HAL]')
+      setReferenceStatus(`${label}受阻：${reason}`)
       return
     }
-    setPendingMotionAction('home')
+    const generation = useTelemetryStore.getState().controlSafety.generation
+    setPendingMotionAction(action)
+    setReferenceStatus(`${action === 'seek' ? '正在寻零' : '正在返回'}：${axes.join('、')}`)
     try {
-      await homeMotionSide(hardwareSide)
-      commandLog(injectLog, '[HAL]', `${operatorLabel}回硬件零点完成（未写入工作原点）`)
+      if (action === 'seek') {
+        // 请求超时或刷新失败时也不能在页面继续使用旧的确认标记。
+        const nextConfirmed = REFERENCE_AXES.map((axis, index) => !axes.includes(axis) && confirmedAxes[index] === true)
+        syncMotionState({ motion: { ...config.motion, homeReference: {
+          ...reference, [hardwareSide === 'left' ? 'leftAxisConfirmed' : 'rightAxisConfirmed']: nextConfirmed,
+        } } })
+        const response = await homeMotionSide(hardwareSide, axes)
+        if (response.data?.homeReference) {
+          syncMotionState({ motion: {
+            ...useTelemetryStore.getState().config.motion,
+            homeReference: response.data.homeReference,
+            ...(response.data.origin ? { origin: response.data.origin } : {}),
+            ...(response.data.workOriginOffset ? { workOriginOffset: response.data.workOriginOffset } : {}),
+          } })
+        }
+      } else {
+        await returnHardwareReferenceSide(hardwareSide, axes)
+      }
+      const current = useTelemetryStore.getState()
+      if (current.controlSafety.generation !== generation || controlSafetyBlockReason(current)) {
+        throw new Error('操作期间发生急停或连接状态变化，请核验执行结果')
+      }
+      setReferenceStatus(`${label}完成：${axes.join('、')}`)
+      commandLog(injectLog, '[HAL]', `${operatorLabel}${label}完成：${axes.join('、')}`)
     } catch (error) {
-      injectLog('ERROR', `${operatorLabel}回硬件零点失败：${commandErrorMessage(error)}`, '[HAL]')
+      const message = `${label}失败：${commandErrorMessage(error)}`
+      setReferenceStatus(message)
+      injectLog('ERROR', `${operatorLabel}${message}`, '[HAL]')
     } finally {
+      if (action === 'seek') {
+        try {
+          const response = await fetchMotionOrigin()
+          if (response.data?.homeReference) {
+            syncMotionState({ motion: {
+              ...useTelemetryStore.getState().config.motion,
+              homeReference: response.data.homeReference,
+              ...(response.data.origin ? { origin: response.data.origin } : {}),
+              ...(response.data.workOriginOffset ? { workOriginOffset: response.data.workOriginOffset } : {}),
+            } })
+          }
+          await refreshMotionOriginStatus()
+        } catch (error) {
+          injectLog('WARNING', `机械参考状态刷新失败：${commandErrorMessage(error)}`, '[HAL]')
+        }
+      }
       setPendingMotionAction(null)
     }
   }
@@ -591,27 +656,32 @@ export function MotionCard({
     }
   }
  /** 处理对应的用户交互。 */
- const requestHome = () => {
-    const reason = controlSafetyBlockReason(useTelemetryStore.getState())
-    if (reason) {
-      injectLog('WARNING', `${operatorLabel}回硬件零点受阻：${reason}`, '[HAL]')
-      return
-    }
+ const requestReferenceAction = () => {
+    if (!referenceAction || selectedAxes.length === 0 || pendingMotionAction) return
+    if (referenceAction === 'return' && unconfirmedSelection.length > 0) return
+    const action = referenceAction
+    const axes = [...selectedAxes]
+    const seeking = action === 'seek'
+    const label = seeking ? '机械寻零' : '返回机械参考点'
     requestComparison({
-      title: `${operatorLabel}回硬件零点`,
+      title: `${operatorLabel}${label}`,
       tone: 'danger',
-      impact: `将通过 HAL 调用 ${operatorLabel} LTDMC HOME 回零流程；本动作不会写入工作原点记录。`,
-      expected: '确认前请确认工作区安全；确认后只移动硬件轴，不更改 homeReference、工作原点或软限位。',
+      impact: seeking
+        ? `仅对 ${axes.join('、')} 执行硬件寻零。全部所选轴完成并停稳后更新这些轴的参考；失败后所选轴保持待确认。`
+        : `仅将 ${axes.join('、')} 返回已确认的机械参考点，不寻零、不更新参考记录。`,
+      expected: seeking
+        ? '确认所选轴的整个寻零路径无遮挡。旋转轴可能沿寻零方向转较大角度，不能保证走最短路径。'
+        : '确认所选轴返回路径无遮挡。任一所选轴参考待确认、目标越限或旋转需超过180°时，整次拒绝返回。',
       current: [
         { label: '使能状态', value: motionStateText },
         { label: '当前位置', value: sidePositionsText || '--' },
       ],
       proposed: [
-        { label: '目标动作', value: '硬件HOME（不写入）' },
-        { label: '命令接口', value: 'motion.home_side' },
+        { label: '参与轴', value: axes.join('、') },
+        { label: seeking ? '参考更新范围' : '目标脉冲', value: seeking ? '仅所选轴' : axes.map((axis) => `${axis}: ${referencePulses[REFERENCE_AXES.indexOf(axis)]}`).join('；') },
       ],
-      confirmText: '确认回硬件零点',
-      onConfirm: handleHome,
+      confirmText: `确认${label}`,
+      onConfirm: () => handleReferenceAction(action, axes),
     })
   }
  /** 处理对应的用户交互。 */
@@ -742,15 +812,6 @@ export function MotionCard({
           </UiSpace>
         )}
         <UiSpace wrap className="motion-origin-actions">
-          <UiButton
-            icon={<RotateCcw size={15} />}
-            loading={pendingMotionAction === 'home'}
-            disabled={Boolean(controlBlockReason)}
-            title={controlBlockReason ?? undefined}
-            onClick={requestHome}
-          >
-            回硬件零点
-          </UiButton>
           {hardwareSide === 'left' && (
             <UiButton
               icon={<RefreshCw size={15} />}
@@ -762,6 +823,53 @@ export function MotionCard({
             </UiButton>
           )}
         </UiSpace>
+      </div>
+      <div className="motion-origin-panel">
+        <div className="hardware-subtitle-row"><b>机械参考点</b><span>逐轴确认，仅作用于所选轴</span></div>
+        <UiSpace wrap>
+          {REFERENCE_AXES.map((axis, index) => (
+            <UiTag key={axis} tone={confirmedAxes[index] === true ? 'success' : 'warning'}>
+              {axis}：{confirmedAxes[index] === true ? '已确认' : '待确认'}
+            </UiTag>
+          ))}
+        </UiSpace>
+        <UiSpace wrap className="motion-origin-actions">
+          <UiButton icon={<RotateCcw size={15} />} disabled={Boolean(controlBlockReason) || pendingMotionAction !== null}
+            title={controlBlockReason ?? undefined} onClick={() => openReferenceAction('return')}>
+            返回机械参考点
+          </UiButton>
+          <UiButton icon={<RefreshCw size={15} />} disabled={Boolean(controlBlockReason) || pendingMotionAction !== null}
+            title={controlBlockReason ?? undefined} onClick={() => openReferenceAction('seek')}>
+            机械寻零
+          </UiButton>
+        </UiSpace>
+        {referenceAction && (
+          <fieldset disabled={pendingMotionAction !== null}>
+            <legend>{referenceAction === 'seek' ? '维护：机械寻零选轴' : '返回机械参考点选轴'}</legend>
+            <UiSpace wrap>
+              {REFERENCE_AXES.map((axis) => (
+                <label key={axis}>
+                  <input type="checkbox" aria-label={axis} checked={selectedAxes.includes(axis)}
+                    onChange={(event) => setSelectedAxes(REFERENCE_AXES.filter((item) => item === axis ? event.target.checked : selectedAxes.includes(item)))} /> {axis}
+                </label>
+              ))}
+              <UiButton onClick={() => setSelectedAxes([...REFERENCE_AXES])}>全选六轴</UiButton>
+              <UiButton onClick={() => setSelectedAxes([])}>清空选择</UiButton>
+            </UiSpace>
+            <p>{referenceAction === 'seek'
+              ? '维护操作：所选轴会运动寻找原点信号，旋转轴可能转较大角度。'
+              : '日常返回：使用已确认的参考记录，不重新寻找原点信号。'}</p>
+            {referenceAction === 'return' && unconfirmedSelection.length > 0 && (
+              <p role="alert">待确认的所选轴：{unconfirmedSelection.join('、')}</p>
+            )}
+            <UiButton disabled={Boolean(controlBlockReason) || selectedAxes.length === 0 || (referenceAction === 'return' && unconfirmedSelection.length > 0)}
+              onClick={requestReferenceAction}>
+              {referenceAction === 'seek' ? '审阅寻零动作' : '审阅返回动作'}
+            </UiButton>
+            <UiButton onClick={() => { setReferenceAction(null); setSelectedAxes([]) }}>取消</UiButton>
+          </fieldset>
+        )}
+        <p role="status" aria-label={`${operatorLabel}原点操作状态`}>{referenceStatus || '尚未执行原点操作'}</p>
       </div>
       <AxisMappingTable
         side={hardwareSide}

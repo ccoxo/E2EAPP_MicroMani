@@ -209,6 +209,8 @@ ICF_HOME_REFERENCE_DEFAULTS: dict[str, Any] = {
     "valid": True,
     "leftValid": True,
     "rightValid": True,
+    "leftAxisConfirmed": [False] * 6,
+    "rightAxisConfirmed": [False] * 6,
     "leftPulse": list(ICF_WORK_ORIGIN_DEFAULTS["leftPulse"]),
     "rightPulse": list(ICF_WORK_ORIGIN_DEFAULTS["rightPulse"]),
     "updatedAt": ICF_WORK_ORIGIN_DEFAULTS["updatedAt"],

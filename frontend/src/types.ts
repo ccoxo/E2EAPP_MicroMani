@@ -297,6 +297,8 @@ export interface MotionHomeReferenceConfig {
   rightValid: boolean
   leftPulse: number[]
   rightPulse: number[]
+  leftAxisConfirmed: boolean[]
+  rightAxisConfirmed: boolean[]
   updatedAt: number
 }
 

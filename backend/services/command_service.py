@@ -121,8 +121,10 @@ class CommandService:
     async def _get_config_async(self) -> dict[str, Any]:
         return await asyncio.to_thread(self.settings.get_config)
 
-    async def _save_config_async(self, config: dict[str, Any], *, emit_log: bool = False) -> dict[str, Any]:
-        return await asyncio.to_thread(self.settings.save_config, config, emit_log=emit_log)
+    async def _save_config_async(self, config: dict[str, Any], *, emit_log: bool = False,
+                                 home_reference_update: bool = False) -> dict[str, Any]:
+        options = {"home_reference_update": True} if home_reference_update else {}
+        return await asyncio.to_thread(self.settings.save_config, config, emit_log=emit_log, **options)
 
     def _ensure_origin_mutation_allowed(self) -> None:
         if self._origin_mutation_locked():
@@ -144,7 +146,8 @@ class CommandService:
         if not isinstance(moving, list) or len(moving) != 12 or any(value is not False for value in moving):
             raise RuntimeError("operation requires confirmed stationary axes")
 
-    async def _confirm_work_origin(self, targets: dict[str, list[float]], requested_at: int, token) -> None:
+    async def _confirm_work_origin(self, targets: dict[str, list[float]], requested_at: int, token,
+                                   enabled_axes: list[bool] | None = None) -> None:
         """回原点应答后再等待新鲜的静止、到位反馈；未确认不能投影成功。"""
         deadline = time.monotonic() + 2.0
         while True:
@@ -158,7 +161,7 @@ class CommandService:
             confirmed = fresh and not state.get("estop_active", False) and isinstance(moving, list) and len(moving) == 12
             for side, target in targets.items():
                 offset = 0 if side == "left" else 6
-                confirmed = confirmed and all(moving[offset + axis] is False and abs(pulses[offset + axis] - target[axis]) <= WORK_ORIGIN_SETTLED_PULSE_TOLERANCE for axis in range(6))
+                confirmed = confirmed and all(moving[offset + axis] is False and abs(pulses[offset + axis] - target[axis]) <= WORK_ORIGIN_SETTLED_PULSE_TOLERANCE for axis in range(6) if enabled_axes is None or enabled_axes[axis])
             if confirmed:
                 return
             if time.monotonic() >= deadline:
@@ -397,28 +400,115 @@ class CommandService:
         return result
 
     @motion_operation("side")
-    async def home_motion_side(self, side: str) -> dict[str, object]:
+    async def return_hardware_reference_side(self, side: str, axes: list[str]) -> dict[str, object]:
+        self._validate_side(side)
+        token = self.safety.capture(side)
+        self.safety.check(token)
+        self._ensure_origin_mutation_allowed()
+        config = await self._get_config_async()
+        reference = self._normalized_home_reference(config)
+        if not axes or len(set(axes)) != len(axes) or any(axis not in AXIS_ORDER for axis in axes):
+            raise RuntimeError("invalid hardware reference return axes")
+        enabled_axes = [axis in axes for axis in AXIS_ORDER]
+        confirmed = cast(list[bool], reference[f"{side}AxisConfirmed"])
+        missing = [axis for index, axis in enumerate(AXIS_ORDER) if enabled_axes[index] and not confirmed[index]]
+        if missing:
+            raise RuntimeError(f"{side} hardware reference unconfirmed for {', '.join(missing)}; entire return refused")
+        target = cast(list[float], reference[f"{side}Pulse"])
+        await self._stop_manual_teleop_connect_before_motion_return()
+        self.safety.check(token)
+        state = await self._ensure_motion_return_allowed()
+        self.require_stationary_motion(state)
+        self._validate_motion_axes_enabled_for_work_origin(state, side, enabled_axes)
+        current = self._motion_state_pulses(state)
+        offset = 0 if side == "left" else 6
+        coefficients = motion_pulse_per_unit(config)
+        limits = effective_limits_ui(config, side)
+        for index, pulse in enumerate(target):
+            if not enabled_axes[index]:
+                continue
+            target_ui = pulse_to_ui(pulse, offset + index, coefficients[offset + index])
+            limit = limits[index]
+            if not all(math.isfinite(v) for v in (target_ui, limit.min, limit.max)) or not limit.min <= target_ui <= limit.max:
+                raise RuntimeError(f"{side} {AXIS_ORDER[index]} hardware reference exceeds soft limit")
+            delta_ui = pulse_to_ui(pulse - current[offset + index], offset + index, coefficients[offset + index])
+            # 不对旋转角取模；疑似跨圈/失效计数基准时整次拒绝，其他轴也不能先动。
+            if index >= 3 and abs(delta_ui) > 180.0:
+                raise RuntimeError(f"{side} {AXIS_ORDER[index]} hardware reference return exceeds 180 degrees; verify calibration")
+        self.safety.check(token)
+        requested_at = now_ms()
+        result = await self.hal.command("motion.return_home_reference", {
+            "side": side, "pulse": target, "enabledAxes": enabled_axes,
+        })
+        if self._real_hardware_mode(config) and result.get("response", {}).get("referenceReturnCompleted") is not True:
+            raise RuntimeError("HAL did not confirm hardware reference return completion; deploy matching HAL binaries")
+        await self._confirm_work_origin({side: target}, requested_at, token, enabled_axes)
+        self.logs.info("[HAL]", f"{side} returned to saved hardware reference; calibration unchanged")
+        return result
+
+    @motion_operation("side")
+    async def home_motion_side(self, side: str, axes: list[str] | None = None) -> dict[str, object]:
         self._validate_side(side)
         safety_token = self.safety.capture(side)
         self.safety.check(safety_token)
         self._ensure_origin_mutation_allowed()
+        await self._stop_manual_teleop_connect_before_motion_return()
         config = await self._get_config_async()
-        enabled_axes = self._home_enabled_axes(side, config)
+        if axes is not None and (not axes or len(set(axes)) != len(axes) or any(axis not in AXIS_ORDER for axis in axes)):
+            raise RuntimeError("invalid hardware home axes")
+        enabled_axes = [axis in axes for axis in AXIS_ORDER] if axes is not None else self._home_enabled_axes(side, config)
+        home_reference = self._normalized_home_reference(config)
+        pulse_key = f"{side}Pulse"
+        # 开始前持久化撤销所选轴的确认；失败、急停、断连不能保留旧成功标记。
+        confirmed = cast(list[bool], home_reference[f"{side}AxisConfirmed"])
+        for index, selected in enumerate(enabled_axes):
+            if selected:
+                confirmed[index] = False
+        config["motion"]["homeReference"] = home_reference
+        await self._save_config_async(config, emit_log=False, home_reference_update=True)
         self.safety.check(safety_token)
         result = await self.hal.command(
             "motion.home_side",
             {"side": side, "enabledAxes": enabled_axes},
         )
-        state = await self.hal.motion_state()
+        if self._real_hardware_mode(config) and result.get("response", {}).get("homeCompleted") is not True:
+            raise RuntimeError("HAL did not confirm hardware home completion; deploy matching HAL binaries")
+        completed_at = now_ms()
+        deadline = time.monotonic() + 2.0
+        while True:
+            self.safety.check(safety_token)
+            state = await self.hal.motion_state()
+            if state.get("estop_active"):
+                raise RuntimeError("emergency stop interrupted hardware home")
+            stamp = state.get("timestamp_ms", 0)
+            moving = state.get("moving")
+            offset = 0 if side == "left" else 6
+            if not self._real_hardware_mode(config) or (
+                isinstance(stamp, (int, float)) and completed_at <= stamp <= now_ms() + 100 and now_ms() - stamp <= 500
+                and isinstance(moving, list) and len(moving) == 12
+                and all(moving[offset + index] is False for index, selected in enumerate(enabled_axes) if selected)
+            ):
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("fresh stationary feedback missing after hardware home completion")
+            await asyncio.sleep(0.02)
         pulses = self._motion_state_pulses(state)
         origin = self._normalized_motion_origin(config)
-        home_reference = self._normalized_home_reference(config)
+        previous_origin_pulse = list(origin[pulse_key])
         work_origin_offset = self._normalized_work_origin_offset(config)
         updated_at = now_ms()
-        self._set_home_reference_side(home_reference, side, pulses, updated_at)
+        # 部分回零不能用未参与轴的当前位置覆盖它们原有的参考点。
+        offset = 0 if side == "left" else 6
+        for index, selected in enumerate(enabled_axes):
+            if not selected:
+                pulses[offset + index] = home_reference[pulse_key][index]
+        self._set_home_reference_side(home_reference, side, pulses, updated_at, enabled_axes)
         valid_key = "leftValid" if side == "left" else "rightValid"
         if bool(work_origin_offset.get(valid_key)):
             self._apply_home_reference_offset(origin, home_reference, work_origin_offset, side, updated_at)
+            for index, selected in enumerate(enabled_axes):
+                if not selected:
+                    origin[pulse_key][index] = previous_origin_pulse[index]
         config["motion"]["origin"] = origin
         config["motion"]["homeReference"] = home_reference
         config["motion"]["workOriginOffset"] = work_origin_offset
@@ -442,8 +532,8 @@ class CommandService:
                     f"{side} motion work origin invalidated after hardware zero refresh: {exc}",
                 )
         self.safety.check(safety_token)
-        saved = await self._save_config_async(config, emit_log=False)
-        self.telemetry.home_side(side)
+        saved = await self._save_config_async(config, emit_log=False, home_reference_update=True)
+        self.telemetry.home_side(side, enabled_axes)
         side_label = "left" if side == "left" else "right"
         self.logs.info("[HAL]", f"{side_label} motion hardware zero refreshed")
         return {
@@ -1512,6 +1602,11 @@ class CommandService:
         reference = raw_reference if isinstance(raw_reference, dict) else {}
         left_pulse = self._six_pulses(reference.get("leftPulse"))
         right_pulse = self._six_pulses(reference.get("rightPulse"))
+        def axis_confirmed(side: str) -> list[bool]:
+            raw = reference.get(f"{side}AxisConfirmed")
+            return [value is True for value in raw] if isinstance(raw, list) and len(raw) == 6 else [False] * 6
+        left_confirmed = axis_confirmed("left")
+        right_confirmed = axis_confirmed("right")
         left_valid = bool(reference.get("leftValid", reference.get("valid", False)))
         right_valid = bool(reference.get("rightValid", reference.get("valid", False)))
         updated_at = reference.get("updatedAt", 0)
@@ -1525,6 +1620,8 @@ class CommandService:
             "rightValid": right_valid,
             "leftPulse": left_pulse,
             "rightPulse": right_pulse,
+            "leftAxisConfirmed": left_confirmed,
+            "rightAxisConfirmed": right_confirmed,
             "updatedAt": updated_at,
         }
 
@@ -1555,11 +1652,16 @@ class CommandService:
         side: str,
         pulses: list[float],
         updated_at: int,
+        enabled_axes: list[bool],
     ) -> None:
         offset = 0 if side == "left" else 6
         pulse_key = "leftPulse" if side == "left" else "rightPulse"
         valid_key = "leftValid" if side == "left" else "rightValid"
         home_reference[pulse_key] = list(pulses[offset : offset + 6])
+        confirmed = cast(list[bool], home_reference[f"{side}AxisConfirmed"])
+        for index, selected in enumerate(enabled_axes):
+            if selected:
+                confirmed[index] = True
         home_reference[valid_key] = True
         home_reference["valid"] = bool(home_reference["leftValid"] and home_reference["rightValid"])
         home_reference["updatedAt"] = updated_at

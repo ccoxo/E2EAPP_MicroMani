@@ -23,6 +23,7 @@ HAL_COMMANDS: dict[str, HalCommandSpec] = {
     "motion.acknowledge_estop": HalCommandSpec("POST", "/motion/acknowledge_estop"),
     "motion.home_all": HalCommandSpec("POST", "/motion/home_all"),
     "motion.home_origin_side": HalCommandSpec("POST", "/motion/home_origin_side"),
+    "motion.return_home_reference": HalCommandSpec("POST", "/motion/return_home_reference"),
     "motion.enable_side": HalCommandSpec("POST", "/motion/enable_side"),
     "motion.disable_side": HalCommandSpec("POST", "/motion/disable_side"),
     "motion.home_side": HalCommandSpec("POST", "/motion/home_side"),
@@ -44,7 +45,7 @@ HAL_COMMANDS: dict[str, HalCommandSpec] = {
     "gripper.replay_target": HalCommandSpec("POST", "/gripper/replay_target"),
 }
 
-_LONG_RUNNING_COMMANDS = {"motion.home_all", "motion.home_origin_side", "motion.home_side"}
+_LONG_RUNNING_COMMANDS = {"motion.home_all", "motion.home_origin_side", "motion.home_side", "motion.return_home_reference"}
 # 仅只读和停止操作允许自动重试；未收到应答不代表运动、使能或确认未执行。
 _RETRY_SAFE_COMMANDS = {
     "hal.reconnect", "teleop.native.status", "motion.emergency_stop",
