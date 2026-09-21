@@ -1248,7 +1248,6 @@ function reportFromSavedEpisode(fallback: RecordQualityReport, episode?: RecordE
   if (!episode) return fallback
   const warnings = Array.isArray(episode.warnings) ? episode.warnings : fallback.warnings
   const drops = episode.cameraDrops ?? {}
-  const assessment = episode.qualityAssessment ?? fallback.qualityAssessment
   return {
     ...fallback,
     index: typeof episode.episodeIndex === 'number' ? episode.episodeIndex : fallback.index,
