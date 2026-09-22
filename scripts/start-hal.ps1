@@ -1,3 +1,8 @@
+﻿# 阅读导航 08｜启动、部署与工具
+# 职责：部署候选 HAL 二进制和依赖 DLL，绑定 HKVL 端口、注入力配置并启动健康检查。
+# 先看：Stop-ProcessTree → Stop-HalRuntimeProcessTrees → Promote-HalCandidate → Copy-RuntimeDllIfNewer。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 param(
   [int]$Port = 8091,
   [switch]$Restart
@@ -133,30 +138,15 @@ function Copy-RuntimeDllIfNewer {
   }
 }
 
-function Assert-HalBuildMatchesSource {
-  $sourceFiles = @(
-    Get-ChildItem -LiteralPath (Join-Path $repo "hal\src") -File -Include *.cpp,*.h -Recurse -ErrorAction SilentlyContinue
-    Get-ChildItem -LiteralPath (Join-Path $repo "hal\include") -File -Include *.cpp,*.h -Recurse -ErrorAction SilentlyContinue
-    Get-Item -LiteralPath (Join-Path $repo "hal\CMakeLists.txt"), (Join-Path $repo "hal\build_hal.cmd") -ErrorAction SilentlyContinue
-  )
-  $latestSource = $sourceFiles | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-  if ($null -eq $latestSource) {
-    return
-  }
-  foreach ($pair in @(
-    @($halExe, $halNextExe),
-    @($workerExe, $workerNextExe)
-  )) {
-    $target, $candidate = $pair
-    if (!(Test-Path -LiteralPath $target)) {
-      continue
-    }
-    $targetIsStale = (Get-Item -LiteralPath $target).LastWriteTimeUtc -lt $latestSource.LastWriteTimeUtc
-    $candidateIsFresh = (Test-Path -LiteralPath $candidate) -and
-      ((Get-Item -LiteralPath $candidate).LastWriteTimeUtc -ge $latestSource.LastWriteTimeUtc)
-    if ($targetIsStale -and !$candidateIsFresh) {
-      throw "HAL binary is older than native sources ($($latestSource.Name)); run hal\build_hal.cmd or an isolated CMake build, then deploy the resulting .next.exe files. Automatic compilation is disabled."
-    }
+function Assert-HalCapabilities {
+  param([object]$Health)
+
+  # 版本号不代表协议能力；旧程序可能使用相同版本号。
+  $missing = @("force_calibration_state_v1", "control_lease_v1" | Where-Object {
+      @($Health.capabilities) -cnotcontains $_
+    })
+  if ($missing.Count -gt 0) {
+    throw "HAL protocol capabilities missing: $($missing -join ', '). Rebuild and deploy both HalServer.exe and JodellGripperWorker.exe from the current branch."
   }
 }
 
@@ -189,12 +179,12 @@ if ($Restart) {
     Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
-Assert-HalBuildMatchesSource
-
 $existing = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
   Select-Object -ExpandProperty OwningProcess -First 1
 if ($existing) {
   if (!$Restart) {
+    $health = Invoke-RestMethod "http://127.0.0.1:$Port/health" -TimeoutSec 3
+    Assert-HalCapabilities -Health $health
     Write-Host "HAL already listening on 127.0.0.1:$Port, pid=$existing"
     exit 0
   }
@@ -379,7 +369,6 @@ $env:APPSTATION_FORCE_CONFIG_JSON = $forceRuntimeConfig | ConvertTo-Json -Compre
 $env:APPSTATION_HAL_PORT = "$Port"
 $env:APPSTATION_HAL_DDS_ENABLED = "1"
 if (-not $env:APPSTATION_DDS_DOMAIN_ID) { $env:APPSTATION_DDS_DOMAIN_ID = "42" }
-if (-not $env:APPSTATION_DDS_LAN_DISCOVERY) { $env:APPSTATION_DDS_LAN_DISCOVERY = "0" }
 $env:APPSTATION_JODELL_WORKER_EXE = "$workerRuntimeExe"
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 $process = Start-Process `
@@ -393,7 +382,9 @@ Start-Sleep -Seconds 2
 
 try {
   $health = Invoke-RestMethod "http://127.0.0.1:$Port/health" -TimeoutSec 3
+  Assert-HalCapabilities -Health $health
 } catch {
+  Stop-ProcessTree -RootPid $process.Id
   throw "HAL started pid=$($process.Id), but /health failed: $($_.Exception.Message)"
 }
 

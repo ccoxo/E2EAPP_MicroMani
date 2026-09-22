@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：封装 Jodell 夹爪配置、开口换算与隔离 worker 通信。
+ * 先看：JodellGripperDriver::configure → JodellGripperDriver::commandTarget → JodellGripperDriver::readPositionMm → JodellGripperDriver::targetMm。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "JodellGripperDriver.h"
 
 #include <algorithm>
@@ -181,8 +187,19 @@ bool JodellGripperDriver::commandTarget(
     int speed,
     int torque,
     std::string* message,
-    bool readPosition) {
+    bool readPosition,
+    const std::function<bool()>& commandAllowed) {
   std::scoped_lock lock(mutex_);
+  const auto cancelled = [&]() {
+    if (!commandAllowed || commandAllowed()) return false;
+    if (message) *message = "gripper command cancelled by emergency stop";
+    return true;
+  };
+  if (cancelled()) return false;
+  if (!std::isfinite(targetMm) || !std::isfinite(config_.strokeMm)) {
+    if (message) *message = "gripper target and stroke must be finite";
+    return false;
+  }
   if (!config_.enabled) {
     if (message) {
       *message = "native gripper teleop disabled";
@@ -207,6 +224,7 @@ bool JodellGripperDriver::commandTarget(
     std::ostringstream command;
     command << "COMMAND\t" << bounded << "\t" << safeSpeed << "\t" << safeTorque;
     std::string workerMessage;
+    if (cancelled()) return false;
     const bool ok = commandProcessWorkerUnlocked(index, command.str(), nullptr, &workerMessage);
     targetMm_[index] = bounded;
     if (!ok) {
@@ -238,6 +256,7 @@ bool JodellGripperDriver::commandTarget(
   }
 
 #ifdef _WIN32
+  if (cancelled()) return false;
   const int retEnable = clawEnable_(slave, 1);
   if (retEnable != 0 && retEnable != 1) {
     std::ostringstream out;
@@ -250,6 +269,7 @@ bool JodellGripperDriver::commandTarget(
   }
   // Jodell 原始位置 0 表示最大开口、255 表示闭合；HAL 对外使用毫米开口。
   const int raw = static_cast<int>(std::lround((stroke - bounded) / stroke * 255.0));
+  if (cancelled()) return false;
   const int retRun = runWithParam_(slave, raw, safeSpeed, safeTorque);
   targetMm_[index] = bounded;
   std::ostringstream out;

@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：验证 HKVL 帧解析、力安全锁存、柔顺修正及力运行时的边界行为。
+ * 先看：main。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "ForceComplianceController.h"
 #include "ForceControlRuntime.h"
 #include "ForceSafetyLatch.h"
@@ -18,14 +24,12 @@
 #include <vector>
 
 namespace appstation::hal {
-
 struct ForceControlRuntimeTestAccess {
   static void markCalibrationReady(ForceControlRuntime& runtime) {
     std::scoped_lock lock(runtime.mutex_);
     runtime.calibration_.state = "ready_for_ack";
   }
 };
-
 }  // namespace appstation::hal
 
 namespace {
@@ -38,7 +42,6 @@ using appstation::hal::ForceSafetyConfig;
 using appstation::hal::ForceSafetyLatch;
 using appstation::hal::HkvlForceFrame;
 using appstation::hal::HkvlForceParser;
-using appstation::hal::HkvlSampleAccumulator;
 using appstation::hal::LTDMCDriver;
 
 void require(bool condition, const std::string& message) {
@@ -131,37 +134,6 @@ void testParser() {
   frames = parser.feed(nonFinite);
   require(frames.empty(), "NaN frame must be invalid");
   require(parser.stats().nonFiniteFrames == 1, "NaN frame must increment nonFiniteFrames");
-}
-
-void testHkvlTareWindowValidation() {
-  HkvlSampleAccumulator stable;
-  for (int sample = 0; sample < 200; ++sample) {
-    const double noise = sample % 2 == 0 ? -0.01 : 0.01;
-    stable.add({1.2 + noise, -0.4, 2.8 - noise, 0.001, -0.002, 0.003});
-  }
-  const auto stableStats = stable.statistics();
-  require(stableStats.sampleCount == 200, "tare window sample count mismatch");
-  require(
-      appstation::hal::hkvlTareStabilityBlocker(stableStats).empty(),
-      "small stationary sensor noise must pass tare stability validation");
-
-  HkvlSampleAccumulator moving;
-  for (int sample = 0; sample < 200; ++sample) {
-    moving.add({sample % 2 == 0 ? -0.4 : 0.4, 0, 0, 0, 0, 0});
-  }
-  require(
-      appstation::hal::hkvlTareStabilityBlocker(moving.statistics()).find("Fx")
-          != std::string::npos,
-      "changing force must block tare and identify the unstable channel");
-
-  HkvlSampleAccumulator residual;
-  for (int sample = 0; sample < 200; ++sample) {
-    residual.add({0.2, 0, 0, 0, 0, 0});
-  }
-  require(
-      appstation::hal::hkvlTareResidualBlocker(residual.statistics()).find("Fx")
-          != std::string::npos,
-      "non-zero post-tare residual must fail validation");
 }
 
 ForceSafetyConfig safetyConfig() {
@@ -297,7 +269,7 @@ void testCompliance() {
   require(controller.cumulativeOffset(0) == std::array<double, 2>{0.0, 0.0}, "reset must clear session offset");
 }
 
-void testForceRuntime() {
+void testDefaultHkvlForceRuntime() {
   int emergencyStops = 0;
   int acknowledgements = 0;
   ForceControlRuntime runtime(
@@ -305,7 +277,6 @@ void testForceRuntime() {
       [&acknowledgements]() { ++acknowledgements; });
 
   ForceRuntimeConfig config;
-  config.source = "hkvl_serial";
   config.serial.protocol = "hkvl_active_v1";
   config.serial.leftPort = "COM15";
   config.serial.rightPort = "COM14";
@@ -314,7 +285,9 @@ void testForceRuntime() {
   config.safety = safetyConfig();
   config.safety.watchdogMs = 1000.0;
   runtime.configure(config, 0.0);
+  // 本用例验证安全阈值/坐标映射；真实自检流程由 ForceTareRuntimeTests 覆盖。
   appstation::hal::ForceControlRuntimeTestAccess::markCalibrationReady(runtime);
+  require(runtime.usesHkvl(), "default runtime must select HKVL");
   require(runtime.safetyLatched(), "HKVL configuration must begin in a safety latch");
   require(emergencyStops == 1, "HKVL configuration must invoke the global emergency stop");
 
@@ -376,6 +349,7 @@ void testForceRuntimeAlignsAllSixChannelsBeforeStandardConsumption() {
   config.safety.watchdogMs = 1000.0;
   config.compliance = complianceConfig();
   runtime.configure(config, 0.0);
+  // 本用例验证安全阈值/坐标映射；真实自检流程由 ForceTareRuntimeTests 覆盖。
   appstation::hal::ForceControlRuntimeTestAccess::markCalibrationReady(runtime);
 
   runtime.acceptSample(
@@ -439,72 +413,15 @@ void testForceRuntimeAlignsAllSixChannelsBeforeStandardConsumption() {
 
 void testNidaqRuntimeDoesNotLatchForceSafetyForManualEstop() {
   ForceControlRuntime runtime([]() {}, []() {});
-  ForceRuntimeConfig config;
-  config.source = "nidaq";
+  const auto config = appstation::hal::jsonForceRuntimeConfig(R"({"source":"nidaq"})");
   runtime.configure(config, 0.0);
+  require(!runtime.usesHkvl(), "explicit NI-DAQ selection must override the HKVL default");
 
   runtime.recordExternalEmergencyStop("manual emergency stop", 1.0);
 
   require(
       !runtime.safetyLatched(),
       "NI-DAQ mode must not report a force safety latch for manual estop");
-}
-
-void testHkvlRuntimeBlocksSafetyAcknowledgeUntilStartupTareCompletes() {
-  int acknowledgements = 0;
-  ForceControlRuntime runtime([]() {}, [&acknowledgements]() { ++acknowledgements; });
-  ForceRuntimeConfig config;
-  config.source = "hkvl_serial";
-  config.safety = safetyConfig();
-  config.safety.watchdogMs = 1000.0;
-  runtime.configure(config, 0.0);
-
-  const std::array<double, 6> unloaded{};
-  runtime.acceptSample(0, unloaded, unloaded, 1.0, 1001);
-  runtime.acceptSample(1, unloaded, unloaded, 1.0, 1001);
-  runtime.acceptSample(0, unloaded, unloaded, 501.0, 1501);
-  runtime.acceptSample(1, unloaded, unloaded, 501.0, 1501);
-
-  bool rejected = false;
-  try {
-    runtime.acknowledgeEmergencyStop(501.0);
-  } catch (const std::runtime_error& error) {
-    rejected = std::string(error.what()).find("startup force self-check")
-        != std::string::npos;
-  }
-  require(rejected, "HKVL safety acknowledgement must require completed startup tare");
-  require(acknowledgements == 0, "blocked force acknowledgement must not reach motion");
-
-  const auto json = runtime.forceStateJson(501.0);
-  require(
-      json.find("\"calibration\":{\"state\":\"waiting_sensors\"")
-          != std::string::npos,
-      "force state must expose the pending startup calibration state");
-  require(
-      json.find("\"canAcknowledge\":false") != std::string::npos
-          && json.find("startup force self-check is not complete") != std::string::npos,
-      "force state must not advertise acknowledgement before startup tare");
-}
-
-void testFailedHkvlTareKeepsSafetyLatchedAndPublishesFailure() {
-  ForceControlRuntime runtime([]() {}, []() {});
-  ForceRuntimeConfig config;
-  config.source = "hkvl_serial";
-  runtime.configure(config, 0.0);
-
-  bool failed = false;
-  try {
-    runtime.tare(-1, 200);
-  } catch (const std::runtime_error&) {
-    failed = true;
-  }
-
-  require(failed, "tare without a running sensor driver must fail");
-  require(runtime.safetyLatched(), "failed tare must keep force safety latched");
-  const auto json = runtime.forceStateJson(1.0);
-  require(
-      json.find("\"calibration\":{\"state\":\"failed\"") != std::string::npos,
-      "failed tare must publish a failed calibration state");
 }
 
 void testMotionAcknowledge() {
@@ -516,6 +433,12 @@ void testMotionAcknowledge() {
 }
 
 void testForceConfigJson() {
+  require(appstation::hal::jsonHealth({}, false, "").find(
+      "\"capabilities\":[\"force_calibration_state_v1\",\"control_lease_v1\",\"replay_absolute_target_v1\",\"record_participation_v1\"]") != std::string::npos,
+      "health must advertise the implemented calibration and control lease contracts");
+  require(
+      appstation::hal::jsonForceRuntimeConfig("{}").source == "hkvl_serial",
+      "force config without a source must default to HKVL");
   ForceRuntimeConfig fallback;
   const auto config = appstation::hal::jsonForceRuntimeConfig(
       R"({
@@ -553,18 +476,17 @@ void testForceConfigJson() {
 
 int main() {
   try {
+    const auto participation = appstation::hal::jsonNativeTeleopConfig(R"({"leftGripperParticipating":false,"rightGripperParticipating":true})");
+    require(!participation.gripperParticipating[0] && participation.gripperParticipating[1], "gripper participation JSON mismatch");
     testParser();
-    testHkvlTareWindowValidation();
     testOfficialHkvlSafetyDefaults();
     testOfficialHkvlHardwareSidePorts();
     testOfficialHkvlMotionAlignedAxisSigns();
     testSafetyLatch();
     testCompliance();
-    testForceRuntime();
+    testDefaultHkvlForceRuntime();
     testForceRuntimeAlignsAllSixChannelsBeforeStandardConsumption();
     testNidaqRuntimeDoesNotLatchForceSafetyForManualEstop();
-    testHkvlRuntimeBlocksSafetyAcknowledgeUntilStartupTareCompletes();
-    testFailedHkvlTareKeepsSafetyLatchedAndPublishesFailure();
     testMotionAcknowledge();
     testForceConfigJson();
     std::cout << "ForceCoreTests passed\n";

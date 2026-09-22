@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：声明TeleopMappingNode 的接口与状态结构；订阅主手状态，调用原生映射算法，再发布 HardwareTarget。
+ * 先看：TeleopMappingNode → Impl。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #pragma once
 
 #include <memory>

@@ -1,8 +1,15 @@
-import { Card, Tag } from 'antd'
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：显示录制期间各轴位姿和双侧力的数值与比例条。
+ * 先看：formatAxisValue → axisRatio → forceRatio → forceTone。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { memo, type CSSProperties } from 'react'
 import { AxisGroupChart, ForceChart } from '../Charts'
 import { useTelemetryStore } from '../../stores/telemetry'
+import { numberArrayEqual, useFrameField } from '../../stores/frameSelectors'
 import type { TelemetrySample } from '../../types'
+import { UiCard, UiTag } from '../ui'
 
 const axes = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'] as const
 const forceLabels = ['Fx', 'Fy', 'Fz', 'Mx', 'My', 'Mz'] as const
@@ -82,9 +89,9 @@ const ArmMonitor = memo(function ArmMonitor({
           <b>{title}</b>
           <span>运动轨迹 / 力觉实时趋势</span>
         </div>
-        <Tag color={dangerTone === 'danger' ? 'error' : dangerTone === 'warn' ? 'warning' : 'success'}>
+        <UiTag tone={dangerTone === 'danger' ? 'error' : dangerTone === 'warn' ? 'warning' : 'success'}>
           {dangerTone === 'danger' ? '风险' : dangerTone === 'warn' ? '注意' : '平稳'}
-        </Tag>
+        </UiTag>
       </div>
 
       <div className="record-arm-monitor-body">
@@ -148,17 +155,17 @@ const ArmMonitor = memo(function ArmMonitor({
 })
 /** 渲染当前界面单元，并连接所需数据。 */
 export default function RecordTelemetryPanel() {
-  const positions = useTelemetryStore((state) => state.frame.jointPositions)
-  const forceLeft = useTelemetryStore((state) => state.frame.forceLeft)
-  const forceRight = useTelemetryStore((state) => state.frame.forceRight)
+  const positions = useFrameField((frame) => frame.jointPositions, numberArrayEqual)
+  const forceLeft = useFrameField((frame) => frame.forceLeft, numberArrayEqual)
+  const forceRight = useFrameField((frame) => frame.forceRight, numberArrayEqual)
   const history = useTelemetryStore((state) => state.history)
 
   return (
-    <Card size="small" title="运动与力觉监看" styles={{ body: { padding: 8 } }}>
+    <UiCard title="运动与力觉监看" bodyStyle={{ padding: 8 }}>
       <div className="record-telemetry-grid">
         <ArmMonitor side="left" title="左臂" positions={positions} axisOffset={0} force={forceLeft} history={history} />
         <ArmMonitor side="right" title="右臂" positions={positions} axisOffset={6} force={forceRight} history={history} />
       </div>
-    </Card>
+    </UiCard>
   )
 }

@@ -1,3 +1,8 @@
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：验证 MJPEG 流选择、重载、待定状态与错误后的手动刷新。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { CameraPreview } from './CameraPreview'

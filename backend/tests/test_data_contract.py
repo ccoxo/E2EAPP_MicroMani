@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -14,6 +17,7 @@ from backend.core.data_contract import (
     validate_data_contract,
 )
 from backend.core.defaults import default_config
+from backend.core.motion_safety import MotionSafetyGate
 from backend.core.units import dataset_pulses_to_ui_state, motion_pulse_per_unit
 from backend.services.dataset_recorder import DatasetRecorderService
 
@@ -92,3 +96,59 @@ def test_native_dataset_with_current_contract_can_resume(tmp_path: Path) -> None
     recorder = object.__new__(DatasetRecorderService)
 
     assert recorder._dataset_contract_error(dataset_dir) == ""
+
+
+@pytest.mark.parametrize("metadata", [None, {"version": "future.v9"}, {"version": DATA_CONTRACT_VERSION}])
+def test_session_rejects_unknown_native_contract_before_starting_writer(tmp_path, monkeypatch, metadata) -> None:
+    dataset_dir = tmp_path / "dataset"
+    (dataset_dir / "meta").mkdir(parents=True)
+    info_path = dataset_dir / "meta" / "info.json"
+    info_path.write_text(json.dumps({"format": "lerobot-v3-native", "dataContract": metadata}), encoding="utf-8")
+    original = info_path.read_bytes()
+    config = default_config()
+    config["storage"]["datasetRoot"] = str(tmp_path)
+    recorder = object.__new__(DatasetRecorderService)
+    recorder.safety = MotionSafetyGate()
+    recorder._lock = asyncio.Lock()
+    recorder._session_active = False
+    recorder._session_starting = False
+    recorder.settings = SimpleNamespace(get_config=lambda: config)
+    recorder.validate_start_origin = AsyncMock()
+    writer = Mock(side_effect=AssertionError("不应启动写线程"))
+    monkeypatch.setattr("backend.services.dataset_recorder.LeRobotWriterThread", writer)
+
+    with pytest.raises(RuntimeError, match="dataset numeric channel order is not compatible"):
+        asyncio.run(recorder.start_session("dataset", "unit task"))
+
+    recorder.validate_start_origin.assert_awaited_once()
+    writer.assert_not_called()
+    assert recorder._session_starting is False
+    assert info_path.read_bytes() == original
+
+
+def test_native_writer_resumes_current_contract_without_recreating_dataset(tmp_path) -> None:
+    dataset_dir = tmp_path / "dataset"
+    (dataset_dir / "meta").mkdir(parents=True)
+    (dataset_dir / "meta" / "info.json").write_text(
+        json.dumps({"format": "lerobot-v3-native", "dataContract": data_contract_metadata(), "fps": 25}),
+        encoding="utf-8",
+    )
+    (dataset_dir / "meta" / "episodes.jsonl").write_text('{"id":"episode_000000"}\n', encoding="utf-8")
+    resumed = object()
+    native = SimpleNamespace(resume=Mock(return_value=resumed), create=Mock(side_effect=AssertionError("不应重建已有数据集")))
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._dataset_dir = dataset_dir
+    recorder._dataset_id = "dataset"
+    recorder._record_fps_hz = 30
+    recorder._recording_config = default_config
+    recorder._native_recording_requested = lambda: True
+    recorder._native_preflight = lambda: ""
+    recorder._native_imports = lambda: (native, None)
+    recorder._native_use_videos_requested = lambda: False
+    recorder._native_writer_kwargs = lambda: {}
+    recorder._configure_native_chunk_settings = lambda _dataset: None
+
+    assert recorder._open_native_dataset_for_writer() is resumed
+    native.resume.assert_called_once_with(repo_id="local/dataset", root=dataset_dir)
+    native.create.assert_not_called()
+    assert recorder._record_fps_hz == 25

@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 02｜前端契约与状态
+ * 职责：集中声明配置、遥测、录制、诊断与页面状态类型；与后端 schemas 对照阅读。
+ * 先看：ConnectionState → TelemetryLinkState → TelemetryLinkStatus → LogLevel。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 export type ConnectionState = 'ok' | 'warn' | 'error' | 'checking' | 'pending'
 
 export type TelemetryLinkState = 'connecting' | 'live' | 'stale' | 'offline'
@@ -116,19 +122,16 @@ export interface ForceStatus {
   sensorRawLeft?: number[]
   sensorRawRight?: number[]
   leftRightSkewMs?: number
-  sides?: {
-    left?: ForceSideStatus
-    right?: ForceSideStatus
-  }
   calibration?: {
     state?: 'not_required' | 'waiting_sensors' | 'checking_stability' | 'taring' | 'validating' | 'ready_for_ack' | 'ready' | 'failed' | string
     progress?: number
     reason?: string
     completedAtUnixMs?: number
-    sides?: {
-      left?: ForceCalibrationSideStatus
-      right?: ForceCalibrationSideStatus
-    }
+    sides?: { left?: ForceCalibrationSideStatus; right?: ForceCalibrationSideStatus }
+  }
+  sides?: {
+    left?: ForceSideStatus
+    right?: ForceSideStatus
   }
   safety?: {
     latched?: boolean
@@ -311,11 +314,6 @@ export interface MotionRelativeSoftLimitsConfig {
   right: ArmSoftLimitConfig
 }
 
-export interface MotionStartupHomeConfig {
-  enabled: boolean
-  mode: 'work_origin'
-}
-
 export type ManualControlSide = 'left' | 'right'
 export type ManualControlAxis = 'X' | 'Y' | 'Z' | 'Roll' | 'Pitch' | 'Yaw'
 export type ManualSpeedMode = 'fine' | 'medium' | 'coarse'
@@ -325,7 +323,7 @@ export type PicoVisionRotation = 'none' | 'cw90' | 'ccw90' | '180'
 export type Omega7StabilityMode = 'track' | 'hold' | 'off'
 export type TeleopControlMode = 'velocity_admittance' | 'incremental_position'
 
-export type RecorderPhase = 'idle' | 'starting' | 'recording' | 'reviewing' | 'resetting' | 'saving' | 'finishing'
+export type RecorderPhase = 'idle' | 'starting' | 'recording' | 'interrupted' | 'reviewing' | 'resetting' | 'saving' | 'discarding' | 'finishing'
 
 export interface EpisodeRecord {
   index: number
@@ -338,12 +336,60 @@ export interface EpisodeRecord {
   cameraDrops: { global: number; wristLeft: number; wristRight: number }
 }
 
+export interface RecordTrainingQualitySide {
+  hardwareSide?: 'left' | 'right'
+  startTranslationNormUm?: number
+  startRotationMaxMdeg?: number
+  startStateGripperMm?: number
+  startActionGripperMm?: number
+  firstSecondMinActionGripperMm?: number | null
+  endStateGripperMm?: number
+  endActionGripperMm?: number
+  translationRangeUm?: number[]
+  maxTranslationRangeUm?: number
+  actionGripperMinMm?: number
+  actionGripperMaxMm?: number
+}
+
+export interface RecordTrainingQuality {
+  version?: string
+  activeDatasetSides?: Array<'left' | 'right'>
+  sides?: Partial<Record<'left' | 'right', RecordTrainingQualitySide>>
+}
+
+export interface RecordQualityReason {
+  severity: 'accept' | 'review' | 'rerecord'
+  code: string
+  message: string
+}
+
+export interface RecordQualityAssessment {
+  version?: string
+  recommendation: 'accept' | 'review' | 'rerecord'
+  reasons: RecordQualityReason[]
+  lateRate?: number
+  cameraDropRates?: Partial<Record<'global' | 'wrist_left' | 'wrist_right', number>>
+}
+
 export interface RecordQualityReport extends EpisodeRecord {
   warnings: string[]
   passed: boolean
+  maxSkewMs?: number
+  cameraMinFps?: Partial<Record<'global' | 'wrist_left' | 'wrist_right', number>>
+  cameraWorkerFallbacks?: string[]
+  trainingQuality?: RecordTrainingQuality
+  qualityAssessment?: RecordQualityAssessment
+}
+
+export interface Participation {
+  version: 'appstation.participation.v1'
+  arms: Array<'left' | 'right'>
+  grippers: Array<'left' | 'right'>
 }
 
 export interface RecordSessionState {
+  participation?: Participation
+  startError: string | null
   datasetName: string
   task: string
   targetEpisodes: number
@@ -365,6 +411,7 @@ export interface RecordSessionState {
   resetReturnedSides: ManualControlSide[]
   resetReady: boolean
   returnOriginInFlight: boolean
+  forceTareActive: boolean
   speedMode: ManualSpeedMode
 }
 
@@ -424,6 +471,7 @@ export interface DatasetEpisodeMotionCalibrationApi {
 }
 
 export interface DatasetEpisodeApi {
+  participation?: Participation | null
   id: string
   name: string
   task: string
@@ -577,7 +625,6 @@ export interface AppConfig {
     homeReference: MotionHomeReferenceConfig
     workOriginOffset: MotionWorkOriginOffsetConfig
     relativeSoftLimits: MotionRelativeSoftLimitsConfig
-    homeOnStartup: MotionStartupHomeConfig
     leftProfile: ArmMotionProfile
     rightProfile: ArmMotionProfile
     leftSoftLimits: ArmSoftLimitConfig

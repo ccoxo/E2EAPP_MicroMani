@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：验证数据集列表先取元数据，选择 episode 后再加载详情样本。
+ * 先看：ok。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { DatasetApi, DatasetEpisodeApi } from './types'

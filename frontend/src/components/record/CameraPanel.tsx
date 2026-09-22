@@ -1,7 +1,13 @@
-import { Card, Tag } from 'antd'
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：组织录制页面的全局与双腕相机区域，复用相机预览组件。
+ * 先看：CameraSlotProps → CameraSlot → CameraPanel。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { useLiveCameraSnapshot } from '../../hooks/useLiveCameraSnapshot'
 import { useTelemetryStore } from '../../stores/telemetry'
 import type { AppConfig, CameraTelemetry } from '../../types'
+import { UiCard, UiTag } from '../ui'
 
 const cameraSpecs = {
   global: { label: '全局', title: '全局相机', model: 'IMX335' },
@@ -72,30 +78,30 @@ export default function CameraPanel() {
   const wristRightResolution = cameraResolution(config, 'wrist_right')
 
   return (
-    <Card size="small" title="相机预览" styles={{ body: { padding: 6 } }} style={{ flexShrink: 0 }}>
+    <UiCard title="相机预览" bodyStyle={{ padding: 6 }} style={{ flexShrink: 0 }}>
       <div className="record-camera-layout">
         <div className="record-camera-panel">
           <div className="record-camera-meta-row">
             <span>{cameraSpecs.global.title}</span>
-            <Tag>{globalResolution}</Tag>
+            <UiTag>{globalResolution}</UiTag>
           </div>
           <CameraSlot kind="global" camera={globalCamera} resolution={globalResolution} />
         </div>
         <div className="record-camera-panel">
           <div className="record-camera-meta-row">
             <span>{cameraSpecs.wrist_left.title}</span>
-            <Tag>{wristLeftResolution}</Tag>
+            <UiTag>{wristLeftResolution}</UiTag>
           </div>
           <CameraSlot kind="wrist_left" camera={wristLeftCamera} resolution={wristLeftResolution} />
         </div>
         <div className="record-camera-panel">
           <div className="record-camera-meta-row">
             <span>{cameraSpecs.wrist_right.title}</span>
-            <Tag>{wristRightResolution}</Tag>
+            <UiTag>{wristRightResolution}</UiTag>
           </div>
           <CameraSlot kind="wrist_right" camera={wristRightCamera} resolution={wristRightResolution} />
         </div>
       </div>
-    </Card>
+    </UiCard>
   )
 }

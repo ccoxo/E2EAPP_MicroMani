@@ -1,3 +1,8 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：查找并停止本项目后端、HAL、夹爪 worker 与前端相关进程树。
+# 先看：Stop-ProcessTree → Stop-BackendProcessTrees → Stop-HalRuntimeProcessTrees。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 $ErrorActionPreference = "Stop"
 $currentPid = $PID
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path

@@ -1,4 +1,8 @@
 @echo off
+rem 阅读导航 08｜启动、部署与工具
+rem 职责：使用 Windows C++ 工具链构建 HAL 和夹爪 worker，并处理候选二进制产物。
+rem 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 setlocal
 rem Enter the MSVC x64 environment before invoking cl/link directly.
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul
@@ -75,6 +79,9 @@ cl %CXX_FLAGS% /c "%SRC%\JodellGripperDriver.cpp" /Fo"JodellGripperDriver.next.o
 echo Compiling MotionControlThread.cpp ...
 cl %CXX_FLAGS% /c "%SRC%\MotionControlThread.cpp" /Fo"MotionControlThread.next.obj" || goto :err
 
+echo Compiling MotionExecutor.cpp ...
+cl %CXX_FLAGS% /c "%SRC%\MotionExecutor.cpp" /Fo"MotionExecutor.next.obj" || goto :err
+
 echo Compiling NativeTeleopController.cpp ...
 cl %CXX_FLAGS% /c "%SRC%\NativeTeleopController.cpp" /Fo"NativeTeleopController.next.obj" || goto :err
 
@@ -114,7 +121,7 @@ cl %CXX_FLAGS% /c "%SRC%\JodellGripperWorker.cpp" /Fo"JodellGripperWorker.next.o
 rem HalServer links motion, master-hand, gripper, the Winsock HTTP boundary, and optional Fast-DDS.
 echo Linking HalServer.next.exe ...
 link /nologo /OUT:"HalServer.next.exe" ^
-  HalServer.next.obj HalJson.next.obj HalCommandDispatcher.next.obj HalDdsControlServer.next.obj HalHttpServer.next.obj TeleopLeaderPublisher.next.obj TeleopMappingNode.next.obj TeleopHardwareTargetExecutor.next.obj TeleopFollowerTargetSubscriber.next.obj HkvlForceProtocol.next.obj HkvlForceDriver.next.obj ForceSafetyLatch.next.obj ForceComplianceController.next.obj ForceControlRuntime.next.obj LTDMCDriver.next.obj JodellGripperDriver.next.obj MotionControlThread.next.obj NativeTeleopController.next.obj Omega7Driver.next.obj ^
+  HalServer.next.obj HalJson.next.obj HalCommandDispatcher.next.obj HalDdsControlServer.next.obj HalHttpServer.next.obj TeleopLeaderPublisher.next.obj TeleopMappingNode.next.obj TeleopHardwareTargetExecutor.next.obj TeleopFollowerTargetSubscriber.next.obj HkvlForceProtocol.next.obj HkvlForceDriver.next.obj ForceSafetyLatch.next.obj ForceComplianceController.next.obj ForceControlRuntime.next.obj LTDMCDriver.next.obj JodellGripperDriver.next.obj MotionControlThread.next.obj MotionExecutor.next.obj NativeTeleopController.next.obj Omega7Driver.next.obj ^
   /LIBPATH:"%FASTDDS_ROOT%\Lib" ws2_32.lib iphlpapi.lib "%FASTDDS_ROOT%\Lib\fastrtps-2.14.lib" "%FASTDDS_ROOT%\Lib\fastcdr-2.2.lib" "%FASTDDS_ROOT%\Lib\foonathan_memory-0.7.3.lib" ^
   || goto :err
 

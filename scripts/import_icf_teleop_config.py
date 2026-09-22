@@ -1,3 +1,8 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：将参考 ICF INI 配置转换为当前运行配置，归一化侧别、轴权限和限位。
+# 先看：main → load_runtime_config → apply_icf_config → apply_gripper_config。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 # ruff: noqa: E402, I001
 

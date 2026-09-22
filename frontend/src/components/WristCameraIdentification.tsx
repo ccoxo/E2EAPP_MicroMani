@@ -1,97 +1,116 @@
-import { Alert, Button, Modal, Select, Space, Typography } from 'antd'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { bindWristCameras, identifyWristCameras, type WristCameraCandidate } from '../api'
 import { refreshCameraStream } from '../hooks/useLiveCameraSnapshot'
 import type { AppConfig } from '../types'
+import { UiButton, UiField, UiSelect, UiSpace, UiText } from './ui'
 
-export function WristCameraIdentification({ onSaved }: {
-  onSaved: (cameras: AppConfig['cameras']) => void
-}) {
+export function WristCameraIdentification({ onSaved }: { onSaved: (cameras: AppConfig['cameras']) => void }) {
   const [open, setOpen] = useState(false)
-  const [busy, setBusy] = useState(false)
+  const [busy, setBusy] = useState<'scan' | 'save' | null>(null)
   const [devices, setDevices] = useState<WristCameraCandidate[]>([])
-  const [left, setLeft] = useState<string>()
-  const [right, setRight] = useState<string>()
+  const [left, setLeft] = useState('')
+  const [right, setRight] = useState('')
   const [error, setError] = useState('')
-  const [result, setResult] = useState('')
+  const [notice, setNotice] = useState('')
+  const mounted = useRef(false)
+  const pending = useRef(false)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
+
   const scan = async () => {
+    if (pending.current) return
+    pending.current = true
     setOpen(true)
-    setBusy(true)
-    setError('')
+    setBusy('scan')
     setDevices([])
-    setLeft(undefined)
-    setRight(undefined)
+    setLeft('')
+    setRight('')
+    setError('')
+    setNotice('')
     try {
-      const response = await identifyWristCameras()
-      setDevices(response.data.devices)
+      const result = await identifyWristCameras()
+      if (mounted.current) setDevices(result.data.devices)
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '扫描失败，请重试')
+      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause))
     } finally {
-      setBusy(false)
+      pending.current = false
+      if (mounted.current) setBusy(null)
     }
   }
+
+  const selectable = devices.filter((device) => device.preview && !device.error)
+  const leftDevice = selectable.find((device) => device.devicePath === left)
+  const rightDevice = selectable.find((device) => device.devicePath === right)
+  const canSave = Boolean(leftDevice && rightDevice && left !== right && leftDevice.identity !== rightDevice.identity)
   const save = async () => {
-    if (!left || !right || left === right) return
-    setBusy(true)
+    if (pending.current || !canSave) return
+    pending.current = true
+    setBusy('save')
     setError('')
     try {
-      const response = await bindWristCameras(left, right)
-      onSaved(response.data.cameras)
+      const result = await bindWristCameras(left, right)
+      // 接口已落盘；这里只同步已保存状态，避免再次 PUT 整份旧配置。
+      onSaved(result.data.cameras)
       refreshCameraStream('wrist_left')
       refreshCameraStream('wrist_right')
-      setResult(response.data.connected ? '腕部相机绑定已保存，重连成功' : '绑定已保存，部分相机未连接，请检查采集状态')
-      setOpen(false)
+      if (mounted.current) {
+        setNotice(result.data.connected ? '腕部相机绑定已保存并重连' : `绑定已保存，重连未完成：${result.data.message}`)
+        setOpen(false)
+      }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '保存失败，请重试')
+      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause))
     } finally {
-      setBusy(false)
+      pending.current = false
+      if (mounted.current) setBusy(null)
     }
   }
+  const options = [
+    { value: '', label: '请选择相机' },
+    ...selectable.map((device) => ({ value: device.devicePath, label: `相机 ${device.index} · ${device.name}` })),
+  ]
+
   return (
-    <div style={{ gridColumn: '1 / -1' }}>
-      <Space wrap>
-        <Button onClick={() => void scan()}>重新识别腕部相机</Button>
-        <Typography.Text type="secondary">{result || '换 USB 插口后，通过画面重新指定左右腕相机。'}</Typography.Text>
-      </Space>
-      <Modal title="重新识别腕部相机" open={open} width={850}
-        onCancel={() => { if (!busy) setOpen(false) }}
-        closable={!busy} maskClosable={!busy}
-        footer={[
-          <Button key="scan" disabled={busy} onClick={() => void scan()}>重新扫描 / 刷新画面</Button>,
-          <Button key="cancel" disabled={busy} onClick={() => setOpen(false)}>取消</Button>,
-          <Button key="save" type="primary" loading={busy}
-            disabled={busy || !left || !right || left === right} onClick={() => void save()}>保存绑定并重连</Button>,
-        ]}>
-        <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-          <Typography.Text>请根据快照指定左腕和右腕。全局相机已排除；扫描期间请保持 USB 连接。</Typography.Text>
-          {error && <Alert type="error" message={error} />}
-          {busy && <Typography.Text role="status">正在处理相机，请稍候…</Typography.Text>}
-          {!busy && !error && devices.length < 2 && <Alert type="warning" message="可识别相机不足两台，请检查连接后重新扫描。" />}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 16 }}>
-            {devices.map((device, index) => (
-              <div key={device.devicePath}>
-                <Typography.Title level={5}>候选相机 {index + 1}</Typography.Title>
-                {device.preview
-                  ? <img src={device.preview} alt={'候选相机 ' + (index + 1)} style={{ width: '100%', aspectRatio: '4 / 3', objectFit: 'contain', background: '#111' }} />
-                  : <Alert type="warning" message="无法获取画面，请重新扫描" description={device.error} />}
+    <div style={{ marginBottom: 12 }}>
+      <UiSpace wrap>
+        <UiButton onClick={() => void scan()} disabled={busy !== null}>识别左右腕相机</UiButton>
+        <UiText secondary>查看候选画面后绑定左右腕；全局相机保持原绑定。</UiText>
+      </UiSpace>
+      {notice && <p role="status">{notice}</p>}
+      {open && (
+        <div className="ui-modal-mask" role="presentation">
+          <div className="ui-modal" role="dialog" aria-modal="true" aria-label="识别左右腕相机" style={{ width: 860, maxWidth: '95vw' }}>
+            <header className="ui-modal-head"><strong>识别左右腕相机</strong></header>
+            <div className="ui-modal-body">
+              <p>请根据画面选择实际安装在左腕、右腕的两台相机。识别期间请勿拔插设备。</p>
+              {busy === 'scan' && <p role="status">正在扫描并获取候选画面…</p>}
+              {error && <div className="ui-alert ui-alert-error" role="alert">{error}</div>}
+              {!busy && !error && devices.length === 0 && <p>未找到可识别的腕部相机，请检查连接和全局相机身份配置。</p>}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
+                {devices.map((device) => (
+                  <section key={device.devicePath}>
+                    <strong>相机 {device.index} · {device.name}</strong>
+                    {device.preview && !device.error ? (
+                      <img src={device.preview} alt={`候选相机 ${device.index}`} style={{ display: 'block', width: '100%' }} />
+                    ) : <p role="status">{device.error || '未取得画面'}</p>}
+                  </section>
+                ))}
               </div>
-            ))}
+              <UiSpace wrap align="start" style={{ marginTop: 16 }}>
+                <UiField label="左腕相机"><UiSelect value={left} options={options} disabled={busy !== null} onChange={setLeft} /></UiField>
+                <UiField label="右腕相机"><UiSelect value={right} options={options} disabled={busy !== null} onChange={setRight} /></UiField>
+              </UiSpace>
+              {left && right && !canSave && <p role="alert">左右腕必须选择两台不同的相机。</p>}
+            </div>
+            <div className="ui-modal-actions">
+              <UiButton disabled={busy !== null} onClick={() => setOpen(false)}>取消</UiButton>
+              <UiButton loading={busy === 'scan'} disabled={busy !== null} onClick={() => void scan()}>重新扫描</UiButton>
+              <UiButton variant="primary" loading={busy === 'save'} disabled={busy !== null || !canSave} onClick={() => void save()}>保存绑定</UiButton>
+            </div>
           </div>
-          <Space wrap>
-            {(['left', 'right'] as const).map((side) => (
-              <Select key={side} aria-label={side === 'left' ? '选择左腕相机' : '选择右腕相机'}
-                placeholder={side === 'left' ? '选择左腕相机' : '选择右腕相机'}
-                style={{ width: 220 }} disabled={busy}
-                value={side === 'left' ? left : right}
-                onChange={side === 'left' ? setLeft : setRight}
-                options={devices.map((device, index) => ({
-                  label: '候选相机 ' + (index + 1), value: device.devicePath,
-                  disabled: !device.preview || device.devicePath === (side === 'left' ? right : left),
-                }))} />
-            ))}
-          </Space>
-        </Space>
-      </Modal>
+        </div>
+      )}
     </div>
   )
 }

@@ -1,3 +1,10 @@
+import type { Participation } from '../types'
+/*
+ * 阅读导航 02｜前端契约与状态
+ * 职责：封装后端 HTTP 请求、错误信息、相机 URL 与页面生命周期命令。
+ * 先看：sendRuntimeLifecycleCommand → installRuntimeLifecycleOnClose → installRuntimeReleaseOnClose → installAutoShutdownOnClose。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { defaultConfig } from '../data'
 import type {
   AppConfig,
@@ -15,11 +22,57 @@ import type {
   MotionWorkOriginOffsetConfig,
   ParameterSnapshot,
   ParameterSnapshotScope,
+  RecordQualityAssessment,
+  RecordTrainingQuality,
 } from '../types'
 
 export const apiBase = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:18082'
 export const wsUrl = import.meta.env.VITE_WS_URL || 'ws://127.0.0.1:18082/ws'
 export const mockMode = import.meta.env.MODE === 'test'
+
+let controlCommandBlockedReason: () => string | null = () => null
+let forceSelfCheckBlockedReason: () => string | null = () => '力觉自检控制状态尚未就绪'
+let forceSelfCheckPending = false
+let controlCommandUncertain: (reason: string) => void = () => undefined
+let controlSessionId: () => string | null = () => null
+let returnOriginPending = false
+export function installControlSessionProvider(read: () => string | null) { controlSessionId = read }
+function commandHeaders() {
+  return { 'Content-Type': 'application/json', 'X-Control-Session': controlSessionId() ?? '' }
+}
+/** 注入只读门闩，避免 API 层反向依赖 Zustand；覆盖页面直接调用的控制入口。 */
+export function installControlCommandGuard(read: () => string | null) {
+  controlCommandBlockedReason = read
+}
+
+export function installForceSelfCheckGuard(read: () => string | null) {
+  forceSelfCheckBlockedReason = read
+}
+
+function isConfirmedForceSelfCheck(path: string, body: unknown): boolean {
+  return path === '/api/sensors/tare' && Boolean(body && typeof body === 'object'
+    && 'unloadedConfirmed' in body && body.unloadedConfirmed === true)
+}
+
+export function installControlCommandTimeoutHandler(handler: (reason: string) => void) {
+  controlCommandUncertain = handler
+}
+
+function commandRequiresSafetyClear(path: string, body: unknown): boolean {
+  if (/^\/api\/datasets\/[^/]+\/episodes\/[^/]+\/replay\/start$/.test(path)) return true
+  if (/^\/api\/motion\/(?:(left|right)\/)?origin\/(capture|restore_previous|clear)$/.test(path)) return true
+  if (/^\/api\/(sensors\/tare|force\/(left|right)\/tare)$/.test(path)) return true
+  if (/^\/api\/motion\/(manual_axis_move|home_all|(left|right)\/(enable_all|home|return_origin))$/.test(path)) return true
+  if (/^\/api\/gripper\/(left|right)\/command$/.test(path)) {
+    const command = body && typeof body === 'object' && 'command' in body ? body.command : undefined
+    return command !== 'stop' && command !== 'disable'
+  }
+  if (/^\/api\/teleop\/(clutch_toggle|(left|right)\/connect)$/.test(path)) return true
+  if (/^\/api\/teleop\/(left|right)\/gravity_compensation$/.test(path)) {
+    return !(body && typeof body === 'object' && 'enabled' in body && body.enabled === false)
+  }
+  return /^\/api\/(auto\/(start|action|dispatch_next)|record\/(session\/create|reset\/skip))$/.test(path)
+}
 
 const runtimeReleasePath = '/api/runtime/release_handles'
 const runtimeShutdownPath = '/api/runtime/shutdown'
@@ -29,7 +82,7 @@ let runtimeShutdownListenerInstalled = false
 function sendRuntimeLifecycleCommand(path: string, reason: string) {
   if (mockMode || typeof window === 'undefined') return
   const url = `${apiBase}${path}`
-  const body = JSON.stringify({ reason })
+  const body = JSON.stringify({ reason, controlSessionId: controlSessionId() })
   try {
     if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
       const blob = new Blob([body], { type: 'application/json' })
@@ -158,6 +211,9 @@ export interface FineTuneJobApi {
 }
 
 const localizedApiErrorMessages: Record<string, string> = {
+  DATASET_DIRECTORY_CONFLICT: '同名目录已包含非本应用数据集文件，请更换数据集名称。',
+  DATASET_CONTRACT_INCOMPATIBLE: '同名数据集的数据契约缺失或不兼容，无法续录，请更换数据集名称。',
+  DATASET_PARQUET_INVALID: '已有数据集的 Parquet 文件损坏、不完整或格式无效，无法续录。请更换数据集名称开始新录制，并保留原目录以便排查和恢复。',
   RECORDING_BUSY: '录制会话已在运行，请先结束当前会话后再开始新的录制。',
   WORK_ORIGIN_MISSING: '目标硬件臂工作原点未设置，请先在设置页记录工作原点后再连接遥操作。',
 }
@@ -251,16 +307,53 @@ export async function fetchHardwareStatus(): Promise<HardwareProbeStatus> {
 
 /** 发送或封装对应的后端命令。 */
 export async function postCommand(path: string, body?: unknown) {
-  if (mockMode) return { ok: true, path, body, ts: Date.now() }
   // 调用方可以传完整接口路径或短路径，这里统一规范成后端路由。
   const apiPath = path.startsWith('/api/') ? path : `/api${path.startsWith('/') ? path : `/${path}`}`
-  const response = await fetch(`${apiBase}${apiPath}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  if (!response.ok) throw await commandErrorFromResponse(response)
-  return response.json() as Promise<unknown>
+  const blocked = isConfirmedForceSelfCheck(apiPath, body) ? forceSelfCheckBlockedReason()
+    : commandRequiresSafetyClear(apiPath, body) ? controlCommandBlockedReason() : null
+  if (blocked) throw new Error(blocked)
+  const returningOrigin = /\/motion\/(home_all|(left|right)\/(home|return_origin))$/.test(apiPath)
+  if (returningOrigin && returnOriginPending) throw new Error('已有回原点操作进行中，请等待设备确认')
+  if (mockMode) return { ok: true, path, body, ts: Date.now() }
+  if (returningOrigin) returnOriginPending = true
+  const controller = new AbortController()
+  const timeoutMs = /\/motion\/(home_all|(left|right)\/(home|return_origin))$/.test(apiPath)
+    ? 80_000
+    : /\/cameras\/wrists\/(identify|bind)$/.test(apiPath) ? 60_000 : 10_000
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const exchange = async () => {
+    const response = await fetch(`${apiBase}${apiPath}`, {
+      method: 'POST',
+      headers: commandHeaders(),
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+    if (!response.ok) throw await commandErrorFromResponse(response)
+    const result: unknown = await response.json()
+    if (result && typeof result === 'object' && 'ok' in result && result.ok === false) {
+      throw new Error('message' in result && typeof result.message === 'string' ? result.message : '后端拒绝请求')
+    }
+    return result
+  }
+  try {
+    return await Promise.race([
+      exchange(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          const reason = '请求超时，执行结果未知；请重新连接核验，禁止自动重发运动'
+          controller.abort()
+          try {
+            if (commandRequiresSafetyClear(apiPath, body)) controlCommandUncertain(reason)
+          } finally {
+            reject(new Error(reason))
+          }
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    if (returningOrigin) returnOriginPending = false
+  }
 }
 
 /** Persist the full settings tree through the backend validator. */
@@ -268,7 +361,7 @@ export async function putConfig(config: AppConfig): Promise<AppConfig> {
   if (mockMode) return structuredClone(config)
   const response = await fetch(`${apiBase}/api/settings`, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+    headers: commandHeaders(),
     body: JSON.stringify(config),
   })
   if (!response.ok) throw new Error(`settings save failed: ${response.status}`)
@@ -279,7 +372,7 @@ export async function applyConfig(config?: AppConfig) {
   if (mockMode) return { ok: true, data: { config }, ts: Date.now() }
   const response = await fetch(`${apiBase}/api/settings/apply`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: commandHeaders(),
     body: config ? JSON.stringify(config) : undefined,
   })
   if (!response.ok) throw await commandErrorFromResponse(response)
@@ -307,7 +400,7 @@ export async function createParameterSnapshot(scope: ParameterSnapshotScope, nam
 /** 应用对应配置或状态。 */
 export async function applyParameterSnapshotApi(id: string) {
   if (mockMode) return { ok: true, data: {}, ts: Date.now() }
-  const response = await fetch(`${apiBase}/api/settings/snapshots/${encodeURIComponent(id)}/apply`, { method: 'POST' })
+  const response = await fetch(`${apiBase}/api/settings/snapshots/${encodeURIComponent(id)}/apply`, { method: 'POST', headers: commandHeaders() })
   if (!response.ok) throw new Error(`snapshot apply failed: ${response.status}`)
   return response.json() as Promise<{ ok: boolean; data?: { config?: AppConfig; snapshots?: ParameterSnapshot[] } }>
 }
@@ -333,18 +426,25 @@ export const reconnectCamera = (camera: CameraTelemetry['key']) =>
 /** 应用对应配置或状态。 */
 export const applyCameraTuning = (camera: CameraTelemetry['key'], config?: AppConfig) =>
   postCommand(`/cameras/${camera}/tuning/apply`, config)
+
 export interface WristCameraCandidate {
   index: number
   devicePath: string
+  identity: string
   name: string
   preview?: string
   error?: string
 }
-export const identifyWristCameras = () => postCommand('/cameras/wrists/identify') as Promise<{
-  data: { devices: WristCameraCandidate[] }
-}>
+
+export const identifyWristCameras = () =>
+  postCommand('/cameras/wrists/identify') as Promise<{
+    ok: boolean
+    data: { devices: WristCameraCandidate[] }
+  }>
+
 export const bindWristCameras = (left: string, right: string) =>
   postCommand('/cameras/wrists/bind', { left, right }) as Promise<{
+    ok: boolean
     data: { cameras: AppConfig['cameras']; connected: boolean; message: string }
   }>
 
@@ -494,10 +594,12 @@ export async function gripperCommand(side: ManualControlSide, command: ManualGri
 
 // 说明当前代码块的功能用途。
 /** 描述当前方法的功能边界。 */
-export const createSession = (datasetName: string, task: string) =>
-  postCommand('/record/session/create', { dataset_name: datasetName, task }) as Promise<RecordSessionCommandResponse>
+export const createSession = (datasetName: string, task: string, participation?: Participation) =>
+  postCommand('/record/session/create', { dataset_name: datasetName, task, ...(participation ? { participation } : {}) }) as Promise<RecordSessionCommandResponse>
 
 export interface RecordStatusApi {
+  participation?: Participation
+  safetyInterrupted?: boolean
   active?: boolean
   recording?: boolean
   datasetName?: string
@@ -535,7 +637,12 @@ export interface RecordEpisodeSaveApi {
   maxForceLeft?: number
   maxForceRight?: number
   cameraDrops?: Partial<Record<'global' | 'wrist_left' | 'wrist_right', number>>
+  cameraMinFps?: Partial<Record<'global' | 'wrist_left' | 'wrist_right', number>>
+  cameraWorkerFallbacks?: string[]
+  maxSkewMs?: number
   warnings?: string[]
+  trainingQuality?: RecordTrainingQuality
+  qualityAssessment?: RecordQualityAssessment
 }
 
 export interface SaveEpisodeResponse {
@@ -715,6 +822,16 @@ export async function deleteDatasetEpisodeApi(datasetId: string, episodeId: stri
 // 说明当前代码块的功能用途。
 /** 发送或封装对应的后端命令。 */
 export const tareForceSensors = () => postCommand('/sensors/tare')
+/** 仅在操作者明确确认双侧卸载后调用；结果等待 HAL 遥测核验，不自动 ACK。 */
+export async function runHkvlStartupSelfCheck() {
+  if (forceSelfCheckPending) throw new Error('双侧力觉自检正在进行，请等待结果')
+  forceSelfCheckPending = true
+  try {
+    return await postCommand('/sensors/tare', { unloadedConfirmed: true })
+  } finally {
+    forceSelfCheckPending = false
+  }
+}
 /** 发送或封装对应的后端命令。 */
 export const tareForceSensor = (side: ManualControlSide) => postCommand(`/force/${side}/tare`)
 

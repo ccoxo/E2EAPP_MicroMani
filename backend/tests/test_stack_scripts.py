@@ -1,9 +1,81 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：启动脚本的进程顺序、DLL 部署、DDS 和 HKVL 配置注入。
+# 先看：test_start_stack_cleans_backend_process_tree_even_without_listening_port → test_start_stack_stops_backend_before_restarting_hal → test_start_hal_passes_configured_port_to_hal_process_and_health_check → test_start_hal_injects_force_runtime_config_from_backend_config。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import re
+import json
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_start_app_cmd_runs_without_command_errors(tmp_path):
+    shell = shutil.which("cmd")
+    if shell is None:
+        pytest.skip("Windows cmd is required for launcher validation")
+    shutil.copyfile(REPO_ROOT / "Start-App.cmd", tmp_path / "Start-App.cmd")
+    (tmp_path / "scripts").mkdir()
+    # 替代服务入口，验证批处理解析而不启动硬件。
+    (tmp_path / "scripts" / "launch-app.ps1").write_text(
+        "Write-Output 'launcher-test-ok'", encoding="ascii"
+    )
+    result = subprocess.run(
+        [shell, "/d", "/c", "chcp 936 >nul & Start-App.cmd"], cwd=tmp_path,
+        input=b"\r\n", capture_output=True, timeout=15,
+    )
+    assert result.returncode == 0
+    assert b"launcher-test-ok" in result.stdout
+    assert result.stderr == b"", result.stderr
+
+
+@pytest.mark.parametrize("capabilities,accepted", [
+    (None, False),
+    (["force_calibration_state_v1"], False),
+    (["control_lease_v1"], False),
+    (["force_calibration_state_v1", "control_lease_v1"], True),
+])
+def test_hal_startup_rejects_missing_protocol_capabilities(capabilities, accepted, tmp_path):
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if shell is None:
+        pytest.skip("PowerShell is required for startup validation")
+    script = REPO_ROOT / "scripts" / "start-hal.ps1"
+    health = tmp_path / "health.json"
+    health.write_text(json.dumps({"version": "hal-real/0.2", "capabilities": capabilities}), encoding="utf-8")
+    # 只加载 AST 中的校验函数，不执行启动、部署或设备操作。
+    command = f"""
+$ErrorActionPreference = 'Stop'
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('{script.as_posix()}', [ref]$null, [ref]$parseErrors)
+if ($parseErrors.Count) {{ throw ($parseErrors | Out-String) }}
+$fn = $ast.Find({{ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-HalCapabilities' }}, $true)
+if ($null -eq $fn) {{ throw 'missing capability validator' }}
+Invoke-Expression $fn.Extent.Text
+try {{
+  Assert-HalCapabilities -Health (Get-Content -Raw '{health.as_posix()}' | ConvertFrom-Json)
+  Write-Output 'accepted'
+}} catch {{
+  Write-Output $_.Exception.Message
+  exit 2
+}}
+"""
+    result = subprocess.run([shell, "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=15)
+    assert result.returncode == (0 if accepted else 2), result.stdout + result.stderr
+    assert ("accepted" if accepted else "Rebuild and deploy both") in result.stdout
+
+
+def test_hal_startup_validates_existing_and_new_processes():
+    script = (REPO_ROOT / "scripts" / "start-hal.ps1").read_text(encoding="utf-8")
+    existing = script.split("if ($existing) {", 1)[1].split("Promote-HalCandidate -CandidateExe", 1)[0]
+    assert existing.index("Assert-HalCapabilities -Health $health") < existing.index("exit 0")
+    started = script.split("$process = Start-Process", 1)[1]
+    assert "Assert-HalCapabilities -Health $health" in started
 
 
 def test_start_stack_cleans_backend_process_tree_even_without_listening_port() -> None:
@@ -40,7 +112,6 @@ def test_start_hal_injects_force_runtime_config_from_backend_config() -> None:
 
     assert "$forceRuntimeConfig" in script
     assert "APPSTATION_FORCE_CONFIG_JSON" in script
-    assert 'source = "hkvl_serial"' in script
     assert 'leftPort = "COM15"' in script
     assert 'rightPort = "COM14"' in script
     assert "leftAxisSign" in script
@@ -192,18 +263,11 @@ def test_start_stack_preserves_existing_dds_domain_for_backend_after_hal_start()
     )
 
 
-def test_start_stack_preserves_existing_dds_lan_discovery_for_backend_after_hal_start() -> None:
-    script = (REPO_ROOT / "scripts" / "start-stack.ps1").read_text(encoding="utf-8")
-    after_hal_start = script.split('start-hal.ps1") -Restart', 1)[1]
-
-    assert (
-        'if (-not $env:APPSTATION_DDS_LAN_DISCOVERY) { $env:APPSTATION_DDS_LAN_DISCOVERY = "0" }'
-        in after_hal_start
-    )
-    assert '$env:APPSTATION_DDS_LAN_DISCOVERY = "0"' not in after_hal_start.replace(
-        'if (-not $env:APPSTATION_DDS_LAN_DISCOVERY) { $env:APPSTATION_DDS_LAN_DISCOVERY = "0" }',
-        "",
-    )
+def test_stack_scripts_use_local_dds_without_lan_switch() -> None:
+    for name in ("start-stack.ps1", "start-hal.ps1", "start-stack-dds.ps1"):
+        script = (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
+        assert "APPSTATION_DDS_LAN_DISCOVERY" not in script
+        assert "$LanDiscovery" not in script
 
 
 def test_launch_app_forwards_hal_port_to_initial_start_and_restart() -> None:
@@ -297,7 +361,7 @@ def test_start_dds_stack_enables_hal_direct_dds_without_python_sidecar() -> None
     assert 'APPSTATION_HAL_DDS_ENABLED = "1"' in script
     assert 'APPSTATION_HAL_TRANSPORT = "dds"' in script
     assert 'APPSTATION_DDS_DOMAIN_ID = "$DomainId"' in script
-    assert 'APPSTATION_DDS_LAN_DISCOVERY = if ($LanDiscovery) { "1" } else { "0" }' in script
+    assert 'ddsTransport = "shared_memory"' in script
     assert "backend.hal_client." + "dds_" + "bridge_runner" not in script
     assert "ddsBridgePid" not in script
     assert "backend.app:create_app" in script

@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 08｜启动、部署与工具
+ * 职责：用本地 HTTP 服务提供构建后的 dist 文件，并处理前端路由回退。
+ * 先看：safePath → sendFile。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { createReadStream, existsSync, statSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { createServer } from 'node:http'

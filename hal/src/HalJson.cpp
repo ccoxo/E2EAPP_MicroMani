@@ -1,4 +1,10 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：集中完成 HAL 状态序列化和配置/命令 JSON 字段解析。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "HalJson.h"
+#include "HalVersion.h"
 
 #include <algorithm>
 #include <cctype>
@@ -6,8 +12,6 @@
 #include <cstdlib>
 #include <sstream>
 #include <stdexcept>
-
-#include "HalVersion.h"
 
 namespace appstation::hal {
 
@@ -59,8 +63,12 @@ std::string jsonHealth(const appstation::hal::HalHealth& motionHealth, bool omeg
       << ",\"omega7_ok\":" << (omegaOk ? "true" : "false")
       << ",\"version\":\"" << motionHealth.version << "\""
       << ",\"uptime_s\":" << motionHealth.uptimeS
-      << ",\"capabilities\":[\"" << kHalCapabilityForceCalibrationState << "\"]"
-      << ",\"message\":\"" << jsonEscape(message) << "\"}";
+      << ",\"capabilities\":[";
+  for (size_t index = 0; index < kHalCapabilities.size(); ++index) {
+    if (index > 0) out << ",";
+    out << "\"" << jsonEscape(kHalCapabilities[index]) << "\"";
+  }
+  out << "],\"message\":\"" << jsonEscape(message) << "\"}";
   return out.str();
 }
 
@@ -790,6 +798,8 @@ appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& bo
       static_cast<int>(jsonNumberValue(body, "continuousMicroConfirmTicks", config.continuousMicroConfirmTicks));
 
   config.gripperTeleopEnabled = jsonBoolValue(body, "gripperTeleopEnabled", config.gripperTeleopEnabled);
+  config.gripperParticipating[0] = jsonBoolValue(body, "leftGripperParticipating", true);
+  config.gripperParticipating[1] = jsonBoolValue(body, "rightGripperParticipating", true);
   config.gripper.ports[0] = jsonStringValueOr(body, "leftPort", "COM8");
   config.gripper.ports[1] = jsonStringValueOr(body, "rightPort", "COM9");
   config.gripper.slaveIds[0] = static_cast<int>(jsonNumberValue(body, "leftSlaveId", 10));

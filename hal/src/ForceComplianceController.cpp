@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：根据力反馈计算柔顺位移，限制单步与累计修正，并接受实际执行量反馈。
+ * 先看：ForceComplianceController::configure → ForceComplianceController::correction → ForceComplianceController::commit → ForceComplianceController::reset。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "ForceComplianceController.h"
 
 #include <algorithm>

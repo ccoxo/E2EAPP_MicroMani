@@ -1,8 +1,15 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：连接 HKVL 采样、安全锁存和柔顺控制，管理监控线程与急停/确认回调。
+ * 先看：ForceControlRuntime::configure → ForceControlRuntime::config → ForceControlRuntime::start → ForceControlRuntime::stop。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "ForceControlRuntime.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -60,9 +67,14 @@ double forceMonotonicMilliseconds() {
 
 ForceControlRuntime::ForceControlRuntime(
     EmergencyStopCallback emergencyStop,
-    AcknowledgeCallback acknowledge)
+    AcknowledgeCallback acknowledge,
+    HkvlForceDriver::ReadLoop readLoop,
+    std::function<void()> monitorTick,
+    WorkerLauncher launcher)
     : emergencyStop_(std::move(emergencyStop)),
-      acknowledge_(std::move(acknowledge)) {}
+      acknowledge_(std::move(acknowledge)),
+      monitorTick_(std::move(monitorTick)), launcher_(launcher),
+      driver_(std::move(readLoop), std::move(launcher)) {}
 
 ForceControlRuntime::~ForceControlRuntime() {
   stop();
@@ -71,15 +83,25 @@ ForceControlRuntime::~ForceControlRuntime() {
 void ForceControlRuntime::configure(
     const ForceRuntimeConfig& config,
     double nowMonotonicMs) {
+  std::scoped_lock lifecycleLock(lifecycleMutex_);
   validateConfig(config);
   const bool restart = running();
   std::optional<ForceSafetyTrip> pendingTrip;
-  if (restart) {
-    stop();
-  }
+  stop();
   {
     std::scoped_lock lock(mutex_);
     config_ = config;
+    emergencyCallbackFailed_.store(false);
+    emergencyCallbackError_.clear();
+    workerFailed_.store(false);
+    workerError_.clear();
+    ++tareEpoch_;
+    tareInProgress_ = false;
+    calibration_ = {};
+    if (config.source == "hkvl_serial") {
+      calibration_.state = "waiting_sensors";
+      calibration_.reason = "operator must confirm both sensors are unloaded";
+    }
     safety_.configure(config.safety, nowMonotonicMs);
     if (config.source == "hkvl_serial") {
       pendingTrip = safety_.latchExternal(
@@ -94,11 +116,6 @@ void ForceControlRuntime::configure(
     hasSample_ = {false, false};
     lastCompliance_ = {};
     lastComplianceActualUm_ = {};
-    calibration_ = {};
-    if (config.source == "hkvl_serial") {
-      calibration_.state = "waiting_sensors";
-      calibration_.reason = "operator must confirm both sensors are unloaded";
-    }
   }
   invokeEmergencyStopIfNeeded(pendingTrip);
   if (restart) {
@@ -112,6 +129,9 @@ ForceRuntimeConfig ForceControlRuntime::config() const {
 }
 
 void ForceControlRuntime::start() {
+  std::scoped_lock lifecycleLock(lifecycleMutex_);
+  if (workerFailed_.load()) throw std::runtime_error("force worker failure requires reconfiguration before restart");
+  if (!running() && monitor_.joinable()) monitor_.join();
   if (running_.exchange(true, std::memory_order_acq_rel)) {
     return;
   }
@@ -123,19 +143,39 @@ void ForceControlRuntime::start() {
   if (current.source != "hkvl_serial") {
     return;
   }
-  driver_.start(current.serial, [this](const HkvlDriverSample& sample) {
-    acceptSample(
-        sample.side,
-        sample.tared,
-        sample.filtered,
-        sample.monotonicMs,
-        sample.unixMs);
-  });
-  monitor_ = std::thread([this]() { monitorLoop(); });
+  try {
+    driver_.start(current.serial, [this](const HkvlDriverSample& sample) {
+      acceptSample(sample.side, sample.tared, sample.filtered, sample.monotonicMs, sample.unixMs);
+    }, [this](int, const char* error) { reportWorkerFailure(error); });
+    if (workerFailed_.load()) throw std::runtime_error("force serial reader failed during startup");
+    monitor_ = launchWorker(launcher_, [this]() {
+      runWorkerBoundary([this]() { monitorLoop(); }, [this](const char* error) { reportWorkerFailure(error); });
+    });
+  } catch (...) {
+    reportWorkerFailure("force worker startup failed");
+    stop();
+    throw;
+  }
 }
 
 void ForceControlRuntime::stop() {
-  running_.store(false, std::memory_order_release);
+  std::scoped_lock lifecycleLock(lifecycleMutex_);
+  const bool wasRunning = running_.exchange(false, std::memory_order_acq_rel);
+  std::optional<ForceSafetyTrip> pendingTrip;
+  {
+    std::scoped_lock lock(mutex_);
+    ++tareEpoch_;
+    if (config_.source == "hkvl_serial") {
+      if (wasRunning) {
+        pendingTrip = safety_.latchExternal("force_acquisition_stopped", forceMonotonicMilliseconds());
+      }
+      calibration_ = {};
+      calibration_.state = "waiting_sensors";
+      calibration_.reason = "force acquisition stopped; repeat startup force self-check";
+      tareInProgress_ = false;
+    }
+  }
+  invokeEmergencyStopIfNeeded(pendingTrip);
   driver_.stop();
   if (monitor_.joinable()) {
     monitor_.join();
@@ -178,8 +218,14 @@ void ForceControlRuntime::acceptSample(
     latestMonotonicMs_[side] = monotonicMs;
     latestUnixMs_[side] = unixMs;
     hasSample_[side] = true;
+    // 安全阈值使用方向校准后的去皮值，柔顺计算另用滤波值，避免低通滤波延迟削弱超限检测。
     trip = safety_.onSample(side, alignedTared, monotonicMs);
+    if (tareInProgress_ && calibration_.epoch == tareEpoch_) {
+      const auto tareTrip = tareSafety_.onSample(side, alignedTared, monotonicMs);
+      if (tareTrip.has_value()) trip = tareTrip;
+    }
     if (trip.has_value()) {
+      ++tareEpoch_;
       compliance_.reset();
       lastCompliance_ = {};
       lastComplianceActualUm_ = {};
@@ -196,7 +242,12 @@ void ForceControlRuntime::checkSafety(double nowMonotonicMs) {
       return;
     }
     trip = safety_.checkWatchdog(nowMonotonicMs);
+    if (tareInProgress_ && calibration_.epoch == tareEpoch_) {
+      const auto tareTrip = tareSafety_.checkWatchdog(nowMonotonicMs);
+      if (tareTrip.has_value()) trip = tareTrip;
+    }
     if (trip.has_value()) {
+      ++tareEpoch_;
       compliance_.reset();
       lastCompliance_ = {};
       lastComplianceActualUm_ = {};
@@ -211,6 +262,7 @@ void ForceControlRuntime::recordExternalEmergencyStop(
   std::optional<ForceSafetyTrip> trip;
   {
     std::scoped_lock lock(mutex_);
+    ++tareEpoch_;
     if (config_.source == "hkvl_serial") {
       trip = safety_.latchExternal(reason, nowMonotonicMs);
     }
@@ -222,69 +274,103 @@ void ForceControlRuntime::recordExternalEmergencyStop(
 }
 
 void ForceControlRuntime::acknowledgeEmergencyStop(
-    double nowMonotonicMs) {
+    double nowMonotonicMs,
+    AcknowledgeCallback acknowledge) {
   std::scoped_lock lock(mutex_);
+  if (emergencyCallbackFailed_.load()) {
+    throw std::runtime_error("force emergency-stop callback failed; diagnose and reconfigure before acknowledgement");
+  }
+  if (workerFailed_.load()) throw std::runtime_error("force worker failed; reconfigure before acknowledgement");
   if (config_.source == "hkvl_serial") {
-    if (calibration_.state != "ready_for_ack"
-        && calibration_.state != "ready") {
+    if (calibration_.state != "ready_for_ack" && calibration_.state != "ready") {
       throw std::runtime_error("startup force self-check is not complete");
     }
+    std::string blocker;
+    if (!safety_.canAcknowledge(nowMonotonicMs, &blocker)) {
+      throw std::runtime_error(blocker);
+    }
+  }
+  // 先确认同一运动急停代际；若其已更新，力锁存也必须保留。
+  const auto& callback = acknowledge ? acknowledge : acknowledge_;
+  if (callback) callback();
+  if (config_.source == "hkvl_serial") {
     safety_.acknowledge(nowMonotonicMs);
+    calibration_.state = "ready";
   }
   compliance_.reset();
   lastCompliance_ = {};
   lastComplianceActualUm_ = {};
-  // Keep this lock until motion acknowledgement completes so a new force trip cannot race it.
-  if (acknowledge_) {
-    acknowledge_();
-  }
-  if (config_.source == "hkvl_serial") {
-    calibration_.state = "ready";
-  }
+  // 上述运动确认和力锁存确认共用此锁，新力事件只能在二者完成后进入。
 }
 
 bool ForceControlRuntime::safetyLatched() const {
   std::scoped_lock lock(mutex_);
-  return safety_.latched();
+  return workerFailed_.load() || safety_.latched();
 }
 
-std::string ForceControlRuntime::tare(int side, int sampleCount) {
-  if (!usesHkvl()) {
-    throw std::runtime_error("force.tare is only available for hkvl_serial");
+std::string ForceControlRuntime::tare(int side, int sampleCount, std::function<bool()> commandAllowed) {
+  std::unique_lock operationLock(tareMutex_, std::try_to_lock);
+  if (!operationLock.owns_lock()) throw std::runtime_error("force self-check is already running");
+  if (side != -1) throw std::runtime_error("HKVL startup force self-check requires side=all");
+  if (sampleCount < kHkvlTareMinSamples || sampleCount > kHkvlTareMaxSamples) {
+    throw std::runtime_error("invalid HKVL tare sample count; expected 200..1000");
   }
-  if (side != -1) {
-    throw std::runtime_error("HKVL startup force self-check requires side=all");
-  }
+  std::uint64_t epoch;
   std::optional<ForceSafetyTrip> pendingTrip;
   {
     std::scoped_lock lock(mutex_);
-    pendingTrip = safety_.latchExternal(
-        "force_tare_pending",
-        forceMonotonicMilliseconds());
+    if (config_.source != "hkvl_serial") {
+      throw std::runtime_error("force.tare is only available for hkvl_serial");
+    }
+    if (workerFailed_.load() || emergencyCallbackFailed_.load()) {
+      throw std::runtime_error("force worker or emergency-stop callback failed; reconfigure before self-check");
+    }
+    if (commandAllowed && !commandAllowed()) throw std::runtime_error("HKVL tare cancelled by emergency stop");
+    epoch = ++tareEpoch_;
+    pendingTrip = safety_.latchExternal("force_tare_pending", forceMonotonicMilliseconds());
     compliance_.reset();
     lastCompliance_ = {};
     lastComplianceActualUm_ = {};
+    calibration_ = {};
+    calibration_.epoch = epoch;
     calibration_.state = "checking_stability";
     calibration_.progress = 5;
-    calibration_.reason.clear();
-    calibration_.hasResult = false;
+    tareSafety_.configure(config_.safety, forceMonotonicMilliseconds());
+    for (int index = 0; index < 2; ++index) {
+      if (hasSample_[index]) {
+        tareSafety_.onSample(index, latestTared_[index], latestMonotonicMs_[index]);
+      }
+    }
+    tareInProgress_ = true;
   }
   invokeEmergencyStopIfNeeded(pendingTrip);
+  const auto allowed = [&]() {
+    return tareEpoch_ == epoch && !tareSafety_.latched()
+        && !workerFailed_.load() && !emergencyCallbackFailed_.load()
+        && (!commandAllowed || commandAllowed());
+  };
   try {
-    const auto result = driver_.tare(
-        side,
-        sampleCount,
-        std::chrono::milliseconds(2000),
-        [this](const std::string& state, int progress) {
+    const auto result = driver_.tare(side, sampleCount, std::chrono::milliseconds(kHkvlTareWindowTimeoutMs),
+        [&](const std::function<void()>& commit) {
           std::scoped_lock lock(mutex_);
+          if (!allowed()) return false;
+          commit();
+          return true;
+        },
+        [&](const std::string& state, int progress) {
+          std::scoped_lock lock(mutex_);
+          if (!allowed()) throw std::runtime_error("HKVL tare cancelled by emergency stop");
           calibration_.state = state;
           calibration_.progress = progress;
-          calibration_.reason.clear();
         });
     std::scoped_lock lock(mutex_);
+    if (!allowed()) throw std::runtime_error("HKVL tare cancelled by emergency stop");
+    tareInProgress_ = false;
+    // 提交后重新等待双侧新样本和稳定窗口，再允许操作者确认恢复。
+    safety_.markDisconnected(0, forceMonotonicMilliseconds());
+    safety_.markDisconnected(1, forceMonotonicMilliseconds());
     calibration_.state = "ready_for_ack";
     calibration_.progress = 100;
-    calibration_.reason.clear();
     calibration_.hasResult = true;
     calibration_.result = result;
     std::ostringstream out;
@@ -292,12 +378,19 @@ std::string ForceControlRuntime::tare(int side, int sampleCount) {
     appendCalibrationJson(out);
     out << "}";
     return out.str();
-  } catch (const std::exception& error) {
+  } catch (...) {
+    std::string reason = "unknown force self-check failure";
+    try { throw; }
+    catch (const std::exception& error) { reason = error.what(); }
+    catch (...) {}
     std::scoped_lock lock(mutex_);
-    calibration_.state = "failed";
-    calibration_.progress = 0;
-    calibration_.reason = error.what();
-    calibration_.hasResult = false;
+    if (calibration_.epoch == epoch) {
+      tareInProgress_ = false;
+      calibration_.state = "failed";
+      calibration_.progress = 0;
+      calibration_.reason = reason;
+      calibration_.hasResult = false;
+    }
     throw;
   }
 }
@@ -409,13 +502,20 @@ std::string ForceControlRuntime::forceStateJson(
   }
   const auto& trip = safety_.trip();
   std::string acknowledgeBlocker;
-  bool canAcknowledge = false;
+  bool canAcknowledge =
+      safety_.canAcknowledge(nowMonotonicMs, &acknowledgeBlocker);
   if (config_.source == "hkvl_serial"
-      && calibration_.state != "ready_for_ack"
-      && calibration_.state != "ready") {
+      && calibration_.state != "ready_for_ack" && calibration_.state != "ready") {
+    canAcknowledge = false;
     acknowledgeBlocker = "startup force self-check is not complete";
-  } else {
-    canAcknowledge = safety_.canAcknowledge(nowMonotonicMs, &acknowledgeBlocker);
+  }
+  if (emergencyCallbackFailed_.load()) {
+    canAcknowledge = false;
+    acknowledgeBlocker = "force emergency-stop callback failed; diagnose and reconfigure before acknowledgement";
+  }
+  if (workerFailed_.load()) {
+    canAcknowledge = false;
+    acknowledgeBlocker = "force worker failed; reconfigure before acknowledgement";
   }
   out << "},\"safety\":{\"latched\":"
       << (safety_.latched() ? "true" : "false")
@@ -426,6 +526,8 @@ std::string ForceControlRuntime::forceStateJson(
       << (trip.channel >= 0 && trip.channel < 6 ? kForceChannels[trip.channel] : "")
       << "\",\"value\":" << trip.value
       << ",\"canAcknowledge\":" << (canAcknowledge ? "true" : "false")
+      << ",\"emergencyCallbackError\":\"" << escapeJson(emergencyCallbackError_) << "\""
+      << ",\"workerError\":\"" << escapeJson(workerError_) << "\""
       << ",\"acknowledgeBlocker\":\"" << escapeJson(acknowledgeBlocker) << "\"}"
       << ",\"compliance\":{\"enabled\":"
       << (config_.compliance.enabled ? "true" : "false");
@@ -458,6 +560,10 @@ void ForceControlRuntime::appendCalibrationJson(std::ostringstream& out) const {
       << ",\"completedAtUnixMs\":"
       << (calibration_.hasResult ? calibration_.result.completedAtUnixMs : 0)
       << ",\"sides\":{";
+  if (!calibration_.hasResult) {
+    out << "}}";
+    return;
+  }
   for (int side = 0; side < 2; ++side) {
     if (side > 0) {
       out << ",";
@@ -554,15 +660,52 @@ void ForceControlRuntime::validateConfig(
 
 void ForceControlRuntime::monitorLoop() {
   while (running_.load(std::memory_order_acquire)) {
-    checkSafety(forceMonotonicMilliseconds());
+    if (monitorTick_) monitorTick_();
+    else checkSafety(forceMonotonicMilliseconds());
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
 }
 
 void ForceControlRuntime::invokeEmergencyStopIfNeeded(
-    const std::optional<ForceSafetyTrip>& trip) {
+    const std::optional<ForceSafetyTrip>& trip) noexcept {
   if (trip.has_value() && emergencyStop_) {
-    emergencyStop_();
+    try { emergencyStop_(); }
+    catch (const std::exception& error) { recordEmergencyCallbackFailure(error.what()); }
+    catch (...) { recordEmergencyCallbackFailure("unknown C++ exception in force emergency-stop callback"); }
+  }
+}
+
+void ForceControlRuntime::reportWorkerFailure(const char* message) noexcept {
+  const bool first = !workerFailed_.exchange(true);
+  running_.store(false, std::memory_order_release);
+  driver_.requestStop();
+  // 先撤销执行权限；不能把安全动作排在诊断锁或字符串分配后。
+  if (first) {
+    try { if (emergencyStop_) emergencyStop_(); }
+    catch (const std::exception& error) { recordEmergencyCallbackFailure(error.what()); }
+    catch (...) { recordEmergencyCallbackFailure("unknown C++ exception in force worker shutdown"); }
+  }
+  // 故障状态先原子锁定；分配或诊断失败也不能放行 ACK。
+  try {
+    std::scoped_lock lock(mutex_);
+    ++tareEpoch_;
+    safety_.latchExternal("force_worker_failed", forceMonotonicMilliseconds());
+    compliance_.reset();
+    lastCompliance_ = {};
+    if (first) workerError_ = message;
+  } catch (...) { std::fputs("force worker fault: latch/diagnostic update failed\n", stderr); }
+  std::fprintf(stderr, "force worker stopped: %s\n", message);
+}
+
+void ForceControlRuntime::recordEmergencyCallbackFailure(const char* message) noexcept {
+  // 原始力锁存仍保留；先标记故障，诊断字符串分配失败也不能允许确认恢复。
+  emergencyCallbackFailed_.store(true);
+  std::fprintf(stderr, "force emergency-stop callback failed: %s\n", message);
+  try {
+    std::scoped_lock lock(mutex_);
+    emergencyCallbackError_ = message;
+  } catch (...) {
+    std::fputs("force emergency-stop callback diagnostic update failed\n", stderr);
   }
 }
 

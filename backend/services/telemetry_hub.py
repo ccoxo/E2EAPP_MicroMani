@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：聚合运动、主手、相机、夹爪和力状态，生成供 WebSocket 与界面使用的遥测帧。
+# 先看：TelemetryHub。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import math
@@ -129,7 +134,7 @@ class TelemetryHub:
         gripper_status = dict(native_gripper_status) if isinstance(native_gripper_status, dict) else {}
         native_detail = gripper_status.get("nativeStatus")
         if isinstance(native_detail, dict):
-            # Action history belongs to the recorder, not each UI telemetry frame.
+            # 动作历史供录制器使用，不随每帧 UI 遥测重复传输；保留原始状态对象。
             gripper_status["nativeStatus"] = {
                 key: value for key, value in native_detail.items() if key != "actionHistory"
             }
@@ -152,6 +157,11 @@ class TelemetryHub:
                     and sides["left"].get("healthy") is True
                     and sides["right"].get("healthy") is True
                 )
+            else:
+                # DDS 源数据失效后可保留最后数值供诊断，但不能延续上一帧的健康状态。
+                self.force_ok = False
+                force_status["sides"]["left"]["healthy"] = False
+                force_status["sides"]["right"]["healthy"] = False
             force_left = list(self.force_left)
             force_right = list(self.force_right)
         elif self.hardware is not None and real_mode:

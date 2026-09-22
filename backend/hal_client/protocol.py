@@ -1,3 +1,8 @@
+# 阅读导航 05｜DDS 传输
+# 职责：集中维护 HAL 命令路径、载荷转换、超时与重试策略；回原点命令采用独立策略。
+# 先看：HalCommandSpec → command_spec → command_request_policy → hal_command_payload。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,6 +17,7 @@ class HalCommandSpec:
 
 # 统一维护 backend command name 到 HAL HTTP path 的映射，避免 HTTP client 和 DDS 路径各自复制协议表。
 HAL_COMMANDS: dict[str, HalCommandSpec] = {
+    "control.lease": HalCommandSpec("POST", "/control/lease"),
     "hal.reconnect": HalCommandSpec("GET", "/health"),
     "motion.emergency_stop": HalCommandSpec("POST", "/motion/emergency_stop"),
     "motion.acknowledge_estop": HalCommandSpec("POST", "/motion/acknowledge_estop"),
@@ -22,6 +28,7 @@ HAL_COMMANDS: dict[str, HalCommandSpec] = {
     "motion.home_side": HalCommandSpec("POST", "/motion/home_side"),
     "motion.manual_axis_move": HalCommandSpec("POST", "/motion/manual_axis_move"),
     "motion.teleop_target_update": HalCommandSpec("POST", "/motion/teleop_target_update"),
+    "motion.replay_absolute_target": HalCommandSpec("POST", "/motion/replay_absolute_target"),
     "motion.teleop_stop_side": HalCommandSpec("POST", "/motion/teleop_stop_side"),
     "omega7.gravity_compensation": HalCommandSpec("POST", "/omega7/gravity_compensation"),
     "omega7.zero_force_feedback": HalCommandSpec("POST", "/omega7/zero_force_feedback"),
@@ -33,9 +40,17 @@ HAL_COMMANDS: dict[str, HalCommandSpec] = {
     "teleop.native.status": HalCommandSpec("GET", "/teleop/native/status"),
     "teleop.native.gripper_command": HalCommandSpec("POST", "/teleop/native/gripper_command"),
     "gripper.command": HalCommandSpec("POST", "/gripper/command"),
+    "gripper.prepare_replay": HalCommandSpec("POST", "/gripper/prepare_replay"),
+    "gripper.replay_target": HalCommandSpec("POST", "/gripper/replay_target"),
 }
 
 _LONG_RUNNING_COMMANDS = {"motion.home_all", "motion.home_origin_side", "motion.home_side"}
+# 仅只读和停止操作允许自动重试；未收到应答不代表运动、使能或确认未执行。
+_RETRY_SAFE_COMMANDS = {
+    "hal.reconnect", "teleop.native.status", "motion.emergency_stop",
+    "motion.disable_side", "motion.teleop_stop_side", "teleop.native.stop",
+    "omega7.zero_force_feedback",
+}
 _TELEOP_DELTA_AXES = ("X", "Y", "Z", "Roll", "Pitch", "Yaw")
 
 
@@ -48,14 +63,17 @@ def command_spec(name: str) -> HalCommandSpec:
 
 def command_request_policy(name: str, timeout_s: float, *, long_timeout_s: float = 75.0) -> tuple[float, int]:
     command_spec(name)
+    if name == "force.tare":
+        # 两个最多 2 秒的窗口，另留 2 秒给停机与调度；去皮不得自动重试。
+        return max(timeout_s, 6.0), 1
     if name in _LONG_RUNNING_COMMANDS:
         # 回零类命令可能跨越多轴运动，DDS/HTTP 两条路径都使用同一套长 timeout 策略。
         return max(timeout_s, long_timeout_s), 1
-    return timeout_s, 2
+    return timeout_s, 2 if name in _RETRY_SAFE_COMMANDS else 1
 
 
 def hal_command_payload(name: str, payload: dict[str, Any]) -> dict[str, Any]:
-    if name != "motion.teleop_target_update":
+    if name not in {"motion.teleop_target_update", "motion.replay_absolute_target"}:
         return payload
     deltas = payload.get("deltas")
     if not isinstance(deltas, dict):

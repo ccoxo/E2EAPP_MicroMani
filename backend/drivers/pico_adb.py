@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：通过 ADB 或参考脚本检查、连接 PICO，并管理视觉串流命令。
+# 先看：PicoResult → PicoAdbDriver。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import os

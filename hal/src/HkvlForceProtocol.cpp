@@ -1,9 +1,16 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：解析 HKVL 字节帧与 CRC，维护帧同步和错误统计。
+ * 先看：HkvlForceParser::feed → HkvlForceParser::reset → HkvlForceParser::stats。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "HkvlForceProtocol.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <limits>
 #include <sstream>
+#include <stdexcept>
 
 namespace appstation::hal {
 namespace {
@@ -19,12 +26,8 @@ constexpr std::array<double, 6> kMaxTareResidualMean{{
     0.10, 0.10, 0.10, 0.005, 0.005, 0.005,
 }};
 
-std::string channelBlocker(
-    const char* phase,
-    std::size_t channel,
-    const char* metric,
-    double value,
-    double limit) {
+std::string channelBlocker(const char* phase, std::size_t channel,
+    const char* metric, double value, double limit) {
   std::ostringstream out;
   out << phase << " " << kChannels[channel] << " " << metric << " " << value
       << " exceeds " << limit;
@@ -35,86 +38,73 @@ std::string channelBlocker(
 
 void HkvlSampleAccumulator::reset() {
   sampleCount_ = 0;
-  sum_ = {};
-  sumSquares_ = {};
-  minimum_.fill((std::numeric_limits<double>::max)());
-  maximum_.fill((std::numeric_limits<double>::lowest)());
+  mean_ = {};
+  squaredDeviations_ = {};
+  minimum_ = {};
+  maximum_ = {};
 }
 
 void HkvlSampleAccumulator::add(const std::array<double, 6>& values) {
+  for (const auto value : values) {
+    if (!std::isfinite(value)) throw std::invalid_argument("HKVL sample must be finite");
+  }
   if (sampleCount_ == 0) {
     minimum_ = values;
     maximum_ = values;
   }
   ++sampleCount_;
   for (std::size_t channel = 0; channel < values.size(); ++channel) {
-    sum_[channel] += values[channel];
-    sumSquares_[channel] += values[channel] * values[channel];
+    // Welford 累积避免较大静态偏置下平方差相减丢失微小振动。
+    const double delta = values[channel] - mean_[channel];
+    mean_[channel] += delta / static_cast<double>(sampleCount_);
+    squaredDeviations_[channel] += delta * (values[channel] - mean_[channel]);
     minimum_[channel] = (std::min)(minimum_[channel], values[channel]);
     maximum_[channel] = (std::max)(maximum_[channel], values[channel]);
   }
 }
 
-int HkvlSampleAccumulator::sampleCount() const {
-  return sampleCount_;
-}
+int HkvlSampleAccumulator::sampleCount() const { return sampleCount_; }
 
 HkvlSampleStatistics HkvlSampleAccumulator::statistics() const {
   HkvlSampleStatistics result;
   result.sampleCount = sampleCount_;
-  if (sampleCount_ <= 0) {
-    return result;
-  }
-  const double count = static_cast<double>(sampleCount_);
-  for (std::size_t channel = 0; channel < result.mean.size(); ++channel) {
-    result.mean[channel] = sum_[channel] / count;
-    const double variance = (std::max)(
-        0.0,
-        sumSquares_[channel] / count - result.mean[channel] * result.mean[channel]);
-    result.standardDeviation[channel] = std::sqrt(variance);
+  if (sampleCount_ <= 0) return result;
+  result.mean = mean_;
+  for (std::size_t channel = 0; channel < mean_.size(); ++channel) {
+    result.standardDeviation[channel] = std::sqrt((std::max)(
+        0.0, squaredDeviations_[channel] / static_cast<double>(sampleCount_)));
     result.peakToPeak[channel] = maximum_[channel] - minimum_[channel];
   }
   return result;
 }
 
 std::string hkvlTareStabilityBlocker(const HkvlSampleStatistics& statistics) {
-  if (statistics.sampleCount <= 0) {
-    return "tare stability window has no samples";
-  }
+  if (statistics.sampleCount < kHkvlTareMinSamples) return "tare stability window requires at least 200 samples";
   for (std::size_t channel = 0; channel < statistics.mean.size(); ++channel) {
+    if (!std::isfinite(statistics.mean[channel])
+        || !std::isfinite(statistics.standardDeviation[channel])
+        || !std::isfinite(statistics.peakToPeak[channel])) {
+      return std::string("tare stability ") + kChannels[channel] + " statistics are not finite";
+    }
     if (statistics.standardDeviation[channel] > kMaxTareStandardDeviation[channel]) {
-      return channelBlocker(
-          "tare stability",
-          channel,
-          "standard deviation",
-          statistics.standardDeviation[channel],
-          kMaxTareStandardDeviation[channel]);
+      return channelBlocker("tare stability", channel, "standard deviation",
+          statistics.standardDeviation[channel], kMaxTareStandardDeviation[channel]);
     }
     if (statistics.peakToPeak[channel] > kMaxTarePeakToPeak[channel]) {
-      return channelBlocker(
-          "tare stability",
-          channel,
-          "peak-to-peak",
-          statistics.peakToPeak[channel],
-          kMaxTarePeakToPeak[channel]);
+      return channelBlocker("tare stability", channel, "peak-to-peak",
+          statistics.peakToPeak[channel], kMaxTarePeakToPeak[channel]);
     }
   }
   return {};
 }
 
 std::string hkvlTareResidualBlocker(const HkvlSampleStatistics& statistics) {
-  const auto stabilityBlocker = hkvlTareStabilityBlocker(statistics);
-  if (!stabilityBlocker.empty()) {
-    return "post-" + stabilityBlocker;
-  }
+  const auto blocker = hkvlTareStabilityBlocker(statistics);
+  if (!blocker.empty()) return "post-" + blocker;
   for (std::size_t channel = 0; channel < statistics.mean.size(); ++channel) {
     if (std::abs(statistics.mean[channel]) > kMaxTareResidualMean[channel]) {
-      return channelBlocker(
-          "post-tare residual",
-          channel,
-          "mean",
-          std::abs(statistics.mean[channel]),
-          kMaxTareResidualMean[channel]);
+      return channelBlocker("post-tare residual", channel, "mean",
+          std::abs(statistics.mean[channel]), kMaxTareResidualMean[channel]);
     }
   }
   return {};
@@ -186,6 +176,10 @@ std::vector<HkvlForceFrame> HkvlForceParser::feed(
 void HkvlForceParser::reset() {
   buffer_.clear();
   stats_ = {};
+}
+
+void HkvlForceParser::discardBufferedBytes() {
+  buffer_.clear();
 }
 
 const HkvlForceParserStats& HkvlForceParser::stats() const {

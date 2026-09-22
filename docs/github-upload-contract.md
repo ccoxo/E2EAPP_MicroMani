@@ -1,60 +1,36 @@
 # GitHub 上传与后续提交契约
 
-本文档是 `E2EAPP_MicroMani` 的仓库级贡献约束。每个提交和 Pull Request 都必须同时满足本文档、根目录 `AGENTS.md` 和 `docs/data-contract-and-deployment.md`；若描述冲突，以代码中的数据契约常量和安全保护为准。
+本文件与根目录 `AGENTS.md`、`docs/data-contract-and-deployment.md` 配合使用。以下是后续修改和提交应遵守的约束；当前实现覆盖范围及未迁入功能以部署说明和实际代码为准，不能把文档要求当成验收结果。
 
-## 1. 不可变的数据边界
+## 数据边界
 
-当前数值契约为 `appstation.dual_arm.operator_sides.v2`，顺序为 `operator_left_then_operator_right`。
+- 数据集和 Policy API 使用 `appstation.dual_arm.operator_sides.v2`：操作者左（硬件右）在前，操作者右（硬件左）在后。
+- HAL、原始遥测、原点、kinematics、物理端口和卡号保持硬件侧语义。
+- backend 是模型通道与 HAL 指令之间唯一转换层，复用 `backend/core/data_contract.py`；外部程序和 HAL 不重复交换。
+- state/action 为含夹爪的 14 维，pulses 为 12 维。同步核对 force、单位和元信息；不能只交换一种数组。
+- 相机角色独立，global、wrist_left、wrist_right 不交换。
 
-| 边界 | 数组含义 | 侧别定义 |
-| --- | --- | --- |
-| HAL、原始遥测、前端内部状态 | 12 维运动、硬件侧顺序 | 硬件左 6 轴 + 硬件右 6 轴 |
-| 原点、kinematics、HAL force sides、物理端口/卡号 | 标定和设备元信息 | 始终按真实硬件侧命名 |
-| LeRobot `observation.state` / `action` | 14 维状态/目标 | 操作者左（硬件右）+ 操作者右（硬件左），夹爪槽位同样按操作者侧 |
-| LeRobot `observation.pulses` | 12 维脉冲 | 操作者左（硬件右）+ 操作者右（硬件左） |
-| LeRobot `observation.force_left/right` | 6 维力值 | 字段名是数据集/操作者侧，`force_left` 来自硬件右传感器 |
-| 相机字段 | 图像角色 | `global`、`wrist_left`、`wrist_right` 独立于数值侧别，不得交换 |
+## 数据兼容与安全
 
-单位必须保持：平移 μm、旋转 mdeg（degree × 1000）、夹爪 mm、力值 SI。脉冲转 UI 时使用对应真实硬件侧的 signed kinematics，不能因为数组顺序改变而机械交换 origin 或 calibration 对象。
+- 新 native 数据集写入完整契约，缺少、未知或不兼容契约的数据不得直接续录、作为数值策略输入或归一化。
+- 修改读取/预览/上传消费者时应明确并校验其契约要求，不猜测无标记数据的顺序。历史未覆盖入口见部署说明，不把本轮 native 续录验证扩大为所有消费入口已经验证。
+- 迁移默认保留原数据；测试使用临时数据，不对用户真实数据集执行归一化 `--apply`。
+- 默认来源为 HKVL，保留显式 NI-DAQ 配置，不自动 fallback。
+- 保留控制者、租约、新鲜度、急停代际、限位、力锁存、夹爪和动作幅度保护。不能为兼容旧程序而放宽。
 
-转换规则只有一处：backend 的 policy boundary。`/api/policy/observation` 输出数据集顺序；`/api/policy/action` 只接受带匹配 `dataContract` 的数据集顺序 action，并在发 HAL 前转换为硬件侧。`controlledSides` 是操作者/数据集侧，HAL payload 的 `side` 是硬件侧。任何新消费者必须复用 `backend/core/data_contract.py`，不得自行切片交换。
+## 原生程序与外部依赖
 
-## 2. 数据集兼容
+- 修改 HAL 后，正式部署前必须同步构建并部署同源的 HalServer.exe 和 JodellGripperWorker.exe；native DDS binding 变更时同步重建。
+- capability 只上报已实现能力。当前本地 `hal-real/0.2` 未包含双阶段校准，不声明 `force_calibration_state_v1`。
+- 在隔离目录构建；明确 SDK/DDS 开关、编译目标和产物类型。无 SDK 骨架不是可部署的实机版本。
+- PR 需写明外部 act_deploy.py 的仓库和固定版本、依赖及参数契约；没有信息时标记未验证，不猜测兼容。
+- 不提交本机 runtime 配置、凭据、SDK/DLL、模型权重、运行二进制或临时产物。
 
-- 新建 native 数据集必须在 `meta/appstation_info.json` 和 `meta/info.json` 写入完整 `dataContract`，包含 version、side order、state/action/pulses/force order、硬件侧映射和单位。
-- 读取、预览、续录、策略消费和原点归一化都必须校验契约。
-- 没有顺序标记、标记不完整或未知版本的数据不得猜测为旧版或新版；必须拒绝并给出人工确认/迁移路径。
-- 迁移必须默认保留原目录，同时处理 `state`、`action`、`pulses`、`force_left/right` 和相关侧别元信息；相机角色保持不变。
-- `scripts/normalize_origin.py` 默认 dry-run。只有明确使用 `--apply` 才能改写，并且不得在测试或验证中指向用户真实数据集。
+## 提交前核对
 
-## 3. 硬件默认与安全边界
-
-- 新配置、缺少 `force.source` 的配置、前端初始值和 HAL 默认统一为 `hkvl_serial`。
-- 显式保存的 `nidaq`、NI 通道和 calibration 参数必须保留。
-- HKVL 缺失、不健康或 stale 时只报告不可用状态，不启动 NI-DAQ，不伪装成正常反馈。
-- 不得削弱急停、限位、力锁存、新鲜度、动作幅度、夹爪启用或来源健康保护来适配旧消费者。
-
-## 4. 原生程序和外部程序
-
-涉及 HAL 源码、头文件、协议或 capability 时，必须配套重新构建并部署：
-
-1. `HalServer.exe`；
-2. 与同一份 core 配套的 `JodellGripperWorker.exe`；
-3. 若 backend native Fast-DDS binding 发生变化，`appstation_fastdds_transport.dll`。
-
-当前 HAL capability 为 `force_calibration_state_v1`，版本为 `hal-real/0.2`。启动脚本会检查源码时间和候选二进制；不要把自动编译或放宽前端 calibration 自检作为兼容方案。构建必须在隔离目录完成，候选文件使用 `.next.exe`，不得覆盖正在运行的二进制。
-
-仓库不包含外部 `act_deploy.py`。上传前必须在 PR 中写明外部仓库 URL、固定 tag/commit、依赖锁定和参数协议；当前仓库无法验证外部程序是否已经实现 `controlled_sides`、`hardware_sides` 和 `dataContract`。外部程序必须发送数据集/操作者顺序，不能再做左右交换或相机交换。
-
-## 5. GitHub 上传前核对
-
-提交者必须：
-
-1. 先确认当前 branch、HEAD 和工作区状态，保留不属于本次工作的已有改动；
-2. 检查未跟踪源码、import、依赖锁文件、构建清单和测试 fixture；
-3. 运行受影响 backend 测试、frontend typecheck/Vitest 和隔离 HAL 离线编译；
-4. 运行 `git diff --check`，检查没有凭据、runtime 配置、SDK/DLL、模型、二进制或临时产物；
-5. 在 PR 中填写实际命令和结果，并单独列出未验证的实机、外部程序和设备范围；
-6. 将提交按“源码修复 / 数据兼容 / 部署配套”分组，提交信息说明 what/why，不提交个人工作区目录。
-
-“测试通过”只代表所列测试和离线编译通过，不代表真实 HAL、串口、相机、运动设备或外部 policy 程序已经验证。
+1. 确认 branch、HEAD、工作区和未跟踪源码；保留不属于本次工作的改动。
+2. 核对 import、类型、依赖锁文件、构建清单与测试夹具是否完整。
+3. 运行受影响测试和必要的类型检查、隔离编译；记录实际命令、结果、跳过与失败原因。
+4. 对本次差异执行 `git diff --check`，检查没有混入机器专属配置或敏感文件。
+5. PR 填写部署、回退和未验证范围；明确真实 HAL、DDS、串口、相机、运动、数据落盘和外部模型程序是否验证。
+6. 按功能组织可独立审阅的提交。离线或 mock 通过不等于实机安全与性能已验证。

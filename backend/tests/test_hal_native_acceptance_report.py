@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：验收报告字段完整性与失败诊断分类。
+# 先看：test_hal_native_acceptance_report_verifier_accepts_full_pass → test_hal_native_acceptance_report_verifier_rejects_missing_axes → test_hal_native_acceptance_report_verifier_explains_missing_observation → test_hal_native_acceptance_report_verifier_rejects_missing_axis_diagnostics。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import json

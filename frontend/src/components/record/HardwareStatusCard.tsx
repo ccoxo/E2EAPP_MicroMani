@@ -1,6 +1,13 @@
-import { Card } from 'antd'
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：展示由 hardwareStatus 推导的硬件连接行及遥测新鲜度。
+ * 先看：dotStyle → HardwareStatusCard。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { deriveHardwareStatusRows, telemetryLinkLabel, type HardwareStatusTone } from '../../hardwareStatus'
+import { hardwareStatusFrameEqual, hardwareStatusFrameSlice, useFrameField } from '../../stores/frameSelectors'
 import { useTelemetryStore } from '../../stores/telemetry'
+import { UiCard } from '../ui'
 
 const toneColor: Record<HardwareStatusTone, string> = {
   ok: '#3B6D11',
@@ -20,10 +27,11 @@ function dotStyle(tone: HardwareStatusTone): React.CSSProperties {
 }
 
 export default function HardwareStatusCard() {
-  const frame = useTelemetryStore((state) => state.frame)
+  // 只订阅派生所需切片；15Hz 整帧替换若内容等价则不重渲染。
+  const frameSlice = useFrameField(hardwareStatusFrameSlice, hardwareStatusFrameEqual)
   const config = useTelemetryStore((state) => state.config)
   const telemetryLink = useTelemetryStore((state) => state.telemetryLink)
-  const rows = deriveHardwareStatusRows(frame, config, telemetryLink)
+  const rows = deriveHardwareStatusRows(frameSlice, config, telemetryLink)
   const linkTone: HardwareStatusTone = telemetryLink.state === 'live'
     ? 'ok'
     : telemetryLink.state === 'offline'
@@ -31,9 +39,8 @@ export default function HardwareStatusCard() {
       : 'unknown'
 
   return (
-    <Card
+    <UiCard
       title="硬件状态"
-      size="small"
       extra={(
         <span style={{ color: toneColor[linkTone], fontSize: 10 }}>
           {telemetryLinkLabel(telemetryLink)}
@@ -60,6 +67,6 @@ export default function HardwareStatusCard() {
           </div>
         ))}
       </div>
-    </Card>
+    </UiCard>
   )
 }

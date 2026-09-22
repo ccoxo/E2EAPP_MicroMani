@@ -1,163 +1,61 @@
-import { Button, Dropdown, Form, Input, InputNumber, Modal, Radio, Select, Slider, Space, Switch, Tabs, Tag, Typography, type MenuProps } from 'antd'
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：设置页壳层；硬件卡按域放在 settings/ 子模块。
+ * 先看：SettingsView → settings/*Cards。
+ */
+import { UiButton, UiField, UiInput, UiSpace, UiTabs, UiTag, UiText, UiTitle } from '../components/ui'
 import {
-  Activity,
   AlertTriangle,
-  Camera,
-  Cpu,
-  Crosshair,
-  Download,
-  FolderOpen,
-  Gamepad2,
-  Hand,
-  Network,
-  Pause,
-  Play,
-  PlugZap,
   RefreshCw,
-  RotateCcw,
   Save,
   ShieldAlert,
-  Square,
-  Trash2,
-  Usb,
-  Waves,
 } from 'lucide-react'
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
-import { ActionCompareModal, type ActionCompareItem } from '../components/ActionCompareModal'
-import { CameraPreview } from '../components/CameraPreview'
-import { WristCameraIdentification } from '../components/WristCameraIdentification'
-import { ForceChart } from '../components/Charts'
-import * as appApi from '../api'
+import { ActionCompareModal } from '../components/ActionCompareModal'
 import {
-  connectTeleopHand,
-  disconnectTeleopHand,
-  captureMotionOrigin,
-  disableMotionSide,
-  enableMotionSide,
-  homeMotionSide,
-  applyCameraTuning,
-  reconnectCamera,
-  reconnectHal,
-  restorePreviousMotionOrigin,
-  setTeleopGravityCompensation,
-  tareForceSensor,
-  tareForceSensors,
-  zeroTeleopForceFeedback,
-  stopMotionSide,
+  applyConfig,
   fetchMotionOrigin,
   mockMode,
-  type ApiCommandError,
-  type MotionOriginCaptureDrift,
   type MotionPreviousRestoreStatus,
 } from '../api'
-import { refreshCameraStream } from '../hooks/useLiveCameraSnapshot'
 import {
-  armHardwareSpecs,
-  axisHardwareSpecs,
-  cameraHardwareSpecs,
-  forceChannels,
-  hardwareChannelLabel,
   hardwareSideForOperatorSide,
-  motionCardModelByNo,
-  nano17Spec,
   operatorSideForHardwareSide,
   operatorSideLabel,
-  semanticAxes,
   type RobotSide,
 } from '../data'
-import { manualAxisStepLimitFromPulse, manualAxisStepLimitPulse } from '../manualMotionLimits'
-import { manualMaxVelocity } from '../manualSpeed'
-import { motionSideReturnOriginReady } from '../motionReturnReady'
+import { numberArrayEqual, teleopHandFrameEqual, teleopHandFrameSlice, useFrameField } from '../stores/frameSelectors'
 import { useTelemetryStore } from '../stores/telemetry'
+import { canAcknowledgeControlSafety } from '../utils/controlSafety'
+import { GripperCard } from './settings/GripperCards'
+import { MotionCard } from './settings/MotionCards'
+import { TeleopHandCard } from './settings/TeleopHandCard'
+import { CameraCard } from './settings/CameraCard'
+import { WristCameraIdentification } from '../components/WristCameraIdentification'
+import { ForceSensorCard } from './settings/ForceSensorCard'
+import { ManualControlPanel } from './settings/ManualControlPanel'
+import { HalCard } from './settings/HalCard'
+import { SafetyCard } from './settings/SafetyCard'
+import { PicoVisionCard } from './settings/PicoVisionCard'
+import { StorageCard } from './settings/StorageCard'
+import { ParameterSnapshotMenu } from './settings/ParameterSnapshotMenu'
+import {
+  type PendingComparison,
+} from './settings/shared'
 import type {
-  AppConfig,
-  ArmMotionProfile,
-  ArmSoftLimitConfig,
-  CameraTelemetry,
-  CameraTuningProfile,
-  ConnectionState,
-  LogEntry,
-  ManualControlAction,
-  ManualControlAxis,
-  ManualControlMemory,
-  ManualControlState,
-  ManualGripperCommand,
-  ManualSpeedMode,
-  MotionOriginConfig,
   ParameterSnapshotScope,
-  RotationWorkLimitSideConfig,
   TelemetryFrame,
 } from '../types'
 
-const TRANSLATION_SOFT_LIMIT_DISABLED_MIN = -1000000000
-const TRANSLATION_SOFT_LIMIT_DISABLED_MAX = 1000000000
-
-type CameraKey = keyof typeof cameraHardwareSpecs
-interface GripperPortHint {
-  side?: string
-  port?: string
-  slaveId?: number
-  baudrate?: number
-  ok?: boolean | null
-  message?: string
-}
-
-type InlineStatusTone = 'ok' | 'warn' | 'error' | 'pending'
-
-interface PendingComparison {
-  title: string
-  tone?: 'default' | 'warning' | 'danger'
-  impact: ReactNode
-  expected?: ReactNode
-  current: ActionCompareItem[]
-  proposed: ActionCompareItem[]
-  confirmText: string
-  onConfirm: () => boolean | void | Promise<boolean | void>
-}
-
 const sideOrder: RobotSide[] = ['left', 'right']
-const cameraOrder: CameraKey[] = ['global', 'wrist_left', 'wrist_right']
-const forceAxisCalibrationAxes = semanticAxes.map((axis, index) => ({ axis, channel: forceChannels[index], index }))
-const forceAxisCalibrationGroups = [
-  { title: '平移力', unit: 'N', axes: forceAxisCalibrationAxes.slice(0, 3) },
-  { title: '旋转力矩', unit: 'N·m', axes: forceAxisCalibrationAxes.slice(3) },
-]
-const fallbackForceAxisSigns: Record<RobotSide, number[]> = {
-  left: [1, 1, -1, -1, -1, 1],
-  right: [1, -1, 1, -1, 1, -1],
-}
-const defaultCameraTuning: Record<CameraKey, CameraTuningProfile> = {
-  global: {
-    autoExposure: true,
-    exposure: -5.5,
-    gain: 0,
-    autoWhiteBalance: true,
-  },
-  wrist_left: {
-    autoExposure: true,
-    exposure: -6,
-    gain: 0,
-    autoWhiteBalance: true,
-  },
-  wrist_right: {
-    autoExposure: true,
-    exposure: -6,
-    gain: 0,
-    autoWhiteBalance: true,
-  },
-}
-const cameraExposureMin = -13
-const cameraExposureMax = 0
-const cameraGainMin = 0
-const cameraGainMax = 64
-const previewResolutionOptions = [
-  { value: '640x480', label: '640x480（推荐）' },
-  { value: '320x240', label: '320x240（低负载）' },
-]
+const cameraOrder = ['global', 'wrist_left', 'wrist_right'] as const
+const emptyValues: number[] = []
+const emptyCameras: TelemetryFrame['cameras'] = []
 
 const hashLabels: Record<string, string> = {
   hal: 'HAL 通信',
+  storage: '数据存储',
   safety: '安全链路',
   teleop: 'PICO-4 视觉推流',
   'motion-left': '左运动控制卡',
@@ -165,3284 +63,66 @@ const hashLabels: Record<string, string> = {
   'camera-global': '全局相机',
   'camera-left': '左腕相机',
   'camera-right': '右腕相机',
-  'force-left': '左 Nano-17',
-  'force-right': '右 Nano-17',
+  'force-left': '左臂六维力',
+  'force-right': '右臂六维力',
   'gripper-left': '左夹爪',
   'gripper-right': '右夹爪',
   'teleop-left': '左 Omega.7',
   'teleop-right': '右 Omega.7',
   manual: '手动控制',
 }
-/** Choose the tab that owns a focused hardware/status hash. */
+
 function tabForHardwareHash(focusHash: string) {
-  return focusHash === 'manual' ? 'manual' : 'config'
+  if (focusHash === 'manual' || focusHash.startsWith('motion-')) return 'motion'
+  if (focusHash.startsWith('gripper-') || focusHash.startsWith('teleop-')) return 'teleop'
+  if (focusHash === 'teleop' || focusHash.startsWith('camera-') || focusHash === 'pico' || focusHash.startsWith('pico-')) return 'vision'
+  if (focusHash.startsWith('force-') || focusHash === 'safety') return 'force'
+  return 'system'
 }
-/** Normalize command failures for toast and modal copy. */
+
 function commandErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
-/** Pull origin-drift confirmation metadata out of API command errors. */
-function originDriftFromError(error: unknown): MotionOriginCaptureDrift | null {
-  const apiError = error as ApiCommandError
-  return apiError?.code === 'ORIGIN_DRIFT_CONFIRM_REQUIRED' && apiError.drift ? apiError.drift : null
-}
-/** 格式化对应数值用于界面展示。 */
-function formatOriginDrift(drift: MotionOriginCaptureDrift) {
-  const items = drift.sides.flatMap((side) =>
-    side.axes.map((axis) => {
-      const operatorSide = operatorSideForHardwareSide(side.side)
-      const sideLabel = operatorSide === 'left' ? '左' : '右'
-      const precision = axis.unit === 'um' ? 0 : 3
-      return `${sideLabel}.${axis.axis} ${axis.absDeltaUi.toFixed(precision)} ${axis.unit}`
-    }),
-  )
-  if (items.length === 0) return '未超过阈值'
-  return items.length > 4 ? `${items.slice(0, 4).join('；')}；另 ${items.length - 4} 项` : items.join('；')
-}
 
-/** 格式化对应数值用于界面展示。 */
-function formatPulseList(values: number[]) {
-  return values
-    .slice(0, 6)
-    .map((value) => {
-      const numeric = Number(value)
-      if (!Number.isFinite(numeric)) return '0'
-      return Number.isInteger(numeric) ? numeric.toFixed(0) : numeric.toFixed(3).replace(/\.?0+$/, '')
-    })
-    .join(',')
-}
-
-/** 格式化对应数值用于界面展示。 */
-function formatWorkOriginPosition(origin: MotionOriginConfig) {
-  return `工作原点位置：左[${formatPulseList(origin.leftPulse)}] 右[${formatPulseList(origin.rightPulse)}]`
-}
-
-/** 格式化对应数值用于界面展示。 */
-function stateTone(state: ConnectionState) {
-  if (state === 'ok') return 'success'
-  if (state === 'warn') return 'warning'
-  if (state === 'error') return 'error'
-  if (state === 'checking') return 'processing'
-  return 'default'
-}
-/** 格式化对应数值用于界面展示。 */
-function stateText(state: ConnectionState) {
-  if (state === 'ok') return '正常'
-  if (state === 'warn') return '注意'
-  if (state === 'error') return '错误'
-  if (state === 'checking') return '检查中'
-  return '待确认'
-}
-/** 计算对应的业务值或展示值。 */
-function inlineToneFromState(state: ConnectionState): InlineStatusTone {
-  if (state === 'ok') return 'ok'
-  if (state === 'warn') return 'warn'
-  if (state === 'error') return 'error'
-  return 'pending'
-}
-/** 计算对应的业务值或展示值。 */
-function cameraByKey(cameras: CameraTelemetry[], key: CameraKey) {
-  return cameras.find((camera) => camera.key === key)
-}
-/** 格式化对应数值用于界面展示。 */
-function physicalText(connected: boolean) {
-  return connected ? '在线' : '离线'
-}
-/** 格式化对应数值用于界面展示。 */
-function formatAxisValue(value: number, semanticIndex: number) {
-  return semanticIndex < 3 ? `${value.toFixed(1)} µm` : `${value.toFixed(3)}°`
-}
-/** 格式化对应数值用于界面展示。 */
-function displaySoftLimitValue(value: number, semanticIndex: number) {
-  return semanticIndex < 3 ? value : value / 1000
-}
-/** Convert displayed rotation degrees back to stored millidegrees. */
-function configSoftLimitValue(value: number, semanticIndex: number) {
-  return semanticIndex < 3 ? value : value * 1000
-}
-/** 格式化对应数值用于界面展示。 */
-function formatSoftLimitValue(value: number, semanticIndex: number) {
-  return semanticIndex < 3 ? value.toFixed(0) : value.toFixed(3)
-}
-/** Return the mechanical soft-limit object for the selected hardware side. */
-function softLimitConfigForSide(config: AppConfig, side: RobotSide) {
-  return side === 'left' ? config.motion.leftSoftLimits : config.motion.rightSoftLimits
-}
-/** Rotation work limits are optional; fall back to permissive defaults. */
-function rotationWorkLimitsForSide(config: AppConfig, side: RobotSide): RotationWorkLimitSideConfig {
-  return config.motion.rotationWorkLimits?.[side] ?? defaultRotationWorkLimits
-}
-/** Prefer signed pulse-per-unit values so UI deltas match hardware direction. */
-function signedPulsePerUnit(config: AppConfig, side: RobotSide, axisIndex: number) {
-  const kinematics = config.motion.kinematics
-  const signed = side === 'left' ? kinematics.leftSignedPulsePerUnit : kinematics.rightSignedPulsePerUnit
-  const fallback = side === 'left' ? kinematics.leftPulsePerUnit : kinematics.rightPulsePerUnit
-  const value = Number(signed?.[axisIndex] ?? fallback?.[axisIndex] ?? 0)
-  return Number.isFinite(value) && value !== 0 ? value : 0
-}
-/** 计算对应的业务值或展示值。 */
-function pulseToAxisUi(config: AppConfig, side: RobotSide, axisIndex: number, pulse: number) {
-  const pulsePerUnit = signedPulsePerUnit(config, side, axisIndex)
-  if (!pulsePerUnit) return null
-  const value = Number(pulse) / pulsePerUnit
-  return axisIndex < 3 ? value * 1000 : value
-}
-/** 计算对应的业务值或展示值。 */
-function originAxisUi(config: AppConfig, side: RobotSide, axisIndex: number) {
-  const origin = config.motion.origin
-  const valid = side === 'left' ? origin.leftValid : origin.rightValid
-  const pulses = side === 'left' ? origin.leftPulse : origin.rightPulse
-  if (!valid || !Array.isArray(pulses) || pulses.length <= axisIndex) return null
-  return pulseToAxisUi(config, side, axisIndex, Number(pulses[axisIndex]))
-}
-/** Combine mechanical limits with work-origin-relative rotation limits. */
-function effectiveAxisLimitUi(config: AppConfig, side: RobotSide, axisKey: keyof ArmSoftLimitConfig, axisIndex: number) {
-  if (axisIndex < 3) {
-    return {
-      min: TRANSLATION_SOFT_LIMIT_DISABLED_MIN,
-      max: TRANSLATION_SOFT_LIMIT_DISABLED_MAX,
-      blocked: false,
-    }
-  }
-  const mechanical = softLimitConfigForSide(config, side)[axisKey]
-  const absolute = {
-    min: displaySoftLimitValue(mechanical.min, axisIndex),
-    max: displaySoftLimitValue(mechanical.max, axisIndex),
-    blocked: false,
-  }
-  if (!config.motion.rotationWorkLimits?.enabled) return absolute
-  const originUi = originAxisUi(config, side, axisIndex)
-  if (originUi === null) return { ...absolute, blocked: true }
-  const workLimit = rotationWorkLimitsForSide(config, side)[axisKey as keyof RotationWorkLimitSideConfig]
-  return {
-    min: Math.max(absolute.min, originUi + workLimit.min),
-    max: Math.min(absolute.max, originUi + workLimit.max),
-    blocked: false,
-  }
-}
-/** 格式化对应数值用于界面展示。 */
-function displayAxisLimitForTelemetry(config: AppConfig, side: RobotSide, axisKey: keyof ArmSoftLimitConfig, axisIndex: number) {
-  const effective = effectiveAxisLimitUi(config, side, axisKey, axisIndex)
-  const originUi = originAxisUi(config, side, axisIndex)
-  if (originUi === null) return effective
-  return {
-    min: effective.min - originUi,
-    max: effective.max - originUi,
-    blocked: effective.blocked,
-  }
-}
-/** 格式化对应数值用于界面展示。 */
-function formatForceValue(value: number, index: number) {
-  return index < 3 ? `${(value * 1000).toFixed(0)} mN` : `${(value * 1000).toFixed(1)} mN·m`
-}
-
-/** 格式化对应数值用于界面展示。 */
-function formatGripperPosition(value: number | undefined) {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? `${value.toFixed(1)} mm` : '不可用'
-}
-/** 格式化对应数值用于界面展示。 */
-function safeGripperPosition(value: number | undefined) {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0
-}
-/** 计算对应的业务值或展示值。 */
-function forceState(values: number[], config: AppConfig) {
-  const danger = Math.max(
-    Math.abs(values[0]) / config.safety.fxyStopN,
-    Math.abs(values[1]) / config.safety.fxyStopN,
-    Math.abs(values[2]) / config.safety.fzStopN,
-    Math.abs(values[3]) / config.safety.momentStopNm,
-    Math.abs(values[4]) / config.safety.momentStopNm,
-    Math.abs(values[5]) / config.safety.momentStopNm,
-  )
-  if (danger >= 1) return 'error'
-  if (danger >= 0.65) return 'warn'
-  return 'ok'
-}
-/** Send a command event into the shared UI log stream. */
-function commandLog(injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void, channel: LogEntry['channel'], msg: string) {
-  injectLog('INFO', msg, channel)
-}
-/** 格式化对应数值用于界面展示。 */
-function picoCommandSummary(result: appApi.PicoCommandResponse) {
-  const ok = result.data?.ok ?? result.ok
-  return {
-    ok,
-    message: result.data?.message ?? (ok ? '命令已完成' : '命令未完成'),
-  }
-}
-/** 格式化对应数值用于界面展示。 */
-function formatSnapshotTime(ts: number) {
-  return new Intl.DateTimeFormat('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).format(new Date(ts))
-}
-/** Generate a human-readable default name for saved hardware snapshots. */
 function defaultSnapshotName(scope: ParameterSnapshotScope) {
   const prefix = scope === 'all' ? '全局硬件' : `${operatorSideLabel(operatorSideForHardwareSide(scope === 'motion-left' ? 'left' : 'right'))}运动控制卡`
-  return `${prefix}快照 ${formatSnapshotTime(Date.now())}`
+  return `${prefix}快照 ${new Date().toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}`
 }
-/** Map the selected robot side to the matching snapshot scope key. */
-function motionSnapshotScope(side: RobotSide): ParameterSnapshotScope {
-  return side === 'left' ? 'motion-left' : 'motion-right'
-}
-/** Keep snapshot modal titles aligned with the scope being saved. */
+
 function snapshotModalTitle(scope: ParameterSnapshotScope) {
   if (scope === 'all') return '保存全局硬件参数快照'
   return `保存${operatorSideLabel(operatorSideForHardwareSide(scope === 'motion-left' ? 'left' : 'right'))}运动控制卡参数`
 }
 
-const softLimitRows = [
-  { key: 'x', label: 'X', unit: 'µm' },
-  { key: 'y', label: 'Y', unit: 'µm' },
-  { key: 'z', label: 'Z', unit: 'µm' },
-  { key: 'roll', label: 'Roll', unit: '°' },
-  { key: 'pitch', label: 'Pitch', unit: '°' },
-  { key: 'yaw', label: 'Yaw', unit: '°' },
-] as const
-const rotationLimitRows = softLimitRows.slice(3)
-const defaultRotationWorkLimits: RotationWorkLimitSideConfig = {
-  roll: { min: -100, max: 100 },
-  pitch: { min: -100, max: 100 },
-  yaw: { min: -7, max: 7 },
-}
-
-const manualAxisOrder: ManualControlAxis[] = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']
-const speedModeOptions: { value: ManualSpeedMode; label: string }[] = [
-  { value: 'fine', label: '精调' },
-  { value: 'medium', label: '中速' },
-  { value: 'coarse', label: '粗调' },
-]
-/** 渲染当前界面单元，并连接所需数据。 */
-function HardwareConfigCard({
-  id,
-  focusHash,
-  icon,
-  title,
-  subtitle,
-  state,
-  badges,
-  actions,
-  children,
-  wide,
-}: {
-  id: string
-  focusHash: string
-  icon: ReactNode
-  title: string
-  subtitle: string
-  state: ConnectionState
-  badges?: ReactNode
-  actions?: ReactNode
-  children: ReactNode
-  wide?: boolean
-}) {
-  const focused = focusHash === id
-  return (
-    <article id={id} className={`hardware-config-card hardware-config-card-state-${state} ${wide ? 'hardware-config-card-wide' : ''} ${focused ? 'hardware-config-card-focused' : ''}`}>
-      <div className="hardware-config-card-head">
-        <div className="hardware-config-title">
-          <span className="hardware-config-icon">{icon}</span>
-          <div>
-            <Typography.Title level={3}>{title}</Typography.Title>
-            <Typography.Text type="secondary">{subtitle}</Typography.Text>
-          </div>
-        </div>
-        <Space wrap>
-          {badges}
-          <Tag color={stateTone(state)}>{stateText(state)}</Tag>
-        </Space>
-      </div>
-      {actions && <div className="hardware-config-actions">{actions}</div>}
-      {children}
-    </article>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function MetricBox({ label, value, hint, tone }: { label: string; value: ReactNode; hint?: ReactNode; tone?: 'warn' | 'ok' | 'neutral' }) {
-  return (
-    <span className={`hardware-metric-box hardware-metric-${tone ?? 'neutral'}`}>
-      <small>{label}</small>
-      <b>{value}</b>
-      {hint && <em>{hint}</em>}
-    </span>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function HalCard({
-  config,
-  updateConfig,
-  focusHash,
-  injectLog,
-}: {
-  config: AppConfig
-  updateConfig: (patch: Partial<AppConfig>) => void
-  focusHash: string
-  injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
-}) {
-  const [reconnecting, setReconnecting] = useState(false)
- /** 处理对应的用户交互。 */
- const handleReconnect = async () => {
-    setReconnecting(true)
-    try {
-      await reconnectHal()
-      commandLog(injectLog, '[HAL]', 'HAL 重连请求已发送')
-    } catch (error) {
-      injectLog('ERROR', `HAL 重连失败：${commandErrorMessage(error)}`, '[HAL]')
-    } finally {
-      setReconnecting(false)
-    }
-  }
-
-  return (
-    <HardwareConfigCard
-      id="hal"
-      focusHash={focusHash}
-      icon={<Network size={20} />}
-      title="C++ HAL 通信"
-      subtitle="Windows HalServer.exe · LTDMC 与 Omega.7 汇聚入口"
-      state="ok"
-      badges={<Tag color="processing">Real HAL</Tag>}
-      actions={
-        <Space wrap>
-          <Button icon={<RefreshCw size={15} />} loading={reconnecting} onClick={() => void handleReconnect()}>
-            重连
-          </Button>
-        </Space>
-      }
-      wide
-    >
-      <Form layout="vertical" className="hardware-form-grid">
-        <Form.Item label="HAL API 地址">
-          <Input value={config.hal.baseUrl} onChange={(event) => updateConfig({ hal: { ...config.hal, baseUrl: event.target.value } })} />
-        </Form.Item>
-        <Form.Item label="HAL WebSocket">
-          <Input value={config.hal.wsUrl} onChange={(event) => updateConfig({ hal: { ...config.hal, wsUrl: event.target.value } })} />
-        </Form.Item>
-        <Form.Item label="轴数">
-          <InputNumber min={12} max={24} value={config.hal.axisCount} onChange={(value) => updateConfig({ hal: { ...config.hal, axisCount: Number(value ?? 12) } })} />
-        </Form.Item>
-        <Form.Item label="开机回工作原点">
-          <div className="motion-startup-row">
-            <Switch
-              checked={config.motion.homeOnStartup.enabled}
-              checkedChildren="已启用"
-              unCheckedChildren="未启用"
-              onChange={(checked) =>
-                updateConfig({
-                  motion: {
-                    ...config.motion,
-                    homeOnStartup: { ...config.motion.homeOnStartup, enabled: checked, mode: 'work_origin' },
-                  },
-                })
-              }
-            />
-            <Tag color="processing">{config.motion.homeOnStartup.mode}</Tag>
-          </div>
-        </Form.Item>
-      </Form>
-      <div className="hardware-metric-grid">
-        <MetricBox label="控制卡初始化" value="dmc_board_init()" hint="无参数，自动发现两张卡" tone="ok" />
-        <MetricBox label="位置读取" value={config.motion.positionSource} hint="步进系统读取内部脉冲计数" tone="ok" />
-        <MetricBox label="线程约束" value={`${config.motion.motionThreadHz} Hz`} hint="LTDMC DLL 串行化调用" tone="ok" />
-        <MetricBox label="禁止路径" value="Python ctypes 直连 DLL" hint="线程安全风险" tone="warn" />
-      </div>
-    </HardwareConfigCard>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function SafetyCard({
-  config,
-  updateConfig,
-  focusHash,
-  dangerIndex,
-  setDangerOverride,
-  acknowledgeSafety,
-  forceStatus,
-  runForceStartupCheck,
-  forceStartupCheckRunning,
-}: {
-  config: AppConfig
-  updateConfig: (patch: Partial<AppConfig>) => void
-  focusHash: string
-  dangerIndex: number
-  setDangerOverride: (danger: number | null) => void
-  acknowledgeSafety: () => void
-  forceStatus: TelemetryFrame['forceStatus']
-  runForceStartupCheck: () => void
-  forceStartupCheckRunning: boolean
-}) {
-  const forceSafety = forceStatus?.safety
-  const calibration = forceStatus?.calibration
-  const leftForce = forceStatus?.sides?.left
-  const rightForce = forceStatus?.sides?.right
-  const latched = Boolean(forceSafety?.latched)
-  const state: ConnectionState = latched || dangerIndex > 0.85 ? 'error' : dangerIndex > 0.55 ? 'warn' : 'ok'
-  const isHkvl = config.force.source === 'hkvl_serial'
-  const calibrationReady = calibration?.state === 'ready_for_ack' || calibration?.state === 'ready'
-  const calibrationStateLabel: Record<string, string> = {
-    waiting_sensors: '等待操作者确认空载',
-    checking_stability: '检查双侧稳定性',
-    taring: '双侧同步 Tare',
-    validating: '验证零后残差',
-    ready_for_ack: '可确认安全态',
-    ready: '已就绪',
-    failed: '自检失败',
-    not_required: '无需 HAL 自检',
-  }
-  const residualSummary = (values: number[] | undefined) => {
-    if (!values || values.length < 6) return '等待验证'
-    const forceResidual = Math.max(...values.slice(0, 3).map((value) => Math.abs(value)))
-    const momentResidual = Math.max(...values.slice(3, 6).map((value) => Math.abs(value)))
-    return `${forceResidual.toFixed(3)} N / ${momentResidual.toFixed(4)} Nm`
-  }
-  return (
-    <HardwareConfigCard
-      id="safety"
-      focusHash={focusHash}
-      icon={<ShieldAlert size={20} />}
-      title="安全链路 / 急停 / 软限位"
-      subtitle={isHkvl ? 'HKVL 原始样本、HAL 全局锁存急停、MotionControl 软限位' : 'NI-DAQ 显示/录制、HAL 人工急停、MotionControl 软限位'}
-      state={state}
-      badges={<Tag color={stateTone(state)}>danger_index {dangerIndex.toFixed(2)}</Tag>}
-      actions={
-        <Space wrap>
-          {isHkvl && (
-            <Button
-              type="primary"
-              icon={<RotateCcw size={15} />}
-              loading={forceStartupCheckRunning}
-              onClick={runForceStartupCheck}
-            >
-              启动力觉自检
-            </Button>
-          )}
-          <Button danger icon={<AlertTriangle size={15} />} onClick={() => setDangerOverride(0.92)}>
-            模拟危险
-          </Button>
-          <Button
-            icon={<RotateCcw size={15} />}
-            disabled={!latched || (isHkvl && !forceSafety?.canAcknowledge)}
-            onClick={acknowledgeSafety}
-          >
-            确认安全态
-          </Button>
-        </Space>
-      }
-      wide
-    >
-      <Form layout="vertical" className="hardware-form-grid hardware-form-grid-compact">
-        <Form.Item label="Fx/Fy 警告 N"><InputNumber min={0} step={0.1} value={config.safety.fxyWarnN} onChange={(value) => updateConfig({ safety: { ...config.safety, fxyWarnN: Number(value ?? 2) } })} /></Form.Item>
-        <Form.Item label="Fx/Fy 急停 N（暂按量程）"><InputNumber min={0} step={0.1} value={config.safety.fxyStopN} onChange={(value) => updateConfig({ safety: { ...config.safety, fxyStopN: Number(value ?? 30) } })} /></Form.Item>
-        <Form.Item label="Fz 警告 N"><InputNumber min={0} step={0.1} value={config.safety.fzWarnN} onChange={(value) => updateConfig({ safety: { ...config.safety, fzWarnN: Number(value ?? 3) } })} /></Form.Item>
-        <Form.Item label="Fz 急停 N（暂按量程）"><InputNumber min={0} step={0.1} value={config.safety.fzStopN} onChange={(value) => updateConfig({ safety: { ...config.safety, fzStopN: Number(value ?? 30) } })} /></Form.Item>
-        <Form.Item label="Moment 警告 Nm"><InputNumber min={0} step={0.001} value={config.safety.momentWarnNm} onChange={(value) => updateConfig({ safety: { ...config.safety, momentWarnNm: Number(value ?? 0.02) } })} /></Form.Item>
-        <Form.Item label="Moment 急停 Nm（暂按量程）"><InputNumber min={0} step={0.001} value={config.safety.momentStopNm} onChange={(value) => updateConfig({ safety: { ...config.safety, momentStopNm: Number(value ?? 1) } })} /></Form.Item>
-        <Form.Item label="Yaw 软限位 °"><InputNumber value={config.safety.yawSoftLimitDeg} onChange={(value) => updateConfig({ safety: { ...config.safety, yawSoftLimitDeg: Number(value ?? 7) } })} /></Form.Item>
-        <Form.Item label="Watchdog ms"><InputNumber value={config.safety.watchdogMs} onChange={(value) => updateConfig({ safety: { ...config.safety, watchdogMs: Number(value ?? 50) } })} /></Form.Item>
-      </Form>
-      <div className="hardware-metric-grid">
-        {isHkvl && (
-          <>
-            <MetricBox
-              label="启动力觉自检"
-              value={`${calibrationStateLabel[calibration?.state ?? 'waiting_sensors'] ?? calibration?.state ?? '等待状态'} · ${calibration?.progress ?? 0}%`}
-              hint={calibration?.reason || '请确认双侧传感器空载，且伺服、运动和遥操作均已停止'}
-              tone={calibrationReady ? 'ok' : 'warn'}
-            />
-            <MetricBox
-              label="左侧力传感器"
-              value={`${leftForce?.port ?? '--'} · ${leftForce?.sampleHz?.toFixed(1) ?? '0.0'} Hz`}
-              hint={leftForce?.error || (leftForce?.healthy ? '连接和采样正常' : '等待连接或新鲜样本')}
-              tone={leftForce?.healthy ? 'ok' : 'warn'}
-            />
-            <MetricBox
-              label="右侧力传感器"
-              value={`${rightForce?.port ?? '--'} · ${rightForce?.sampleHz?.toFixed(1) ?? '0.0'} Hz`}
-              hint={rightForce?.error || (rightForce?.healthy ? '连接和采样正常' : '等待连接或新鲜样本')}
-              tone={rightForce?.healthy ? 'ok' : 'warn'}
-            />
-            <MetricBox
-              label="零后最大残差"
-              value={`左 ${residualSummary(calibration?.sides?.left?.residualMean)}`}
-              hint={`右 ${residualSummary(calibration?.sides?.right?.residualMean)}`}
-              tone={calibrationReady ? 'ok' : 'warn'}
-            />
-          </>
-        )}
-        <MetricBox
-          label="HAL 安全锁存"
-          value={latched ? forceSafety?.reason || '已锁存' : '未锁存'}
-          hint={latched ? forceSafety?.acknowledgeBlocker || '等待人工确认安全态' : '确认操作不会恢复伺服'}
-          tone={latched ? 'warn' : 'ok'}
-        />
-        <MetricBox label="确认语义" value="只清锁存" hint="不会恢复伺服；后续使能必须由操作员单独执行" tone="warn" />
-      </div>
-      <div className="safety-layer-grid">
-        <MetricBox
-          label="Layer 1"
-          value={isHkvl ? 'HKVL 全速判定' : 'NI-DAQ 采集'}
-          hint={isHkvl ? '未低通去皮样本直接进入 HAL 安全判断' : '兼容显示、去皮和录制，不承担 HAL 力联锁'}
-        />
-        <MetricBox label="Layer 2" value="HAL 急停 5-15ms" hint="HAL 急停入口调用 LTDMC" />
-        <MetricBox label="Layer 3" value="软限位 <1ms" hint="Motion Thread 内拦截" />
-      </div>
-    </HardwareConfigCard>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function AxisMappingTable({
-  side,
-  positions,
-  profile,
-  limits,
-  onProfileChange,
-  onLimitChange,
-}: {
-  side: RobotSide
-  positions: number[]
-  profile: ArmMotionProfile
-  limits: ArmSoftLimitConfig
-  onProfileChange: (nextProfile: ArmMotionProfile) => void
-  onLimitChange: (nextLimits: ArmSoftLimitConfig) => void
-}) {
-  const sideSpec = armHardwareSpecs[side]
- /** 描述当前方法的功能边界。 */
- const updateProfile = (
-    group: keyof ArmMotionProfile,
-    field: keyof ArmMotionProfile[keyof ArmMotionProfile],
-    value: number,
-  ) => {
-    onProfileChange({
-      ...profile,
-      [group]: {
-        ...profile[group],
-        [field]: value,
-      },
-    })
-  }
- /** 描述当前方法的功能边界。 */
- const updateLimit = (axis: keyof ArmSoftLimitConfig, bound: 'min' | 'max', value: number) => {
-    onLimitChange({
-      ...limits,
-      [axis]: {
-        ...limits[axis],
-        [bound]: value,
-      },
-    })
-  }
- /** 描述当前方法的功能边界。 */
- const renderProfileInput = (
-    group: keyof ArmMotionProfile,
-    field: keyof ArmMotionProfile[keyof ArmMotionProfile],
-    step = 1,
-  ) => (
-    <InputNumber
-      className="axis-map-input"
-      min={0}
-      step={step}
-      value={profile[group][field]}
-      onChange={(value) => updateProfile(group, field, Number(value ?? 0))}
-    />
-  )
-  return (
-    <div className="axis-map-table-wrap">
-      <table className="axis-map-table">
-        <thead>
-          <tr>
-            <th>语义轴</th>
-            <th>物理轴号</th>
-            <th>型号 / 行程</th>
-            <th>相对工作原点位置</th>
-            <th>脉冲当量</th>
-            <th>初始速度</th>
-            <th>最大速度</th>
-            <th>加速时间</th>
-            <th>减速时间</th>
-            <th>绝对软限位下限</th>
-            <th>绝对软限位上限</th>
-          </tr>
-        </thead>
-        <tbody>
-          {axisHardwareSpecs.map((axis, index) => {
-            const pulse = side === 'left' ? axis.leftPulsePerUnit : axis.rightPulsePerUnit
-            const group = index < 3 ? 'translation' : 'rotation'
-            const axisKey = softLimitRows[index].key
-            const minLimit = displaySoftLimitValue(limits[axisKey].min, index)
-            const maxLimit = displaySoftLimitValue(limits[axisKey].max, index)
-            const translationSoftLimitDisabled = index < 3
-            return (
-              <tr key={axis.axis} className={axis.warning ? 'axis-row-warning' : ''}>
-                <td><b>{axis.axis}</b></td>
-                <td>axis {sideSpec.axisOrder[index]}</td>
-                <td>
-                  <b className="axis-model">{axis.model}</b>
-                  <span className="axis-travel">{axis.travel}</span>
-                </td>
-                <td className="numeric-cell">{formatAxisValue(positions[sideSpec.stateOffset + index] ?? 0, index)}</td>
-                <td className="numeric-cell">{pulse.toFixed(axis.axis === 'X' || axis.axis === 'Z' ? 4 : 3)}</td>
-                <td>{renderProfileInput(group, 'startSpeed', group === 'translation' ? 0.1 : 0.01)}</td>
-                <td>{renderProfileInput(group, 'maxSpeed', group === 'translation' ? 0.1 : 0.01)}</td>
-                <td>{renderProfileInput(group, 'accTimeSec', 0.01)}</td>
-                <td>{renderProfileInput(group, 'decTimeSec', 0.01)}</td>
-                <td>
-                  {translationSoftLimitDisabled ? (
-                    <Tag>已取消</Tag>
-                  ) : (
-                    <InputNumber
-                      className="axis-map-input axis-limit-input"
-                      step={0.1}
-                      value={minLimit}
-                      onChange={(value) => updateLimit(axisKey, 'min', configSoftLimitValue(Number(value ?? 0), index))}
-                    />
-                  )}
-                </td>
-                <td>
-                  {translationSoftLimitDisabled ? (
-                    <Tag color="processing">机械限位 / 急停</Tag>
-                  ) : (
-                    <span className="axis-limit-field">
-                      <InputNumber
-                        className="axis-map-input axis-limit-input"
-                        step={0.1}
-                        value={maxLimit}
-                        onChange={(value) => updateLimit(axisKey, 'max', configSoftLimitValue(Number(value ?? 0), index))}
-                      />
-                      <span className="axis-unit">{axis.unit}</span>
-                    </span>
-                  )}
-                </td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
-      <div className="axis-map-note">
-        <Tag>平移单位 um，速度 um/s</Tag>
-        <Tag>旋转界面单位 °，配置存储 mdeg</Tag>
-        <Tag>LTDMC profile 使用初始速度、最大速度、加速时间、减速时间</Tag>
-        <Tag color="processing">XYZ 软件软限位已取消，仅保留机械限位 / 急停</Tag>
-      </div>
-    </div>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function RotationWorkLimitPanel({
-  side,
-  config,
-  updateConfig,
-}: {
-  side: RobotSide
-  config: AppConfig
-  updateConfig: (patch: Partial<AppConfig>) => void
-}) {
-  const root = config.motion.rotationWorkLimits ?? {
-    enabled: true,
-    left: defaultRotationWorkLimits,
-    right: defaultRotationWorkLimits,
-  }
-  const enabled = Boolean(root.enabled)
-  const sideLimits = rotationWorkLimitsForSide(config, side)
-  const sideOriginValid = side === 'left' ? config.motion.origin.leftValid : config.motion.origin.rightValid
-  /** 描述当前方法的功能边界。 */
-  const updateRoot = (patch: Partial<AppConfig['motion']['rotationWorkLimits']>) =>
-    updateConfig({
-      motion: {
-        ...config.motion,
-        rotationWorkLimits: {
-          ...root,
-          ...patch,
-          left: patch.left ?? root.left ?? defaultRotationWorkLimits,
-          right: patch.right ?? root.right ?? defaultRotationWorkLimits,
-        },
-      },
-    })
-  /** 描述当前方法的功能边界。 */
-  const updateLimit = (axis: keyof RotationWorkLimitSideConfig, bound: 'min' | 'max', value: number) => {
-    updateRoot({
-      [side]: {
-        ...sideLimits,
-        [axis]: {
-          ...sideLimits[axis],
-          [bound]: value,
-        },
-      },
-    })
-  }
-  return (
-    <div className="rotation-work-panel">
-      <div className="hardware-subtitle-row">
-        <b>旋转工作窗口</b>
-        <Space wrap>
-          <Tag color={sideOriginValid ? 'success' : 'warning'}>{sideOriginValid ? 'Origin ready' : 'Origin missing'}</Tag>
-          <Switch
-            checked={enabled}
-            checkedChildren="On"
-            unCheckedChildren="Off"
-            onChange={(checked) => updateRoot({ enabled: checked })}
-          />
-        </Space>
-      </div>
-      <table className="rotation-work-table">
-        <thead>
-          <tr>
-            <th>Axis</th>
-            <th>Origin abs</th>
-            <th>Work min</th>
-            <th>Work max</th>
-            <th>Mechanical abs</th>
-            <th>Effective abs</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rotationLimitRows.map((row, rowIndex) => {
-            const axisIndex = rowIndex + 3
-            const axisKey = row.key as keyof RotationWorkLimitSideConfig
-            const originUi = originAxisUi(config, side, axisIndex)
-            const mechanical = softLimitConfigForSide(config, side)[axisKey]
-            const mechanicalMin = displaySoftLimitValue(mechanical.min, axisIndex)
-            const mechanicalMax = displaySoftLimitValue(mechanical.max, axisIndex)
-            const effective = effectiveAxisLimitUi(config, side, axisKey, axisIndex)
-            return (
-              <tr key={row.key}>
-                <td><b>{row.label}</b></td>
-                <td className="numeric-cell">{originUi === null ? '-' : `${originUi.toFixed(3)}°`}</td>
-                <td>
-                  <InputNumber
-                    className="axis-map-input axis-limit-input"
-                    disabled={!enabled}
-                    step={0.1}
-                    value={sideLimits[axisKey].min}
-                    onChange={(value) => updateLimit(axisKey, 'min', Number(value ?? 0))}
-                  />
-                </td>
-                <td>
-                  <InputNumber
-                    className="axis-map-input axis-limit-input"
-                    disabled={!enabled}
-                    step={0.1}
-                    value={sideLimits[axisKey].max}
-                    onChange={(value) => updateLimit(axisKey, 'max', Number(value ?? 0))}
-                  />
-                </td>
-                <td className="numeric-cell">{mechanicalMin.toFixed(3)} ~ {mechanicalMax.toFixed(3)}°</td>
-                <td className="numeric-cell">
-                  {effective.blocked ? <Tag color="error">work_origin_missing</Tag> : `${effective.min.toFixed(3)} ~ ${effective.max.toFixed(3)}°`}
-                </td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
-    </div>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function MotionCard({
-  side,
-  config,
-  updateConfig,
-  focusHash,
-  positions,
-  motionEnabled,
-  motionAxisEnabled,
-  injectLog,
-  triggerEmergencyStop,
-  snapshotMenu,
-  openSnapshotModal,
-  requestComparison,
-  previousRestoreStatus,
-  refreshMotionOriginStatus,
-}: {
-  side: RobotSide
-  config: AppConfig
-  updateConfig: (patch: Partial<AppConfig>) => void
-  focusHash: string
-  positions: number[]
-  motionEnabled: boolean | null | undefined
-  motionAxisEnabled?: Array<boolean | null>
-  injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
-  triggerEmergencyStop: () => void
-  snapshotMenu: (scope: ParameterSnapshotScope) => MenuProps
-  openSnapshotModal: (scope: ParameterSnapshotScope) => void
-  requestComparison: (comparison: PendingComparison) => void
-  previousRestoreStatus: MotionPreviousRestoreStatus | null
-  refreshMotionOriginStatus: () => Promise<void>
-}) {
-  const hardwareSide = hardwareSideForOperatorSide(side)
-  const sideSpec = armHardwareSpecs[hardwareSide]
-  const operatorLabel = operatorSideLabel(side)
-  const id = `motion-${side}`
-  const snapshotScope = motionSnapshotScope(hardwareSide)
-  const configCardNo = hardwareSide === 'left' ? config.motion.leftCardNo : config.motion.rightCardNo
-  const cardModel = motionCardModelByNo[configCardNo] ?? 'DMC'
-  const profileKey = hardwareSide === 'left' ? 'leftProfile' : 'rightProfile'
-  const softLimitKey = hardwareSide === 'left' ? 'leftSoftLimits' : 'rightSoftLimits'
- /** 描述当前方法的功能边界。 */
- const updateCardNo = (cardNo: number) =>
-    updateConfig({ motion: { ...config.motion, [hardwareSide === 'left' ? 'leftCardNo' : 'rightCardNo']: cardNo } })
- /** 描述当前方法的功能边界。 */
- const updateProfile = (nextProfile: ArmMotionProfile) =>
-    updateConfig({ motion: { ...config.motion, [profileKey]: nextProfile } })
- /** 描述当前方法的功能边界。 */
- const updateSoftLimits = (nextLimits: ArmSoftLimitConfig) =>
-    updateConfig({ motion: { ...config.motion, [softLimitKey]: nextLimits } })
-  const motionOrigin = config.motion.origin
-  const sideOriginValid = hardwareSide === 'left' ? motionOrigin.leftValid : motionOrigin.rightValid
-  const originStatusText = sideOriginValid ? '已记录' : '未记录'
-  const originScopeText =
-    sideOriginValid
-      ? motionOrigin.valid
-        ? '双侧工作原点都已记录'
-        : '仅当前侧工作原点已记录'
-      : '当前侧工作原点未记录'
-  const originUpdatedText = motionOrigin.updatedAt > 0 ? `最后更新 ${formatSnapshotTime(motionOrigin.updatedAt)}` : originScopeText
-  const [pendingMotionAction, setPendingMotionAction] = useState<'enable' | 'disable' | 'home' | null>(null)
-  const [pendingOriginAction, setPendingOriginAction] = useState<'capture' | 'restore' | null>(null)
-  const [optimisticEnabled, setOptimisticEnabled] = useState<boolean | null>(null)
-  useEffect(() => {
-    if (optimisticEnabled !== null && motionEnabled === optimisticEnabled) {
-      const timer = window.setTimeout(() => setOptimisticEnabled(null), 0)
-      return () => window.clearTimeout(timer)
-    }
-    return undefined
-  }, [motionEnabled, optimisticEnabled])
-  const effectiveEnabled = optimisticEnabled ?? motionEnabled ?? null
-  const knownAxisEnabled = motionAxisEnabled?.filter((value) => value !== null && value !== undefined) ?? []
-  const partialEnabled = effectiveEnabled !== true && knownAxisEnabled.some((value) => value === true)
-  const enableTag =
-    effectiveEnabled === true
-      ? <Tag color="success">已使能</Tag>
-      : partialEnabled
-        ? <Tag color="warning">部分使能</Tag>
-      : effectiveEnabled === false
-        ? <Tag color="warning">未使能</Tag>
-        : <Tag color="default">使能状态未知</Tag>
-  const motionStateText =
-    effectiveEnabled === true
-      ? '已使能'
-      : partialEnabled
-        ? '部分使能'
-        : effectiveEnabled === false
-          ? '未使能'
-          : '未知'
-  const sidePositionsText = positions
-    .slice(sideSpec.stateOffset, sideSpec.stateOffset + 6)
-    .map((value) => (Number.isFinite(value) ? value.toFixed(1) : '--'))
-    .join(', ')
-  const previousRestoreAvailable = Boolean(motionOrigin.previousValid || previousRestoreStatus?.available)
-  const previousRestoreReady = previousRestoreStatus?.restorable === true
-  const previousRestoreLabel = !previousRestoreAvailable
-    ? '无备份'
-    : previousRestoreStatus?.restorable
-      ? '备份可恢复'
-      : previousRestoreStatus
-        ? '备份不可恢复'
-        : '备份待校验'
-  const previousRestoreMessage = previousRestoreAvailable ? previousRestoreStatus?.message : ''
- /** 处理对应的用户交互。 */
- const handleEnable = async () => {
-    setPendingMotionAction('enable')
-    try {
-      await enableMotionSide(hardwareSide)
-      setOptimisticEnabled(true)
-      commandLog(injectLog, '[HAL]', `${operatorLabel}全部轴使能请求已发送`)
-    } catch (error) {
-      injectLog('ERROR', `${operatorLabel}使能失败：${commandErrorMessage(error)}`, '[HAL]')
-    } finally {
-      setPendingMotionAction(null)
-    }
-  }
- /** 处理对应的用户交互。 */
- const handleDisable = async () => {
-    setPendingMotionAction('disable')
-    try {
-      await disableMotionSide(hardwareSide)
-      setOptimisticEnabled(false)
-      commandLog(injectLog, '[HAL]', `${operatorLabel} motion axes disable requested`)
-    } catch (error) {
-      injectLog('ERROR', `${operatorLabel} motion disable failed: ${commandErrorMessage(error)}`, '[HAL]')
-    } finally {
-      setPendingMotionAction(null)
-    }
-  }
- /** 处理对应的用户交互。 */
- const handleHome = async () => {
-    setPendingMotionAction('home')
-    try {
-      await homeMotionSide(hardwareSide)
-      commandLog(injectLog, '[HAL]', `${operatorLabel}回硬件零点完成（未写入工作原点）`)
-    } catch (error) {
-      injectLog('ERROR', `${operatorLabel}回硬件零点失败：${commandErrorMessage(error)}`, '[HAL]')
-    } finally {
-      setPendingMotionAction(null)
-    }
-  }
- /** 处理对应的用户交互。 */
- const handleCaptureOrigin = async (confirmLargeDrift = false) => {
-    setPendingOriginAction('capture')
-    try {
-      const response = await captureMotionOrigin(hardwareSide, confirmLargeDrift ? { confirmLargeDrift: true } : undefined)
-      const responseMotion = response.data?.config?.motion
-      const nextOrigin = response.data?.origin ?? responseMotion?.origin ?? {
-        ...motionOrigin,
-        leftValid: hardwareSide === 'left' ? true : motionOrigin.leftValid,
-        rightValid: hardwareSide === 'right' ? true : motionOrigin.rightValid,
-        valid:
-          (hardwareSide === 'left' ? true : motionOrigin.leftValid) &&
-          (hardwareSide === 'right' ? true : motionOrigin.rightValid),
-        updatedAt: motionOrigin.updatedAt,
-      }
-      updateConfig({
-        motion: responseMotion ?? {
-          ...config.motion,
-          origin: nextOrigin,
-          homeReference: response.data?.homeReference ?? config.motion.homeReference,
-          workOriginOffset: response.data?.workOriginOffset ?? config.motion.workOriginOffset,
-        },
-      })
-      const drift = response.data?.originCaptureDrift
-      const positionText = formatWorkOriginPosition(nextOrigin)
-      await refreshMotionOriginStatus()
-      commandLog(
-        injectLog,
-        '[HAL]',
-        `${drift?.requiresConfirmation
-          ? `${operatorLabel}工作原点已确认大漂移并写入`
-          : `${operatorLabel}工作原点已记录`}：${positionText}`,
-      )
-    } catch (error) {
-      const drift = originDriftFromError(error)
-      if (!confirmLargeDrift && drift) {
-        requestComparison({
-          title: `${operatorLabel}工作原点漂移过大`,
-          tone: 'danger',
-          impact: '本次当前位置读数与已有工作原点记录差距超过保护阈值。未再次确认前，后端不会写入新的工作原点。',
-          expected: `阈值：平移 ${drift.thresholds.translationUm.toFixed(0)} µm，旋转 ${drift.thresholds.rotationDeg.toFixed(3)}°。`,
-          current: [
-            { label: '当前状态', value: originStatusText },
-            { label: '当前位置', value: sidePositionsText || '--' },
-          ],
-          proposed: [
-            { label: '超限漂移', value: formatOriginDrift(drift) },
-            { label: '写入策略', value: '二次确认后覆盖' },
-          ],
-          confirmText: '确认覆盖零点',
-          onConfirm: () => handleCaptureOrigin(true),
-        })
-        return false
-      }
-      injectLog('ERROR', `${operatorLabel}工作原点记录失败：${commandErrorMessage(error)}`, '[HAL]')
-    } finally {
-      setPendingOriginAction(null)
-    }
-    return true
-  }
-  /** 处理对应的用户交互。 */
-  const handleRestorePreviousOrigin = async () => {
-    setPendingOriginAction('restore')
-    try {
-      const response = await restorePreviousMotionOrigin()
-      const responseMotion = response.data?.config?.motion
-      const nextOrigin = response.data?.origin ?? responseMotion?.origin ?? motionOrigin
-      updateConfig({ motion: responseMotion ?? { ...config.motion, origin: nextOrigin } })
-      await refreshMotionOriginStatus()
-      commandLog(injectLog, '[HAL]', '已恢复上个工作原点')
-    } catch (error) {
-      injectLog('ERROR', `恢复上个工作原点失败：${commandErrorMessage(error)}`, '[HAL]')
-    } finally {
-      setPendingOriginAction(null)
-    }
-  }
- /** 处理对应的用户交互。 */
- const requestHome = () =>
-    requestComparison({
-      title: `${operatorLabel}回硬件零点`,
-      tone: 'danger',
-      impact: `将通过 HAL 调用 ${operatorLabel} LTDMC HOME 回零流程；本动作不会写入工作原点记录。`,
-      expected: '确认前请确认工作区安全；确认后只移动硬件轴，不更改 homeReference、工作原点或软限位。',
-      current: [
-        { label: '使能状态', value: motionStateText },
-        { label: '当前位置', value: sidePositionsText || '--' },
-      ],
-      proposed: [
-        { label: '目标动作', value: '硬件HOME（不写入）' },
-        { label: '命令接口', value: 'motion.home_side' },
-      ],
-      confirmText: '确认回硬件零点',
-      onConfirm: handleHome,
-    })
- /** 处理对应的用户交互。 */
- const requestCaptureOrigin = () =>
-    requestComparison({
-      title: `${operatorLabel}记录工作原点`,
-      tone: 'warning',
-      impact: `将当前${operatorLabel} HAL 脉冲记录为工作原点，不执行硬件 HOME。`,
-      expected: '确认前请把从臂移动到期望工作原点；确认后只记录当前位置，不移动硬件。',
-      current: [
-        { label: '当前状态', value: originStatusText },
-        { label: '当前位置', value: sidePositionsText || '--' },
-      ],
-      proposed: [
-        { label: '当前状态', value: '已记录' },
-        { label: '更新时间', value: '确认时写入' },
-      ],
-      confirmText: '确认记录工作原点',
-      onConfirm: handleCaptureOrigin,
-    })
- /** 处理对应的用户交互。 */
- const requestRestorePreviousOrigin = () => {
-    if (!previousRestoreReady) {
-      injectLog('WARNING', previousRestoreMessage || '上个工作原点备份暂不可恢复', '[HAL]')
-      return
-    }
-    requestComparison({
-      title: '恢复上个工作原点',
-      tone: 'warning',
-      impact: '将把当前工作原点记录替换为上一份备份记录。',
-      expected: '确认后只切换工作原点记录，不会移动硬件。',
-      current: [
-        { label: '当前状态', value: originStatusText },
-        { label: '范围', value: originScopeText },
-      ],
-      proposed: [
-        { label: '当前状态', value: previousRestoreLabel },
-        { label: '范围', value: '恢复上一份工作原点备份' },
-      ],
-      confirmText: '确认恢复',
-      onConfirm: handleRestorePreviousOrigin,
-    })
-  }
-  const rotationWindowLabel = configCardNo === 0 ? `Roll -95~5\u00b0 / Pitch \u00b130\u00b0 \u00b7 Yaw \u00b17\u00b0` : `Roll -5~95\u00b0 / Pitch \u00b130\u00b0 \u00b7 Yaw \u00b17\u00b0`
-
-  return (
-    <HardwareConfigCard
-      id={id}
-      focusHash={focusHash}
-      icon={<Cpu size={20} />}
-      title={`${operatorLabel}运动控制卡 · Card ${configCardNo}`}
-      subtitle={`LTDMC/${cardModel} · ${sideSpec.configKey} · 6 轴串行控制`}
-      state="ok"
-      badges={
-        <>
-          <Tag color="processing">{sideSpec.axisOrder.join(',')}</Tag>
-          <Tag color="processing">{hardwareChannelLabel(hardwareSide)}</Tag>
-          <Tag color="warning">{rotationWindowLabel}</Tag>
-          {enableTag}
-        </>
-      }
-      actions={
-        <Space wrap>
-          <Button icon={<PlugZap size={15} />} loading={pendingMotionAction === 'enable'} onClick={() => void handleEnable()}>
-            使能全部
-          </Button>
-          <Button danger icon={<Usb size={15} />} loading={pendingMotionAction === 'disable'} onClick={() => void handleDisable()}>
-            断使能
-          </Button>
-          <Button icon={<Crosshair size={15} />} loading={pendingOriginAction === 'capture'} onClick={requestCaptureOrigin}>
-            记录工作原点
-          </Button>
-          <Button danger icon={<ShieldAlert size={15} />} onClick={triggerEmergencyStop}>
-            急停
-          </Button>
-        </Space>
-      }
-      wide
-    >
-      <div className="motion-card-snapshot-toolbar">
-        <Dropdown menu={snapshotMenu(snapshotScope)} trigger={['click']}>
-          <Button icon={<RefreshCw size={15} />}>
-            选择运动参数
-          </Button>
-        </Dropdown>
-      </div>
-      <Form layout="vertical" className="hardware-form-grid hardware-form-grid-compact">
-        <Form.Item label="控制卡号">
-          <InputNumber min={0} max={8} value={configCardNo} onChange={(value) => updateCardNo(Number(value ?? sideSpec.cardNo))} />
-        </Form.Item>
-        <Form.Item label="位置源">
-          <Select
-            value={config.motion.positionSource}
-            onChange={(value: AppConfig['motion']['positionSource']) => updateConfig({ motion: { ...config.motion, positionSource: value } })}
-            options={[{ value: 'dmc_get_position' }, { value: 'dmc_get_encoder', label: 'dmc_get_encoder（不建议）' }]}
-          />
-        </Form.Item>
-        <Form.Item label="Motion Thread">
-          <Tag color="processing">{config.motion.motionThreadHz} Hz</Tag>
-        </Form.Item>
-        <Form.Item label="线程策略">
-          <Tag>串行化 LTDMC 调用</Tag>
-        </Form.Item>
-        <Form.Item label="工作窗口">
-          <Tag color="warning">{rotationWindowLabel}</Tag>
-        </Form.Item>
-        <Form.Item label="参数映射">
-          <Tag>表内编辑</Tag>
-        </Form.Item>
-      </Form>
-      <div className="motion-origin-panel">
-        <div className="hardware-subtitle-row">
-          <b>工作原点</b>
-          <span>{originScopeText}</span>
-        </div>
-        <div className="hardware-metric-grid hardware-metric-grid-single">
-          <MetricBox label="当前状态" value={originStatusText} hint={originUpdatedText} tone={sideOriginValid ? 'ok' : 'warn'} />
-        </div>
-        <Typography.Text type="secondary">{formatWorkOriginPosition(motionOrigin)}</Typography.Text>
-        {hardwareSide === 'left' && previousRestoreAvailable && (
-          <Space wrap size={6}>
-            <Tag color={previousRestoreReady ? 'success' : 'warning'}>{previousRestoreLabel}</Tag>
-            {previousRestoreMessage && (
-              <Typography.Text type={previousRestoreReady ? 'secondary' : 'danger'}>
-                {previousRestoreMessage}
-              </Typography.Text>
-            )}
-          </Space>
-        )}
-        <Space wrap className="motion-origin-actions">
-          <Button
-            icon={<RotateCcw size={15} />}
-            loading={pendingMotionAction === 'home'}
-            onClick={requestHome}
-          >
-            回硬件零点
-          </Button>
-          {hardwareSide === 'left' && (
-            <Button
-              icon={<RefreshCw size={15} />}
-              loading={pendingOriginAction === 'restore'}
-              disabled={!previousRestoreReady}
-              onClick={requestRestorePreviousOrigin}
-            >
-              恢复上个工作原点
-            </Button>
-          )}
-        </Space>
-      </div>
-      <AxisMappingTable
-        side={hardwareSide}
-        positions={positions}
-        profile={config.motion[profileKey]}
-        limits={config.motion[softLimitKey]}
-        onProfileChange={updateProfile}
-        onLimitChange={updateSoftLimits}
-      />
-      <RotationWorkLimitPanel side={hardwareSide} config={config} updateConfig={updateConfig} />
-      <div className="motion-card-snapshot-footer">
-        <Button type="primary" icon={<Save size={15} />} onClick={() => openSnapshotModal(snapshotScope)}>
-          保存运动参数
-        </Button>
-      </div>
-    </HardwareConfigCard>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function CameraCard({
-  cameraKey,
-  camera,
-  config,
-  updateConfig,
-  focusHash,
-  injectLog,
-  requestComparison,
-}: {
-  cameraKey: CameraKey
-  camera?: CameraTelemetry
-  config: AppConfig
-  updateConfig: (patch: Partial<AppConfig>) => void
-  focusHash: string
-  injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
-  requestComparison: (comparison: PendingComparison) => void
-}) {
-  const spec = cameraHardwareSpecs[cameraKey]
-  const id = cameraKey === 'global' ? 'camera-global' : cameraKey === 'wrist_left' ? 'camera-left' : 'camera-right'
-  const configField = cameraKey === 'global' ? 'global' : cameraKey === 'wrist_left' ? 'wristLeft' : 'wristRight'
-  const resolutionField =
-    cameraKey === 'global' ? 'globalResolution' : cameraKey === 'wrist_left' ? 'wristLeftResolution' : 'wristRightResolution'
-  const previewResolution = config.cameras[resolutionField] ?? config.cameras.previewResolution
-  const telemetryState = camera?.health ?? 'pending'
-  const [previewHealth, setPreviewHealth] = useState<ConnectionState>('checking')
-  const state: ConnectionState = !camera
-    ? 'pending'
-    : telemetryState === 'error' || previewHealth === 'error'
-      ? 'error'
-      : telemetryState === 'pending'
-        ? 'pending'
-        : previewHealth === 'checking' || previewHealth === 'pending'
-          ? 'checking'
-          : telemetryState === 'warn'
-            ? 'warn'
-            : 'ok'
-  const tuning = config.cameras.tuning?.[cameraKey] ?? defaultCameraTuning[cameraKey]
-  const [pendingCameraAction, setPendingCameraAction] = useState<'apply' | 'reconnect' | null>(null)
- /** 描述当前方法的功能边界。 */
- const sanitizeTuning = (next: CameraTuningProfile): CameraTuningProfile => {
-    const exposure = Math.min(cameraExposureMax, Math.max(cameraExposureMin, Number(next.exposure)))
-    const gain = Math.min(cameraGainMax, Math.max(cameraGainMin, Number(next.gain)))
-    return {
-      autoExposure: Boolean(next.autoExposure),
-      exposure: Number.isFinite(exposure) ? exposure : defaultCameraTuning[cameraKey].exposure,
-      gain: Number.isFinite(gain) ? gain : defaultCameraTuning[cameraKey].gain,
-      autoWhiteBalance: Boolean(next.autoWhiteBalance),
-    }
-  }
- /** 描述当前方法的功能边界。 */
- const updateTuning = (patch: Partial<CameraTuningProfile>) => {
-    const nextTuning = sanitizeTuning({ ...tuning, ...patch })
-    updateConfig({
-      cameras: {
-        ...config.cameras,
-        tuning: {
-          ...(config.cameras.tuning ?? defaultCameraTuning),
-          [cameraKey]: nextTuning,
-        },
-      },
-    })
-  }
- /** 处理对应的用户交互。 */
- const handleApplyTuning = async () => {
-    setPendingCameraAction('apply')
-    try {
-      await applyCameraTuning(cameraKey, {
-        ...config,
-        cameras: {
-          ...config.cameras,
-          tuning: {
-            ...(config.cameras.tuning ?? defaultCameraTuning),
-            [cameraKey]: sanitizeTuning(tuning),
-          },
-        },
-      })
-      refreshCameraStream(cameraKey)
-      commandLog(injectLog, '[CAMERA]', `${spec.label} camera tuning applied`)
-    } catch (error) {
-      injectLog('ERROR', `${spec.label} camera tuning failed: ${commandErrorMessage(error)}`, '[CAMERA]')
-    } finally {
-      setPendingCameraAction(null)
-    }
-  }
- /** 处理对应的用户交互。 */
- const handleReconnect = async () => {
-    setPendingCameraAction('reconnect')
-    try {
-      await reconnectCamera(cameraKey)
-      refreshCameraStream(cameraKey)
-      commandLog(injectLog, '[CAMERA]', `${spec.label} camera reconnect requested`)
-    } catch (error) {
-      injectLog('ERROR', `${spec.label} camera reconnect failed: ${commandErrorMessage(error)}`, '[CAMERA]')
-    } finally {
-      setPendingCameraAction(null)
-    }
-  }
- /** 计算对应的业务值或展示值。 */
- const cameraTuningItems = (profile: CameraTuningProfile): ActionCompareItem[] => [
-    { label: '分辨率', value: previewResolution },
-    { label: 'FPS', value: `${config.cameras.fps}` },
-    { label: 'Exposure', value: `${profile.exposure}` },
-    { label: 'Gain', value: `${profile.gain}` },
-    { label: 'Auto exposure', value: profile.autoExposure ? '开' : '关' },
-    { label: 'Auto WB', value: profile.autoWhiteBalance ? '开' : '关' },
-  ]
- /** 处理对应的用户交互。 */
- const requestApplyTuning = () => {
-    const nextTuning = sanitizeTuning(tuning)
-    requestComparison({
-      title: `应用${spec.label}参数`,
-      tone: 'warning',
-      impact: `将写入${spec.label}预览参数，并刷新当前预览流。`,
-      expected: '确认后会调用现有相机参数接口，失败时继续写入日志面板。',
-      current: cameraTuningItems(tuning),
-      proposed: cameraTuningItems(nextTuning),
-      confirmText: '确认应用',
-      onConfirm: handleApplyTuning,
-    })
-  }
-  const cameraInlineTone = inlineToneFromState(state)
-  const frameAgeTone: InlineStatusTone = !camera ? 'pending' : camera.frameAgeMs > 250 ? 'warn' : 'ok'
-  const deviceText = config.cameras[configField] || spec.device
-
-  return (
-    <HardwareConfigCard
-      id={id}
-      focusHash={focusHash}
-      icon={<Camera size={20} />}
-      title={`${spec.label} · ${spec.model}`}
-      subtitle={`${previewResolution} @ ${config.cameras.fps}Hz · ${spec.lerobotKey}`}
-      state={state}
-      badges={<Tag color={stateTone(state)}>{previewResolution}</Tag>}
-    >
-      {camera && <CameraPreview camera={camera} compact resolution={previewResolution} onPreviewHealthChange={setPreviewHealth} />}
-      <div className="camera-status-strip">
-        <div className={`camera-status-${cameraInlineTone}`}>
-          <b>采集链路</b>
-          <span>{stateText(state)}</span>
-          <small>{camera ? `${camera.fps.toFixed(1)} FPS / ${previewResolution}` : '等待 telemetry'}</small>
-        </div>
-        <div className="camera-status-ok">
-          <b>设备</b>
-          <span>{deviceText}</span>
-          <small>{spec.lerobotKey}</small>
-        </div>
-        <div className={`camera-status-${frameAgeTone}`}>
-          <b>帧延迟</b>
-          <span>{camera ? `${camera.frameAgeMs.toFixed(0)} ms` : '-'}</span>
-          <small>{camera ? `clock ${camera.timestampSkewMs.toFixed(1)} ms` : '未收到帧'}</small>
-        </div>
-      </div>
-      <div className="hardware-metric-grid camera-metric-grid">
-        <MetricBox label="FPS" value={`${(camera?.fps ?? 0).toFixed(1)} / ${spec.fps}`} />
-        <MetricBox label="Frame age" value={`${(camera?.frameAgeMs ?? 0).toFixed(0)} ms`} />
-        <MetricBox label="Clock skew" value={`${(camera?.timestampSkewMs ?? 0).toFixed(1)} ms`} tone={Math.abs(camera?.timestampSkewMs ?? 0) > 16 ? 'warn' : 'ok'} />
-      </div>
-      <div className="camera-tuning-panel">
-        <div className="camera-tuning-head">
-          <Typography.Text strong>相机参数</Typography.Text>
-          <Space className="camera-tuning-actions" wrap>
-            <Button icon={<Save size={15} />} loading={pendingCameraAction === 'apply'} onClick={requestApplyTuning}>
-              应用参数
-            </Button>
-            <Button icon={<RefreshCw size={15} />} loading={pendingCameraAction === 'reconnect'} onClick={() => void handleReconnect()}>
-              重连预览
-            </Button>
-          </Space>
-        </div>
-      <Form layout="vertical" className="hardware-form-grid hardware-form-grid-compact camera-tuning-grid">
-        <Form.Item label="设备">
-          <Input value={config.cameras[configField]} onChange={(event) => updateConfig({ cameras: { ...config.cameras, [configField]: event.target.value } })} />
-        </Form.Item>
-        <Form.Item label="预览分辨率" tooltip="仅影响前端预览和相机流负载；默认 640x480 足够观察。">
-          <Select
-            value={previewResolution}
-            onChange={(value) => updateConfig({ cameras: { ...config.cameras, [resolutionField]: value } })}
-            options={previewResolutionOptions}
-          />
-        </Form.Item>
-        <Form.Item label="相机采集目标 FPS" tooltip="后端相机预览流的目标帧率；数据保存频率在数据存储里的录制 FPS 单独设置。"><InputNumber min={1} max={60} value={config.cameras.fps} onChange={(value) => updateConfig({ cameras: { ...config.cameras, fps: Number(value ?? 30) } })} /></Form.Item>
-        <Form.Item label="曝光 / 增益" className="camera-tuning-span">
-          <div className="camera-tuning-control-stack">
-            <div className="camera-tuning-toggle-row">
-              <Switch
-                checked={Boolean(tuning.autoExposure)}
-                checkedChildren="Auto"
-                unCheckedChildren="Manual"
-                onChange={(checked) => updateTuning({ autoExposure: checked })}
-              />
-              <Switch
-                checked={Boolean(tuning.autoWhiteBalance)}
-                checkedChildren="Auto WB"
-                unCheckedChildren="Manual WB"
-                onChange={(checked) => updateTuning({ autoWhiteBalance: checked })}
-              />
-            </div>
-            <div className="camera-tuning-control-row">
-              <Typography.Text className="camera-tuning-control-label" type="secondary">Exposure</Typography.Text>
-              <Slider
-                min={cameraExposureMin}
-                max={cameraExposureMax}
-                step={0.5}
-                value={tuning.exposure}
-                onChange={(value) => updateTuning({ exposure: Number(value) })}
-              />
-              <InputNumber
-                min={cameraExposureMin}
-                max={cameraExposureMax}
-                step={0.5}
-                value={tuning.exposure}
-                onChange={(value) => updateTuning({ exposure: Number(value ?? defaultCameraTuning[cameraKey].exposure) })}
-              />
-            </div>
-            <div className="camera-tuning-control-row">
-              <Typography.Text className="camera-tuning-control-label" type="secondary">Gain</Typography.Text>
-              <Slider
-                min={cameraGainMin}
-                max={cameraGainMax}
-                step={1}
-                value={tuning.gain}
-                onChange={(value) => updateTuning({ gain: Number(value) })}
-              />
-              <InputNumber
-                min={cameraGainMin}
-                max={cameraGainMax}
-                step={1}
-                value={tuning.gain}
-                onChange={(value) => updateTuning({ gain: Number(value ?? 0) })}
-              />
-            </div>
-          </div>
-        </Form.Item>
-      </Form>
-      </div>
-    </HardwareConfigCard>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function ForceSensorCard({
-  side,
-  config,
-  updateConfig,
-  focusHash,
-  values,
-  forceStatus,
-  history,
-  injectLog,
-}: {
-  side: RobotSide
-  config: AppConfig
-  updateConfig: (patch: Partial<AppConfig>) => void
-  focusHash: string
-  values: number[]
-  forceStatus: TelemetryFrame['forceStatus']
-  history: ReturnType<typeof useTelemetryStore.getState>['history']
-  injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
-}) {
-  const hardwareSide = hardwareSideForOperatorSide(side)
-  const sideSpec = armHardwareSpecs[hardwareSide]
-  const operatorLabel = operatorSideLabel(side)
-  const ipKey = sideSpec.forceIpKey
-  const isHkvl = config.force.source === 'hkvl_serial'
-  const sideStatus = forceStatus?.sides?.[hardwareSide]
-  const state = isHkvl && !sideStatus?.healthy ? 'error' : forceState(values, config)
-  const id = `force-${side}`
-  const serialPortKey = hardwareSide === 'left' ? 'leftPort' : 'rightPort'
-  const compliance = config.force.compliance[hardwareSide]
-  const mappingsConfirmed =
-    config.force.compliance.left.mappingConfirmed
-    && config.force.compliance.right.mappingConfirmed
-  const axisSignConfig = config.force.axisSign ?? fallbackForceAxisSigns
-  const axisSigns = axisSignConfig[hardwareSide] ?? fallbackForceAxisSigns[hardwareSide]
-  const [axisCalibrationOpen, setAxisCalibrationOpen] = useState(false)
-  const [axisSignDraft, setAxisSignDraft] = useState<number[]>(axisSigns)
-  const updateCompliance = (nextSide: typeof compliance) => {
-    updateConfig({
-      force: {
-        ...config.force,
-        compliance: {
-          ...config.force.compliance,
-          [hardwareSide]: nextSide,
-        },
-      },
-    })
-  }
-  const updateComplianceArray = (
-    key: 'matrix' | 'deadbandN' | 'gainUmPerNs' | 'maxStepUm' | 'maxOffsetUm',
-    index: number,
-    value: number | null,
-  ) => {
-    const next = [...compliance[key]]
-    next[index] = Number(value ?? 0)
-    updateCompliance({ ...compliance, [key]: next })
-  }
-  const openAxisCalibration = () => {
-    setAxisSignDraft([...axisSigns])
-    setAxisCalibrationOpen(true)
-  }
-  const saveAxisCalibration = () => {
-    updateConfig({
-      force: {
-        ...config.force,
-        axisSign: {
-          ...axisSignConfig,
-          [hardwareSide]: axisSignDraft,
-        },
-        compliance: {
-          ...config.force.compliance,
-          [hardwareSide]: {
-            ...compliance,
-            mappingConfirmed: true,
-          },
-        },
-      },
-    })
-    commandLog(injectLog, '[FORCE]', `${operatorLabel} 六轴方向标定已保存；请释放载荷后重新执行启动力觉自检`)
-    setAxisCalibrationOpen(false)
-  }
-  const updateAxisSignDraft = (index: number, value: number) => {
-    setAxisSignDraft((current) => current.map((sign, signIndex) => signIndex === index ? value : sign))
-  }
-  return (
-    <HardwareConfigCard
-      id={id}
-      focusHash={focusHash}
-      icon={<Waves size={20} />}
-      title={`${operatorLabel} ${isHkvl ? 'HKVL-36A' : 'Nano-17'} 六维力`}
-      subtitle={isHkvl ? 'HAL 原生串口 · N / Nm · 只读主动帧' : `${nano17Spec.model} · Fx/Fy/Fz=mN · Mx/My/Mz=mN·m`}
-      state={state}
-      actions={
-        <Space wrap>
-          {!isHkvl && (
-            <Button
-              icon={<RotateCcw size={15} />}
-              onClick={() => {
-                void tareForceSensor(hardwareSide)
-                commandLog(injectLog, '[FORCE]', `${operatorLabel} Nano-17 Tare`)
-              }}
-            >
-              Tare
-            </Button>
-          )}
-          <Button icon={<Download size={15} />} onClick={() => commandLog(injectLog, '[FORCE]', `${operatorLabel} 力数据导出`)}>
-            CSV
-          </Button>
-        </Space>
-      }
-      wide
-    >
-      <div className={`force-settings-layout${isHkvl ? ' force-settings-layout-hkvl' : ''}`}>
-        <div className="force-visual-area">
-          <ForceChart history={history} side={hardwareSide} height={170} />
-          <div className="force-current-grid force-current-grid-settings">
-            {forceChannels.map((channel, index) => (
-              <span key={channel}>
-                <b>{channel}</b>
-                {formatForceValue(values[index] ?? 0, index)}
-              </span>
-            ))}
-          </div>
-        </div>
-        <div className="force-settings-column">
-          <Form layout="vertical" className="hardware-form-grid hardware-form-grid-compact">
-            <Form.Item label="数据源">
-              <Select
-                value={config.force.source}
-                options={[
-                  { value: 'nidaq', label: 'ATI Nano-17 / NI-DAQ' },
-                  { value: 'hkvl_serial', label: 'HKVL-36A / HAL 串口' },
-                ]}
-                onChange={(source) => updateConfig({ force: { ...config.force, source } })}
-              />
-            </Form.Item>
-            {isHkvl ? (
-              <>
-                <Form.Item label="串口">
-                  <Input
-                    value={config.force.serial[serialPortKey]}
-                    onChange={(event) => updateConfig({
-                      force: {
-                        ...config.force,
-                        serial: { ...config.force.serial, [serialPortKey]: event.target.value },
-                      },
-                    })}
-                  />
-                </Form.Item>
-                <Form.Item label="协议"><Input disabled value={config.force.serial.protocol} /></Form.Item>
-                <Form.Item label="波特率"><InputNumber disabled value={config.force.serial.baudrate} /></Form.Item>
-                <Form.Item label="测量采样率 Hz"><InputNumber disabled value={config.force.serial.expectedSampleHz} /></Form.Item>
-              </>
-            ) : (
-              <>
-                <Form.Item label="DAQ 通道">
-                  <Input value={config.force[ipKey]} onChange={(event) => updateConfig({ force: { ...config.force, [ipKey]: event.target.value } })} />
-                </Form.Item>
-                <Form.Item label="采样率 Hz"><InputNumber min={1} value={config.force.sampleHz} onChange={(value) => updateConfig({ force: { ...config.force, sampleHz: Number(value ?? 200) } })} /></Form.Item>
-                <Form.Item label="录制窗口样本"><InputNumber min={0} max={512} value={config.force.recordWindowSamples} onChange={(value) => updateConfig({ force: { ...config.force, recordWindowSamples: Number(value ?? 0) } })} /></Form.Item>
-              </>
-            )}
-            <Form.Item label="Tare 样本"><InputNumber min={0} max={512} value={config.force.tareSamples} onChange={(value) => updateConfig({ force: { ...config.force, tareSamples: Number(value ?? 0) } })} /></Form.Item>
-            <Form.Item label="低通滤波">
-              <Switch
-                checked={config.force.lowpassEnabled}
-                checkedChildren="ON"
-                unCheckedChildren="OFF"
-                onChange={(checked) => updateConfig({ force: { ...config.force, lowpassEnabled: checked } })}
-              />
-            </Form.Item>
-            <Form.Item label="低通截止 Hz"><InputNumber min={0} value={config.force.lowpassCutoffHz} onChange={(value) => updateConfig({ force: { ...config.force, lowpassCutoffHz: Number(value ?? 10) } })} /></Form.Item>
-            {!isHkvl && <Form.Item label="标定证书">
-              <Switch
-                checked={config.force.certificateConfirmed}
-                checkedChildren="已确认"
-                unCheckedChildren="待确认"
-                onChange={(checked) => updateConfig({ force: { ...config.force, certificateConfirmed: checked } })}
-              />
-            </Form.Item>}
-          </Form>
-          <div className="hardware-metric-grid">
-            {isHkvl ? (
-              <>
-                <MetricBox label="端口" value={sideStatus?.port || config.force.serial[serialPortKey]} hint={`${config.force.serial.baudrate.toLocaleString()} bps · 8N1`} tone={sideStatus?.connected ? 'ok' : 'warn'} />
-                <MetricBox label="采样率" value={`${Number(sideStatus?.sampleHz ?? 0).toFixed(1)} Hz`} hint={`样本年龄 ${Number(sideStatus?.sampleAgeMs ?? 0).toFixed(1)} ms`} tone={sideStatus?.healthy ? 'ok' : 'warn'} />
-                <MetricBox label="帧校验" value={`CRC ${sideStatus?.crcErrors ?? 0}`} hint={`resync ${sideStatus?.resyncBytes ?? 0}`} tone={(sideStatus?.crcErrors ?? 0) > 0 ? 'warn' : 'ok'} />
-                <MetricBox label="连接" value={sideStatus?.healthy ? '健康' : '异常'} hint={sideStatus?.error || `左右偏差 ${Number(forceStatus?.leftRightSkewMs ?? 0).toFixed(1)} ms`} tone={sideStatus?.healthy ? 'ok' : 'warn'} />
-              </>
-            ) : (
-              <>
-                <MetricBox label="Fx/Fy 量程" value={nano17Spec.range.fxy} />
-                <MetricBox label="Fz 量程" value={nano17Spec.range.fz} />
-                <MetricBox label="Moment 量程" value={nano17Spec.range.moment} />
-                <MetricBox label="NI-DAQmx" value="DIFF ai0:5" hint={`${nano17Spec.fastDaqHz}Hz`} />
-              </>
-            )}
-          </div>
-          {isHkvl && (
-            <>
-              <div className="force-control-workbench">
-                <section className="force-control-panel force-coordinate-panel">
-                  <div className="force-control-panel-head">
-                    <div>
-                      <b>六轴坐标方向</b>
-                      <span>操作者视角 · 传感器原始坐标到滑轨坐标</span>
-                    </div>
-                    <Tag color={compliance.mappingConfirmed ? 'success' : 'warning'}>
-                      {compliance.mappingConfirmed ? '已验证' : '待标定'}
-                    </Tag>
-                  </div>
-                  <Button
-                    aria-label={`${operatorLabel}六轴方向标定`}
-                    className="force-calibration-launch"
-                    icon={<Crosshair size={15} />}
-                    disabled={config.force.compliance.enabled}
-                    onClick={openAxisCalibration}
-                  >
-                    六轴方向标定
-                  </Button>
-                  <div className="force-axis-sign-grid" aria-label={`${operatorLabel}已标定方向`}>
-                    {forceAxisCalibrationAxes.map(({ axis, channel, index }) => (
-                      <span className="force-axis-sign" key={axis}>
-                        <small>{channel}</small>
-                        <b>{`${axis}${axisSigns[index] < 0 ? '−' : '+'}`}</b>
-                      </span>
-                    ))}
-                  </div>
-                  <Typography.Text type="secondary" className="force-control-note">
-                    {config.force.compliance.enabled ? '请先关闭位置导纳，才能修改方向标定。' : '保存后会重新加载传感器，随后需在无外力时 Tare。'}
-                  </Typography.Text>
-                </section>
-
-                <section className="force-control-panel force-compliance-panel">
-                  <div className="force-control-panel-head">
-                    <div>
-                      <b>X/Z 顺应</b>
-                      <span>仅作用于新的 Omega.7 原生遥操作目标</span>
-                    </div>
-                    <Switch
-                      aria-label="启用 X/Z 顺应"
-                      checked={config.force.compliance.enabled}
-                      disabled={!mappingsConfirmed && !config.force.compliance.enabled}
-                      checkedChildren="已启用"
-                      unCheckedChildren={mappingsConfirmed ? '已关闭' : '等待标定'}
-                      onChange={(enabled) => updateConfig({
-                        force: {
-                          ...config.force,
-                          compliance: { ...config.force.compliance, enabled },
-                        },
-                      })}
-                    />
-                  </div>
-                  <Form layout="vertical" className="force-compliance-grid">
-                    <Form.Item label="X/Z 映射矩阵">
-                      <Space.Compact block>
-                        {compliance.matrix.map((value, index) => (
-                          <InputNumber
-                            aria-label={`${operatorLabel}映射矩阵 ${index + 1}`}
-                            key={index}
-                            step={0.1}
-                            value={value}
-                            onChange={(next) => updateComplianceArray('matrix', index, next)}
-                          />
-                        ))}
-                      </Space.Compact>
-                    </Form.Item>
-                    {([
-                      ['deadbandN', 'X/Z 死区 N'],
-                      ['gainUmPerNs', 'X/Z 增益 μm/(N·s)'],
-                      ['maxStepUm', '单帧上限 μm'],
-                      ['maxOffsetUm', '会话偏移上限 μm'],
-                    ] as const).map(([key, label]) => (
-                      <Form.Item label={label} key={key}>
-                        <Space.Compact block>
-                          {compliance[key].map((value, index) => (
-                            <InputNumber
-                              aria-label={`${operatorLabel}${label} ${index === 0 ? 'X' : 'Z'}`}
-                              key={index}
-                              min={0}
-                              value={value}
-                              onChange={(next) => updateComplianceArray(key, index, next)}
-                            />
-                          ))}
-                        </Space.Compact>
-                      </Form.Item>
-                    ))}
-                  </Form>
-                </section>
-              </div>
-              <Typography.Text type="secondary" className="force-control-footer-note">
-                停止、急停或配置变化会清空累计偏移；方向标定只改变力坐标解释，不改变滑轨运动方向。
-              </Typography.Text>
-              <Modal
-                title={`${operatorLabel} 六轴方向标定`}
-                width={720}
-                className="force-axis-calibration-modal"
-                open={axisCalibrationOpen}
-                onCancel={() => setAxisCalibrationOpen(false)}
-                onOk={saveAxisCalibration}
-                okText="保存标定"
-                cancelText="取消"
-                okButtonProps={{ disabled: config.force.compliance.enabled }}
-              >
-                <div className="force-calibration-intro">
-                  <div>
-                    <span>操作者视角</span>
-                    <b>{operatorLabel}</b>
-                    <span>{sideStatus?.port || config.force.serial[serialPortKey]}</span>
-                  </div>
-                  <p>选择传感器原始轴相对滑轨运动坐标的方向。此操作不会改变滑轨运动方向。</p>
-                </div>
-                <div className="force-axis-calibration-groups">
-                  {forceAxisCalibrationGroups.map((group) => (
-                    <section className="force-axis-calibration-group" key={group.title}>
-                      <div className="force-axis-calibration-group-head">
-                        <b>{group.title}</b>
-                        <span>{group.unit}</span>
-                      </div>
-                      <div className="force-axis-calibration-axis-grid">
-                        {group.axes.map(({ axis, channel, index }) => (
-                          <div className="force-axis-calibration-axis" key={axis}>
-                            <div>
-                              <b>{axis}</b>
-                              <span>{channel}</span>
-                            </div>
-                            <Radio.Group
-                              aria-label={`${operatorLabel}${axis}方向`}
-                              buttonStyle="solid"
-                              optionType="button"
-                              value={axisSignDraft[index] ?? 1}
-                              onChange={(event) => updateAxisSignDraft(index, Number(event.target.value))}
-                            >
-                              <Radio.Button value={1}>同向 +</Radio.Button>
-                              <Radio.Button value={-1}>反向 −</Radio.Button>
-                            </Radio.Group>
-                          </div>
-                        ))}
-                      </div>
-                    </section>
-                  ))}
-                </div>
-                <Typography.Text type="secondary" className="force-calibration-warning">
-                  保存会重新加载力传感器。请释放外力、完成 Tare 后，再启用位置导纳。
-                </Typography.Text>
-              </Modal>
-            </>
-          )}
-        </div>
-      </div>
-    </HardwareConfigCard>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function GripperCard({
-  side,
-  config,
-  updateConfig,
-  focusHash,
-  currentMm,
-  issueManualGripperMove,
-  injectLog,
-  requestComparison,
-}: {
-  side: RobotSide
-  config: AppConfig
-  updateConfig: (patch: Partial<AppConfig>) => void
-  focusHash: string
-  currentMm: number
-  issueManualGripperMove: (side: RobotSide, command: ManualGripperCommand, targetMm?: number) => void
-  injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
-  requestComparison: (comparison: PendingComparison) => void
-}) {
-  const hardwareSide = hardwareSideForOperatorSide(side)
-  const sideSpec = armHardwareSpecs[hardwareSide]
-  const operatorLabel = operatorSideLabel(side)
-  const id = `gripper-${side}`
-  const portKey = hardwareSide === 'left' ? 'leftPort' : 'rightPort'
-  const targetKey = hardwareSide === 'left' ? 'targetLeftMm' : 'targetRightMm'
-  const slaveKey = hardwareSide === 'left' ? 'leftSlaveId' : 'rightSlaveId'
-  const enabledKey = hardwareSide === 'left' ? 'leftEnabled' : 'rightEnabled'
-  const gripperEnabled = Boolean(config.gripper[enabledKey])
-  const halNativeGripperTeleop = true
-  const canCommandGripper = true
-  const gapMinKey = side === 'left' ? 'leftGapMinMm' : 'rightGapMinMm'
-  const gapMaxKey = side === 'left' ? 'leftGapMaxMm' : 'rightGapMaxMm'
-  const protectedMinGapMm = config.gripper.icfTargetProtectionEnabled
-    ? Math.min(Math.max(config.gripper.icfTargetMinGapMm, 0), config.gripper.strokeMm)
-    : 0
- /** 设置当前流程的对应状态。 */
- const setTarget = (value: number) => updateConfig({ gripper: { ...config.gripper, [targetKey]: Math.min(Math.max(value, protectedMinGapMm), config.gripper.strokeMm) } })
- /** 设置当前流程的对应状态。 */
- const setForceFeedback = (checked: boolean) => updateConfig({ gripper: { ...config.gripper, forceFeedbackAvailable: checked } })
-  const currentText = formatGripperPosition(currentMm)
- /** 设置当前流程的对应状态。 */
- const setTargetAndRun = (label: string, value: number) => {
-    const targetValue = Math.min(Math.max(value, protectedMinGapMm), config.gripper.strokeMm)
-    setTarget(targetValue)
-    issueManualGripperMove(hardwareSide, 'target', targetValue)
-    commandLog(injectLog, '[GRIPPER]', `${operatorLabel}夹爪${label}`)
-  }
-  const gt = config.teleop.gripperTeleop
-  /** 设置当前流程的对应状态。 */
-  const setGt = (patch: Partial<typeof gt>) =>
-    updateConfig({ teleop: { ...config.teleop, gripperTeleop: { ...gt, ...patch } } })
-  const teleopRunning = halNativeGripperTeleop && Boolean(config.teleop.leftConnected || config.teleop.rightConnected)
-  const fallbackTeleopPort: GripperPortHint = {
-    side: hardwareSide,
-    port: config.gripper[portKey],
-    slaveId: config.gripper[slaveKey],
-    baudrate: config.gripper.baudrate,
-  }
-  const teleopPort = fallbackTeleopPort
-  const teleopPortSummary = `${teleopPort.port ?? '-'} / slave ${teleopPort.slaveId ?? '-'}`
-  const teleopPortDetail = `${teleopPort.baudrate ?? config.gripper.baudrate} baud · HAL-native 夹爪遥操作串口`
-  const teleopRunSummary = halNativeGripperTeleop
-    ? teleopRunning
-      ? '随 Omega.7 自动遥操作'
-      : '等待主手连接'
-    : gripperEnabled
-      ? '已使能'
-      : '未使能'
-  const teleopRunDetail = halNativeGripperTeleop ? '主手连接后 HAL-native 会自动接管夹爪' : '等待 Omega.7 夹爪输入'
-  const gripperPortTone: InlineStatusTone = 'pending'
-  const gripperRunTone: InlineStatusTone = teleopRunning ? 'ok' : 'pending'
-  const gripperHasTeleopError = false
-  const gripperErrorDetail = ''
-  const gripperCardState: ConnectionState = halNativeGripperTeleop
-    ? teleopRunning ? 'ok' : 'pending'
-    : config.gripper[enabledKey] ? 'ok' : 'pending'
-  const gripperControlLabel = halNativeGripperTeleop ? '控制状态' : '使能状态'
-  const gripperControlValue = halNativeGripperTeleop ? teleopRunSummary : gripperEnabled ? '已使能' : '未使能'
-  const gripperControlTone = halNativeGripperTeleop ? teleopRunning ? 'ok' : 'warn' : gripperEnabled ? 'ok' : 'warn'
-  /** 处理对应的用户交互。 */
-  const requestGripperTarget = () =>
-    requestComparison({
-      title: `${operatorLabel}夹爪执行目标`,
-      tone: 'warning',
-      impact: `将向${operatorLabel}夹爪下发目标开合命令。`,
-      expected: '确认后仍由现有夹爪安全限制和命令力限制保护。',
-      current: [
-        { label: '当前开度', value: currentText },
-        { label: gripperControlLabel, value: gripperControlValue },
-      ],
-      proposed: [
-        { label: '目标开合', value: `${config.gripper[targetKey].toFixed(1)} mm` },
-        { label: '命令力限制', value: `≤${config.gripper.commandForceLimitN.toFixed(1)} N` },
-      ],
-      confirmText: '确认执行',
-     onConfirm: () => issueManualGripperMove(hardwareSide, 'target', Math.max(config.gripper[targetKey], protectedMinGapMm)),
-    })
-  return (
-    <HardwareConfigCard
-      id={id}
-      focusHash={focusHash}
-      icon={<Hand size={20} />}
-      title={`${operatorLabel}夹爪 · EPG006`}
-      subtitle={`RS485 / pyserial · ${config.gripper[portKey]} · 从站 ${config.gripper[slaveKey]}`}
-      state={gripperCardState}
-      badges={
-        <>
-          <Tag color="processing">0-26 mm</Tag>
-          <Tag color="warning">力传感待确认</Tag>
-          {halNativeGripperTeleop && <Tag color={teleopRunning ? 'success' : 'processing'}>HAL-native 接管</Tag>}
-        </>
-      }
-    >
-      <div className="gripper-settings-stack">
-        <div className="gripper-config-section">
-          <div className="hardware-subtitle-row">
-            <b>连接参数</b>
-            <span>配置保存到后端；下方按钮会通过 RS485 下发夹爪命令</span>
-          </div>
-          <Form layout="vertical" className="hardware-form-grid hardware-form-grid-compact">
-            <Form.Item label="COM 口">
-              <Input value={config.gripper[portKey]} onChange={(event) => updateConfig({ gripper: { ...config.gripper, [portKey]: event.target.value } })} />
-            </Form.Item>
-            <Form.Item label="波特率"><InputNumber value={config.gripper.baudrate} onChange={(value) => updateConfig({ gripper: { ...config.gripper, baudrate: Number(value ?? 115200) } })} /></Form.Item>
-            <Form.Item label="从站地址"><InputNumber value={config.gripper[slaveKey]} onChange={(value) => updateConfig({ gripper: { ...config.gripper, [slaveKey]: Number(value ?? sideSpec.gripperSlaveId) } })} /></Form.Item>
-            <Form.Item label="行程 mm"><InputNumber value={config.gripper.strokeMm} onChange={(value) => updateConfig({ gripper: { ...config.gripper, strokeMm: Number(value ?? 26) } })} /></Form.Item>
-            <Form.Item label="命令力限制 N"><InputNumber min={0} max={8} value={config.gripper.commandForceLimitN} onChange={(value) => updateConfig({ gripper: { ...config.gripper, commandForceLimitN: Number(value ?? 8) } })} /></Form.Item>
-            <Form.Item label="采样 Hz">
-              <InputNumber min={1} max={60} value={config.gripper.sampleHz} onChange={(value) => updateConfig({ gripper: { ...config.gripper, sampleHz: Number(value ?? 30) } })} />
-            </Form.Item>
-            <Form.Item label="力反馈传感">
-              <Switch checked={config.gripper.forceFeedbackAvailable} checkedChildren="已接入" unCheckedChildren="待确认" onChange={setForceFeedback} />
-            </Form.Item>
-            <Form.Item label="ICF 靶保护">
-              <Switch checked={config.gripper.icfTargetProtectionEnabled} checkedChildren="开" unCheckedChildren="关" onChange={(value) => updateConfig({ gripper: { ...config.gripper, icfTargetProtectionEnabled: value } })} />
-            </Form.Item>
-            <Form.Item label="最小开度 mm">
-              <InputNumber min={0} max={config.gripper.strokeMm} step={0.01} value={config.gripper.icfTargetMinGapMm} onChange={(value) => updateConfig({ gripper: { ...config.gripper, icfTargetMinGapMm: Math.min(Math.max(Number(value ?? 1.02), 0), config.gripper.strokeMm) } })} />
-            </Form.Item>
-          </Form>
-        </div>
-        <div className="gripper-status-section">
-          <div className="hardware-metric-grid gripper-metric-grid">
-            <MetricBox label={gripperControlLabel} value={gripperControlValue} tone={gripperControlTone} />
-            <MetricBox label="当前开度" value={currentText} />
-            <MetricBox label="目标开度" value={`${config.gripper[targetKey].toFixed(1)} mm`} />
-            <MetricBox label="Omega.7 映射" value={`${gt[gapMinKey].toFixed(1)}-${gt[gapMaxKey].toFixed(1)} mm`} hint="夹持角 0-0.45 rad" />
-            <MetricBox label="ICF 靶保护" value={config.gripper.icfTargetProtectionEnabled ? `${protectedMinGapMm.toFixed(2)} mm` : '关闭'} />
-            <MetricBox label="夹持角力矩反馈" value="手册未给出" hint="EPG006 章节仅确认位置接口" tone="warn" />
-            <MetricBox label="命令侧力限制" value={`≤${config.gripper.commandForceLimitN.toFixed(1)} N`} hint="Omega.7 gripper force 输出上限" />
-          </div>
-          <Slider min={protectedMinGapMm} max={config.gripper.strokeMm} step={0.1} value={Math.max(config.gripper[targetKey], protectedMinGapMm)} onChange={(value) => setTarget(Number(value))} />
-        </div>
-        <div className="gripper-action-section">
-          {!halNativeGripperTeleop && (
-            <Button
-              type={gripperEnabled ? 'default' : 'primary'}
-              icon={<PlugZap size={15} />}
-              onClick={() => issueManualGripperMove(hardwareSide, gripperEnabled ? 'disable' : 'enable')}
-            >
-              {gripperEnabled ? '断使能' : '使能'}
-            </Button>
-          )}
-          <Button disabled={!canCommandGripper} onClick={requestGripperTarget}>执行目标</Button>
-          <Button disabled={!canCommandGripper} onClick={() => issueManualGripperMove(hardwareSide, 'open')}>打开</Button>
-          <Button disabled={!canCommandGripper} onClick={() => issueManualGripperMove(hardwareSide, 'close')}>闭合</Button>
-          <Button disabled={!canCommandGripper} icon={<RotateCcw size={15} />} onClick={() => setTargetAndRun('回零', 0)}>
-            回零
-          </Button>
-          <Button icon={<Square size={15} />} onClick={() => issueManualGripperMove(hardwareSide, 'stop')}>
-            停止
-          </Button>
-        </div>
-        {halNativeGripperTeleop && (
-          <div className="gripper-manual-command-section">
-            <div className="hardware-subtitle-row">
-              <b>高级手动命令</b>
-              <span>通常无需操作；主手连接后 HAL-native 会自动接管夹爪</span>
-            </div>
-            <Space size={8} wrap>
-              <Button size="small" icon={<PlugZap size={14} />} onClick={() => issueManualGripperMove(hardwareSide, 'enable')}>
-                手动下发使能
-              </Button>
-              <Button size="small" danger onClick={() => issueManualGripperMove(hardwareSide, 'disable')}>
-                手动断使能
-              </Button>
-            </Space>
-          </div>
-        )}
-        <div className="gripper-config-section">
-          <div className="hardware-subtitle-row">
-            <b>Omega7 夹爪遥操作</b>
-            <Space size={6}>
-              <Tag color={teleopRunning ? 'success' : 'processing'}>{teleopRunSummary}</Tag>
-            </Space>
-          </div>
-          {gripperHasTeleopError && (
-            <div className="hardware-error-callout gripper-error-callout" role="alert">
-            <b>{operatorLabel}夹爪遥操连接异常</b>
-              <span>{gripperErrorDetail || teleopRunSummary}</span>
-            </div>
-          )}
-          <div className="gripper-teleop-strip">
-            <div className={`gripper-status-${gripperPortTone}`}>
-              <b>夹爪串口</b>
-              <span>{teleopPortSummary}</span>
-              <small>{teleopPortDetail}</small>
-            </div>
-            <div className={`gripper-status-${gripperRunTone}`}>
-              <b>遥操作</b>
-              <span>{teleopRunSummary}</span>
-              <small>{teleopRunDetail}</small>
-            </div>
-          </div>
-          <Form layout="vertical" className="hardware-form-grid hardware-form-grid-compact">
-            <Form.Item label="Gap 最小 mm (夹紧)">
-              <InputNumber value={gt[gapMinKey]} onChange={(v) => setGt({ [gapMinKey]: Number(v ?? 0) })} />
-            </Form.Item>
-            <Form.Item label="Gap 最大 mm (张开)">
-              <InputNumber value={gt[gapMaxKey]} onChange={(v) => setGt({ [gapMaxKey]: Number(v ?? 50) })} />
-            </Form.Item>
-            <Form.Item label="开阈值 (0-1)">
-              <InputNumber min={0} max={1} step={0.05} value={gt.openThreshold} onChange={(v) => setGt({ openThreshold: Number(v ?? 0.3) })} />
-            </Form.Item>
-            <Form.Item label="闭阈值 (0-1)">
-              <InputNumber min={0} max={1} step={0.05} value={gt.closeThreshold} onChange={(v) => setGt({ closeThreshold: Number(v ?? 0.7) })} />
-            </Form.Item>
-            <Form.Item label="夹持速度">
-              <InputNumber min={1} max={255} value={gt.gripSpeed} onChange={(v) => setGt({ gripSpeed: Number(v ?? 255) })} />
-            </Form.Item>
-            <Form.Item label="夹持力矩">
-              <InputNumber min={1} max={255} value={gt.gripTorque} onChange={(v) => setGt({ gripTorque: Number(v ?? 1) })} />
-            </Form.Item>
-            <Form.Item label="释放速度">
-              <InputNumber min={1} max={255} value={gt.releaseSpeed} onChange={(v) => setGt({ releaseSpeed: Number(v ?? 255) })} />
-            </Form.Item>
-            <Form.Item label="释放力矩">
-              <InputNumber min={1} max={255} value={gt.releaseTorque} onChange={(v) => setGt({ releaseTorque: Number(v ?? 1) })} />
-            </Form.Item>
-            <Form.Item label="诊断日志">
-              <Switch checked={gt.diagLog} checkedChildren="开" unCheckedChildren="关" onChange={(v) => setGt({ diagLog: v })} />
-            </Form.Item>
-            <Form.Item label="Gap 自动量程">
-              <Switch checked={gt.autoGapCalibration} checkedChildren="开" unCheckedChildren="关" onChange={(v) => setGt({ autoGapCalibration: v })} />
-            </Form.Item>
-          </Form>
-        </div>
-      </div>
-    </HardwareConfigCard>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function PicoVisionCard({
-  config,
-  updateConfig,
-  focusHash,
-  injectLog,
-}: {
-  config: AppConfig
-  updateConfig: (patch: Partial<AppConfig>) => void
-  focusHash: string
-  injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
-}) {
- /** 描述当前方法的功能边界。 */
- const updatePico = (patch: Partial<AppConfig['picoVision']>) => updateConfig({ picoVision: { ...config.picoVision, ...patch } })
- const [pendingPicoAction, setPendingPicoAction] = useState<'connect' | 'status' | 'start' | 'stop' | null>(null)
- const [lastPicoAction, setLastPicoAction] = useState<'idle' | 'connect' | 'status' | 'start' | 'stop'>('idle')
- const [pendingNetworkDetection, setPendingNetworkDetection] = useState(false)
- const picoConnection = useTelemetryStore((state) => state.picoConnection)
- const picoNetworkInfo = useTelemetryStore((state) => state.picoNetworkInfo)
- const autoConfigurePicoNetwork = useTelemetryStore((state) => state.autoConfigurePicoNetwork)
- const setPicoConnectionStatus = useTelemetryStore((state) => state.setPicoConnectionStatus)
- const runNetworkDetection = async () => {
-    setPendingNetworkDetection(true)
-    try {
-      await autoConfigurePicoNetwork(config.picoVision.ip)
-    } catch (error) {
-      injectLog('ERROR', `自动识别网口失败: ${commandErrorMessage(error)}`, '[CAMERA]')
-    } finally {
-      setPendingNetworkDetection(false)
-    }
-  }
- /** 处理对应的用户交互。 */
- const runPicoAction = async (
-    action: 'connect' | 'status' | 'start' | 'stop',
-    label: string,
-    command: () => Promise<appApi.PicoCommandResponse>,
-  ) => {
-    setPendingPicoAction(action)
-    setPicoConnectionStatus('checking', `${label}执行中`)
-    try {
-      const result = await command()
-      const summary = picoCommandSummary(result)
-      setLastPicoAction(action)
-      setPicoConnectionStatus(summary.ok ? 'ok' : 'warn', summary.message)
-      injectLog(summary.ok ? 'INFO' : 'WARNING', `${label}: ${summary.message}`, '[CAMERA]')
-    } catch (error) {
-      const message = commandErrorMessage(error)
-      setLastPicoAction(action)
-      setPicoConnectionStatus('error', message)
-      injectLog('ERROR', `${label}失败: ${message}`, '[CAMERA]')
-    } finally {
-      setPendingPicoAction(null)
-    }
-  }
-  const activePicoState: ConnectionState = pendingPicoAction ? 'checking' : picoConnection.state
-  const activePicoTone = inlineToneFromState(activePicoState)
-  const sourceSpec = cameraHardwareSpecs[config.picoVision.cameraSource]
-  const streamTone: InlineStatusTone =
-    pendingPicoAction === 'start'
-      ? 'pending'
-      : lastPicoAction === 'start' && picoConnection.state === 'ok'
-        ? 'ok'
-        : picoConnection.state === 'error'
-          ? 'error'
-          : picoConnection.state === 'warn'
-            ? 'warn'
-            : 'pending'
-  return (
-    <HardwareConfigCard
-      id="teleop"
-      focusHash={focusHash}
-      icon={<Camera size={20} />}
-      title="PICO-4 视觉推流"
-      subtitle="将上位机相机画面编码后通过 ADB/TCP 链路推送到 PICO-4 显示"
-      state={activePicoState}
-      badges={<Tag color={stateTone(activePicoState)}>{pendingPicoAction ? '命令执行中' : stateText(activePicoState)}</Tag>}
-      actions={
-        <Space wrap>
-          <Button
-            icon={<Usb size={15} />}
-            loading={pendingPicoAction === 'connect'}
-            onClick={() => runPicoAction('connect', '连接无线 ADB', appApi.connectPicoAdb)}
-          >
-            连接无线 ADB
-          </Button>
-          <Button
-            icon={<Network size={15} />}
-            loading={pendingNetworkDetection}
-            onClick={() => void runNetworkDetection()}
-          >
-            重新识别网口
-          </Button>
-          <Button
-            type="primary"
-            icon={<Play size={15} />}
-            loading={pendingPicoAction === 'start'}
-            onClick={() => runPicoAction('start', '启动 PICO-4 视觉推流', appApi.startPicoVision)}
-          >
-            启动视觉
-          </Button>
-          <Button
-            icon={<Square size={15} />}
-            loading={pendingPicoAction === 'stop'}
-            onClick={() => runPicoAction('stop', '停止 PICO-4 视觉推流', appApi.stopPicoVision)}
-          >
-            停止视觉
-          </Button>
-          <Button
-            icon={<RefreshCw size={15} />}
-            loading={pendingPicoAction === 'status'}
-            onClick={() => runPicoAction('status', '检查 PICO-4 状态', appApi.checkPicoStatus)}
-          >
-            检查状态
-          </Button>
-        </Space>
-      }
-      wide
-    >
-      <div className="pico-status-strip">
-        <div className={`pico-status-${activePicoTone}`}>
-          <b>ADB</b>
-          <span>{`${config.picoVision.ip}:${config.picoVision.adbPort}`}</span>
-          <small>{pendingPicoAction ? '命令执行中' : picoConnection.message}</small>
-        </div>
-        <div className={`pico-status-${streamTone}`}>
-          <b>H.264</b>
-          <span>{`${config.picoVision.videoPort} / ${config.picoVision.commandPort}`}</span>
-          <small>{lastPicoAction === 'start' && picoConnection.state === 'ok' ? 'sender 已启动' : '等待启动视觉'}</small>
-        </div>
-        <div className="pico-status-ok">
-          <b>画面源</b>
-          <span>{sourceSpec.label}</span>
-          <small>{sourceSpec.device}</small>
-        </div>
-        <div className={picoNetworkInfo ? 'pico-status-ok' : 'pico-status-pending'}>
-          <b>路由</b>
-          <span>{`IF ${config.picoVision.ifIndex} / ${config.picoVision.gateway}`}</span>
-          <small>
-            {picoNetworkInfo
-              ? `${picoNetworkInfo.interfaceAlias} · ${picoNetworkInfo.localIp}/${picoNetworkInfo.prefixLength}`
-              : '启动时自动识别；PICO IP 可由操作者校正'}
-          </small>
-        </div>
-      </div>
-      <div className="hardware-metric-grid">
-        <MetricBox label="ADB 端点" value={`${config.picoVision.ip}:${config.picoVision.adbPort}`} />
-        <MetricBox label="视频端口" value={config.picoVision.videoPort} hint="PICO 端 H.264 接收" />
-        <MetricBox label="命令端口" value={config.picoVision.commandPort} hint="PC sender 等待控制连接" />
-        <MetricBox label="画面源" value={sourceSpec.label} hint={sourceSpec.model} />
-      </div>
-      <Form layout="vertical" className="hardware-form-grid pico-vision-form">
-        <Form.Item label="PICO IP">
-          <Input value={config.picoVision.ip} onChange={(event) => updatePico({ ip: event.target.value })} />
-        </Form.Item>
-        <Form.Item label="ADB 端口">
-          <InputNumber min={1} max={65535} value={config.picoVision.adbPort} onChange={(value) => updatePico({ adbPort: Number(value ?? 5555) })} />
-        </Form.Item>
-        <Form.Item label="视频端口">
-          <InputNumber min={1} max={65535} value={config.picoVision.videoPort} onChange={(value) => updatePico({ videoPort: Number(value ?? 12345) })} />
-        </Form.Item>
-        <Form.Item label="命令端口">
-          <InputNumber min={1} max={65535} value={config.picoVision.commandPort} onChange={(value) => updatePico({ commandPort: Number(value ?? 13579) })} />
-        </Form.Item>
-        <Form.Item label="网关">
-          <Input value={config.picoVision.gateway} onChange={(event) => updatePico({ gateway: event.target.value })} />
-        </Form.Item>
-        <Form.Item label="网卡 IF">
-          <InputNumber min={0} value={config.picoVision.ifIndex} onChange={(value) => updatePico({ ifIndex: Number(value ?? 13) })} />
-        </Form.Item>
-        <Form.Item label="画面旋转">
-          <Select
-            value={config.picoVision.rotation}
-            options={[
-              { value: 'ccw90', label: '逆时针 90°' },
-              { value: 'cw90', label: '顺时针 90°' },
-              { value: '180', label: '旋转 180°' },
-              { value: 'none', label: '不旋转' },
-            ]}
-            onChange={(value) => updatePico({ rotation: value })}
-          />
-        </Form.Item>
-        <Form.Item label="相机源">
-          <Select
-            value={config.picoVision.cameraSource}
-            options={[
-              { value: 'global', label: '全局相机' },
-              { value: 'wrist_left', label: '左腕相机' },
-              { value: 'wrist_right', label: '右腕相机' },
-            ]}
-            onChange={(value) => updatePico({ cameraSource: value })}
-          />
-        </Form.Item>
-      </Form>
-    </HardwareConfigCard>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function StorageCard({
-  config,
-  updateConfig,
-  focusHash,
-}: {
-  config: AppConfig
-  updateConfig: (patch: Partial<AppConfig>) => void
-  focusHash: string
-}) {
- /** 描述当前方法的功能边界。 */
- const updateStorage = (patch: Partial<AppConfig['storage']>) => updateConfig({ storage: { ...config.storage, ...patch } })
-  const recordFps = config.storage.recordFps ?? config.cameras.fps
-  return (
-    <HardwareConfigCard
-      id="storage"
-      focusHash={focusHash}
-      icon={<FolderOpen size={20} />}
-      title="数据存储"
-      subtitle="录制完成的数据集写入目录"
-      state="ok"
-      badges={<Tag color="processing">Dataset Root</Tag>}
-      wide
-    >
-      <div className="hardware-metric-grid">
-        <MetricBox label="当前目录" value={config.storage.datasetRoot} hint="支持绝对路径 / ~ 用户目录" />
-        <MetricBox label="录制 FPS" value={recordFps} hint="数据集保存帧率" />
-        <MetricBox label="视频 CRF" value={config.storage.videoCrf} />
-        <MetricBox label="Hub 上传" value={config.storage.pushToHub ? '启用' : '关闭'} />
-      </div>
-      <Form layout="vertical" className="hardware-form-grid">
-        <Form.Item label="数据集根目录">
-          <Input
-            value={config.storage.datasetRoot}
-            placeholder="C:/Users/Administrator/.appstation/datasets"
-            onChange={(event) => updateStorage({ datasetRoot: event.target.value })}
-          />
-        </Form.Item>
-        <Form.Item label="录制 FPS" tooltip="数据集保存帧率；未设置时后端旧逻辑会回退到相机采集目标 FPS。">
-          <InputNumber min={1} max={60} value={recordFps} onChange={(value) => updateStorage({ recordFps: Number(value ?? 30) })} />
-        </Form.Item>
-      </Form>
-    </HardwareConfigCard>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function TeleopHandCard({
-  side,
-  config,
-  updateConfig,
-  focusHash,
-  frame,
-  injectLog,
-  pendingReturnOriginSide,
-  setPendingReturnOriginSide,
-}: {
-  side: RobotSide
-  config: AppConfig
-  updateConfig: (patch: Partial<AppConfig>) => void
-  focusHash: string
-  frame: TelemetryFrame
-  injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
-  pendingReturnOriginSide: RobotSide | null
-  setPendingReturnOriginSide: (side: RobotSide | null) => void
-}) {
-  const sideSpec = armHardwareSpecs[side]
-  const mappedHardwareSide = hardwareSideForOperatorSide(side)
-  const hardwareSide = config.teleop.swapTeleopChannels ? mappedHardwareSide : side
-  const id = `teleop-${side}`
-  const handState = frame.teleopHands.find((item) => item.side === side)
-  const logicalConnected = side === 'left' ? config.teleop.leftConnected : config.teleop.rightConnected
-  const connected = logicalConnected && Boolean(handState?.connected)
-  const openId = side === 'left' ? config.teleop.leftOpenId : config.teleop.rightOpenId
-  const translationScale = side === 'left' ? config.teleop.leftTranslationScale : config.teleop.rightTranslationScale
-  const rotationScale = side === 'left' ? config.teleop.leftRotationScale : config.teleop.rightRotationScale
-  const gravityCompensation = side === 'left' ? config.teleop.leftGravityCompensation : config.teleop.rightGravityCompensation
-  const forceFeedback = side === 'left' ? config.teleop.leftForceFeedback : config.teleop.rightForceFeedback
-  const rawGravityScale = side === 'left' ? config.teleop.leftGravityScale : config.teleop.rightGravityScale
-  const gravityScale = Number.isFinite(rawGravityScale) ? Math.max(0, Math.min(1, rawGravityScale)) : side === 'left' ? 0.45 : 1
- /** 描述当前方法的功能边界。 */
- const updateTeleop = (patch: Partial<AppConfig['teleop']>) => updateConfig({ teleop: { ...config.teleop, ...patch } })
- /** 设置当前流程的对应状态。 */
- const setConnected = (value: boolean) => updateTeleop(side === 'left' ? { leftConnected: value } : { rightConnected: value })
- /** 设置当前流程的对应状态。 */
- const setOpenId = (value: number) => updateTeleop(side === 'left' ? { leftOpenId: value } : { rightOpenId: value })
- /** 设置当前流程的对应状态。 */
- const setTranslationScale = (value: number) => updateTeleop(side === 'left' ? { leftTranslationScale: value } : { rightTranslationScale: value })
- /** 设置当前流程的对应状态。 */
- const setRotationScale = (value: number) => updateTeleop(side === 'left' ? { leftRotationScale: value } : { rightRotationScale: value })
- /** 设置当前流程的对应状态。 */
- const setGravityCompensation = (value: boolean) => updateTeleop(side === 'left' ? { leftGravityCompensation: value } : { rightGravityCompensation: value })
- /** 设置当前流程的对应状态。 */
- const setForceFeedback = (value: boolean) => updateTeleop(side === 'left' ? { leftForceFeedback: value } : { rightForceFeedback: value })
- /** 璁剧疆褰撳墠娴佺▼鐨勫搴旂姸鎬併€?*/
- const setGravityScale = (value: number) => updateTeleop(side === 'left' ? { leftGravityScale: value } : { rightGravityScale: value })
-  const axisOutputScale = side === 'left' ? config.teleop.leftAxisOutputScale : config.teleop.rightAxisOutputScale
-  const enabledAxes = side === 'left' ? config.teleop.leftEnabledAxes : config.teleop.rightEnabledAxes
- /** 设置当前流程的对应状态。 */
- const setAxisOutputScale = (axisIndex: number, value: number) => {
-    const next = [...axisOutputScale]
-    next[axisIndex] = value
-    updateTeleop(side === 'left' ? { leftAxisOutputScale: next } : { rightAxisOutputScale: next })
-  }
- /** 设置当前流程的对应状态。 */
- const setEnabledAxis = (axisIndex: number, value: boolean) => {
-    const next = [...enabledAxes]
-    next[axisIndex] = value
-    updateTeleop(side === 'left' ? { leftEnabledAxes: next } : { rightEnabledAxes: next })
-  }
-  const physicalConnected = Boolean(handState?.connected)
-  const liveReadOk = logicalConnected && physicalConnected && Boolean(handState?.lastReadOk)
-  const pose = liveReadOk ? (handState?.pose ?? [0, 0, 0, 0, 0, 0]) : [0, 0, 0, 0, 0, 0]
-  const positionMm = pose.slice(0, 3).map((value) => value * 1000)
-  const rotationDeg = pose.slice(3, 6)
-  const targetWorkOriginValid = hardwareSide === 'left' ? config.motion.origin.leftValid : config.motion.origin.rightValid
-  const startupReturnsToWorkOrigin = config.teleop.homeBeforeStart && config.motion.homeOnStartup.mode === 'work_origin'
-  const targetWorkOriginBlocked = startupReturnsToWorkOrigin && !targetWorkOriginValid
-  const targetWorkOriginLabel = hardwareSide === 'left' ? '目标硬件左臂' : '目标硬件右臂'
-  const readState: ConnectionState = !physicalConnected ? 'error' : targetWorkOriginBlocked ? 'warn' : !logicalConnected ? 'pending' : handState?.lastReadOk ? 'ok' : 'warn'
-  const [connectionPending, setConnectionPending] = useState(false)
-  const [connectSyncPending, setConnectSyncPending] = useState(false)
-  const [connectionHint, setConnectionHint] = useState('')
-  const teleopConnectPending = connectionPending || connectSyncPending
-  useEffect(() => {
-    if (!connectSyncPending) return
-    if (!logicalConnected || physicalConnected) {
-      setConnectSyncPending(false)
-      setConnectionPending(false)
-    }
-  }, [connectSyncPending, logicalConnected, physicalConnected])
-  const liveOpenId = handState?.openId ?? openId
-  const omegaSummary = `OpenID ${liveOpenId} / device ${handState?.deviceId ?? '-'}`
-  const handedText = handState?.leftHanded == null ? 'handedness -' : handState.leftHanded ? 'left-handed' : 'right-handed'
-  const omegaDetail = `SN ${handState?.serial || '-'} · ${handedText} · Force Dimension USB`
-  const connectionSummary = logicalConnected
-    ? `逻辑已连接 · 物理${physicalText(physicalConnected)} · 读数${liveReadOk ? '正常' : '待恢复'}`
-    : `逻辑未连接 · 物理${physicalText(physicalConnected)}`
-  const workOriginBlockMessage = `${targetWorkOriginLabel}工作原点未设置`
-  const connectionDetail = connectionHint || (targetWorkOriginBlocked ? '连接已阻止' : handState?.message) || (logicalConnected ? 'HAL-native 会等读数恢复后再放行动作' : '等待操作员连接')
-  const teleopConnectionTone: InlineStatusTone =
-    !physicalConnected ? 'error' : targetWorkOriginBlocked ? 'warn' : !logicalConnected ? 'pending' : handState?.lastReadOk ? 'ok' : 'warn'
-  const teleopDeviceTone: InlineStatusTone = physicalConnected ? 'ok' : 'error'
-  const teleopHasConnectionError = teleopConnectionTone === 'error' || teleopDeviceTone === 'error'
-  const targetSideLabel = side === 'left' ? '左臂' : '右臂'
-  const hardwareSideLabel = hardwareSide === 'left' ? '硬件左臂' : '硬件右臂'
-  const teleopRouteHint = config.teleop.swapTeleopChannels ? `操作视角 · ${hardwareSideLabel}` : '同侧硬件通道'
-  const returnOriginReady = motionSideReturnOriginReady(hardwareSide, frame.motionEnabled, frame.motionAxisEnabled)
-  /** 发送或封装对应的后端命令。 */
-  const returnToWorkOrigin = () => {
-    if (!returnOriginReady) {
-      injectLog('WARNING', `${sideSpec.shortLabel}未使能，已阻止返回工作原点`, '[HAL]')
-      return
-    }
-    setPendingReturnOriginSide(side)
-    commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel}返回工作原点`)
-    void appApi.returnMotionOriginSide(hardwareSide)
-      .then(() => injectLog('INFO', `${sideSpec.shortLabel}返回工作原点完成`, '[HAL]'))
-      .catch((error) => injectLog('ERROR', `${sideSpec.shortLabel}返回工作原点失败: ${commandErrorMessage(error)}`, '[HAL]'))
-      .finally(() => setPendingReturnOriginSide(null))
-  }
-  /** 发送或封装对应的后端命令。 */
-  const toggleConnection = () => {
-    if (teleopConnectPending) return
-    if (!logicalConnected && targetWorkOriginBlocked) {
-      setConnectionHint(workOriginBlockMessage)
-      injectLog('WARNING', `${sideSpec.shortLabel} Omega.7 connect blocked: ${workOriginBlockMessage}`, '[HAL]')
-      return
-    }
-    setConnectionPending(true)
-    if (logicalConnected) {
-      setConnectSyncPending(false)
-      setConnectionHint('断开请求已发送')
-      commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel} Omega.7 logical disconnect`)
-      void disconnectTeleopHand(side)
-        .then(() => {
-          setConnected(false)
-          setConnectionHint('逻辑连接已断开')
-        })
-        .catch((error) => {
-          const message = commandErrorMessage(error)
-          setConnectionHint(message)
-          injectLog('ERROR', `${sideSpec.shortLabel} Omega.7 disconnect failed: ${message}`, '[HAL]')
-        })
-        .finally(() => setConnectionPending(false))
-      return
-    }
-    setConnectionHint('逻辑连接请求已发送，后台同步 HAL')
-    commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel} Omega.7 connect dhdOpenID(${openId})`)
-    let waitForTelemetry = false
-    void connectTeleopHand(side)
-      .then((result) => {
-        const payload = result as { data?: { connected?: boolean; backgroundSync?: boolean; physicalConnected?: boolean; lastReadOk?: boolean; message?: string } }
-        const nextConnected = payload.data?.connected ?? true
-        setConnected(nextConnected)
-        if (payload.data?.backgroundSync) {
-          if (nextConnected) {
-            waitForTelemetry = true
-            setConnectSyncPending(true)
-          }
-          setConnectionHint(`${nextConnected ? '逻辑已连接' : '连接被拒绝'} · 后台同步中，等待遥测刷新${payload.data?.message ? ` · ${payload.data.message}` : ''}`)
-        } else {
-          const physical = payload.data?.physicalConnected ? '物理在线' : '物理离线'
-          const read = payload.data?.lastReadOk ? '读数正常' : '读数待恢复'
-          setConnectionHint(`${nextConnected ? '逻辑已连接' : '连接被拒绝'} · ${physical} · ${read}${payload.data?.message ? ` · ${payload.data.message}` : ''}`)
-        }
-        if (!nextConnected && payload.data?.message) {
-          injectLog('WARNING', `${sideSpec.shortLabel} Omega.7 connect rejected: ${payload.data.message}`, '[HAL]')
-        }
-      })
-      .catch((error) => {
-        const message = commandErrorMessage(error)
-        setConnectionHint(message)
-        injectLog('ERROR', `${sideSpec.shortLabel} Omega.7 connect failed: ${message}`, '[HAL]')
-      })
-      .finally(() => {
-        if (!waitForTelemetry) setConnectionPending(false)
-      })
-  }
-  /** 设置当前流程的对应状态。 */
-  const setGravityScaleValue = (value: number | null) => {
-    const nextScale = Math.max(0, Math.min(1, Number(value ?? gravityScale)))
-    setGravityScale(nextScale)
-    if (!gravityCompensation) return
-    void setTeleopGravityCompensation(side, { enabled: true, scale: nextScale }).catch((error) =>
-      injectLog('ERROR', `${sideSpec.shortLabel} gravity scale command failed: ${String(error)}`, '[HAL]'),
-    )
-    commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel} gravity compensation scale ${nextScale.toFixed(2)}`)
-  }
-  const setGravityEnabled = (enabled: boolean) => {
-    setGravityCompensation(enabled)
-    setForceFeedback(enabled)
-    void setTeleopGravityCompensation(side, { enabled, scale: gravityScale }).catch((error) =>
-      injectLog('ERROR', `${sideSpec.shortLabel} gravity compensation command failed: ${String(error)}`, '[HAL]'),
-    )
-    commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel}主手重力补偿${enabled ? '启用' : '关闭'}`)
-  }
-  return (
-    <HardwareConfigCard
-      id={id}
-      focusHash={focusHash}
-      icon={<Gamepad2 size={20} />}
-      title={`${sideSpec.shortLabel} Omega.7 主手`}
-      subtitle={`配置 dhdOpenID(${openId}) · Force Dimension SDK / USB 直连`}
-      state={readState}
-      badges={
-        <Space size={6} wrap>
-          <Tag color={physicalConnected ? (logicalConnected ? 'success' : 'warning') : 'error'}>
-            {physicalConnected ? (logicalConnected ? '已连接' : '物理在线') : '物理离线'}
-          </Tag>
-          <Tag color={connected && liveReadOk ? 'success' : !physicalConnected ? 'error' : logicalConnected ? 'warning' : 'default'}>
-            {connected && liveReadOk ? '读数正常' : !physicalConnected ? '连接失败' : logicalConnected ? '未收到读数' : '逻辑断开'}
-          </Tag>
-          <Tag>SN {handState?.serial || '-'}</Tag>
-          <Tag>建议固定 USB 口顺序</Tag>
-        </Space>
-      }
-      actions={
-        <Space wrap>
-          <Button
-            icon={<RotateCcw size={15} />}
-            onClick={returnToWorkOrigin}
-            loading={pendingReturnOriginSide === side}
-            disabled={!returnOriginReady || pendingReturnOriginSide !== null}
-          >
-            回工作原点
-          </Button>
-          <span className="teleop-route-label">
-            <small>目标臂</small>
-            <b>{targetSideLabel}</b>
-            <em>{teleopRouteHint}</em>
-          </span>
-          <Button
-            type={logicalConnected ? 'default' : 'primary'}
-            danger={logicalConnected}
-            icon={<Usb size={15} />}
-            onClick={toggleConnection}
-            loading={teleopConnectPending}
-            disabled={teleopConnectPending || (!logicalConnected && targetWorkOriginBlocked)}
-          >
-            {logicalConnected ? '断开主手' : '连接主手'}
-          </Button>
-          <Button icon={<PlugZap size={15} />} onClick={() => setGravityEnabled(!gravityCompensation)}>
-            重力补偿
-          </Button>
-          <Button icon={<ShieldAlert size={15} />} onClick={() => {
-            void zeroTeleopForceFeedback(side).catch((error) =>
-              injectLog('ERROR', `${sideSpec.shortLabel} zero force feedback failed: ${String(error)}`, '[HAL]'),
-            )
-            commandLog(injectLog, '[HAL]', `${sideSpec.shortLabel}主手清零力反馈`)
-          }}>
-            清零力反馈
-          </Button>
-        </Space>
-      }
-    >
-      {teleopHasConnectionError && (
-        <div className="hardware-error-callout teleop-error-callout" role="alert">
-          <b>{sideSpec.shortLabel}主手物理离线</b>
-          <span>{connectionDetail}</span>
-        </div>
-      )}
-      {targetWorkOriginBlocked && (
-        <div className="hardware-error-callout teleop-error-callout" role="alert">
-          <b>{workOriginBlockMessage}</b>
-          <span>连接前需要有效的目标硬件臂工作原点。</span>
-        </div>
-      )}
-      <div className="teleop-connection-strip">
-        <div className={`teleop-status-${teleopConnectionTone}`}>
-          <b>连接</b>
-          <span>{connectionSummary}</span>
-          <small>{connectionDetail}</small>
-        </div>
-        <div className={`teleop-status-${teleopDeviceTone}`}>
-          <b>Omega.7</b>
-          <span>{omegaSummary}</span>
-          <small>{omegaDetail}</small>
-        </div>
-      </div>
-      <div className="hardware-metric-grid">
-        <MetricBox label="X / Y / Z" value={liveReadOk ? `${positionMm[0].toFixed(1)}, ${positionMm[1].toFixed(1)}, ${positionMm[2].toFixed(1)} mm` : '-'} tone={liveReadOk ? 'ok' : 'warn'} />
-        <MetricBox label="Roll / Pitch / Yaw" value={liveReadOk ? `${rotationDeg[0].toFixed(2)}, ${rotationDeg[1].toFixed(2)}, ${rotationDeg[2].toFixed(2)}°` : '-'} hint={`旋转比例 ${rotationScale}`} tone={liveReadOk ? 'ok' : 'warn'} />
-        <MetricBox label="按钮 0 / 1" value={liveReadOk ? `${handState?.clutchPressed ? '按下' : '释放'} / ${handState?.gripperPressed ? '按下' : '释放'}` : '-'} />
-        <MetricBox label="设备" value={`id ${handState?.deviceId ?? -1} · ${handState?.systemName || 'Omega.7'}`} hint={handState?.message || undefined} tone={physicalConnected && !handState?.message ? 'ok' : 'warn'} />
-        <MetricBox label="夹爪间隙" value={handState?.gripperGapMm == null ? '-' : `${handState.gripperGapMm.toFixed(1)} mm`} />
-        <MetricBox label="左右手属性" value={handState?.leftHanded == null ? '-' : handState.leftHanded ? 'Left-handed' : 'Right-handed'} />
-      </div>
-      <Form layout="vertical" className="hardware-form-grid teleop-hand-form">
-        <Form.Item label="配置 OpenID">
-          <InputNumber min={0} value={openId} onChange={(value) => setOpenId(Number(value ?? sideSpec.omegaDeviceId))} />
-        </Form.Item>
-        <Form.Item label="命令更新周期 ms">
-          <InputNumber min={1} value={config.teleop.commandIntervalMs} onChange={(value) => updateTeleop({ commandIntervalMs: Number(value ?? 10) })} />
-        </Form.Item>
-        <Form.Item label="平移单步上限 um">
-          <InputNumber
-            min={1}
-            step={100}
-            value={config.teleop.translationStepUm}
-            onChange={(value) => updateTeleop({ translationStepUm: Number(value ?? 5000) })}
-          />
-        </Form.Item>
-        <Form.Item label="旋转单步上限 °">
-          <InputNumber
-            min={0.001}
-            step={0.01}
-            value={config.teleop.rotationStepDeg}
-            onChange={(value) => updateTeleop({ rotationStepDeg: Number(value ?? 0.2) })}
-          />
-        </Form.Item>
-        <Form.Item label="稳定模式">
-          <Select
-            value={config.teleop.stabilityMode}
-            options={[
-              { value: 'hold', label: 'Hold' },
-              { value: 'track', label: 'Track' },
-              { value: 'off', label: 'Off / Free' },
-            ]}
-            onChange={(value) => updateTeleop({ stabilityMode: value })}
-          />
-        </Form.Item>
-        <Form.Item label="平移比例">
-          <InputNumber min={0} step={0.01} value={translationScale} onChange={(value) => setTranslationScale(Number(value ?? 0.3))} />
-        </Form.Item>
-        <Form.Item label="旋转比例">
-          <InputNumber min={0} step={0.01} value={rotationScale} onChange={(value) => setRotationScale(Number(value ?? 0.1))} />
-        </Form.Item>
-        <Form.Item label="Gravity compensation scale">
-          <Space.Compact>
-            <Slider className="teleop-gravity-scale-slider" min={0} max={1} step={0.05} value={gravityScale} onChange={(value) => setGravityScaleValue(Number(value))} />
-            <InputNumber min={0} max={1} step={0.05} value={gravityScale} onChange={(value) => setGravityScaleValue(value == null ? null : Number(value))} />
-          </Space.Compact>
-        </Form.Item>
-        <Form.Item label="Translation step pulse">
-          <InputNumber min={1} step={100} value={config.teleop.translationStepLimitPulse} onChange={(value) => updateTeleop({ translationStepLimitPulse: Number(value ?? 4000) })} />
-        </Form.Item>
-        <Form.Item label="Rotation step pulse">
-          <InputNumber min={1} step={50} value={config.teleop.rotationStepLimitPulse} onChange={(value) => updateTeleop({ rotationStepLimitPulse: Number(value ?? 1250) })} />
-        </Form.Item>
-        <Form.Item label="平移死区">
-          <InputNumber min={0} step={0.00001} value={config.teleop.translationDeadzone} onChange={(value) => updateTeleop({ translationDeadzone: Number(value ?? 0) })} />
-        </Form.Item>
-        <Form.Item label="旋转死区 °">
-          <InputNumber min={0} step={0.01} value={config.teleop.rotationDeadzone} onChange={(value) => updateTeleop({ rotationDeadzone: Number(value ?? 0.02) })} />
-        </Form.Item>
-        <Form.Item label="Translation pulse deadband">
-          <InputNumber min={0} step={1} value={config.teleop.translationPulseDeadband} onChange={(value) => updateTeleop({ translationPulseDeadband: Number(value ?? 2) })} />
-        </Form.Item>
-        <Form.Item label="Rotation pulse deadband">
-          <InputNumber min={0} step={1} value={config.teleop.rotationPulseDeadband} onChange={(value) => updateTeleop({ rotationPulseDeadband: Number(value ?? 2) })} />
-        </Form.Item>
-        <Form.Item label="Translation min delta">
-          <InputNumber min={0} step={0.00001} value={config.teleop.incrementalTranslationMinEffectiveDelta} onChange={(value) => updateTeleop({ incrementalTranslationMinEffectiveDelta: Number(value ?? 0.000025) })} />
-        </Form.Item>
-        <Form.Item label="Reverse deadzone">
-          <InputNumber min={0} step={0.00001} value={config.teleop.incrementalTranslationReverseDeadzone} onChange={(value) => updateTeleop({ incrementalTranslationReverseDeadzone: Number(value ?? 0.00005) })} />
-        </Form.Item>
-        <Form.Item label="Translation speed um/s">
-          <Space.Compact>
-            <InputNumber min={0} value={config.teleop.translationStartVelocityUmS} onChange={(value) => updateTeleop({ translationStartVelocityUmS: Number(value ?? 600) })} />
-            <InputNumber min={1} value={config.teleop.translationMaxVelocityUmS} onChange={(value) => updateTeleop({ translationMaxVelocityUmS: Number(value ?? 8000) })} />
-          </Space.Compact>
-        </Form.Item>
-        <Form.Item label="Rotation speed deg/s">
-          <Space.Compact>
-            <InputNumber min={0} step={0.05} value={config.teleop.rotationStartVelocityDegS} onChange={(value) => updateTeleop({ rotationStartVelocityDegS: Number(value ?? 1) })} />
-            <InputNumber min={1} step={0.1} value={config.teleop.rotationMaxVelocityDegS} onChange={(value) => updateTeleop({ rotationMaxVelocityDegS: Number(value ?? 12) })} />
-          </Space.Compact>
-        </Form.Item>
-        <Form.Item label="Profile acc/dec s">
-          <Space.Compact>
-            <InputNumber min={0.001} step={0.01} value={config.teleop.motionProfileAccSec} onChange={(value) => updateTeleop({ motionProfileAccSec: Number(value ?? 0.05) })} />
-            <InputNumber min={0.001} step={0.01} value={config.teleop.motionProfileDecSec} onChange={(value) => updateTeleop({ motionProfileDecSec: Number(value ?? 0.05) })} />
-          </Space.Compact>
-        </Form.Item>
-        <Form.Item label="诊断日志">
-          <Switch checked={config.teleop.diagLog} checkedChildren="开" unCheckedChildren="关" onChange={(value) => updateTeleop({ diagLog: value })} />
-        </Form.Item>
-      </Form>
-      <div className="teleop-switch-row">
-        {semanticAxes.map((axis, axisIndex) => (
-          <span key={axis}>
-            <small>{axis}</small>
-            <InputNumber min={0} step={0.05} value={axisOutputScale[axisIndex] ?? 1} onChange={(value) => setAxisOutputScale(axisIndex, Number(value ?? 1))} />
-            <Switch
-              checked={enabledAxes[axisIndex] ?? true}
-              checkedChildren="On"
-              unCheckedChildren="Off"
-              onChange={(value) => setEnabledAxis(axisIndex, value)}
-            />
-          </span>
-        ))}
-      </div>
-      <div className="teleop-switch-row">
-        <span>
-          <small>Swap hands</small>
-          <Switch checked={config.teleop.swapHands} checkedChildren="On" unCheckedChildren="Off" onChange={(value) => updateTeleop({ swapHands: value })} />
-        </span>
-        <span>
-          <small>Swap teleop channels</small>
-          <Switch checked={config.teleop.swapTeleopChannels} checkedChildren="On" unCheckedChildren="Off" onChange={(value) => updateTeleop({ swapTeleopChannels: value })} />
-        </span>
-        <span>
-          <small>重力补偿</small>
-          <Switch checked={gravityCompensation} checkedChildren="开" unCheckedChildren="关" onChange={setGravityEnabled} />
-        </span>
-        <span>
-          <small>力反馈使能</small>
-          <Switch checked={forceFeedback} checkedChildren="开" unCheckedChildren="关" onChange={setForceFeedback} />
-        </span>
-        <span>
-          <small>Require clutch</small>
-          <Switch checked={config.teleop.requireClutch} checkedChildren="On" unCheckedChildren="Off" onChange={(value) => updateTeleop({ requireClutch: value })} />
-        </span>
-        <span>
-          <small>TCP fallback</small>
-          <InputNumber min={1} max={65535} value={config.teleop.tcpFallbackPort} onChange={(value) => updateTeleop({ tcpFallbackPort: Number(value ?? 12345) })} />
-        </span>
-      </div>
-    </HardwareConfigCard>
-  )
-}
-/** 计算或执行手动控制的对应逻辑。 */
-function manualAxisUnit(axis: ManualControlAxis) {
-  return manualAxisOrder.indexOf(axis) < 3 ? 'um' : '°'
-}
-/** 计算或执行手动控制的对应逻辑。 */
-function manualAxisSoftKey(axis: ManualControlAxis): keyof ArmSoftLimitConfig {
-  return axis === 'X' ? 'x' : axis === 'Y' ? 'y' : axis === 'Z' ? 'z' : axis === 'Roll' ? 'roll' : axis === 'Pitch' ? 'pitch' : 'yaw'
-}
-/** 计算或执行手动控制的对应逻辑。 */
-function manualAxisPulsePerUiUnit(config: AppConfig, side: RobotSide, axisIndex: number) {
-  const kinematics = config.motion.kinematics
-  const signed = side === 'left' ? kinematics.leftSignedPulsePerUnit : kinematics.rightSignedPulsePerUnit
-  const unsigned = side === 'left' ? kinematics.leftPulsePerUnit : kinematics.rightPulsePerUnit
-  const pulsePerUnit = Math.abs(Number(signed?.[axisIndex] ?? unsigned?.[axisIndex] ?? 0))
-  if (!Number.isFinite(pulsePerUnit) || pulsePerUnit <= 0) return 0
-  return axisIndex < 3 ? pulsePerUnit / 1000 : pulsePerUnit
-}
-/** 计算或执行手动控制的对应逻辑。 */
-function manualAxisStepLimit(config: AppConfig, side: RobotSide, axisIndex: number, speedMode: ManualSpeedMode) {
-  const pulsePerUiUnit = manualAxisPulsePerUiUnit(config, side, axisIndex)
-  return manualAxisStepLimitFromPulse(pulsePerUiUnit, axisIndex >= 3, speedMode)
-}
-
-/** 计算对应的业务值或展示值。 */
-function clampManualAxisStep(value: number, limit: number) {
-  return Math.min(Math.max(0, value), limit)
-}
-/** 格式化对应数值用于界面展示。 */
-function formatManualStepValue(value: number, unit: string) {
-  if (!Number.isFinite(value)) return '-'
-  return unit === 'um' ? value.toFixed(0) : value.toFixed(3)
-}
-/** 格式化对应数值用于界面展示。 */
-function formatManualAction(action: ManualControlAction) {
-  const operatorSide = operatorSideForHardwareSide(action.side)
-  if (action.type === 'arm-axis') {
-    const side = operatorSideLabel(operatorSide)
-    return `${side} ${action.axis} ${action.delta >= 0 ? '+' : ''}${action.delta.toFixed(action.unit === 'um' ? 1 : 3)}${action.unit}`
-  }
-  const side = operatorSide === 'left' ? '左夹爪' : '右夹爪'
-  const commandText: Record<ManualGripperCommand, string> = {
-    enable: '使能',
-    disable: '断使能',
-    open: '打开',
-    close: '闭合',
-    home: '回零',
-    target: `目标 ${action.targetMm.toFixed(1)}mm`,
-    stop: '停止',
-  }
-  return `${side} ${commandText[action.command]}`
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function ManualArmControl({
-  side,
-  positions,
-  config,
-  manualControl,
-  nowMs,
-  motionEnabled,
-  motionAxisEnabled,
-  selectManualAxis,
-  setManualAxisStep,
-  setManualSpeedMode,
-  issueManualAxisMove,
-  triggerEmergencyStop,
-  injectLog,
-}: {
-  side: RobotSide
-  positions: number[]
-  config: AppConfig
-  manualControl: ManualControlState
-  nowMs: number
-  motionEnabled: boolean | null | undefined
-  motionAxisEnabled?: Array<boolean | null>
-  selectManualAxis: (side: RobotSide, axis: ManualControlAxis) => void
-  setManualAxisStep: (unit: 'um' | '°', value: number) => void
-  setManualSpeedMode: (mode: ManualSpeedMode) => void
-  issueManualAxisMove: (side: RobotSide, axis: ManualControlAxis, direction: -1 | 1) => void
-  triggerEmergencyStop: () => void
-  injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
-}) {
-  const hardwareSide = hardwareSideForOperatorSide(side)
-  const sideSpec = armHardwareSpecs[hardwareSide]
-  const motionCardNo = hardwareSide === 'left' ? config.motion.leftCardNo : config.motion.rightCardNo
-  const operatorLabel = operatorSideLabel(side)
-  const selectedAxis = manualControl.selectedSide === hardwareSide ? manualControl.selectedAxis : 'X'
-  const axisIndex = manualAxisOrder.indexOf(selectedAxis)
-  const axisKey = manualAxisSoftKey(selectedAxis)
-  const unit = manualAxisUnit(selectedAxis)
-  const position = positions[sideSpec.stateOffset + axisIndex] ?? 0
-  const displayLimits = displayAxisLimitForTelemetry(config, hardwareSide, axisKey, axisIndex)
-  const translationSoftLimitDisabled = axisIndex < 3
-  const stepValue = unit === 'um' ? manualControl.axisStepUm : manualControl.axisStepDeg
-  const stepLimit = manualAxisStepLimit(config, hardwareSide, axisIndex, manualControl.speedMode)
-  const boundedStepValue = clampManualAxisStep(stepValue, stepLimit)
-  const manualAxisBlocked = displayLimits.blocked
-  const manualAxisBlockedText = 'work_origin_missing'
-  const softMargin = manualAxisBlocked || translationSoftLimitDisabled ? 0 : Math.min(Math.abs(position - displayLimits.min), Math.abs(displayLimits.max - position))
-  const profile = hardwareSide === 'left' ? config.motion.leftProfile : config.motion.rightProfile
-  const group = axisIndex < 3 ? profile.translation : profile.rotation
-  const effectiveMaxSpeed = manualMaxVelocity(group.maxSpeed, axisIndex < 3 ? 20000 : 30, manualControl.speedMode)
-  const busyKey = `${hardwareSide}-${selectedAxis}`
-  const busyUntil = manualControl.axisBusyUntil[busyKey] ?? 0
-  const axisBusy = busyUntil > nowMs
-  const busyText = `${Math.max(0, (busyUntil - nowMs) / 1000).toFixed(1)}s`
-  const stepLimitHint =
-    axisIndex >= 3 && manualControl.speedMode === 'coarse'
-      ? `${manualAxisStepLimitPulse} pulse · ≈2° 分段执行`
-      : `${manualAxisStepLimitPulse} pulse`
-  const speedUnit = axisIndex < 3 ? 'um/s' : '°/s'
-  const originValid = hardwareSide === 'left' ? config.motion.origin.leftValid : config.motion.origin.rightValid
-  const originHint = originValid ? '相对工作原点' : '未记录工作原点，显示 HAL 绝对位置'
-  const [pendingMotionAction, setPendingMotionAction] = useState<'enable' | 'disable' | 'stop' | null>(null)
-  const [optimisticEnabled, setOptimisticEnabled] = useState<boolean | null>(null)
-  useEffect(() => {
-    if (optimisticEnabled !== null && motionEnabled === optimisticEnabled) {
-      const timer = window.setTimeout(() => setOptimisticEnabled(null), 0)
-      return () => window.clearTimeout(timer)
-    }
-    return undefined
-  }, [motionEnabled, optimisticEnabled])
-  const effectiveMotionEnabled = optimisticEnabled ?? motionEnabled ?? null
-  const selectedAxisEnabled = motionAxisEnabled?.[axisIndex] ?? effectiveMotionEnabled
-  const knownAxisEnabled = motionAxisEnabled?.filter((value) => value !== null && value !== undefined) ?? []
-  const partialMotionEnabled = effectiveMotionEnabled !== true && knownAxisEnabled.some((value) => value === true)
-  const motionReady = mockMode || selectedAxisEnabled !== false
-  const nextMotionAction = effectiveMotionEnabled === true ? 'disable' : 'enable'
- /** 发送或封装对应的后端命令。 */
- const toggleMotionEnabled = async () => {
-    setPendingMotionAction(nextMotionAction)
-    try {
-      if (nextMotionAction === 'enable') {
-        await enableMotionSide(hardwareSide)
-      } else {
-        await disableMotionSide(hardwareSide)
-      }
-      setOptimisticEnabled(nextMotionAction === 'enable')
-      injectLog(
-        'INFO',
-        `${operatorLabel} manual ${nextMotionAction === 'enable' ? 'enable' : 'disable'} requested`,
-        '[HAL]',
-      )
-    } catch (error) {
-      injectLog(
-        'ERROR',
-        `${operatorLabel} manual ${nextMotionAction === 'enable' ? 'enable' : 'disable'} failed: ${String(error)}`,
-        '[HAL]',
-      )
-    } finally {
-      setPendingMotionAction(null)
-    }
-  }
- /** 停止对应流程。 */
- const stopMotion = async () => {
-    setPendingMotionAction('stop')
-    try {
-      await stopMotionSide(hardwareSide)
-      injectLog('WARNING', `${operatorLabel} manual stop requested`, '[HAL]')
-    } catch (error) {
-      injectLog('ERROR', `${operatorLabel} manual stop failed: ${commandErrorMessage(error)}`, '[HAL]')
-    } finally {
-      setPendingMotionAction(null)
-    }
-  }
-
-  return (
-    <article className={`manual-arm-card ${manualControl.selectedSide === hardwareSide ? 'manual-card-active' : ''}`}>
-      <div className="manual-card-head">
-        <div>
-          <Typography.Title level={3}>{operatorLabel}手动控制</Typography.Title>
-          <Typography.Text type="secondary">Card {motionCardNo} · {sideSpec.axisOrder.join(' / ')}</Typography.Text>
-        </div>
-        <Space wrap>
-          <Tag color={effectiveMotionEnabled === true ? 'success' : effectiveMotionEnabled === false || partialMotionEnabled ? 'warning' : 'default'}>
-            {effectiveMotionEnabled === true ? '已使能' : partialMotionEnabled ? '部分使能' : effectiveMotionEnabled === false ? '未使能' : '使能未知'}
-          </Tag>
-          <Tag color={originValid ? 'success' : 'warning'}>{originValid ? '工作原点已设置' : '工作原点未设置'}</Tag>
-          <Tag>检测通过</Tag>
-          <Tag color="processing">{manualControl.speedMode}</Tag>
-        </Space>
-      </div>
-
-      <div className="manual-arm-layout">
-        <div className={`manual-axis-visual manual-axis-${axisKey}`}>
-          <div className="manual-axis-rails">
-            <span className="axis-rail axis-rail-x" />
-            <span className="axis-rail axis-rail-y" />
-            <span className="axis-rail axis-rail-z" />
-            <span className="axis-wrist-ring" />
-          </div>
-          <div className="manual-axis-chip-grid">
-            {manualAxisOrder.map((axis) => {
-              const active = manualControl.selectedSide === hardwareSide && manualControl.selectedAxis === axis
-              return (
-                <Button key={axis} type={active ? 'primary' : 'default'} onClick={() => selectManualAxis(hardwareSide, axis)}>
-                  {axis}
-                </Button>
-              )
-            })}
-          </div>
-        </div>
-
-        <div className="manual-axis-controls">
-          <div className="manual-readout-row">
-            <MetricBox label="当前轴" value={selectedAxis} />
-            <MetricBox label="相对工作原点" value={`${position.toFixed(unit === 'um' ? 1 : 3)} ${unit}`} hint={originHint} tone={originValid ? 'neutral' : 'warn'} />
-            <MetricBox
-              label="软限位余量"
-              value={translationSoftLimitDisabled ? '已取消' : manualAxisBlocked ? manualAxisBlockedText : `${softMargin.toFixed(unit === 'um' ? 0 : 2)} ${unit}`}
-              tone={manualAxisBlocked ? 'warn' : 'ok'}
-            />
-            <MetricBox
-              label="最大速度"
-              value={`${effectiveMaxSpeed.toFixed(axisIndex < 3 ? 0 : 2)} ${speedUnit}`}
-              hint={`${manualControl.speedMode} · 配置 ${group.maxSpeed} ${speedUnit}`}
-            />
-            <MetricBox
-              label="单次上限"
-              value={`${formatManualStepValue(stepLimit, unit)} ${unit}`}
-              hint={stepLimitHint}
-            />
-          </div>
-          <Form layout="vertical" className="manual-command-form manual-command-form-arm">
-            <Form.Item label={`目标增量 ${unit}`}>
-              <InputNumber
-                min={0}
-                max={Number.isFinite(stepLimit) ? stepLimit : undefined}
-                step={unit === 'um' ? 10 : 0.1}
-                value={boundedStepValue}
-                onChange={(value) => setManualAxisStep(unit, clampManualAxisStep(Number(value ?? 0), stepLimit))}
-              />
-            </Form.Item>
-            <Form.Item label="速度档位">
-              <Select value={manualControl.speedMode} options={speedModeOptions} onChange={setManualSpeedMode} />
-            </Form.Item>
-            <Form.Item label="软限位范围">
-              <Input
-                value={translationSoftLimitDisabled ? 'XYZ 软件限位已取消，仅保留机械限位 / 急停' : manualAxisBlocked ? manualAxisBlockedText : `${formatSoftLimitValue(displayLimits.min, axisIndex)} ~ ${formatSoftLimitValue(displayLimits.max, axisIndex)} ${unit}`}
-                readOnly
-              />
-            </Form.Item>
-          </Form>
-          <div className="manual-action-row">
-            <Button disabled={axisBusy || !motionReady || manualAxisBlocked} onClick={() => issueManualAxisMove(hardwareSide, selectedAxis, -1)}>
-              {axisBusy ? busyText : `-${boundedStepValue}${unit}`}
-            </Button>
-            <Button type="primary" disabled={axisBusy || !motionReady || manualAxisBlocked} onClick={() => issueManualAxisMove(hardwareSide, selectedAxis, 1)}>
-              {axisBusy ? busyText : `+${boundedStepValue}${unit}`}
-            </Button>
-            <Button icon={<Square size={15} />} loading={pendingMotionAction === 'stop'} onClick={() => void stopMotion()}>
-              停止
-            </Button>
-            <Button icon={<Activity size={15} />} onClick={() => injectLog('INFO', `${operatorLabel} manual self-check requested`, '[HAL]')}>
-              检查
-            </Button>
-            <Button
-              icon={<PlugZap size={15} />}
-              danger={nextMotionAction === 'disable'}
-              loading={pendingMotionAction !== null}
-              onClick={() => void toggleMotionEnabled()}
-            >
-              {nextMotionAction === 'enable' ? '使能' : '断使能'}
-            </Button>
-            <Button danger icon={<ShieldAlert size={15} />} onClick={triggerEmergencyStop}>
-              急停
-            </Button>
-          </div>
-        </div>
-      </div>
-    </article>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function ManualGripperControl({
-  side,
-  config,
-  updateConfig,
-  currentMm,
-  issueManualGripperMove,
-  requestComparison,
-}: {
-  side: RobotSide
-  config: AppConfig
-  updateConfig: (patch: Partial<AppConfig>) => void
-  currentMm: number
-  issueManualGripperMove: (side: RobotSide, command: ManualGripperCommand, targetMm?: number) => void
-  requestComparison: (comparison: PendingComparison) => void
-}) {
-  const hardwareSide = hardwareSideForOperatorSide(side)
-  const operatorLabel = operatorSideLabel(side)
-  const portKey = hardwareSide === 'left' ? 'leftPort' : 'rightPort'
-  const targetKey = hardwareSide === 'left' ? 'targetLeftMm' : 'targetRightMm'
-  const slaveKey = hardwareSide === 'left' ? 'leftSlaveId' : 'rightSlaveId'
-  const enabledKey = hardwareSide === 'left' ? 'leftEnabled' : 'rightEnabled'
-  const gripperEnabled = Boolean(config.gripper[enabledKey])
-  const canCommandGripper = true
-  /** 设置当前流程的对应状态。 */
-  const protectedMinGapMm = config.gripper.icfTargetProtectionEnabled
-    ? Math.min(Math.max(config.gripper.icfTargetMinGapMm, 0), config.gripper.strokeMm)
-    : 0
-  const setTarget = (value: number) => updateConfig({ gripper: { ...config.gripper, [targetKey]: Math.min(Math.max(value, protectedMinGapMm), config.gripper.strokeMm) } })
-  const currentText = formatGripperPosition(currentMm)
-  const jawMm = safeGripperPosition(currentMm)
- /** 处理对应的用户交互。 */
- const requestGripperTarget = () =>
-    requestComparison({
-      title: `${operatorLabel}夹爪执行目标`,
-      tone: 'warning',
-      impact: `将向${operatorLabel}夹爪下发目标开合命令。`,
-      expected: '确认后仍由现有夹爪安全限制和命令力限制保护。',
-      current: [
-        { label: '当前开度', value: currentText },
-        { label: '使能状态', value: gripperEnabled ? '已使能' : '未使能' },
-      ],
-      proposed: [
-        { label: '目标开合', value: `${config.gripper[targetKey].toFixed(1)} mm` },
-        { label: '命令力限制', value: `≤${config.gripper.commandForceLimitN.toFixed(1)} N` },
-      ],
-      confirmText: '确认执行',
-      onConfirm: () => issueManualGripperMove(hardwareSide, 'target', Math.max(config.gripper[targetKey], protectedMinGapMm)),
-    })
-  return (
-    <article className="manual-gripper-card">
-      <div className="manual-card-head">
-        <div>
-          <Typography.Title level={3}>{operatorLabel}夹爪手动控制</Typography.Title>
-          <Typography.Text type="secondary">{config.gripper[portKey]} · 从站 {config.gripper[slaveKey]} · EPG006</Typography.Text>
-        </div>
-        <Space wrap>
-          <Tag color={config.gripper[enabledKey] ? 'success' : 'warning'}>{config.gripper[enabledKey] ? '已使能' : '未使能'}</Tag>
-          <Tag>0-26 mm</Tag>
-        </Space>
-      </div>
-      <div className="manual-gripper-body">
-        <div className="manual-gripper-visual">
-          <span className="gripper-jaw gripper-jaw-left" style={{ transform: `translateX(${-Math.min(34, jawMm * 1.2)}px)` }} />
-          <span className="gripper-jaw gripper-jaw-right" style={{ transform: `translateX(${Math.min(34, jawMm * 1.2)}px)` }} />
-          <b>{currentText}</b>
-        </div>
-        <div className="manual-gripper-controls">
-          <div className="manual-readout-row">
-            <MetricBox label="目标开度" value={`${config.gripper[targetKey].toFixed(1)} mm`} />
-            <MetricBox label="命令力限制" value={`≤${config.gripper.commandForceLimitN.toFixed(1)} N`} />
-            <MetricBox label="ICF 靶保护" value={config.gripper.icfTargetProtectionEnabled ? `${protectedMinGapMm.toFixed(2)} mm` : '关闭'} />
-            <MetricBox label="夹爪力矩传感" value="待确认" hint="手册未给出 EPG006 反馈接口" tone="warn" />
-          </div>
-          <Slider min={protectedMinGapMm} max={config.gripper.strokeMm} step={0.1} value={Math.max(config.gripper[targetKey], protectedMinGapMm)} onChange={(value) => setTarget(Number(value))} />
-          <Form layout="vertical" className="manual-command-form">
-            <Form.Item label="目标开度 mm">
-              <InputNumber min={protectedMinGapMm} max={config.gripper.strokeMm} step={0.1} value={Math.max(config.gripper[targetKey], protectedMinGapMm)} onChange={(value) => setTarget(Number(value ?? protectedMinGapMm))} />
-            </Form.Item>
-            <Form.Item label="命令力限制 N">
-              <InputNumber min={0} max={8} value={config.gripper.commandForceLimitN} onChange={(value) => updateConfig({ gripper: { ...config.gripper, commandForceLimitN: Number(value ?? 8) } })} />
-            </Form.Item>
-          </Form>
-          <div className="manual-action-row">
-            <Button type={gripperEnabled ? 'default' : 'primary'} icon={<PlugZap size={15} />} onClick={() => issueManualGripperMove(hardwareSide, gripperEnabled ? 'disable' : 'enable')}>
-              {gripperEnabled ? '断使能' : '使能'}
-            </Button>
-            <Button disabled={!canCommandGripper} onClick={requestGripperTarget}>执行目标</Button>
-            <Button disabled={!canCommandGripper} onClick={() => issueManualGripperMove(hardwareSide, 'open')}>打开</Button>
-            <Button disabled={!canCommandGripper} onClick={() => issueManualGripperMove(hardwareSide, 'close')}>闭合</Button>
-            <Button disabled={!canCommandGripper} icon={<RotateCcw size={15} />} onClick={() => issueManualGripperMove(hardwareSide, 'home')}>回零</Button>
-            <Button icon={<Square size={15} />} onClick={() => issueManualGripperMove(hardwareSide, 'stop')}>停止</Button>
-          </div>
-        </div>
-      </div>
-    </article>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function ManualMemoryRow({
-  memory,
-  replaying,
-  replayManualMemory,
-  pauseManualReplay,
-  deleteManualMemory,
-}: {
-  memory: ManualControlMemory
-  replaying: boolean
-  replayManualMemory: (id: number) => void
-  pauseManualReplay: () => void
-  deleteManualMemory: (id: number) => void
-}) {
-  return (
-    <div className="manual-memory-row">
-      <div>
-        <b>{memory.name}</b>
-        <span>{memory.actions.length} steps · {(memory.durationMs / 1000).toFixed(1)} s</span>
-      </div>
-      <Space>
-        <Button size="small" icon={replaying ? <Pause size={14} /> : <Play size={14} />} onClick={() => (replaying ? pauseManualReplay() : replayManualMemory(memory.id))}>
-          {replaying ? '暂停' : '回放'}
-        </Button>
-        <Button size="small" icon={<Trash2 size={14} />} onClick={() => deleteManualMemory(memory.id)} />
-      </Space>
-    </div>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function ManualReplayPanel({
-  manualControl,
-  startManualRecording,
-  stopManualRecording,
-  saveManualMemory,
-  replayManualMemory,
-  pauseManualReplay,
-  deleteManualMemory,
-}: {
-  manualControl: ManualControlState
-  startManualRecording: () => void
-  stopManualRecording: () => void
-  saveManualMemory: (name?: string) => void
-  replayManualMemory: (id: number) => void
-  pauseManualReplay: () => void
-  deleteManualMemory: (id: number) => void
-}) {
-  const [memoryName, setMemoryName] = useState('')
- /** 描述当前方法的功能边界。 */
- const saveMemory = () => {
-    saveManualMemory(memoryName)
-    setMemoryName('')
-  }
-  return (
-    <article className="manual-replay-panel">
-      <div className="manual-card-head">
-        <div>
-          <Typography.Title level={3}>动作记忆与回放</Typography.Title>
-          <Typography.Text type="secondary">记录网页端下发的轴动作和左右夹爪动作；回放时仍按硬件安全限幅逐条执行。</Typography.Text>
-        </div>
-        <Tag color={manualControl.recording ? 'error' : manualControl.replayingMemoryId ? 'processing' : 'default'}>
-          {manualControl.recording ? '记录中' : manualControl.replayingMemoryId ? '回放队列' : '待命'}
-        </Tag>
-      </div>
-      <div className="manual-recorder-row">
-        <Input placeholder="动作记忆名称" value={memoryName} onChange={(event) => setMemoryName(event.target.value)} />
-        <Button type="primary" icon={<Activity size={15} />} disabled={manualControl.recording} onClick={startManualRecording}>
-          开始记录
-        </Button>
-        <Button icon={<Square size={15} />} disabled={!manualControl.recording} onClick={stopManualRecording}>
-          停止记录
-        </Button>
-        <Button icon={<Save size={15} />} disabled={manualControl.draftActions.length === 0} onClick={saveMemory}>
-          保存动作记忆
-        </Button>
-      </div>
-      <div className="manual-replay-layout">
-        <div className="manual-action-feed">
-          <b>本次记录</b>
-          {manualControl.draftActions.length === 0 ? (
-            <span className="manual-empty">还没有记录动作</span>
-          ) : (
-            manualControl.draftActions.slice(-8).map((action) => <span key={action.id}>{formatManualAction(action)}</span>)
-          )}
-        </div>
-        <div className="manual-memory-list">
-          <b>动作记忆</b>
-          {manualControl.memories.length === 0 ? (
-            <span className="manual-empty">保存后可在这里选择并回放</span>
-          ) : (
-            manualControl.memories.map((memory) => (
-              <ManualMemoryRow
-                key={memory.id}
-                memory={memory}
-                replaying={manualControl.replayingMemoryId === memory.id}
-                replayManualMemory={replayManualMemory}
-                pauseManualReplay={pauseManualReplay}
-                deleteManualMemory={deleteManualMemory}
-              />
-            ))
-          )}
-        </div>
-      </div>
-    </article>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
-function ManualControlPanel({
-  positions,
-  grippers,
-  config,
-  updateConfig,
-  manualControl,
-  nowMs,
-  motionEnabled,
-  motionAxisEnabled,
-  selectManualAxis,
-  setManualAxisStep,
-  setManualSpeedMode,
-  issueManualAxisMove,
-  issueManualGripperMove,
-  triggerEmergencyStop,
-  startManualRecording,
-  stopManualRecording,
-  saveManualMemory,
-  replayManualMemory,
-  pauseManualReplay,
-  deleteManualMemory,
-  injectLog,
-  requestComparison,
-}: {
-  positions: number[]
-  grippers: number[]
-  config: AppConfig
-  updateConfig: (patch: Partial<AppConfig>) => void
-  manualControl: ManualControlState
-  nowMs: number
-  motionEnabled: TelemetryFrame['motionEnabled']
-  motionAxisEnabled: TelemetryFrame['motionAxisEnabled']
-  selectManualAxis: (side: RobotSide, axis: ManualControlAxis) => void
-  setManualAxisStep: (unit: 'um' | '°', value: number) => void
-  setManualSpeedMode: (mode: ManualSpeedMode) => void
-  issueManualAxisMove: (side: RobotSide, axis: ManualControlAxis, direction: -1 | 1) => void
-  issueManualGripperMove: (side: RobotSide, command: ManualGripperCommand, targetMm?: number) => void
-  triggerEmergencyStop: () => void
-  startManualRecording: () => void
-  stopManualRecording: () => void
-  saveManualMemory: (name?: string) => void
-  replayManualMemory: (id: number) => void
-  pauseManualReplay: () => void
-  deleteManualMemory: (id: number) => void
-  injectLog: (level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR', msg: string, channel?: LogEntry['channel']) => void
-  requestComparison: (comparison: PendingComparison) => void
-}) {
-  const selectedOperatorSide = operatorSideForHardwareSide(manualControl.selectedSide)
-  return (
-    <section id="manual" className="manual-control-page">
-      <div className="manual-page-summary">
-        <MetricBox label="当前选择" value={`${operatorSideLabel(selectedOperatorSide)} ${manualControl.selectedAxis}`} />
-        <MetricBox label="平移步长" value={`${manualControl.axisStepUm} um`} />
-        <MetricBox label="旋转步长" value={`${manualControl.axisStepDeg} °`} />
-        <MetricBox label="记录动作" value={`${manualControl.draftActions.length} steps`} tone={manualControl.recording ? 'warn' : 'neutral'} />
-      </div>
-      <div className="manual-control-grid">
-        {sideOrder.map((side) => (
-          (() => {
-            const hardwareSide = hardwareSideForOperatorSide(side)
-            return (
-              <ManualArmControl
-                key={side}
-                side={side}
-                positions={positions}
-                config={config}
-                manualControl={manualControl}
-                nowMs={nowMs}
-                motionEnabled={motionEnabled?.[hardwareSide] ?? null}
-                motionAxisEnabled={motionAxisEnabled?.[hardwareSide] ?? undefined}
-                selectManualAxis={selectManualAxis}
-                setManualAxisStep={setManualAxisStep}
-                setManualSpeedMode={setManualSpeedMode}
-                issueManualAxisMove={issueManualAxisMove}
-                triggerEmergencyStop={triggerEmergencyStop}
-                injectLog={injectLog}
-              />
-            )
-          })()
-        ))}
-        {sideOrder.map((side) => (
-          (() => {
-            const hardwareSide = hardwareSideForOperatorSide(side)
-            return (
-              <ManualGripperControl
-                key={side}
-                side={side}
-                config={config}
-                updateConfig={updateConfig}
-                currentMm={grippers[hardwareSide === 'left' ? 0 : 1] ?? -1}
-                issueManualGripperMove={issueManualGripperMove}
-                requestComparison={requestComparison}
-              />
-            )
-          })()
-        ))}
-        <ManualReplayPanel
-          manualControl={manualControl}
-          startManualRecording={startManualRecording}
-          stopManualRecording={stopManualRecording}
-          saveManualMemory={saveManualMemory}
-          replayManualMemory={replayManualMemory}
-          pauseManualReplay={pauseManualReplay}
-          deleteManualMemory={deleteManualMemory}
-        />
-      </div>
-    </section>
-  )
-}
-/** 渲染当前界面单元，并连接所需数据。 */
+/** 壳层：系统连接 / 安全与力觉 / 运动控制 / 遥操作 / 视觉 */
 export function SettingsView() {
+  const canAcknowledge = useTelemetryStore(canAcknowledgeControlSafety)
+  const location = useLocation()
+  const focusHash = location.hash.replace('#', '')
+  const [activeTab, setActiveTab] = useState(() => tabForHardwareHash(focusHash))
   const config = useTelemetryStore((state) => state.config)
-  const frame = useTelemetryStore((state) => state.frame)
-  const history = useTelemetryStore((state) => state.history)
+  const dangerIndex = useTelemetryStore((state) => activeTab === 'force' ? state.frame.dangerIndex : 0)
+  const forceLeft = useFrameField((frame) => activeTab === 'force' ? frame.forceLeft : emptyValues, numberArrayEqual)
+  const forceRight = useFrameField((frame) => activeTab === 'force' ? frame.forceRight : emptyValues, numberArrayEqual)
+  const jointPositions = useFrameField((frame) => activeTab === 'motion' ? frame.jointPositions : emptyValues, numberArrayEqual)
+  const gripperPositions = useFrameField((frame) => activeTab === 'motion' || activeTab === 'teleop' ? frame.gripperPositions : emptyValues, numberArrayEqual)
+  const cameras = useTelemetryStore((state) => activeTab === 'vision' ? state.frame.cameras : emptyCameras)
+  const forceStatus = useTelemetryStore((state) => activeTab === 'force' ? state.frame.forceStatus : undefined)
+  const teleopFrame = useFrameField(
+    (frame) => activeTab === 'teleop' ? teleopHandFrameSlice(frame) : null,
+    (a, b) => a === b || (a !== null && b !== null && teleopHandFrameEqual(a, b)),
+  )
   const updateConfig = useTelemetryStore((state) => state.updateConfig)
   const injectLog = useTelemetryStore((state) => state.sendBackendCommandLog)
   const setDangerOverride = useTelemetryStore((state) => state.setDangerOverride)
   const acknowledgeSafety = useTelemetryStore((state) => state.acknowledgeSafety)
+  const triggerEmergencyStop = useTelemetryStore((state) => state.triggerEmergencyStop)
+  const issueManualGripperMove = useTelemetryStore((state) => state.issueManualGripperMove)
   const manualControl = useTelemetryStore((state) => state.manualControl)
   const selectManualAxis = useTelemetryStore((state) => state.selectManualAxis)
   const setManualAxisStep = useTelemetryStore((state) => state.setManualAxisStep)
   const setManualSpeedMode = useTelemetryStore((state) => state.setManualSpeedMode)
   const issueManualAxisMove = useTelemetryStore((state) => state.issueManualAxisMove)
-  const issueManualGripperMove = useTelemetryStore((state) => state.issueManualGripperMove)
-  const triggerEmergencyStop = useTelemetryStore((state) => state.triggerEmergencyStop)
   const startManualRecording = useTelemetryStore((state) => state.startManualRecording)
   const stopManualRecording = useTelemetryStore((state) => state.stopManualRecording)
   const saveManualMemory = useTelemetryStore((state) => state.saveManualMemory)
@@ -3453,50 +133,49 @@ export function SettingsView() {
   const saveParameterSnapshot = useTelemetryStore((state) => state.saveParameterSnapshot)
   const applyParameterSnapshot = useTelemetryStore((state) => state.applyParameterSnapshot)
   const deleteParameterSnapshot = useTelemetryStore((state) => state.deleteParameterSnapshot)
-  const location = useLocation()
-  const focusHash = location.hash.replace('#', '')
-  const targetTab = tabForHardwareHash(focusHash)
-  const [snapshotDraft, setSnapshotDraft] = useState<{ scope: ParameterSnapshotScope; name: string } | null>(null)
-  const [manualClockMs, setManualClockMs] = useState(() => Date.now())
+
   const [pendingComparison, setPendingComparison] = useState<PendingComparison | null>(null)
-  const [comparisonRunning, setComparisonRunning] = useState(false)
-  const [pendingTeleopReturnOriginSide, setPendingTeleopReturnOriginSide] = useState<RobotSide | null>(null)
   const [previousRestoreStatus, setPreviousRestoreStatus] = useState<MotionPreviousRestoreStatus | null>(null)
+  const [snapshotDraft, setSnapshotDraft] = useState<{ scope: ParameterSnapshotScope; name: string } | null>(null)
+  const [pendingReturnOriginSide, setPendingReturnOriginSide] = useState<RobotSide | null>(null)
+  const returnOriginLock = useRef<RobotSide | null>(null)
+  const applyingConfigRef = useRef(false)
   const [applyingConfig, setApplyingConfig] = useState(false)
-  const [forceStartupCheckRunning, setForceStartupCheckRunning] = useState(false)
+  const [configApplyStatus, setConfigApplyStatus] = useState('')
+
+  useEffect(() => {
+    setActiveTab(tabForHardwareHash(focusHash))
+  }, [focusHash])
+
+  useEffect(() => {
+    if (!applyingConfigRef.current) setConfigApplyStatus('')
+  }, [config])
+
+  // 锁保留在壳层，避免切换 Tab 后重新挂载的主手卡再次发送回原点请求。
+  const updatePendingReturnOriginSide = useCallback((side: RobotSide | null) => {
+    if (side !== null && returnOriginLock.current !== null) return false
+    returnOriginLock.current = side
+    setPendingReturnOriginSide(side)
+    return true
+  }, [])
 
   const applyRuntimeConfig = async () => {
+    if (applyingConfigRef.current) return
+    applyingConfigRef.current = true
     setApplyingConfig(true)
+    setConfigApplyStatus('正在应用配置')
     try {
-      await appApi.applyConfig(config)
-      injectLog('INFO', '配置已由 HAL 安全检查并应用', '[HAL]')
+      await applyConfig(config)
+      setConfigApplyStatus(useTelemetryStore.getState().config === config ? '配置已保存并应用' : '本次配置已应用；后续修改尚未应用')
+      injectLog('INFO', '配置已保存并应用', '[HAL]')
     } catch (error) {
-      injectLog('ERROR', `配置应用失败：${commandErrorMessage(error)}`, '[HAL]')
+      const message = `配置应用失败：${commandErrorMessage(error)}`
+      setConfigApplyStatus(message)
+      injectLog('ERROR', message, '[HAL]')
     } finally {
+      applyingConfigRef.current = false
       setApplyingConfig(false)
     }
-  }
-
-  const runForceStartupCheck = async () => {
-    setForceStartupCheckRunning(true)
-    try {
-      await tareForceSensors()
-      injectLog('INFO', '双侧力传感器启动自检完成；等待稳定窗口后可确认安全态', '[FORCE]')
-    } catch (error) {
-      injectLog('ERROR', `启动力觉自检失败：${commandErrorMessage(error)}`, '[FORCE]')
-    } finally {
-      setForceStartupCheckRunning(false)
-    }
-  }
-
-  const requestForceStartupCheck = () => {
-    Modal.confirm({
-      title: '确认双侧力传感器空载',
-      content: '请移除夹具外载和接触力，并确认全部伺服、运动及遥操作均已停止。系统无法区分恒定外载与零点偏置。',
-      okText: '确认空载并开始',
-      cancelText: '取消',
-      onOk: runForceStartupCheck,
-    })
   }
 
   const refreshMotionOriginStatus = useCallback(async () => {
@@ -3504,300 +183,314 @@ export function SettingsView() {
       const response = await fetchMotionOrigin()
       setPreviousRestoreStatus(response.data?.previousRestore ?? null)
     } catch (error) {
-      setPreviousRestoreStatus(null)
       injectLog('WARNING', `motion origin status fetch failed: ${commandErrorMessage(error)}`, '[HAL]')
     }
   }, [injectLog])
 
-/** 处理对应的用户交互。 */
-const openSnapshotModal = (scope: ParameterSnapshotScope) => setSnapshotDraft({ scope, name: defaultSnapshotName(scope) })
- /** 处理对应的用户交互。 */
- const commitSnapshot = () => {
-    if (!snapshotDraft) return
-    const name = snapshotDraft.name.trim()
-    if (!name) return
-    saveParameterSnapshot(snapshotDraft.scope, name)
-    setSnapshotDraft(null)
-  }
- /** 处理对应的用户交互。 */
- const confirmPendingComparison = async () => {
-    if (!pendingComparison) return
-    setComparisonRunning(true)
-    try {
-      const result = await pendingComparison.onConfirm()
-      if (result !== false) {
-        setPendingComparison(null)
-      }
-    } finally {
-      setComparisonRunning(false)
-    }
-  }
-  /** 描述当前方法的功能边界。 */
-  const snapshotMenu = (scope: ParameterSnapshotScope): MenuProps => {
-    const scopedSnapshots = parameterSnapshots.filter((item) => item.scope === scope)
-    return {
-      items: scopedSnapshots.length > 0
-        ? scopedSnapshots.map((snapshot) => ({
-            key: snapshot.id,
-            label: (
-              <span className="snapshot-menu-label">
-                <span className="snapshot-menu-copy">
-                  <b>{snapshot.name}</b>
-                  <small>{formatSnapshotTime(snapshot.createdAt)}</small>
-                </span>
-                <Button
-                  aria-label={`删除 ${snapshot.name}`}
-                  danger
-                  icon={<Trash2 size={13} />}
-                  size="small"
-                  type="text"
-                  onClick={(event) => {
-                    event.preventDefault()
-                    event.stopPropagation()
-                    deleteParameterSnapshot(snapshot.id)
-                  }}
-                />
-              </span>
-            ),
-          }))
-        : [{ key: 'empty', label: '暂无快照', disabled: true }],
-     onClick: ({ key }) => {
-        if (key === 'empty') return
-        applyParameterSnapshot(String(key))
-      },
-    }
-  }
-
   useEffect(() => {
-    if (!focusHash) return
-    const timer = window.setTimeout(() => {
-      document.getElementById(focusHash)?.scrollIntoView?.({ block: 'start', behavior: 'smooth' })
-    }, 120)
-    return () => window.clearTimeout(timer)
-  }, [focusHash])
+    void refreshMotionOriginStatus()
+  }, [refreshMotionOriginStatus])
 
-  useEffect(() => {
-    const timer = window.setInterval(() => setManualClockMs(Date.now()), 200)
-    return () => window.clearInterval(timer)
-  }, [])
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      void refreshMotionOriginStatus()
-    }, 0)
-    return () => window.clearTimeout(timer)
-  }, [
-    config.motion.origin.previousValid,
-    config.motion.origin.previousUpdatedAt,
-    config.motion.origin.updatedAt,
-    config.motion.homeReference.updatedAt,
-    config.motion.workOriginOffset.updatedAt,
-    refreshMotionOriginStatus,
-  ])
+  const openSnapshotModal = (scope: ParameterSnapshotScope) => setSnapshotDraft({ scope, name: defaultSnapshotName(scope) })
+  const snapshotMenu = (scope: ParameterSnapshotScope) => ({
+    items: parameterSnapshots
+      .filter((item) => item.scope === scope)
+      .map((item) => ({ key: item.id, label: item.name })),
+    onClick: ({ key }: { key: string }) => applyParameterSnapshot(key),
+    onDelete: deleteParameterSnapshot,
+  })
 
   return (
     <div className="view-stack hardware-settings-view">
       <section className="page-header">
         <div>
-          <Typography.Title level={2}>硬件设置</Typography.Title>
-          <Typography.Text type="secondary">参数保存到后端 config.json；手动控制命令经 Backend/HAL 下发到已连接硬件。</Typography.Text>
+          <UiTitle level={2}>硬件设置</UiTitle>
+          <UiText secondary>参数保存到后端 config.json；手动控制命令经 Backend/HAL 下发到已连接硬件。</UiText>
         </div>
-        <Space wrap>
-          {focusHash && <Tag color="processing">当前聚焦：{hashLabels[focusHash] ?? focusHash}</Tag>}
-          <Dropdown menu={snapshotMenu('all')} trigger={['click']}>
-            <Button icon={<RefreshCw size={16} />}>
-              选择硬件快照
-            </Button>
-          </Dropdown>
-          <Button type="primary" icon={<Save size={16} />} onClick={() => openSnapshotModal('all')}>
+        <UiSpace wrap>
+          {focusHash && <UiTag tone="processing">当前聚焦：{hashLabels[focusHash] ?? focusHash}</UiTag>}
+          <ParameterSnapshotMenu title="选择硬件快照" menu={snapshotMenu('all')} />
+          <UiButton icon={<Save size={16} />} variant="primary" onClick={() => openSnapshotModal('all')}>
             保存硬件快照
-          </Button>
-          <Button icon={<Play size={16} />} loading={applyingConfig} onClick={() => void applyRuntimeConfig()}>
+          </UiButton>
+          <UiButton
+            icon={<RefreshCw size={16} />}
+            loading={applyingConfig}
+            onClick={() => void applyRuntimeConfig()}
+          >
             应用配置
-          </Button>
-        </Space>
+          </UiButton>
+          {configApplyStatus && <span role="status" aria-label="配置应用状态">{configApplyStatus}</span>}
+          {mockMode && <UiButton danger icon={<AlertTriangle size={16} />} onClick={() => setDangerOverride(0.9)}>
+            模拟危险
+          </UiButton>}
+          <UiButton icon={<ShieldAlert size={16} />} disabled={!canAcknowledge} onClick={acknowledgeSafety}>
+            确认安全态
+          </UiButton>
+        </UiSpace>
       </section>
 
-      <Tabs
-        key={focusHash || 'settings-tabs'}
-        defaultActiveKey={targetTab}
-        items={[
-          {
-            key: 'config',
-            label: '硬件配置',
-            children: (
-              <section className="hardware-settings-page">
-                <div className="hardware-focus-strip">
-                  <MetricBox label="平台轴数" value="12 轴 + 2 夹爪" />
-                  <MetricBox label="运动控制卡" value="Card 0 DMC5C10 / Card 1 DMC3C00" hint="Card 1 左，Card 0 右" />
-                  <MetricBox label="相机" value="3x IMX335" hint="按原始比例预览" />
-                  <MetricBox
-                    label="力觉"
-                    value={config.force.source === 'hkvl_serial' ? '2× HKVL-36A' : '2× ATI Nano-17'}
-                    hint={config.force.source === 'hkvl_serial' ? 'HAL 双串口 · N / Nm' : 'NI-DAQ · 显示/录制'}
-                  />
-                </div>
-                <div className="hardware-settings-grid">
-                  <HalCard config={config} updateConfig={updateConfig} focusHash={focusHash} injectLog={injectLog} />
-                  <SafetyCard
-                    config={config}
-                    updateConfig={updateConfig}
-                    focusHash={focusHash}
-                    dangerIndex={frame.dangerIndex}
-                    setDangerOverride={setDangerOverride}
-                    acknowledgeSafety={acknowledgeSafety}
-                    forceStatus={frame.forceStatus}
-                    runForceStartupCheck={requestForceStartupCheck}
-                    forceStartupCheckRunning={forceStartupCheckRunning}
-                  />
-                  {sideOrder.map((side) => (
-                    (() => {
-                      const hardwareSide = hardwareSideForOperatorSide(side)
-                      return (
-                        <MotionCard
-                          key={side}
-                          side={side}
-                          config={config}
-                          updateConfig={updateConfig}
-                          focusHash={focusHash}
-                          positions={frame.jointPositions}
-                          motionEnabled={frame.motionEnabled?.[hardwareSide] ?? null}
-                          motionAxisEnabled={frame.motionAxisEnabled?.[hardwareSide] ?? undefined}
-                          injectLog={injectLog}
-                          triggerEmergencyStop={triggerEmergencyStop}
-                          snapshotMenu={snapshotMenu}
-                          openSnapshotModal={openSnapshotModal}
-                          requestComparison={setPendingComparison}
-                          previousRestoreStatus={previousRestoreStatus}
-                          refreshMotionOriginStatus={refreshMotionOriginStatus}
-                        />
-                      )
-                    })()
-                  ))}
-                  <WristCameraIdentification onSaved={(cameras) => updateConfig({ cameras })} />
-                  {cameraOrder.map((cameraKey) => (
-                    <CameraCard
-                      key={cameraKey}
-                      cameraKey={cameraKey}
-                      camera={cameraByKey(frame.cameras, cameraKey)}
-                      config={config}
-                      updateConfig={updateConfig}
-                      focusHash={focusHash}
-                      injectLog={injectLog}
-                      requestComparison={setPendingComparison}
-                    />
-                  ))}
-                  {sideOrder.map((side) => (
-                    <ForceSensorCard
-                      key={side}
-                      side={side}
-                      config={config}
-                      updateConfig={updateConfig}
-                      focusHash={focusHash}
-                      values={hardwareSideForOperatorSide(side) === 'left' ? frame.forceLeft : frame.forceRight}
-                      forceStatus={frame.forceStatus}
-                      history={history}
-                      injectLog={injectLog}
-                    />
-                  ))}
-                  {sideOrder.map((side) => (
-                    <GripperCard
-                      key={side}
-                      side={side}
-                      config={config}
-                      updateConfig={updateConfig}
-                      focusHash={focusHash}
-                      currentMm={frame.gripperPositions[hardwareSideForOperatorSide(side) === 'left' ? 0 : 1] ?? -1}
-                      issueManualGripperMove={issueManualGripperMove}
-                      injectLog={injectLog}
-                      requestComparison={setPendingComparison}
-                    />
-                  ))}
-                  {sideOrder.map((side) => (
-                    <TeleopHandCard
-                      key={side}
-                      side={side}
-                      config={config}
-                      updateConfig={updateConfig}
-                      focusHash={focusHash}
-                      frame={frame}
-                      injectLog={injectLog}
-                      pendingReturnOriginSide={pendingTeleopReturnOriginSide}
-                      setPendingReturnOriginSide={setPendingTeleopReturnOriginSide}
-                    />
-                  ))}
-                  <StorageCard config={config} updateConfig={updateConfig} focusHash={focusHash} />
-                  <PicoVisionCard config={config} updateConfig={updateConfig} focusHash={focusHash} injectLog={injectLog} />
-                </div>
-              </section>
-            ),
-          },
-          {
-            key: 'manual',
-            label: '手动控制',
-            children: (
-              <ManualControlPanel
-                positions={frame.jointPositions}
-                grippers={frame.gripperPositions}
-                config={config}
-                updateConfig={updateConfig}
-                manualControl={manualControl}
-                nowMs={manualClockMs}
-                motionEnabled={frame.motionEnabled}
-                motionAxisEnabled={frame.motionAxisEnabled}
-                selectManualAxis={selectManualAxis}
-                setManualAxisStep={setManualAxisStep}
-                setManualSpeedMode={setManualSpeedMode}
-                issueManualAxisMove={issueManualAxisMove}
-                issueManualGripperMove={issueManualGripperMove}
-                triggerEmergencyStop={triggerEmergencyStop}
-                startManualRecording={startManualRecording}
-                stopManualRecording={stopManualRecording}
-                saveManualMemory={saveManualMemory}
-                replayManualMemory={replayManualMemory}
-                pauseManualReplay={pauseManualReplay}
-                deleteManualMemory={deleteManualMemory}
-                injectLog={injectLog}
-                requestComparison={setPendingComparison}
-              />
-            ),
-          },
-        ]}
-      />
+      <div className="ui-tabs">
+        <UiTabs
+          activeKey={activeTab}
+          onChange={setActiveTab}
+          items={[
+            { key: 'system', label: '系统连接' },
+            { key: 'force', label: '安全与力觉' },
+            { key: 'motion', label: '运动控制' },
+            { key: 'teleop', label: '遥操作' },
+            { key: 'vision', label: '视觉' },
+          ]}
+        />
+      </div>
 
-      <Modal
-        title={snapshotDraft ? snapshotModalTitle(snapshotDraft.scope) : '保存参数快照'}
-        open={Boolean(snapshotDraft)}
-        onCancel={() => setSnapshotDraft(null)}
-        onOk={commitSnapshot}
-        okText="保存"
-        cancelText="取消"
-        okButtonProps={{ disabled: !snapshotDraft?.name.trim() }}
-      >
-        <Form layout="vertical">
-          <Form.Item label="快照名称">
-            <Input
-              autoFocus
-              value={snapshotDraft?.name ?? ''}
-              onChange={(event) => setSnapshotDraft((current) => current ? { ...current, name: event.target.value } : current)}
-              onPressEnter={commitSnapshot}
+      {activeTab === 'system' ? (
+        <section className="hardware-settings-page">
+          <div className="module-group">
+            <div className="module-group-head">
+              HAL 通信
+              <small>Backend ↔ HalServer</small>
+            </div>
+            <HalCard
+              config={config}
+              updateConfig={updateConfig}
+              focusHash={focusHash}
+              injectLog={injectLog}
             />
-          </Form.Item>
-        </Form>
-      </Modal>
-      <ActionCompareModal
-        open={Boolean(pendingComparison)}
-        title={pendingComparison?.title ?? ''}
-        tone={pendingComparison?.tone}
-        impact={pendingComparison?.impact ?? ''}
-        expected={pendingComparison?.expected}
-        current={pendingComparison?.current ?? []}
-        proposed={pendingComparison?.proposed ?? []}
-        confirmText={pendingComparison?.confirmText ?? '确认'}
-        confirmLoading={comparisonRunning}
-        onCancel={() => setPendingComparison(null)}
-        onConfirm={() => void confirmPendingComparison()}
-      />
+          </div>
+          <div className="module-group">
+            <div className="module-group-head">数据存储<small>目录 · 录制帧率</small></div>
+            <StorageCard config={config} updateConfig={updateConfig} focusHash={focusHash} />
+          </div>
+        </section>
+      ) : null}
+
+      {activeTab === 'force' ? (
+        <section className="hardware-settings-page">
+          <div className="module-group">
+            <div className="module-group-head">
+              安全链路 / 急停 / 软限位
+              <small>danger_index {dangerIndex.toFixed(2)}</small>
+            </div>
+            <SafetyCard
+              config={config}
+              updateConfig={updateConfig}
+              focusHash={focusHash}
+              triggerEmergencyStop={triggerEmergencyStop}
+              acknowledgeSafety={acknowledgeSafety}
+            />
+          </div>
+          <div className="module-group">
+            <div className="module-group-head">
+              六维力
+              <small>Nano-17 / HKVL</small>
+            </div>
+            <div className="hardware-settings-grid">
+              {sideOrder.map((side) => (
+                <ForceSensorCard
+                  key={side}
+                  side={side}
+                  config={config}
+                  updateConfig={updateConfig}
+                  focusHash={focusHash}
+                  values={hardwareSideForOperatorSide(side) === 'left' ? forceLeft : forceRight}
+                  forceStatus={forceStatus}
+                  injectLog={injectLog}
+                />
+              ))}
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {activeTab === 'motion' ? (
+        <section className="hardware-settings-page">
+          <div className="module-group">
+            <div className="module-group-head">
+              手动控制
+              <small>点动 · 夹爪开合 · 动作回放</small>
+            </div>
+            <ManualControlPanel
+              positions={jointPositions}
+              grippers={gripperPositions}
+              config={config}
+              updateConfig={updateConfig}
+              manualControl={manualControl}
+              selectManualAxis={selectManualAxis}
+              setManualAxisStep={setManualAxisStep}
+              setManualSpeedMode={setManualSpeedMode}
+              issueManualAxisMove={issueManualAxisMove}
+              issueManualGripperMove={issueManualGripperMove}
+              triggerEmergencyStop={triggerEmergencyStop}
+              startManualRecording={startManualRecording}
+              stopManualRecording={stopManualRecording}
+              saveManualMemory={saveManualMemory}
+              replayManualMemory={replayManualMemory}
+              pauseManualReplay={pauseManualReplay}
+              deleteManualMemory={deleteManualMemory}
+              injectLog={injectLog}
+              requestComparison={setPendingComparison}
+            />
+          </div>
+          <div className="module-group">
+            <div className="module-group-head">
+              运动控制卡
+              <small>轴映射 · 软限位 · 工作原点</small>
+            </div>
+            <div className="hardware-settings-grid">
+              {sideOrder.map((side) => (
+                <MotionCard
+                  key={side}
+                  side={side}
+                  config={config}
+                  updateConfig={updateConfig}
+                  focusHash={focusHash}
+                  positions={jointPositions}
+                  injectLog={injectLog}
+                  triggerEmergencyStop={triggerEmergencyStop}
+                  snapshotMenu={snapshotMenu}
+                  openSnapshotModal={openSnapshotModal}
+                  requestComparison={setPendingComparison}
+                  previousRestoreStatus={previousRestoreStatus}
+                  refreshMotionOriginStatus={refreshMotionOriginStatus}
+                />
+              ))}
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {activeTab === 'teleop' && teleopFrame ? (
+        <section className="hardware-settings-page">
+          <div className="module-group">
+            <div className="module-group-head">
+              Omega.7 主手
+              <small>SDK 连接 · 映射与力反馈</small>
+            </div>
+            <div className="hardware-settings-grid">
+              {sideOrder.map((side) => (
+                <TeleopHandCard
+                  key={side}
+                  side={side}
+                  config={config}
+                  updateConfig={updateConfig}
+                  focusHash={focusHash}
+                  frame={teleopFrame}
+                  injectLog={injectLog}
+                  pendingReturnOriginSide={pendingReturnOriginSide}
+                  setPendingReturnOriginSide={updatePendingReturnOriginSide}
+                />
+              ))}
+            </div>
+          </div>
+          <div className="module-group">
+            <div className="module-group-head">
+              夹爪
+              <small>EPG006 串口 · Omega.7 夹爪映射</small>
+            </div>
+            <div className="hardware-settings-grid">
+              {sideOrder.map((side) => (
+                <GripperCard
+                  key={side}
+                  side={side}
+                  config={config}
+                  updateConfig={updateConfig}
+                  focusHash={focusHash}
+                  currentMm={gripperPositions[hardwareSideForOperatorSide(side) === 'left' ? 0 : 1] ?? -1}
+                  issueManualGripperMove={issueManualGripperMove}
+                  injectLog={injectLog}
+                  requestComparison={setPendingComparison}
+                />
+              ))}
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {activeTab === 'vision' ? (
+        <section className="hardware-settings-page">
+          <div className="module-group">
+            <div className="module-group-head">
+              PICO-4 视觉推流
+              <small>ADB · 网口 · 推流</small>
+            </div>
+            <PicoVisionCard
+              config={config}
+              updateConfig={updateConfig}
+              focusHash={focusHash}
+              injectLog={injectLog}
+            />
+          </div>
+          <div className="module-group">
+            <div className="module-group-head">
+              相机
+              <small>预览 · 调参 · 重连</small>
+            </div>
+            <WristCameraIdentification onSaved={(savedCameras) => useTelemetryStore.setState((state) => ({
+              config: { ...state.config, cameras: savedCameras },
+            }))} />
+            <div className="hardware-settings-grid">
+              {cameraOrder.map((key) => (
+                <CameraCard
+                  key={key}
+                  cameraKey={key}
+                  camera={cameras.find((camera) => camera.key === key)}
+                  config={config}
+                  updateConfig={updateConfig}
+                  focusHash={focusHash}
+                  injectLog={injectLog}
+                  requestComparison={setPendingComparison}
+                />
+              ))}
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {pendingComparison && (
+        <ActionCompareModal
+          open
+          title={pendingComparison.title}
+          tone={pendingComparison.tone}
+          impact={pendingComparison.impact}
+          expected={pendingComparison.expected}
+          current={pendingComparison.current}
+          proposed={pendingComparison.proposed}
+          confirmText={pendingComparison.confirmText}
+          onConfirm={() => {
+            void pendingComparison.onConfirm()
+            setPendingComparison(null)
+          }}
+          onCancel={() => setPendingComparison(null)}
+        />
+      )}
+
+      {snapshotDraft && (
+        <div className="ui-modal-mask" role="presentation" onClick={() => setSnapshotDraft(null)}>
+          <div className="ui-modal" role="dialog" aria-label="保存参数快照" onClick={(event) => event.stopPropagation()}>
+            <header className="ui-modal-head">
+              <strong>{snapshotModalTitle(snapshotDraft.scope)}</strong>
+            </header>
+            <div className="ui-modal-body ui-form">
+              <UiField label="快照名称">
+                <UiInput value={snapshotDraft.name} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, name: event.target.value })} />
+              </UiField>
+            </div>
+            <div className="ui-modal-actions">
+              <UiButton onClick={() => setSnapshotDraft(null)}>取消</UiButton>
+              <UiButton
+                variant="primary"
+                onClick={() => {
+                  saveParameterSnapshot(snapshotDraft.scope, snapshotDraft.name)
+                  setSnapshotDraft(null)
+                }}
+              >
+                保存
+              </UiButton>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

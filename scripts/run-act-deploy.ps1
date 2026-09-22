@@ -1,3 +1,7 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：装配 ACT 模型部署参数并调用外部策略工程；Send 控制是否发送真实动作。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 param(
   [string]$CheckpointDir = "D:\ACT_TEXT\act_text\checkpoints\003000",
   [string]$Checkpoint = "pretrained_model",
@@ -20,40 +24,14 @@ param(
   [int]$SignConfirmFrames = 3,
   [double]$TranslationDeadbandUm = 0.0,
   [int]$PolicyUpdateInterval = 1,
-  [string]$ControlledSides = "right",
-  [string]$HardwareSides = "",
-  [switch]$FreezeUncontrolledState,
   [switch]$Send,
-  [switch]$UseExistingStack,
-  [switch]$SkipStartupHome,
-  [switch]$WithFrontend,
-  [switch]$LogToDesktop,
-  [string]$LogPath = ""
+  [switch]$WithFrontend
 )
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $backendUrl = "http://127.0.0.1:$BackendPort"
 $cameraIdParts = @($CameraIds.Split(",") | ForEach-Object { $_.Trim() })
-$transcriptStarted = $false
-$actOutputLogPath = ""
-
-if ($LogToDesktop -or -not [string]::IsNullOrWhiteSpace($LogPath)) {
-  if ([string]::IsNullOrWhiteSpace($LogPath)) {
-    $desktop = [Environment]::GetFolderPath("Desktop")
-    if ([string]::IsNullOrWhiteSpace($desktop)) {
-      $desktop = Join-Path $env:USERPROFILE "Desktop"
-    }
-    $LogPath = Join-Path $desktop ("ACT-JEPA-Deploy-{0}.txt" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
-  }
-  $logDirectory = Split-Path -Parent $LogPath
-  $logBaseName = [System.IO.Path]::GetFileNameWithoutExtension($LogPath)
-  $actOutputLogPath = Join-Path $logDirectory ($logBaseName + "-ACT.txt")
-  Start-Transcript -Path $LogPath -Force | Out-Host
-  $transcriptStarted = $true
-  Write-Host "Logging deploy output to $LogPath"
-  Write-Host "Logging ACT subprocess output to $actOutputLogPath"
-}
 
 if (-not (Test-Path -LiteralPath $CondaExe)) {
   throw "Conda executable not found: $CondaExe"
@@ -75,18 +53,13 @@ if (-not (Test-Path -LiteralPath (Join-Path $DeployDir "act_deploy.py"))) {
   throw "act_deploy.py not found in deploy directory: $DeployDir"
 }
 
-if ($UseExistingStack) {
-  Write-Host "Using existing HAL/backend at $backendUrl; startup/restart is skipped."
-} elseif ($WithFrontend) {
+if ($WithFrontend) {
   $stackArgs = @(
     "-ExecutionPolicy", "Bypass",
     "-File", (Join-Path $repo "scripts\start-stack.ps1"),
     "-BackendPort", "$BackendPort",
     "-FrontendPort", "$FrontendPort"
   )
-  if ($SkipStartupHome) {
-    $stackArgs += "-SkipStartupHome"
-  }
 
   Write-Host "Starting AppStation stack with frontend..."
   & powershell @stackArgs | Out-Host
@@ -110,7 +83,6 @@ if ($UseExistingStack) {
   Write-Host "Launching backend on $backendUrl..."
   $env:APPSTATION_HAL_MODE = "real"
   $env:APPSTATION_HAL_BASE_URL = "http://127.0.0.1:8091"
-  $env:APPSTATION_SKIP_STARTUP_HOME = if ($SkipStartupHome) { "true" } else { "false" }
   $env:APPSTATION_DISABLE_CAMERA_PROBE = "true"
   $backend = Start-Process `
     -FilePath (Join-Path $repo "backend\.venv\Scripts\python.exe") `
@@ -125,7 +97,6 @@ if ($UseExistingStack) {
     hal = "http://127.0.0.1:8091"
     frontend = "disabled"
     cameraProbe = "disabled"
-    skipStartupHome = [bool]$SkipStartupHome
   } | Format-List | Out-Host
 }
 
@@ -134,12 +105,7 @@ $deadline = (Get-Date).AddSeconds(20)
 do {
   try {
     $response = Invoke-RestMethod -Uri "$backendUrl/api/policy/observation" -Method GET -TimeoutSec 5
-    if (
-      $response.ok -eq $true -and
-      $response.data.state.Count -eq 14 -and
-      $response.data.dataContract.version -eq "appstation.dual_arm.operator_sides.v2" -and
-      $response.data.dataContract.sideOrder -eq "operator_left_then_operator_right"
-    ) {
+    if ($response.ok -eq $true -and $response.data.state.Count -eq 14) {
       break
     }
   } catch {
@@ -148,7 +114,7 @@ do {
 } while ((Get-Date) -lt $deadline)
 
 if ((Get-Date) -ge $deadline) {
-  throw "Policy bridge did not expose the required numeric side-order contract at $backendUrl/api/policy/observation"
+  throw "Policy bridge did not become ready at $backendUrl/api/policy/observation"
 }
 
 $actArgs = @(
@@ -169,37 +135,19 @@ $actArgs = @(
   "--flip_damping", "$FlipDamping",
   "--sign_confirm_frames", "$SignConfirmFrames",
   "--translation_deadband_um", "$TranslationDeadbandUm",
-  "--policy_update_interval", "$PolicyUpdateInterval",
-  "--controlled_sides", $ControlledSides
+  "--policy_update_interval", "$PolicyUpdateInterval"
 )
-if (-not [string]::IsNullOrWhiteSpace($HardwareSides)) {
-  $actArgs += @("--hardware_sides", $HardwareSides)
-}
 if ($Send) {
   $actArgs += "--send"
 }
-if ($FreezeUncontrolledState) {
-  $actArgs += "--freeze_uncontrolled_state"
-}
 
-Write-Host "Starting ACT deploy. Send=$([bool]$Send), cameras=$CameraIds, controlledSides=$ControlledSides, hardwareSides=$HardwareSides, deployDir=$DeployDir"
+Write-Host "Starting ACT deploy. Send=$([bool]$Send), cameras=$CameraIds, deployDir=$DeployDir"
 if ($cameraIdParts.Count -ge 3) {
   Write-Host "Camera mapping: global=$($cameraIdParts[0]), wrist_left=$($cameraIdParts[1]), wrist_right=$($cameraIdParts[2])"
 }
 Push-Location -LiteralPath $DeployDir
 try {
-  if ($transcriptStarted) {
-    & $CondaExe @actArgs 2>&1 | Tee-Object -FilePath $actOutputLogPath -Append
-    $actExitCode = $LASTEXITCODE
-    if ($actExitCode -ne 0) {
-      throw "ACT deploy exited with code $actExitCode"
-    }
-  } else {
-    & $CondaExe @actArgs
-  }
+  & $CondaExe @actArgs
 } finally {
   Pop-Location
-  if ($transcriptStarted) {
-    Stop-Transcript | Out-Host
-  }
 }

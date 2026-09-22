@@ -1,9 +1,17 @@
-import { Button, Card, Divider, Form, Input, Progress, Select, Spin } from 'antd'
+import type { Participation } from '../../types'
+import { ParticipationSelector } from '../ParticipationSelector'
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：提供录制会话、episode 保存/丢弃及复位流程的主要操作入口。
+ * 先看：EpisodeControlPanelProps → EpisodeControlPanel。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { Crosshair } from 'lucide-react'
 import React from 'react'
 import { hardwareSideForOperatorSide } from '../../data'
 import { motionSideReturnOriginReady } from '../../motionReturnReady'
 import { useTelemetryStore } from '../../stores/telemetry'
+import { UiButton, UiCard, UiProgress, UiSpin } from '../ui'
 
 const PRESET_TASKS = [
   { value: 'Assemble ICF target component', label: 'Assemble ICF target component' },
@@ -12,12 +20,14 @@ const PRESET_TASKS = [
 ]
 
 const phaseConfig = {
+  interrupted: { label: '采集中断，待核验；未保存片段可保存或丢弃', color: '#fa8c16', barColor: '#fa8c16' },
   idle: { label: '就绪', color: '#8c8c8c', barColor: '#d9d9d9' },
   starting: { label: '启动中', color: '#1677ff', barColor: '#1677ff' },
   recording: { label: '录制中', color: '#cf1322', barColor: '#cf1322' },
   reviewing: { label: '质检中', color: '#fa8c16', barColor: '#fa8c16' },
   resetting: { label: '复位中', color: '#722ed1', barColor: '#722ed1' },
   saving: { label: '保存中', color: '#1677ff', barColor: '#1677ff' },
+  discarding: { label: '丢弃中，等待遥操作停止', color: '#1677ff', barColor: '#1677ff' },
   finishing: { label: '结束中', color: '#52c41a', barColor: '#52c41a' },
 }
 
@@ -33,7 +43,6 @@ const kbdStyle: React.CSSProperties = {
 const HINTS = [
   { key: 'Ctrl', desc: '离合器切换' },
   { key: '1/2/3', desc: '速度粗/中/细' },
-  { key: 'T', desc: '力觉 Tare' },
   { key: 'R', desc: '回工作原点' },
   { key: 'P', desc: '暂停遥操作' },
 ]
@@ -46,7 +55,10 @@ interface EpisodeControlPanelProps {
 }
 /** 渲染当前界面单元，并连接所需数据。 */
 export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPanelProps) {
+  const participation: Participation = useTelemetryStore((s) => s.recordSession.participation) ?? { version: 'appstation.participation.v1', arms: [], grippers: [] }
+  const setParticipation = useTelemetryStore((s) => s.setRecordParticipation)
   const phase = useTelemetryStore((s) => s.recordSession.phase)
+  const startError = useTelemetryStore((s) => s.recordSession.startError)
   const elapsedS = useTelemetryStore((s) => s.recordSession.recorderElapsedS)
   const totalS = useTelemetryStore((s) => s.recordSession.recorderTotalS)
   const episodeTimeS = useTelemetryStore((s) => s.recordSession.episodeTimeS)
@@ -72,10 +84,10 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
   const [pendingOriginSide, setPendingOriginSide] = React.useState<'left' | 'right' | null>(null)
 
   const cfg = phaseConfig[phase]
-  const busy = phase === 'starting' || phase === 'saving' || phase === 'finishing'
+  const busy = phase === 'starting' || phase === 'saving' || phase === 'discarding' || phase === 'finishing'
   const progressTotalS =
     totalS >= 0 ? totalS : phase === 'recording' ? episodeTimeS : phase === 'resetting' ? resetTimeS : -1
-  const phasePercent = progressTotalS > 0 ? Math.min(100, Math.round((elapsedS / progressTotalS) * 100)) : 0
+  const phasePercent = progressTotalS > 0 ? Math.max(0, Math.min(100, Math.round((elapsedS / progressTotalS) * 100))) : 0
   const leftHardwareSide = hardwareSideForOperatorSide('left')
   const rightHardwareSide = hardwareSideForOperatorSide('right')
   const leftReturnReady = motionSideReturnOriginReady(leftHardwareSide, motionEnabled, motionAxisEnabled)
@@ -92,29 +104,35 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
   }
 
   return (
-    <Card size="small" title="录制控制" styles={{ body: { padding: '10px 12px' } }}>
-      <Form layout="vertical" size="small" style={{ marginBottom: 0 }}>
-        <Form.Item label="任务描述" style={{ marginBottom: 8 }}>
-          <Select
-            value={task}
-            onChange={setTask}
-            options={PRESET_TASKS}
-            showSearch
-            allowClear={false}
-            disabled={phase !== 'idle'}
-          />
-        </Form.Item>
-        <Form.Item label="数据集名称" style={{ marginBottom: 0 }}>
-          <Input
-            value={datasetName}
-            onChange={(e) => setDatasetName(e.target.value)}
-            placeholder="micro_assembly_v1"
-            disabled={phase !== 'idle'}
-          />
-        </Form.Item>
-      </Form>
+    <UiCard title="录制控制" bodyStyle={{ padding: '10px 12px' }}>
+      <label style={{ display: 'block', marginBottom: 8 }}>
+        <span style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#7a8b9c', marginBottom: 4 }}>任务描述</span>
+        <select
+          className="ui-select"
+          style={{ width: '100%' }}
+          value={task}
+          onChange={(event) => setTask(event.target.value)}
+          disabled={phase !== 'idle'}
+        >
+          {PRESET_TASKS.map((item) => (
+            <option key={item.value} value={item.value}>{item.label}</option>
+          ))}
+        </select>
+      </label>
+      <label style={{ display: 'block' }}>
+        <span style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#7a8b9c', marginBottom: 4 }}>数据集名称</span>
+        <input
+          className="ui-input"
+          style={{ width: '100%' }}
+          value={datasetName}
+          onChange={(event) => setDatasetName(event.target.value)}
+          placeholder="micro_assembly_v1"
+          disabled={phase !== 'idle'}
+        />
+      </label>
 
-      <Divider style={{ margin: '10px 0' }} />
+      <ParticipationSelector value={participation} onChange={setParticipation} disabled={phase !== 'idle'} />
+      <hr className="ui-divider" />
 
       <div className="record-episode-progress-head">
         <span>#{String(currentEpisode).padStart(3, '0')}</span>
@@ -122,14 +140,9 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
           目标 {targetEpisodes} 条 / 已完成 {savedEpisodes}
         </small>
       </div>
-      <Progress
-        percent={targetEpisodes > 0 ? Math.round((savedEpisodes / targetEpisodes) * 100) : 0}
-        showInfo={false}
-        strokeColor="#185FA5"
-        size="small"
-      />
+      <UiProgress percent={targetEpisodes > 0 ? Math.round((savedEpisodes / targetEpisodes) * 100) : 0} />
 
-      <Divider style={{ margin: '10px 0' }} />
+      <hr className="ui-divider" />
 
       <div className="record-phase-row">
         <div>
@@ -143,54 +156,64 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
           </div>
         </div>
       </div>
-      <Progress
-        percent={phasePercent}
-        showInfo={false}
-        strokeColor={cfg.barColor}
-        size="small"
-      />
+      <div
+        role="progressbar"
+        aria-label="当前阶段进度"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={phasePercent}
+        style={{ background: '#e8eef5', height: 6, borderRadius: 99, overflow: 'hidden', marginTop: 4 }}
+      >
+        <div style={{ width: `${phasePercent}%`, height: '100%', background: cfg.barColor }} />
+      </div>
 
-      <Divider style={{ margin: '10px 0' }} />
+      <hr className="ui-divider" />
 
       {busy && (
         <div style={{ textAlign: 'center', padding: '8px 0' }}>
-          <Spin size="small" />
+          <UiSpin />
           <div style={{ fontSize: 11, color: '#8c8c8c', marginTop: 4 }}>{cfg.label}</div>
         </div>
       )}
 
       {phase === 'idle' && (
         <div className="record-action-stack">
-          <Button type="primary" block onClick={onStartSession}>
+          {startError && (
+            <div role="alert" style={{ color: '#cf1322', background: '#fff1f0', border: '1px solid #ffa39e', borderRadius: 4, padding: 8, overflowWrap: 'anywhere' }}>
+              <strong>录制启动失败</strong>
+              <div>{startError}</div>
+            </div>
+          )}
+          <UiButton variant="primary" block disabled={!participation.arms.length} onClick={onStartSession}>
             开始采集会话
-          </Button>
+          </UiButton>
         </div>
       )}
 
-      {phase === 'recording' && (
+      {(phase === 'recording' || phase === 'interrupted') && (
         <div className="record-action-stack">
           <div className="record-action-grid">
-            <Button type="primary" onClick={saveRecordEpisode} block disabled={busy}>
+            <UiButton variant="primary" onClick={saveRecordEpisode} block disabled={busy}>
               保存 <kbd style={kbdStyle}>Space</kbd>
-            </Button>
-            <Button onClick={discardRecordEpisode} block disabled={busy}>
+            </UiButton>
+            <UiButton onClick={discardRecordEpisode} block disabled={busy}>
               丢弃重录
-            </Button>
+            </UiButton>
           </div>
-          <Button danger block size="small" onClick={finishRecordSession} disabled={busy}>
+          <UiButton danger block onClick={finishRecordSession} disabled={busy}>
             ESC - 结束采集会话并 finalize()
-          </Button>
+          </UiButton>
         </div>
       )}
 
       {phase === 'resetting' && (
         <div className="record-action-stack">
-          <Button type="primary" block onClick={skipRecordReset} disabled={busy || returnOriginInFlight || !resetReady}>
+          <UiButton variant="primary" block onClick={skipRecordReset} disabled={busy || returnOriginInFlight || !resetReady}>
             跳过复位，立即开始
-          </Button>
-          <Button danger block size="small" onClick={finishRecordSession} disabled={busy}>
+          </UiButton>
+          <UiButton danger block onClick={finishRecordSession} disabled={busy}>
             ESC - 结束采集会话并 finalize()
-          </Button>
+          </UiButton>
         </div>
       )}
 
@@ -209,34 +232,32 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
 
       {phase !== 'idle' && (
         <div className="record-teleop-buttons">
-          <Button size="small" onClick={toggleRecordClutch}>离合器</Button>
-          <Button size="small" onClick={() => setRecordSpeedMode('coarse')}>粗</Button>
-          <Button size="small" onClick={() => setRecordSpeedMode('medium')}>中</Button>
-          <Button size="small" onClick={() => setRecordSpeedMode('fine')}>细</Button>
+          <UiButton onClick={toggleRecordClutch}>离合器</UiButton>
+          <UiButton onClick={() => setRecordSpeedMode('coarse')}>粗</UiButton>
+          <UiButton onClick={() => setRecordSpeedMode('medium')}>中</UiButton>
+          <UiButton onClick={() => setRecordSpeedMode('fine')}>细</UiButton>
         </div>
       )}
-      <Divider style={{ margin: '10px 0' }} />
+      <hr className="ui-divider" />
 
       <div className="record-origin-actions">
-        <Button
-          size="small"
+        <UiButton
           icon={<Crosshair size={13} />}
           loading={pendingOriginSide === 'left'}
           disabled={busy || returnOriginInFlight || pendingOriginSide !== null || !leftReturnReady}
           onClick={() => void handleReturnOrigin('left')}
         >
           左从臂回工作原点
-        </Button>
-        <Button
-          size="small"
+        </UiButton>
+        <UiButton
           icon={<Crosshair size={13} />}
           loading={pendingOriginSide === 'right'}
           disabled={busy || returnOriginInFlight || pendingOriginSide !== null || !rightReturnReady}
           onClick={() => void handleReturnOrigin('right')}
         >
           右从臂回工作原点
-        </Button>
+        </UiButton>
       </div>
-    </Card>
+    </UiCard>
   )
 }

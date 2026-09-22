@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：ADB 离线设备不能被报告为连接成功。
+# 先看：test_pico_status_reports_offline_device_as_not_ok。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from pathlib import Path

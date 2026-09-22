@@ -1,3 +1,8 @@
+# 阅读导航 03｜后端契约与配置
+# 职责：集中定义硬件标定、轴映射、相机和遥操作默认值，并生成独立的默认配置副本。
+# 先看：anchored_mechanical_soft_limits → rotation_work_limits_from_soft_limits → stable_mechanical_soft_limits → default_config。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -25,12 +30,12 @@ ICF_HOME_REFERENCE_VERSION = "icf_home_reference_20260602_v1"
 ICF_CAMERA_TUNING_DEFAULTS_VERSION = "auto_awb_exposure_20260616"
 
 ICF_CAMERA_DEFAULTS: dict[str, Any] = {
-    "global": "IMX335 / index 0",
-    "globalIdentity": "20250606105",
-    "wristLeft": "IMX335 / index 1",
-    "wristLeftIdentity": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)",
+    "global": "IMX335 / index 1",
+    "globalIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000",
+    "wristLeft": "IMX335 / index 0",
+    "wristLeftIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000",
     "wristRight": "IMX335 / index 2",
-    "wristRightIdentity": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)",
+    "wristRightIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000",
     "previewResolution": "640x480",
     "globalResolution": "640x480",
     "wristLeftResolution": "640x480",
@@ -388,10 +393,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "homeReference": deepcopy(ICF_HOME_REFERENCE_DEFAULTS),
         "workOriginOffset": deepcopy(ICF_WORK_ORIGIN_OFFSET_DEFAULTS),
         "relativeSoftLimits": deepcopy(ICF_RELATIVE_SOFT_LIMIT_DEFAULTS),
-        "homeOnStartup": {
-            "enabled": False,
-            "mode": "work_origin",
-        },
         "leftProfile": deepcopy(DEFAULT_MOTION_PROFILE),
         "rightProfile": deepcopy(DEFAULT_MOTION_PROFILE),
         "leftSoftLimits": deepcopy(ICF_LEFT_MOTION_MECHANICAL_LIMITS),

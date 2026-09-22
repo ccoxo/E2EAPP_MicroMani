@@ -1,6 +1,13 @@
-import { Progress, Space, Tag } from 'antd'
-import { Bot, Camera, Gamepad2, Hand, RadioTower } from 'lucide-react'
-import { axisNames, forceChannels } from '../../data'
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：汇总单侧机械臂的相机、力、夹爪和诊断状态。
+ * 先看：diagnosticState → cameraByKey → forceMagnitude → formatGripperPosition。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
+import { UiProgress, UiSpace, UiTag } from '../ui'
+import { Bot, RadioTower } from 'lucide-react'
+import { axisNames, forceChannels, forceSensorModelLabel } from '../../data'
+import { useTelemetryStore } from '../../stores/telemetry'
 import { teleopHandState, teleopHandValue } from '../../teleopStatus'
 import type { CameraTelemetry, ConnectionState, DiagnosticItem, TelemetryFrame, TelemetrySample } from '../../types'
 import { CameraPreview } from '../CameraPreview'
@@ -38,6 +45,8 @@ export function ArmOverviewPanel({
   const isLeft = side === 'left'
   const sideLabel = isLeft ? '左机械臂' : '右机械臂'
   const axisOffset = isLeft ? 0 : 6
+  const forceSource = useTelemetryStore((state) => state.config.force.source)
+  const forceModel = forceSensorModelLabel(forceSource)
   const camera = cameraByKey(frame.cameras, isLeft ? 'wrist_left' : 'wrist_right')
   const forces = isLeft ? frame.forceLeft : frame.forceRight
   const forceDiag = diagnosticState(diagnostics, isLeft ? 'ati-left' : 'ati-right')
@@ -76,11 +85,11 @@ export function ArmOverviewPanel({
     },
     {
       key: `${side}-force`,
-      label: 'Nano-17',
+      label: forceModel,
       state: forceDiag,
       primary: `|F| ${forceNorm.toFixed(2)} N`,
-      secondary: '单位、采样率和标定证书需实机复核',
-      metric: '单位待确认',
+      secondary: forceSource === 'hkvl_serial' ? 'HAL 串口主动帧 · N / Nm' : 'NI-DAQ · 单位、采样率和标定证书需实机复核',
+      metric: forceSource === 'hkvl_serial' ? 'HKVL' : 'NI-DAQ',
       group: '力觉',
     },
     {
@@ -107,26 +116,26 @@ export function ArmOverviewPanel({
     <section className="panel-surface arm-overview-panel">
       <div className="section-title">
         <span><Bot size={17} />{sideLabel}</span>
-        <Space size={6} wrap>
+        <UiSpace size={6} wrap>
           <MetricPill state={frame.halOk ? 'ok' : 'error'} label="HAL" />
           <MetricPill state={riskState} label="Safety" />
-        </Space>
+        </UiSpace>
       </div>
 
       <div className="arm-data-layout">
         <div className="arm-visual-stack">
           {camera && <CameraPreview camera={camera} compact />}
           <div className="arm-inline-status">
-            <Tag icon={<Camera size={13} />} color={camera?.health === 'ok' ? 'success' : 'default'}>腕相机</Tag>
-            <Tag icon={<Hand size={13} />} color={gripState === 'ok' ? 'success' : 'default'}>夹爪 {gripperText}</Tag>
-            <Tag icon={<Gamepad2 size={13} />} color={teleopState === 'ok' ? 'success' : 'default'}>主手</Tag>
+            <UiTag tone={camera?.health === 'ok' ? 'success' : 'muted'}>腕相机</UiTag>
+            <UiTag tone={gripState === 'ok' ? 'success' : 'muted'}>夹爪 {gripperText}</UiTag>
+            <UiTag tone={teleopState === 'ok' ? 'success' : 'muted'}>主手</UiTag>
           </div>
         </div>
 
         <div className="arm-motion-stack">
           <div className="panel-title">
             <span><RadioTower size={15} />运动轴 / 夹爪</span>
-            <Tag color="default">只读监控</Tag>
+            <UiTag tone="default">只读监控</UiTag>
           </div>
           <div className="joint-strip arm-joint-strip">
             {axisNames.slice(axisOffset, axisOffset + 6).map((name, index) => (
@@ -148,7 +157,7 @@ export function ArmOverviewPanel({
               </span>
             ))}
           </div>
-          <Progress percent={Math.min(100, forceNorm * 28)} size="small" status={forceNorm > 2.4 ? 'exception' : 'active'} format={() => `|F| ${forceNorm.toFixed(2)} N`} />
+          <UiProgress percent={Math.min(100, forceNorm * 28)} status={forceNorm > 2.4 ? 'exception' : 'active'} format={() => `|F| ${forceNorm.toFixed(2)} N`} />
         </div>
       </div>
 

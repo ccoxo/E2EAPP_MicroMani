@@ -1,11 +1,40 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：LeRobot 14 维状态、动作限幅、预演和控制侧选择。
+# 先看：test_lerobot_state_from_ui_inserts_grippers_and_converts_rotation_to_mdeg → test_build_policy_action_plan_clamps_motion_and_gripper_steps → test_policy_observation_endpoint_returns_lerobot_state → test_policy_action_endpoint_is_dry_run_by_default。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
+import asyncio
+
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.app import create_app
 from backend.core.data_contract import data_contract_metadata
 from backend.core.defaults import default_config
+from backend.core.motion_limits import effective_limit_arrays
+from backend.services.dataset_recorder import DatasetRecorderService
 from backend.services.policy_bridge import build_policy_action_plan, lerobot_state_from_ui
+from backend.tests.test_control_watchdog import confirm_mock_browser_lease
+
+
+@pytest.fixture
+def authorized_policy_client(tmp_path, monkeypatch):
+    """通过真实租约应答及显式确认准备 Test HAL，不绕过控制保护。"""
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    client = TestClient(create_app(tmp_path))
+    client.app.state.telemetry.hardware = None
+    watchdog = client.app.state.control_watchdog
+    session = asyncio.run(confirm_mock_browser_lease(watchdog))
+    client.headers["X-Control-Session"] = session
+    response = client.post("/api/motion/safety/acknowledge")
+    assert response.status_code == 200, response.text
+    try:
+        yield client
+    finally:
+        asyncio.run(watchdog.close())
+        client.app.state.telemetry.shutdown()
 
 
 def test_lerobot_state_from_ui_inserts_grippers_and_converts_rotation_to_mdeg() -> None:
@@ -18,14 +47,15 @@ def test_lerobot_state_from_ui_inserts_grippers_and_converts_rotation_to_mdeg() 
 
 
 def test_policy_hold_position_keeps_dataset_sides_and_grippers() -> None:
-    current = lerobot_state_from_ui(
-        [1, 2, 3, 0.1, -0.2, 0.3, 4, 5, 6, -0.4, 0.5, -0.6],
-        [7, 8],
-    )
+    positions = [1, 2, 3, 0.1, -0.2, 0.3, 4, 5, 6, -0.4, 0.5, -0.6]
+    grippers = [7, 8]
+    current = lerobot_state_from_ui(positions, grippers)
+    recorder = object.__new__(DatasetRecorderService)
+    recorded_hold = recorder._compose_observation_state(positions, grippers)
 
     plan = build_policy_action_plan(
         current,
-        current,
+        recorded_hold,
         default_config(),
         max_translation_um=500.0,
         max_rotation_deg=0.2,
@@ -35,6 +65,22 @@ def test_policy_hold_position_keeps_dataset_sides_and_grippers() -> None:
     assert plan["motion"]["left"]["deltas"] == {axis: 0.0 for axis in ("X", "Y", "Z", "Roll", "Pitch", "Yaw")}
     assert plan["motion"]["right"]["deltas"] == {axis: 0.0 for axis in ("X", "Y", "Z", "Roll", "Pitch", "Yaw")}
     assert plan["grippers"] == {"leftMm": 8.0, "rightMm": 7.0}
+
+
+def test_policy_plan_uses_corresponding_hardware_side_limits_and_enabled_axes() -> None:
+    config = default_config()
+    config["teleop"]["leftEnabledAxes"] = [True, False, True, False, True, False]
+    config["teleop"]["rightEnabledAxes"] = [False, True, False, True, False, True]
+    plan = build_policy_action_plan(
+        [0.0] * 14, [0.0] * 14, config,
+        max_translation_um=500.0, max_rotation_deg=0.2, max_gripper_mm=1.0,
+    )
+
+    for operator_side, hardware_side in (("left", "right"), ("right", "left")):
+        lower, upper = effective_limit_arrays(config, hardware_side)
+        assert plan["motion"][operator_side]["softLimitMin"] == lower
+        assert plan["motion"][operator_side]["softLimitMax"] == upper
+        assert plan["motion"][operator_side]["enabledAxes"] == config["teleop"][f"{hardware_side}EnabledAxes"]
 
 
 def test_build_policy_action_plan_clamps_motion_and_gripper_steps() -> None:
@@ -123,9 +169,8 @@ def test_policy_action_endpoint_is_dry_run_by_default(tmp_path, monkeypatch) -> 
     assert payload["plan"]["motion"]["left"]["deltas"]["X"] == 500.0
 
 
-def test_policy_action_endpoint_can_send_through_test_hal(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
-    client = TestClient(create_app(tmp_path))
+def test_policy_action_endpoint_can_send_through_test_hal(authorized_policy_client) -> None:
+    client = authorized_policy_client
     client.app.state.telemetry.motion_positions = [0.0] * 12
     client.app.state.telemetry.gripper_positions = [13.0, 13.0]
     config = client.get("/api/settings").json()
@@ -146,9 +191,8 @@ def test_policy_action_endpoint_can_send_through_test_hal(tmp_path, monkeypatch)
     assert set(payload["results"]["grippers"]) == {"left", "right"}
 
 
-def test_policy_action_endpoint_skips_disabled_grippers_when_sending_motion(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
-    client = TestClient(create_app(tmp_path))
+def test_policy_action_endpoint_skips_disabled_grippers_when_sending_motion(authorized_policy_client) -> None:
+    client = authorized_policy_client
     client.app.state.telemetry.motion_positions = [0.0] * 12
     client.app.state.telemetry.gripper_positions = [13.0, 13.0]
 
@@ -165,9 +209,8 @@ def test_policy_action_endpoint_skips_disabled_grippers_when_sending_motion(tmp_
     assert payload["results"]["grippers"] == {}
 
 
-def test_policy_action_endpoint_can_limit_control_to_left_side(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
-    client = TestClient(create_app(tmp_path))
+def test_policy_action_endpoint_can_limit_control_to_left_side(authorized_policy_client) -> None:
+    client = authorized_policy_client
     client.app.state.telemetry.motion_positions = [0.0] * 12
     client.app.state.telemetry.gripper_positions = [13.0, 13.0]
     config = client.get("/api/settings").json()

@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 02｜前端契约与状态
+ * 职责：管理相机预览流 URL 及刷新事件；名称保留 Snapshot，但当前预览使用流接口。
+ * 先看：CameraRefreshEventDetail → useLiveCameraSnapshot → refreshCameraStream。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { apiBase, mockMode } from '../api'
 import type { CameraTelemetry } from '../types'

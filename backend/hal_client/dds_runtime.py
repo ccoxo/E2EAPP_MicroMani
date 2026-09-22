@@ -1,3 +1,8 @@
+# 阅读导航 05｜DDS 传输
+# 职责：通过 ctypes 加载原生 Fast-DDS DLL，管理传输句柄、缓存读取、应答等待与关闭。
+# 先看：FastDdsBindingUnavailableError → FastDdsHalTransport。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import ctypes

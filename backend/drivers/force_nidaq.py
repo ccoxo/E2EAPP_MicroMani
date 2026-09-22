@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：管理 NI-DAQ 任务、六维力标定、去皮、滤波与采样窗口；与 HKVL 的 HAL 路径分开。
+# 先看：ForceProbeResult → NidaqForceDriver。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import time

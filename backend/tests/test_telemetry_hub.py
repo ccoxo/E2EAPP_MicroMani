@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：力与夹爪遥测反馈、故障状态和来源选择。
+# 先看：FakeSettings → FakeForce → FakeCameras → FakeHardware。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from typing import Any
@@ -32,7 +37,9 @@ class FakeHardware:
 
 
 def test_real_hal_ok_is_not_reported_faulted_when_force_probe_is_unavailable() -> None:
-    telemetry = TelemetryHub(FakeSettings(), FakeHardware())
+    settings = FakeSettings()
+    settings.config["force"]["source"] = "nidaq"
+    telemetry = TelemetryHub(settings, FakeHardware())
     try:
         telemetry.force_ok = False
 
@@ -44,7 +51,9 @@ def test_real_hal_ok_is_not_reported_faulted_when_force_probe_is_unavailable() -
 
 
 def test_nidaq_force_status_reports_the_motion_estop_latch() -> None:
-    telemetry = TelemetryHub(FakeSettings(), FakeHardware())
+    settings = FakeSettings()
+    settings.config["force"]["source"] = "nidaq"
+    telemetry = TelemetryHub(settings, FakeHardware())
     try:
         frame = telemetry.next_frame(
             hal_ok=True,
@@ -55,6 +64,17 @@ def test_nidaq_force_status_reports_the_motion_estop_latch() -> None:
             "latched": True,
             "reason": "manual_emergency_stop",
         }
+    finally:
+        telemetry.shutdown()
+
+
+def test_default_force_source_does_not_start_nidaq_when_hkvl_state_is_missing() -> None:
+    telemetry = TelemetryHub(FakeSettings(), FakeHardware())
+    try:
+        frame = telemetry.next_frame(hal_ok=True)
+
+        assert frame.forceStatus["source"] == "hkvl_serial"
+        assert telemetry._force_future is None
     finally:
         telemetry.shutdown()
 
@@ -119,7 +139,6 @@ def test_refresh_gripper_positions_does_not_replace_hal_native_cache() -> None:
 
 def test_hkvl_force_state_drives_real_force_telemetry_and_danger() -> None:
     settings = FakeSettings()
-    settings.config["force"]["source"] = "hkvl_serial"
     telemetry = TelemetryHub(settings, FakeHardware())
     force_state = {
         "source": "hkvl_serial",

@@ -1,9 +1,13 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：硬件默认值、标定、轴映射、相机与运动参数的版本约定。
+# 先看：test_hal_defaults_use_backend_hal_boundary → test_motion_translation_profile_uses_um_units → test_omega7_teleop_defaults_match_icf_strategy → test_motion_kinematics_defaults_match_icf_mapping。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import pytest
 
 from backend.core.defaults import default_config
-from backend.core.force_config import hal_force_config_payload, validate_force_config
 
 
 def _target_arm_gain(config: dict, side: str, axis_index: int) -> float:
@@ -148,7 +152,7 @@ def test_work_origin_defaults_match_icf_reference_position() -> None:
     assert origin["rightPulse"] == [99772.0, 382486.0, 881207.0, 19527.0, -175127.0, -9668.0]
 
 
-def test_force_defaults_start_with_hkvl_reference_project() -> None:
+def test_force_defaults_use_hkvl_and_preserve_nidaq_backup_settings() -> None:
     config = default_config()
 
     assert config["force"]["source"] == "hkvl_serial"
@@ -176,25 +180,6 @@ def test_force_defaults_start_with_hkvl_reference_project() -> None:
     assert config["force"]["compliance"]["right"]["gainUmPerNs"] == [0.0, 0.0]
 
 
-@pytest.mark.parametrize("source", ["hkvl_serial", "nidaq"])
-def test_explicit_force_source_is_preserved(source: str) -> None:
-    config = default_config()
-    config["force"]["source"] = source
-
-    validate_force_config(config)
-
-    assert hal_force_config_payload(config)["source"] == source
-
-
-def test_missing_force_source_uses_hkvl_without_enabling_nidaq() -> None:
-    config = default_config()
-    del config["force"]["source"]
-
-    validate_force_config(config)
-
-    assert hal_force_config_payload(config)["source"] == "hkvl_serial"
-
-
 def test_safety_defaults_are_stored_in_backend_units() -> None:
     config = default_config()
 
@@ -218,12 +203,12 @@ def test_pico_script_defaults_point_to_reference_tools() -> None:
 def test_storage_defaults_separate_recording_fps_from_camera_preview() -> None:
     config = default_config()
 
-    assert config["cameras"]["global"] == "IMX335 / index 0"
-    assert config["cameras"]["globalIdentity"] == "20250606105"
-    assert config["cameras"]["wristLeft"] == "IMX335 / index 1"
-    assert config["cameras"]["wristLeftIdentity"] == "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)"
+    assert config["cameras"]["global"] == "IMX335 / index 1"
+    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 0"
+    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
     assert config["cameras"]["wristRight"] == "IMX335 / index 2"
-    assert config["cameras"]["wristRightIdentity"] == "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)"
+    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000"
     assert config["cameras"]["previewResolution"] == "640x480"
     assert config["cameras"]["fps"] == 30
     assert config["storage"]["recordFps"] == 30

@@ -1,6 +1,13 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：声明JodellGripperDriver 的接口与状态结构；封装 Jodell 夹爪配置、开口换算与隔离 worker 通信。
+ * 先看：JodellGripperConfig → JodellGripperDriver → ProcessWorkerHandle。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #pragma once
 
 #include <array>
+#include <functional>
 #include <mutex>
 #include <string>
 
@@ -39,7 +46,8 @@ class JodellGripperDriver {
       int speed,
       int torque,
       std::string* message = nullptr,
-      bool readPosition = true);
+      bool readPosition = true,
+      const std::function<bool()>& commandAllowed = {});
   // 主动读取某侧当前位置，成功后刷新 positionMm_ 缓存。
   bool readPositionMm(Side side, std::string* message = nullptr);
   // 以下快照接口供 teleop 状态 JSON 使用，调用方不需要直接持有 mutex_。

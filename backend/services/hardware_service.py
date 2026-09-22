@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：聚合相机、NI-DAQ、夹爪与 PICO 的 Python 驱动实例，并提供硬件状态查询。
+# 先看：HardwareService。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from typing import Any
@@ -19,13 +24,13 @@ class HardwareService:
         self.gripper = Rs485GripperDriver()
         self.pico = PicoAdbDriver()
 
-    def status(self, *, include_gripper: bool = True) -> dict[str, Any]:
+    def status(self, *, include_gripper: bool = True, include_pico: bool = True) -> dict[str, Any]:
         config = self.settings.get_config()
         camera = self.cameras.probe(config)
         force_source = str(config.get("force", {}).get("source", "hkvl_serial")).lower()
         force = self.force.probe(config) if force_source == "nidaq" else None
         gripper = self.gripper.probe(config) if include_gripper else None
-        pico = self.pico.status(config)
+        pico = self.pico.status(config) if include_pico else None
         return {
             "camera": {
                 "ok": camera.ok,
@@ -35,12 +40,6 @@ class HardwareService:
             "force": (
                 {"ok": force.ok, "message": force.message, "source": "nidaq"}
                 if force is not None
-                else {
-                    "ok": False,
-                    "message": f"unsupported force source: {force_source}",
-                    "source": force_source,
-                }
-                if force_source not in {"hkvl_serial", "nidaq"}
                 else {
                     "ok": None,
                     "message": "managed by HAL-native HKVL serial runtime",
@@ -57,5 +56,8 @@ class HardwareService:
                 if gripper is not None
                 else {"ok": None, "message": "managed by HAL-native gripper"}
             ),
-            "pico": {"ok": pico.ok, "message": pico.message, "stdout": pico.stdout, "stderr": pico.stderr},
+            "pico": (
+                {"ok": pico.ok, "message": pico.message, "stdout": pico.stdout, "stderr": pico.stderr}
+                if pico is not None else {"ok": None, "message": "not probed"}
+            ),
         }

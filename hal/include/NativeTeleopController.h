@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：声明NativeTeleopController 的接口与状态结构；管理主手采样与遥操作状态机，计算映射、滤波、门控和夹爪跟随。
+ * 先看：NativeTeleopConfig → NativeTeleopAction → NativeTeleopController → PendingGripperCommand。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #pragma once
 
 #include <array>
@@ -13,6 +19,7 @@
 #include "HalTypes.h"
 #include "JodellGripperDriver.h"
 #include "LTDMCDriver.h"
+#include "MotionExecutor.h"
 #include "Omega7Driver.h"
 #include "TeleopDdsTypes.h"
 
@@ -133,6 +140,7 @@ struct NativeTeleopConfig {
   // 夹爪 teleop 配置。主手开口单位为 mm，最终会映射到 Jodell 目标行程。
   JodellGripperConfig gripper{};
   bool gripperTeleopEnabled{false};
+  std::array<bool, 2> gripperParticipating{true, true};
   std::array<double, 2> gripperGapMinMm{{0.0, 0.0}};
   std::array<double, 2> gripperGapMaxMm{{25.0, 25.0}};
   std::array<bool, 2> gripperGapInvert{{false, false}};
@@ -176,17 +184,25 @@ class NativeTeleopController {
   using LeaderStatePublisher = std::function<void(const std::array<Omega7State, 2>&)>;
   using HardwareTargetPublisher = std::function<void(const TeleopHardwareTarget&)>;
 
-  NativeTeleopController(LTDMCDriver& motion, Omega7Driver& omega, JodellGripperDriver& gripper);
+  NativeTeleopController(LTDMCDriver& motion, MotionExecutor& executor, Omega7Driver& omega, JodellGripperDriver& gripper);
   ~NativeTeleopController();
 
-  void configure(const NativeTeleopConfig& config);
+  void configure(const NativeTeleopConfig& config,
+      std::optional<std::uint64_t> expectedEpoch = std::nullopt);
   void configureGripper(const JodellGripperConfig& config);
+  void prepareReplayGripper(const JodellGripperConfig& config, std::uint64_t epoch,
+      const std::array<bool, 2>& participating);
+  bool replayGripperReady() const { return !running_.load() && gripperWorkerRunning_.load(); }
   // 运行时更新夹爪保护，主要给后端配置热更新使用。
   void configureGripperProtection(bool enabled, double minGapMm);
   // leftConnected/rightConnected 是逻辑主手连接状态，用于在部分连接时只启动可用通道。
-  void start(bool leftConnected, bool rightConnected);
+  void start(bool leftConnected, bool rightConnected,
+      std::optional<std::uint64_t> expectedEpoch = std::nullopt);
   void stop();
   void requestEmergencyStop();
+  void latchControlStop() noexcept;
+  // 线程和外部控制回调的异常出口：先锁存停车，再保留诊断，不能向线程边界抛出。
+  void reportControlFailure(const char* message) noexcept;
   // statusJson 直接面向 HalServer 响应，包含 blocker、最后动作、夹爪和滤波诊断。
   std::string statusJson() const;
   bool running() const;
@@ -194,7 +210,8 @@ class NativeTeleopController {
   void setHardwareTargetPublisher(HardwareTargetPublisher publisher);
   void processLeaderState(const std::array<Omega7State, 2>& hands, double dtSec);
   // 手动夹爪命令会进入同一条 gripper worker 队列，避免和 teleop 自动命令交叉写串口。
-  bool commandGripperTarget(Side side, double targetMm, int speed, int torque, std::string* message = nullptr);
+  bool commandGripperTarget(Side side, double targetMm, int speed, int torque, std::string* message = nullptr,
+      std::optional<std::uint64_t> expectedEpoch = std::nullopt);
 
  private:
   // 每个目标侧只保留最新一条夹爪命令，teleop 高频输入会被合并为最新目标。
@@ -205,6 +222,7 @@ class NativeTeleopController {
     double targetMm{};
     int speed{};
     int torque{};
+    std::uint64_t motionEpoch{};
   };
 
   // 单个语义轴的 Kalman 状态，严格对应 x_k=[p_k, v_k]^T、P_k、Q_k、R_k。
@@ -255,7 +273,7 @@ class NativeTeleopController {
   void resetKalmanSideUnlocked(int sourceIndex);
   // tickGrippers 根据 Omega.7 主手开口或按钮兜底生成从端夹爪目标。
   void tickGrippers(const std::array<Omega7State, 2>& hands);
-  void enqueueGripperCommand(int targetIndex, Side side, double targetMm, int speed, int torque);
+  void enqueueGripperCommand(int targetIndex, Side side, double targetMm, int speed, int torque, std::uint64_t motionEpoch);
   void setBlockerUnlocked(int sourceIndex, const std::string& state, const std::string& message);
   void recordPublishedTargetActionUnlocked(Side sourceSide, const TeleopHardwareTarget& target, int sourceIndex);
   void recordActionUnlocked(Side sourceSide, Side targetSide, const TeleopTargetUpdateResult& result);
@@ -291,6 +309,7 @@ class NativeTeleopController {
 
   // 底层驱动由外部构造并保证生命周期覆盖控制器。
   LTDMCDriver& motion_;
+  MotionExecutor& executor_;
   Omega7Driver& omega_;
   JodellGripperDriver& gripper_;
   // mutex_ 保护 teleop 配置、引用位姿、诊断状态和动作历史；夹爪队列使用单独 mutex。
@@ -300,6 +319,7 @@ class NativeTeleopController {
   HardwareTargetPublisher hardwareTargetPublisher_;
   std::uint64_t hardwareTargetSequence_{0};
   std::atomic<bool> running_{false};
+  std::mutex lifecycleMutex_;
   std::thread worker_;
   // logicalConnected_ 是启动时认定可用的主手通道，targetActive_ 表示该通道当前正在输出运动。
   std::array<bool, 2> logicalConnected_{{false, false}};
@@ -345,6 +365,8 @@ class NativeTeleopController {
   std::array<bool, 2> gripperLastCommandOk_{{false, false}};
   std::array<std::string, 2> gripperLastMessage_{};
   std::array<std::int64_t, 2> gripperLastCommandTs_{{0, 0}};
+  std::array<std::int64_t, 2> gripperPositionSampleTs_{{0, 0}};
+  std::array<bool, 2> gripperPositionOk_{{false, false}};
   std::mutex gripperMutex_;
   std::condition_variable gripperCv_;
   std::thread gripperWorker_;

@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：在独立进程内打开并读取相机，通过队列或标准输入输出协议回传图像与状态。
+# 先看：run_camera_capture_worker → run_camera_capture_worker_stdio。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import base64

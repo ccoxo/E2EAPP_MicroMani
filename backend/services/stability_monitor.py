@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：运行稳定性观察任务，采集 HAL、相机和力状态并记录诊断结果。
+# 先看：StabilityMonitorService。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import asyncio
@@ -193,11 +198,6 @@ class StabilityMonitorService:
             force_status["leftCrcErrors"] = int(left_status.get("crcErrors", 0))
             force_status["rightCrcErrors"] = int(right_status.get("crcErrors", 0))
             force_status["leftRightSkewMs"] = float(state.get("leftRightSkewMs", 0.0))
-            return
-        if source != "nidaq":
-            force_status["failures"] = int(force_status["failures"]) + 1
-            force_status["lastError"] = f"unsupported force source: {source}"
-            self._append_error(force_status["lastError"])
             return
         sample_hz = self._sample_hz(config)
         sample_count = min(max(int(round(sample_hz * 0.1)), 1), 512)

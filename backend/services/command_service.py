@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：执行手动运动、原点、使能与安全命令；在调用 HAL 前检查配置与录制状态。
+# 先看：axis_enabled_feedback_unreadable → normalize_motion_axis_enabled → MotionOriginDriftConfirmationRequired → CommandService。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 """Validate operator commands before they reach HAL or simulated telemetry.
 
 Command handlers are the backend safety boundary for manual jog, work-origin,
@@ -8,6 +13,7 @@ that protect real hardware or keep frontend state aligned with command effects.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 from collections.abc import Callable
@@ -15,6 +21,7 @@ from copy import deepcopy
 from typing import Any, cast
 
 from backend.core.config import SettingsService, reanchor_motion_soft_limits_to_current_origin
+from backend.core.force_config import hkvl_tare_sample_count
 from backend.core.gripper_protection import (
     icf_target_min_gap_mm,
     icf_target_protection_enabled,
@@ -30,6 +37,7 @@ from backend.core.motion_limits import (
     target_allowed_with_recovery,
 )
 from backend.core.schemas import GripperCommandRequest, ManualAxisMoveRequest, SettingsCommandRequest
+from backend.core.motion_safety import MotionSafetyGate, motion_operation
 from backend.core.units import motion_pulse_per_unit, pulse_to_ui
 from backend.hal_client.client import HalClient
 from backend.services.gripper_backend import (
@@ -43,6 +51,8 @@ from backend.services.telemetry_hub import TelemetryHub
 
 AXIS_ORDER = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
 AXIS_LABELS = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
+# 与 LTDMCDriver.cpp 的回工作原点免移动范围一致，避免 HAL 已到位而后端永远拒绝确认。
+WORK_ORIGIN_SETTLED_PULSE_TOLERANCE = 100.0
 MANUAL_AXIS_STEP_LIMIT_PULSE = 100000.0
 MANUAL_TRANSLATION_STEP_LIMIT_UM = 5000.0
 MANUAL_ROTATION_STEP_LIMIT_DEG = 2.0
@@ -91,10 +101,12 @@ class CommandService:
         origin_mutation_locked: Callable[[], bool] | None = None,
         teleop: Any | None = None,
         gripper_router: Any | None = None,
+        safety: MotionSafetyGate | None = None,
     ) -> None:
         self.settings = settings
         self.telemetry = telemetry
         self.hal = hal
+        self.safety = safety if safety is not None else MotionSafetyGate()
         self.logs = logs
         self.hardware = hardware
         self.teleop = teleop
@@ -123,6 +135,35 @@ class CommandService:
         if bool(state.get("estop_active", False)):
             raise RuntimeError("emergency stop active; acknowledge safety before returning to work origin")
         return state
+
+    def require_stationary_motion(self, state: dict[str, Any]) -> None:
+        moving = state.get("moving")
+        stamp = state.get("timestamp_ms")
+        if not isinstance(stamp, (int, float)) or not math.isfinite(stamp) or not -100 <= now_ms() - stamp <= 500:
+            raise RuntimeError("stationary motion feedback is stale or unavailable")
+        if not isinstance(moving, list) or len(moving) != 12 or any(value is not False for value in moving):
+            raise RuntimeError("operation requires confirmed stationary axes")
+
+    async def _confirm_work_origin(self, targets: dict[str, list[float]], requested_at: int, token) -> None:
+        """回原点应答后再等待新鲜的静止、到位反馈；未确认不能投影成功。"""
+        deadline = time.monotonic() + 2.0
+        while True:
+            self.safety.check(token)
+            state = await self.hal.motion_state()
+            self.safety.check(token)
+            pulses = self._motion_state_pulses(state)
+            moving = state.get("moving")
+            stamp = state.get("timestamp_ms")
+            fresh = isinstance(stamp, (float, int)) and math.isfinite(stamp) and requested_at <= stamp <= now_ms() + 100 and now_ms() - stamp <= 500
+            confirmed = fresh and not state.get("estop_active", False) and isinstance(moving, list) and len(moving) == 12
+            for side, target in targets.items():
+                offset = 0 if side == "left" else 6
+                confirmed = confirmed and all(moving[offset + axis] is False and abs(pulses[offset + axis] - target[axis]) <= WORK_ORIGIN_SETTLED_PULSE_TOLERANCE for axis in range(6))
+            if confirmed:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError("work origin result unconfirmed: fresh stationary position feedback required")
+            await asyncio.sleep(0.05)
 
     async def _stop_manual_teleop_connect_before_motion_return(self) -> None:
         teleop = getattr(self, "teleop", None)
@@ -168,13 +209,21 @@ class CommandService:
         return result
 
     async def emergency_stop(self) -> dict[str, object]:
+        self.safety.interrupt(emergency=True)
         # 先更新本地遥测状态，再请求 HAL 急停，让 UI 能立即进入安全态。
-        self.telemetry.emergency_stop()
+        try:
+            self.telemetry.emergency_stop()
+        except Exception as exc:
+            # 显示状态更新异常不能阻断真正的硬件急停。
+            self.logs.error("[SAFETY]", f"local emergency stop projection failed: {exc}")
         result = await self.hal.command("motion.emergency_stop")
         self.logs.error("[SAFETY]", "hardware emergency stop requested")
         return result
 
+    @motion_operation()
     async def home_all(self) -> dict[str, object]:
+        safety_token = self.safety.capture()
+        self.safety.check(safety_token)
         motion_state = await self._ensure_motion_return_allowed()
         config = await self._get_config_async()
         op_id = self.logs.new_op_id("work_origin")
@@ -220,6 +269,8 @@ class CommandService:
             right_enabled_axes,
             current_pulses=current_pulses[6:12],
         )
+        self.safety.check(safety_token)
+        requested_at = now_ms()
         result = await self.hal.command(
             "motion.home_all",
             {
@@ -229,6 +280,7 @@ class CommandService:
                 "rightEnabledAxes": right_enabled_axes,
             },
         )
+        await self._confirm_work_origin({"left": left_pulse, "right": right_pulse}, requested_at, safety_token)
         self.telemetry.home_all()
         self._log_work_origin_moves(config, op_id, "home_all", "complete", "left", left_pulse, left_enabled_axes)
         self._log_work_origin_moves(config, op_id, "home_all", "complete", "right", right_pulse, right_enabled_axes)
@@ -244,7 +296,10 @@ class CommandService:
         )
         return result
 
+    @motion_operation("side")
     async def return_motion_origin_side(self, side: str) -> dict[str, object]:
+        safety_token = self.safety.capture(side)
+        self.safety.check(safety_token)
         self._validate_side(side)
         motion_state = await self._ensure_motion_return_allowed()
         config = await self._get_config_async()
@@ -281,6 +336,8 @@ class CommandService:
             enabled_axes,
             current_pulses=current_pulses[side_offset : side_offset + 6],
         )
+        self.safety.check(safety_token)
+        requested_at = now_ms()
         result = await self.hal.command(
             "motion.home_origin_side",
             {
@@ -289,6 +346,7 @@ class CommandService:
                 "enabledAxes": enabled_axes,
             },
         )
+        await self._confirm_work_origin({side: pulse}, requested_at, safety_token)
         self.telemetry.home_side(side)
         self._log_work_origin_moves(config, op_id, "home_origin_side", "complete", side, pulse, enabled_axes)
         self.logs.event(
@@ -304,13 +362,17 @@ class CommandService:
         )
         return result
 
+    @motion_operation("side")
     async def enable_motion_side(self, side: str, enabled_axes: list[bool] | None = None) -> dict[str, object]:
         self._validate_side(side)
+        safety_token = self.safety.capture(side)
+        self.safety.check(safety_token)
         if enabled_axes is None:
             config = await self._get_config_async()
             enabled_axes = self._home_enabled_axes(side, config)
         payload: dict[str, object] = {"side": side}
         payload["enabledAxes"] = list(enabled_axes)
+        self.safety.check(safety_token)
         result = await self.hal.command("motion.enable_side", payload)
         await self._refresh_motion_enabled(side)
         side_label = "left" if side == "left" else "right"
@@ -319,6 +381,7 @@ class CommandService:
 
     async def disable_motion_side(self, side: str) -> dict[str, object]:
         self._validate_side(side)
+        self.safety.interrupt(side)
         result = await self.hal.command("motion.disable_side", {"side": side})
         await self._refresh_motion_enabled(side)
         side_label = "left" if side == "left" else "right"
@@ -327,16 +390,21 @@ class CommandService:
 
     async def stop_motion_side(self, side: str) -> dict[str, object]:
         self._validate_side(side)
+        self.safety.interrupt(side)
         result = await self.hal.command("motion.teleop_stop_side", {"side": side})
         side_label = "left" if side == "left" else "right"
         self.logs.warning("[HAL]", f"{side_label} motion stop requested")
         return result
 
+    @motion_operation("side")
     async def home_motion_side(self, side: str) -> dict[str, object]:
         self._validate_side(side)
+        safety_token = self.safety.capture(side)
+        self.safety.check(safety_token)
         self._ensure_origin_mutation_allowed()
         config = await self._get_config_async()
         enabled_axes = self._home_enabled_axes(side, config)
+        self.safety.check(safety_token)
         result = await self.hal.command(
             "motion.home_side",
             {"side": side, "enabledAxes": enabled_axes},
@@ -373,6 +441,7 @@ class CommandService:
                     "[HAL]",
                     f"{side} motion work origin invalidated after hardware zero refresh: {exc}",
                 )
+        self.safety.check(safety_token)
         saved = await self._save_config_async(config, emit_log=False)
         self.telemetry.home_side(side)
         side_label = "left" if side == "left" else "right"
@@ -445,6 +514,7 @@ class CommandService:
             "message": "previous motion work origin is restorable",
         }
 
+    @motion_operation()
     async def capture_motion_origin(
         self,
         side: str | None = None,
@@ -453,8 +523,11 @@ class CommandService:
     ) -> dict[str, object]:
         if side is not None:
             self._validate_side(side)
+        safety_token = self.safety.capture()
+        self.safety.check(safety_token)
         self._ensure_origin_mutation_allowed()
         state = await self.hal.motion_state()
+        self.require_stationary_motion(state)
         pulses = self._motion_state_pulses(state)
         config = await self._get_config_async()
         origin = self._normalized_motion_origin(config)
@@ -489,14 +562,19 @@ class CommandService:
         reanchor_motion_soft_limits_to_current_origin(config, side)
         for active_side in ("left", "right") if side is None else (side,):
             self._validate_work_origin_target(config, active_side, self._home_enabled_axes(active_side, config))
+        self.safety.check(safety_token)
         saved = await self._save_config_async(config, emit_log=False)
         label = side or "both"
         self.logs.info("[HAL]", f"{label} motion work origin recorded")
         await self._stop_native_teleop_after_origin_change()
         return {"origin": saved["motion"]["origin"], "config": saved, "originCaptureDrift": drift}
 
+    @motion_operation()
     async def restore_previous_motion_origin(self) -> dict[str, object]:
+        safety_token = self.safety.capture()
+        self.safety.check(safety_token)
         self._ensure_origin_mutation_allowed()
+        self.require_stationary_motion(await self.hal.motion_state())
         config = await self._get_config_async()
         origin = self._normalized_motion_origin(config)
         if not bool(origin["previousValid"]):
@@ -537,16 +615,20 @@ class CommandService:
         reanchor_motion_soft_limits_to_current_origin(config)
         self._validate_work_origin_target(config, "left", self._home_enabled_axes("left", config))
         self._validate_work_origin_target(config, "right", self._home_enabled_axes("right", config))
+        self.safety.check(safety_token)
         saved = await self._save_config_async(config, emit_log=False)
         self.logs.info("[HAL]", "previous motion work origin restored")
         await self._stop_native_teleop_after_origin_change()
         return {"origin": saved["motion"]["origin"], "config": saved}
 
-    def clear_motion_origin(self, side: str | None = None) -> dict[str, object]:
+    @motion_operation()
+    async def clear_motion_origin(self, side: str | None = None) -> dict[str, object]:
         if side is not None:
             self._validate_side(side)
+        token = self.safety.capture()
         self._ensure_origin_mutation_allowed()
-        config = self.settings.get_config()
+        self.require_stationary_motion(await self.hal.motion_state())
+        config = await self._get_config_async()
         origin = self._normalized_motion_origin(config)
         if side in {None, "left"}:
             origin["leftPulse"] = [0.0] * 6
@@ -567,13 +649,22 @@ class CommandService:
         work_origin_offset["valid"] = bool(work_origin_offset["leftValid"] and work_origin_offset["rightValid"])
         work_origin_offset["updatedAt"] = origin["updatedAt"]
         config["motion"]["workOriginOffset"] = work_origin_offset
-        saved = self.settings.save_config(config, emit_log=False)
+        self.safety.check(token)
+        saved = await self._save_config_async(config, emit_log=False)
         label = side or "both"
         self.logs.info("[HAL]", f"{label} motion work origin record cleared")
         return {"origin": saved["motion"]["origin"], "config": saved}
 
-    async def acknowledge_safety(self) -> dict[str, object]:
+    async def acknowledge_safety(self, *, readiness_check: Callable[[], None] | None = None) -> dict[str, object]:
+        # HAL 可自行触发力急停；确认入口也必须取消后端旧流程，并在确认失败时保持锁存。
+        self.safety.interrupt(emergency=True)
+        safety_token = self.safety.capture()
+        if readiness_check is not None:
+            readiness_check()
         result = await self.hal.command("motion.acknowledge_estop", {})
+        if readiness_check is not None:
+            readiness_check()
+        self.safety.acknowledge(safety_token)
         self.telemetry.acknowledge_safety()
         self.logs.info("[SAFETY]", "safety state acknowledged; servos remain disabled")
         return {
@@ -583,32 +674,85 @@ class CommandService:
             "hal": result,
         }
 
-    async def tare_force(self, side: str | None = None) -> dict[str, object]:
-        # 真机模式优先执行传感器 tare；测试模式仅重置本地模拟力数据。
+    async def tare_force(
+        self, side: str | None = None, *, unloaded_confirmed: bool = False,
+        readiness_check: Callable[[], None] | None = None,
+    ) -> dict[str, object]:
+        token = self.safety.capture()
         config = await self._get_config_async()
         force = config.get("force", {}) if isinstance(config.get("force"), dict) else {}
         source = str(force.get("source", "hkvl_serial")).lower()
+        is_hkvl = source == "hkvl_serial"
+        if is_hkvl and side is not None:
+            raise RuntimeError("HKVL startup self-check requires both sensors; use the all-sensors Tare entry")
+        if is_hkvl and unloaded_confirmed is not True:
+            raise RuntimeError("confirm both force sensors are unloaded before HKVL startup self-check")
+
+        def check_ready() -> None:
+            # 一个 episode 只能对应一次力校准，暂停或待保存的会话也不能换零点。
+            if self._origin_mutation_locked():
+                raise RuntimeError("finish the recording session before changing force calibration")
+            if not is_hkvl:
+                self.safety.check(token)
+                return
+            # 自检不会运动，可在锁存中执行，但仍需当前控制租约、互斥资源和停止代际。
+            check = readiness_check or self.safety.readiness_check
+            if check is not None:
+                check()
+            if token != self.safety.capture():
+                raise RuntimeError("force self-check cancelled by a newer stop")
+
         hal_result: dict[str, object] | None = None
-        real_hardware = self._real_hardware_mode(config)
-        if real_hardware and source == "hkvl_serial":
-            payload: dict[str, object] = {"side": side or "all"}
-            tare_samples = int(force.get("tareSamples", 0) or 0)
-            if tare_samples > 0:
-                payload["samples"] = tare_samples
-            hal_result = await self.hal.command("force.tare", payload)
-        elif self.hardware is not None and real_hardware:
-            result = await asyncio.to_thread(self.hardware.force.tare, config, side)
-            if not result.ok:
-                self.logs.error("[FORCE]", result.message)
-                raise RuntimeError(result.message)
-        if not (real_hardware and source == "hkvl_serial"):
-            self.telemetry.tare_force()
+        with self.safety.operation():
+            check_ready()
+            real_hardware = self._real_hardware_mode(config)
+            if real_hardware and is_hkvl:
+                payload: dict[str, object] = {"side": "all", "unloadedConfirmed": True}
+                payload["samples"] = hkvl_tare_sample_count(force.get("tareSamples", 0))
+                try:
+                    hal_result = await self.hal.command("force.tare", payload)
+                except Exception as exc:
+                    self.logs.error("[FORCE]", f"HKVL startup self-check failed: {exc}")
+                    raise
+            elif self.hardware is not None and real_hardware:
+                result = await asyncio.to_thread(self.hardware.force.tare, config, side)
+                if not result.ok:
+                    self.logs.error("[FORCE]", result.message)
+                    raise RuntimeError(result.message)
+            check_ready()
+            if not is_hkvl:
+                self.telemetry.tare_force()
         label = "both sides" if side is None else ("left" if side == "left" else "right")
         self.logs.info("[FORCE]", f"{label} {source} tare requested")
         return {"side": side or "all", "source": source, "hal": hal_result}
 
-    async def manual_axis_move(self, request: ManualAxisMoveRequest) -> dict[str, object]:
+    async def validate_policy_axis_action(self, action: dict[str, Any]) -> None:
+        """策略方向已是硬件方向；复用位置边界，不重复操作者方向转换。"""
+        request = ManualAxisMoveRequest(**{key: action[key] for key in ("side", "axis", "direction", "step", "speedMode")})
         config = await self._get_config_async()
+        self._validate_manual_axis_safety(config, request)
+        await self._validate_motion_axis_enabled(request.side, request.axis)
+        await self._validate_manual_axis_soft_limit(config, request, request.direction)
+
+    async def validate_record_origin(self, sides: set[str]) -> None:
+        token = self.safety.capture()
+        self.safety.check(token)
+        config = await self._get_config_async()
+        origin = self._normalized_motion_origin(config)
+        targets = {}
+        for side in sides:
+            self._validate_side(side)
+            if not origin[f"{side}Valid"]:
+                raise RuntimeError(f"{side} work origin is not captured")
+            targets[side] = origin[f"{side}Pulse"]
+        await self._confirm_work_origin(targets, now_ms() - 500, token)
+
+    @motion_operation("request")
+    async def manual_axis_move(self, request: ManualAxisMoveRequest) -> dict[str, object]:
+        safety_token = self.safety.capture(request.side)
+        self.safety.check(safety_token)
+        config = await self._get_config_async()
+        self.safety.check(safety_token)
         # 所有手动 jog 都先过后端安全边界，再决定发往真机还是本地模拟。
         self._validate_manual_axis_safety(config, request)
         effective_direction = self._manual_axis_effective_direction(request.side, request.axis, request.direction)
@@ -634,6 +778,7 @@ class CommandService:
                         remaining_request,
                         effective_direction,
                     )
+                self.safety.check(safety_token)
                 hal_result = await self.hal.command(
                     "motion.manual_axis_move",
                     {
@@ -651,6 +796,7 @@ class CommandService:
                 )
                 if len(chunk_steps) > 1:
                     await self._wait_manual_axis_idle(request.side, request.axis, profile, chunk_step)
+                self.safety.check(safety_token)
             self.logs.event(
                 "[HAL]",
                 "INFO",
@@ -671,7 +817,7 @@ class CommandService:
                     "chunkSteps": chunk_steps,
                 },
             )
-            return {"hal": hal_result, "chunkCount": len(chunk_steps), "chunkSteps": chunk_steps}
+        return {"hal": hal_result, "chunkCount": len(chunk_steps), "chunkSteps": chunk_steps}
         applied = self.telemetry.apply_axis_move(request.side, request.axis, effective_direction, request.step, config)
         self.logs.event(
             "[HAL]",
@@ -691,7 +837,10 @@ class CommandService:
         return {"applied": applied}
 
     async def gripper_command(self, request: GripperCommandRequest) -> dict[str, object]:
+        safety_token = self.safety.capture(request.side)
         config = await self._get_config_async()
+        if request.command not in {"stop", "disable"}:
+            self.safety.check(safety_token)
         if self.hardware is not None and self._real_hardware_mode(config):
             return await self._dispatch_real_gripper_command(config, request)
         self._validate_gripper_command_enabled(config, request)
@@ -981,14 +1130,19 @@ class CommandService:
             raise RuntimeError(f"{request.side} gripper is disabled; enable it before motion commands")
 
     def _validate_manual_axis_safety(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> None:
+        if not math.isfinite(request.step) or request.step < 0:
+            raise RuntimeError("manual step must be finite and non-negative")
         limit = self._manual_axis_step_ui_limit(config, request.side, request.axis, request.speedMode)
+        if not math.isfinite(limit) or limit <= 0:
+            raise RuntimeError("manual step limit must be finite and positive")
         if abs(float(request.step)) > limit:
             unit = "um" if request.axis in {"X", "Y", "Z"} else "degree"
             raise RuntimeError(
                 f"manual {request.axis} step must be <= {limit:.3f} {unit} "
                 f"(HAL single-step / {MANUAL_AXIS_STEP_LIMIT_PULSE:.0f} pulse cap)"
             )
-        if self._axis_profile(config, request)["maxVelocity"] <= 0:
+        velocity = self._axis_profile(config, request)["maxVelocity"]
+        if not math.isfinite(velocity) or velocity <= 0:
             raise RuntimeError("manual axis velocity must be positive")
 
     def _manual_axis_step_pulse(self, config: dict[str, Any], request: ManualAxisMoveRequest) -> float:
@@ -1090,6 +1244,8 @@ class CommandService:
         current = side_positions_ui(config, request.side, pulses)[axis_index]
         target = current + request.step * effective_direction
         limit = limits[axis_index]
+        if not all(math.isfinite(value) for value in (current, target, limit.min, limit.max)) or limit.min > limit.max:
+            raise RuntimeError("motion position and soft limits must be finite and ordered")
         if not target_allowed_with_recovery(current, target, limit):
             raise RuntimeError(
                 f"{request.side} {request.axis} target exceeds soft limit: "
@@ -1156,7 +1312,7 @@ class CommandService:
                 continue
             limit = limits[axis_index]
             target = origin[axis_index]
-            if limit.min > limit.max or target < limit.min or target > limit.max:
+            if not all(math.isfinite(value) for value in (target, limit.min, limit.max)) or limit.min > limit.max or target < limit.min or target > limit.max:
                 raise RuntimeError(
                     f"{side} {axis_name} work origin exceeds soft limit: "
                     f"{target:.3f} not in [{limit.min:.3f}, {limit.max:.3f}]"
@@ -1177,12 +1333,6 @@ class CommandService:
                 for axis_index, axis_name in enumerate(AXIS_ORDER)
                 if enabled_axes[axis_index] and not bool(raw_enabled[offset + axis_index])
             ]
-        elif isinstance(raw_enabled, dict):
-            value = raw_enabled.get(side)
-            if value is not True:
-                disabled_axes = [
-                    axis_name for axis_index, axis_name in enumerate(AXIS_ORDER) if enabled_axes[axis_index]
-                ]
         else:
             raise RuntimeError("HAL motion state does not include enabled feedback")
         if disabled_axes:
@@ -1203,6 +1353,9 @@ class CommandService:
         profile = motion[profile_key]
         group = "translation" if request.axis in {"X", "Y", "Z"} else "rotation"
         group_profile = profile.get(group, {})
+        for key in ("maxSpeed", "startSpeed", "accTimeSec", "decTimeSec"):
+            if key in group_profile and not math.isfinite(float(group_profile[key])):
+                raise RuntimeError(f"motion profile {key} must be finite")
         # Hardware-side guardrails: leishine + Yamaha stages handle these without
         # complaint, but anything beyond is almost certainly a config typo.
         max_velocity_cap = 20000.0 if group == "translation" else 30.0  # um/s, deg/s
@@ -1309,13 +1462,18 @@ class CommandService:
             raise RuntimeError("side must be left or right")
 
     def _home_enabled_axes(self, side: str, config: dict[str, Any] | None = None) -> list[bool]:
+        # 当前设备契约固定每侧六轴；不可按缺失/断使能反馈静默跳过轴。
+        self._validate_side(side)
         return [True] * 6
 
     def _motion_state_pulses(self, state: dict[str, Any]) -> list[float]:
         raw_pulses = state.get("pulses")
         if not isinstance(raw_pulses, list) or len(raw_pulses) != 12:
             raise RuntimeError("HAL motion state does not include 12 pulse values")
-        return [float(value) for value in raw_pulses]
+        pulses = [float(value) for value in raw_pulses]
+        if not all(math.isfinite(value) for value in pulses):
+            raise RuntimeError("HAL motion pulses must be finite")
+        return pulses
 
     def _normalized_motion_origin(self, config: dict[str, Any]) -> dict[str, object]:
         raw_origin = config.get("motion", {}).get("origin", {})
@@ -1449,4 +1607,6 @@ class CommandService:
         if not isinstance(value, list):
             return [0.0] * 6
         pulses = [float(item) for item in value[:6]]
+        if not all(math.isfinite(item) for item in pulses):
+            raise RuntimeError("motion origin pulses must be finite")
         return pulses + [0.0] * max(0, 6 - len(pulses))

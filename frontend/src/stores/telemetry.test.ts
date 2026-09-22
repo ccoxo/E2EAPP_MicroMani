@@ -1,18 +1,30 @@
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：验证配置默认值迁移、相机绑定和候选 HAL 二进制诊断提示。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
 import { defaultConfig, defaultDiagnostics } from '../data'
 import { diagnosticsFromHardwareStatus, normalizeConfig, useTelemetryStore } from './telemetry'
-import type { AppConfig } from '../types'
 
 describe('telemetry config normalization', () => {
-  it('fills a missing force source with HKVL while preserving explicit NI-DAQ', () => {
-    const missingSourceConfig = structuredClone(defaultConfig) as AppConfig
-    Object.assign(missingSourceConfig.force, { source: undefined })
-    const explicitNidaq = structuredClone(defaultConfig)
-    explicitNidaq.force.source = 'nidaq'
+  it('保留用户显式选择的 NI-DAQ 备用数据源及通道', () => {
+    const config = structuredClone(defaultConfig)
+    config.force.source = 'nidaq'
+    config.force.leftIp = 'Dev7/ai0:5'
 
-    expect(normalizeConfig(missingSourceConfig).force.source).toBe('hkvl_serial')
-    expect(normalizeConfig(explicitNidaq).force.source).toBe('nidaq')
+    expect(normalizeConfig(config).force).toMatchObject({ source: 'nidaq', leftIp: 'Dev7/ai0:5' })
+  })
+
+  it('丢弃旧开机回原点配置并保留工作原点及遥操作准备配置', () => {
+    const legacy = structuredClone(defaultConfig)
+    Object.assign(legacy.motion, { homeOnStartup: { enabled: true, mode: 'work_origin' } })
+    const normalized = normalizeConfig(legacy)
+    expect(normalized.motion).not.toHaveProperty('homeOnStartup')
+    expect(normalized.motion.origin).toEqual(legacy.motion.origin)
+    expect(normalized.teleop.homeBeforeStart).toBe(legacy.teleop.homeBeforeStart)
+    expect(legacy.motion).toHaveProperty('homeOnStartup')
   })
 
   it('migrates stale PICO and camera hardware defaults', () => {
@@ -25,8 +37,8 @@ describe('telemetry config normalization', () => {
     const normalized = normalizeConfig(staleConfig)
 
     expect(normalized.picoVision.ip).toBe('10.90.129.166')
-    expect(normalized.cameras.global).toBe('IMX335 / index 0')
-    expect(normalized.cameras.wristLeft).toBe('IMX335 / index 1')
+    expect(normalized.cameras.global).toBe('IMX335 / index 1')
+    expect(normalized.cameras.wristLeft).toBe('IMX335 / index 0')
     expect(normalized.cameras.wristRight).toBe('IMX335 / index 2')
   })
 
@@ -41,30 +53,11 @@ describe('telemetry config normalization', () => {
 
     const normalized = normalizeConfig(staleConfig)
 
-    expect(normalized.cameras.globalIdentity).toBe('20250606105')
-    expect(normalized.cameras.wristLeft).toBe('IMX335 / index 1')
-    expect(normalized.cameras.wristLeftIdentity).toBe('PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)')
+    expect(normalized.cameras.globalIdentity).toBe('USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000')
+    expect(normalized.cameras.wristLeft).toBe('IMX335 / index 0')
+    expect(normalized.cameras.wristLeftIdentity).toBe('USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000')
     expect(normalized.cameras.wristRight).toBe('IMX335 / index 2')
-    expect(normalized.cameras.wristRightIdentity).toBe('PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)')
-  })
-
-  it('migrates previous DirectShow device-path bindings', () => {
-    const staleConfig = structuredClone(defaultConfig)
-    staleConfig.cameras.global = 'IMX335 / index 1'
-    staleConfig.cameras.globalIdentity = 'USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000'
-    staleConfig.cameras.wristLeft = 'IMX335 / index 0'
-    staleConfig.cameras.wristLeftIdentity = 'USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000'
-    staleConfig.cameras.wristRight = 'IMX335 / index 2'
-    staleConfig.cameras.wristRightIdentity = 'USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000'
-
-    const normalized = normalizeConfig(staleConfig)
-
-    expect(normalized.cameras.global).toBe('IMX335 / index 0')
-    expect(normalized.cameras.globalIdentity).toBe('20250606105')
-    expect(normalized.cameras.wristLeft).toBe('IMX335 / index 1')
-    expect(normalized.cameras.wristLeftIdentity).toBe('PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)')
-    expect(normalized.cameras.wristRight).toBe('IMX335 / index 2')
-    expect(normalized.cameras.wristRightIdentity).toBe('PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)')
+    expect(normalized.cameras.wristRightIdentity).toBe('USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000')
   })
 })
 

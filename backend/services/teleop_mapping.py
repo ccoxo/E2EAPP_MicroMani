@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：管理 HAL-native 遥操作启停、来源共享、回原点安全门控和状态镜像；实时映射在 HAL。
+# 先看：TeleopMappingService。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 """Coordinate HAL-native Omega.7 teleop modes and guard live motion handoffs.
 
 Python owns native start/stop, work-origin safety gates, status mirroring and
@@ -11,11 +16,15 @@ import math
 import os
 import time
 from collections import deque
+from contextvars import ContextVar
 from typing import Any, Literal
 
+from backend.core.motion_profile import teleop_motion_profile
+from backend.core.participation import scoped_config
 from backend.core.config import SettingsService
 from backend.core.defaults import ICF_KINEMATICS_DEFAULTS, ICF_TELEOP_DEFAULTS
 from backend.core.logging import LogService, now_ms
+from backend.core.motion_safety import MotionSafetyGate, MotionSafetyToken, motion_operation
 from backend.core.motion_limits import (
     WorkOriginMissing,
     effective_limit_arrays,
@@ -46,12 +55,16 @@ PRE_HOME_ROTATION_LIMIT_TOLERANCE_DEG = 1e-6
 class TeleopMappingService:
     """HAL-native teleop lifecycle and status bridge used during recording."""
 
+    # 同一个原生控制器可能同时被连接界面和录制会话使用；来源集合决定停止一个入口后是否仍需运行。
     _NATIVE_ARM_SOURCES = {"teleop-connect", "recording"}
 
-    def __init__(self, settings: SettingsService, hal: HalClient, logs: LogService) -> None:
+    def __init__(self, settings: SettingsService, hal: HalClient, logs: LogService, *, safety: MotionSafetyGate | None = None) -> None:
         self.settings = settings
         self.hal = hal
         self.logs = logs
+        self.safety = safety if safety is not None else MotionSafetyGate()
+        self._source_stop_generation: dict[str, int] = {}
+        self._transition_token: ContextVar[tuple[MotionSafetyToken, str, int] | None] = ContextVar("teleop_transition_token", default=None)
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
         self._last_action: dict[str, Any] | None = None
@@ -62,6 +75,7 @@ class TeleopMappingService:
         self._arm_sources: set[str] = set()
         self._last_blockers: dict[str, dict[str, Any]] = {}
         self._last_diag_zero_log_ms: dict[str, int] = {}
+        self._last_diag_fault_log: dict[str, tuple[tuple[str, str, str], int]] = {}
         self._last_native_diag_action_key = ""
         self._last_native_status_summary = ""
         self._last_native_status_summary_ms = 0
@@ -72,8 +86,10 @@ class TeleopMappingService:
     async def _get_config_async(self) -> dict[str, Any]:
         if self.settings is None:
             return {}
-        return await asyncio.to_thread(self.settings.get_config)
+        config = await asyncio.to_thread(self.settings.get_config)
+        return self._recording_scope(config)
 
+    @motion_operation()
     async def start(
         self,
         source: str = "recording",
@@ -81,13 +97,48 @@ class TeleopMappingService:
         *,
         pre_home: bool = True,
     ) -> dict[str, Any]:
+        token = self._transition_token.set((self.safety.capture(), source, self._source_stop_generation.get(source, 0)))
+        try:
+            self._check_transition_current()
+            return await self._start_current(source, home_side, pre_home=pre_home)
+        finally:
+            self._transition_token.reset(token)
+
+    def _check_transition_current(self) -> None:
+        token = self._transition_token.get()
+        if token is None:
+            self.safety.check(self.safety.capture())
+            return
+        safety_token, source, generation = token
+        self.safety.check(safety_token)
+        if self._source_stop_generation.get(source, 0) != generation:
+            raise RuntimeError(f"teleop {source} start cancelled by a newer stop")
+
+    async def _native_command(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        # configure/pre-home/start 之间的 await 不能跨过停止或急停后继续发下一条。
+        if name != "teleop.native.stop":
+            self._check_transition_current()
+        result = await self.hal.command(name, payload)
+        if name != "teleop.native.stop":
+            self._check_transition_current()
+        return result
+
+    async def _start_current(
+        self,
+        source: str = "recording",
+        home_side: SideName | None = None,
+        *,
+        pre_home: bool = True,
+    ) -> dict[str, Any]:
         config = await self._get_config_async()
+        self._check_transition_current()
         op_id = self.logs.new_op_id("teleop") if self.logs is not None else None
         mode = self._hal_mode(config)
         if mode == "real":
             # Native teleop reconfiguration can stop/re-home/start hardware, so
             # serialize it even when UI connect and recording start race.
             async with self._native_transition_lock:
+                self._check_transition_current()
                 return await self._start_native_locked(config, op_id, source, home_side, pre_home)
         if self._task is not None and not self._task.done():
             self._arm_sources.add(source)
@@ -101,6 +152,7 @@ class TeleopMappingService:
         self.logs.info("[HAL]", "HAL-native teleop armed in test mode; no hardware motion will be sent")
         return self.status(config)
 
+    # 启动切换涉及停止、回原点和配置重发，必须串行，防止录制按钮与连接按钮并发改变硬件状态。
     async def _start_native_locked(
         self,
         config: dict[str, Any],
@@ -191,18 +243,11 @@ class TeleopMappingService:
         teleop_config = config.get("teleop", {})
         if not force and isinstance(teleop_config, dict) and not bool(teleop_config.get("homeBeforeStart", True)):
             return
-        startup_config = config.get("motion", {}).get("homeOnStartup", {})
-        if (
-            not force
-            and isinstance(startup_config, dict)
-            and str(startup_config.get("mode", "work_origin")) != "work_origin"
-        ):
-            return
         origin = self._normalized_motion_origin(config)
         if side is None and not bool(origin["valid"]):
             raise RuntimeError("motion work origin is not captured")
         if side is None:
-            await self.hal.command(
+            await self._native_command(
                 "motion.home_all",
                 {
                     "leftPulse": origin["leftPulse"],
@@ -217,7 +262,7 @@ class TeleopMappingService:
         pulse_key = "leftPulse" if side == "left" else "rightPulse"
         if not bool(origin[valid_key]):
             raise RuntimeError(f"{side} motion work origin is not captured")
-        await self.hal.command(
+        await self._native_command(
             "motion.home_origin_side",
             {
                 "side": side,
@@ -302,11 +347,7 @@ class TeleopMappingService:
         teleop_config = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         if isinstance(teleop_config, dict) and not bool(teleop_config.get("homeBeforeStart", True)):
             return False
-        startup_config = config.get("motion", {}).get("homeOnStartup", {})
-        return not (
-            isinstance(startup_config, dict)
-            and str(startup_config.get("mode", "work_origin")) != "work_origin"
-        )
+        return True
 
     def _native_startup_blockers(self, config: dict[str, Any]) -> dict[str, dict[str, Any]]:
         if not self._native_prehome_enabled(config):
@@ -443,6 +484,14 @@ class TeleopMappingService:
         )
 
     async def stop(self, source: str = "recording", *, restart_remaining: bool = True) -> dict[str, Any]:
+        self._source_stop_generation[source] = self._source_stop_generation.get(source, 0) + 1
+        token = self._transition_token.set((self.safety.capture(), source, self._source_stop_generation[source]))
+        try:
+            return await self._stop_current(source, restart_remaining=restart_remaining)
+        finally:
+            self._transition_token.reset(token)
+
+    async def _stop_current(self, source: str, *, restart_remaining: bool) -> dict[str, Any]:
         config = await self._get_config_async()
         if self._hal_mode(config) == "real":
             async with self._native_transition_lock:
@@ -599,12 +648,12 @@ class TeleopMappingService:
         await self._configure_and_start_native_payload(payload)
 
     async def _configure_and_start_native_payload(self, payload: dict[str, Any]) -> None:
-        await self.hal.command("teleop.native.configure", payload)
-        await self.hal.command("teleop.native.start", payload)
+        await self._native_command("teleop.native.configure", payload)
+        await self._native_command("teleop.native.start", payload)
         self._last_native_payload = dict(payload)
 
     async def _start_native_payload(self, payload: dict[str, Any]) -> None:
-        await self.hal.command("teleop.native.start", payload)
+        await self._native_command("teleop.native.start", payload)
         self._last_native_payload = dict(payload)
 
     async def _refresh_native_status(self) -> None:
@@ -693,6 +742,10 @@ class TeleopMappingService:
     def _log_diag_action(self, config: dict[str, Any], action: dict[str, Any]) -> None:
         if self.logs is None or not bool(config.get("teleop", {}).get("diagLog", False)):
             return
+        last_error = str(action.get("lastError", self._last_error) or "")
+        level = self._diagnostic_log_level("teleop_status", action, last_error)
+        if level is None:
+            return
         requested = action.get("requestedDeltas")
         applied = action.get("appliedDeltas")
         requested_pulse = action.get("halRequestedPulseDeltas") or action.get("requestedPulseDeltas")
@@ -710,7 +763,7 @@ class TeleopMappingService:
         has_clip = isinstance(clipped, dict) and any(bool(clipped.get(axis)) for axis in AXES)
         now = now_ms()
         zero_key = f"{action.get('sourceSide')}->{action.get('side')}"
-        if not has_motion and not has_clip:
+        if level == "DEBUG" and not has_motion and not has_clip:
             last_zero_ms = self._last_diag_zero_log_ms.get(zero_key, 0)
             if now - last_zero_ms < 1000:
                 return
@@ -722,11 +775,11 @@ class TeleopMappingService:
         latency = float(action.get("commandLatencyMs", 0.0))
         self.logs.event(
             "[HAL]",
-            "INFO",
+            level,
             "teleop_status",
             component="TELEOP",
             rate_key=f"teleop_status:{action.get('sourceSide')}->{action.get('side')}",
-            rate_ms=1000 if not has_motion and not has_clip else None,
+            rate_ms=1000 if level == "DEBUG" and not has_motion and not has_clip else None,
             sideMap=f"{action.get('sourceSide')}->{action.get('side')}",
             refState="active",
             blockReason="-",
@@ -737,32 +790,16 @@ class TeleopMappingService:
             emitPulse=self._format_axis_values(applied_pulse or requested_pulse),
             targetPulse=self._format_axis_values(target_pulse),
             currentPulse=self._format_axis_values(current_pulse),
+            launchPulse=self._format_axis_values(launch_pulse),
+            movingBefore=self._format_axis_flags(moving_before),
+            moveStarted=self._format_axis_flags(move_started),
             limit="payload",
             clip=clip_axes,
             updateRet=self._format_axis_values(update_return),
             stopReason=self._format_axis_values(stop_reason),
             axisIoStatus=self._format_axis_values(axis_io_status),
-            lastError=self._last_error or "",
+            lastError=last_error,
             latencyMs=round(latency, 3),
-        )
-        self.logs.info(
-            "[HAL]",
-            (
-                f"teleop diag {action.get('sourceSide')}->{action.get('side')} "
-                f"axis={action.get('axis')} clip={clip_axes} latency={latency:.1f}ms "
-                f"req={self._format_axis_values(requested)} "
-                f"app={self._format_axis_values(applied)} "
-                f"pulseReq={self._format_axis_values(requested_pulse)} "
-                f"pulseApp={self._format_axis_values(applied_pulse)} "
-                f"targetPulse={self._format_axis_values(target_pulse)} "
-                f"currentPulse={self._format_axis_values(current_pulse)} "
-                f"launchPulse={self._format_axis_values(launch_pulse)} "
-                f"movingBefore={self._format_axis_flags(moving_before)} "
-                f"moveStarted={self._format_axis_flags(move_started)} "
-                f"updateRet={self._format_axis_values(update_return)} "
-                f"stopReason={self._format_axis_values(stop_reason)} "
-                f"axisIoStatus={self._format_axis_values(axis_io_status)}"
-            ),
         )
 
     def _log_native_diag_action(
@@ -773,11 +810,14 @@ class TeleopMappingService:
     ) -> None:
         if not bool(config.get("teleop", {}).get("diagLog", False)):
             return
-        action_key = self._native_diag_action_key(action)
+        fallback_error = action.get("lastError", self._last_error)
+        payload_error = str(payload.get("lastError", fallback_error) or "") if isinstance(payload, dict) else str(fallback_error or "")
+        action_key = f"{self._native_diag_action_key(action)}|{payload_error}"
         if action_key == self._last_native_diag_action_key:
             return
         self._last_native_diag_action_key = action_key
         diag_action = dict(action)
+        diag_action["lastError"] = payload_error
         diag_action["requestedDeltas"] = self._axis_dict_from_six(
             action.get("requestedDeltas") or action.get("deltas")
         )
@@ -813,6 +853,10 @@ class TeleopMappingService:
     ) -> None:
         if self.logs is None or not bool(config.get("teleop", {}).get("diagLog", False)):
             return
+        last_error = str(payload.get("lastError", action.get("lastError", self._last_error)) or "")
+        level = self._diagnostic_log_level("teleop_axis_trace", action, last_error)
+        if level is None:
+            return
         source = str(action.get("sourceSide") or "?")
         target = str(action.get("side") or "?")
         input_detail = self._native_input_detail(payload, source)
@@ -842,7 +886,7 @@ class TeleopMappingService:
         latency = float(action.get("commandLatencyMs", 0.0))
         self.logs.event(
             "[HAL]",
-            "INFO",
+            level,
             "teleop_axis_trace",
             component="TELEOP",
             source=source,
@@ -868,9 +912,29 @@ class TeleopMappingService:
             blockReason=self._native_block_reason(block),
             referenceValid=bool(input_detail.get("referenceValid", False)),
             inputActive=bool(input_detail.get("inputActive", False)),
-            lastError=str(payload.get("lastError") or self._last_error or ""),
+            lastError=last_error,
             latencyMs=round(latency, 3),
         )
+
+    def _diagnostic_log_level(
+        self, event: str, action: dict[str, Any], last_error: str,
+    ) -> Literal["DEBUG", "WARNING"] | None:
+        key = f"{event}:{action.get('sourceSide')}->{action.get('side')}"
+        has_fault = bool(last_error) or any(
+            self._axis_dict_has_motion(action.get(field)) for field in ("updateReturn", "stopReason")
+        )
+        if not has_fault:
+            self._last_diag_fault_log.pop(key, None)
+            return "DEBUG"
+        # 脉冲值和裁剪可持续变化；只按异常原因限频，新的异常立即可见。
+        signature = (last_error, self._format_axis_values(action.get("updateReturn")),
+                     self._format_axis_values(action.get("stopReason")))
+        now = now_ms()
+        previous = self._last_diag_fault_log.get(key)
+        if previous is not None and previous[0] == signature and now - previous[1] < 5000:
+            return None
+        self._last_diag_fault_log[key] = (signature, now)
+        return "WARNING"
 
     def _native_input_detail(self, payload: dict[str, Any], source: str) -> dict[str, Any]:
         inputs = payload.get("inputs")
@@ -910,7 +974,17 @@ class TeleopMappingService:
         self._last_native_status_summary = summary
         self._last_native_status_summary_ms = now
         self._log_native_status_events(payload)
-        self.logs.info("[HAL]", summary)
+        grippers = payload.get("grippers")
+        has_fault = bool(payload.get("lastError")) or (
+            isinstance(grippers, dict)
+            and any(
+                isinstance(detail, dict)
+                and bool(detail.get("lastCommandTs"))
+                and detail.get("ok") is False
+                for detail in grippers.values()
+            )
+        )
+        (self.logs.warning if has_fault else self.logs.debug)("[HAL]", summary)
 
     def _log_teleop_mode(
         self,
@@ -1003,7 +1077,7 @@ class TeleopMappingService:
             block = blockers.get(source_side, {}) if isinstance(blockers, dict) else {}
             self.logs.event(
                 "[HAL]",
-                "INFO",
+                "DEBUG",
                 "teleop_status",
                 component="TELEOP",
                 sideMap=f"{source_side}->{target_side}",
@@ -1154,6 +1228,9 @@ class TeleopMappingService:
                 "axis",
                 "delta",
                 "unit",
+                "updateReturn",
+                "stopReason",
+                "lastError",
             )
         )
 
@@ -1199,7 +1276,12 @@ class TeleopMappingService:
         sample_hz = min(max(sample_hz, 1.0), 60.0)
         return 1.0 / sample_hz
 
+    def _recording_scope(self, config):
+        selected = getattr(self, "recording_participation", lambda: None)()
+        return scoped_config(config, selected) if selected else config
+
     def _native_payload(self, config: dict[str, Any]) -> dict[str, Any]:
+        config = self._recording_scope(config)
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
         gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
         gripper_teleop = teleop.get("gripperTeleop", {}) if isinstance(teleop.get("gripperTeleop"), dict) else {}
@@ -1352,6 +1434,8 @@ class TeleopMappingService:
             "motionProfileAccSec": self._motion_profile_acc_sec(config),
             "motionProfileDecSec": self._motion_profile_dec_sec(config),
             "gripperTeleopEnabled": self._native_gripper_teleop_enabled(config),
+            "leftGripperParticipating": bool(teleop.get("leftGripperParticipating", True)),
+            "rightGripperParticipating": bool(teleop.get("rightGripperParticipating", True)),
             "leftPort": str(gripper.get("leftPort", "COM8")),
             "rightPort": str(gripper.get("rightPort", "COM9")),
             "leftSlaveId": int(gripper.get("leftSlaveId", 10)),
@@ -1444,48 +1528,16 @@ class TeleopMappingService:
         )
 
     def _translation_start_velocity_um_s(self, config: dict[str, Any]) -> float:
-        return max(
-            0.0,
-            float(
-                config.get("teleop", {}).get(
-                    "translationStartVelocityUmS",
-                    ICF_TELEOP_DEFAULTS["translationStartVelocityUmS"],
-                )
-            ),
-        )
+        return teleop_motion_profile(config)["translationStartVelocityUmS"]
 
     def _translation_max_velocity_um_s(self, config: dict[str, Any]) -> float:
-        return max(
-            1.0,
-            float(
-                config.get("teleop", {}).get(
-                    "translationMaxVelocityUmS",
-                    ICF_TELEOP_DEFAULTS["translationMaxVelocityUmS"],
-                )
-            ),
-        )
+        return teleop_motion_profile(config)["translationMaxVelocityUmS"]
 
     def _rotation_start_velocity_deg_s(self, config: dict[str, Any]) -> float:
-        return max(
-            0.0,
-            float(
-                config.get("teleop", {}).get(
-                    "rotationStartVelocityDegS",
-                    ICF_TELEOP_DEFAULTS["rotationStartVelocityDegS"],
-                )
-            ),
-        )
+        return teleop_motion_profile(config)["rotationStartVelocityDegS"]
 
     def _rotation_max_velocity_deg_s(self, config: dict[str, Any]) -> float:
-        return max(
-            1.0,
-            float(
-                config.get("teleop", {}).get(
-                    "rotationMaxVelocityDegS",
-                    ICF_TELEOP_DEFAULTS["rotationMaxVelocityDegS"],
-                )
-            ),
-        )
+        return teleop_motion_profile(config)["rotationMaxVelocityDegS"]
 
     def _continuous_increment_mode(self, config: dict[str, Any]) -> bool:
         return bool(
@@ -1555,16 +1607,10 @@ class TeleopMappingService:
         )
 
     def _motion_profile_acc_sec(self, config: dict[str, Any]) -> float:
-        return max(
-            0.001,
-            float(config.get("teleop", {}).get("motionProfileAccSec", ICF_TELEOP_DEFAULTS["motionProfileAccSec"])),
-        )
+        return teleop_motion_profile(config)["motionProfileAccSec"]
 
     def _motion_profile_dec_sec(self, config: dict[str, Any]) -> float:
-        return max(
-            0.001,
-            float(config.get("teleop", {}).get("motionProfileDecSec", ICF_TELEOP_DEFAULTS["motionProfileDecSec"])),
-        )
+        return teleop_motion_profile(config)["motionProfileDecSec"]
 
     def _incremental_translation_min_effective_delta(self, config: dict[str, Any]) -> float:
         teleop = config.get("teleop", {})

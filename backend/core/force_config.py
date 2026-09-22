@@ -1,8 +1,25 @@
+# 阅读导航 03｜后端契约与配置
+# 职责：校验 HKVL 串口、六轴方向、安全阈值与柔顺参数，并转换为 HAL 的扁平配置。
+# 先看：validate_force_config → hal_force_config_payload。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import math
 import os
 from typing import Any
+
+HKVL_TARE_DEFAULT_SAMPLES = 200
+HKVL_TARE_MAX_SAMPLES = 1000
+
+
+def hkvl_tare_sample_count(value: object) -> int:
+    samples = _number(value, "force.tareSamples")
+    if isinstance(value, bool) or not samples.is_integer() or (
+        samples != 0 and not HKVL_TARE_DEFAULT_SAMPLES <= samples <= HKVL_TARE_MAX_SAMPLES
+    ):
+        raise ValueError("HKVL force.tareSamples must be 0 (default 200) or an integer from 200 to 1000")
+    return int(samples) if samples else HKVL_TARE_DEFAULT_SAMPLES
 
 
 def _mapping(value: object, name: str) -> dict[str, Any]:
@@ -56,6 +73,7 @@ def validate_force_config(config: dict[str, Any]) -> None:
 
     serial = _mapping(force.get("serial"), "force.serial")
     if source == "hkvl_serial":
+        hkvl_tare_sample_count(force.get("tareSamples", 0))
         if str(serial.get("protocol", "")) != "hkvl_active_v1":
             raise ValueError("HKVL force protocol must be hkvl_active_v1")
         left_port = str(serial.get("leftPort", "")).strip().upper()
@@ -115,10 +133,11 @@ def hal_force_config_payload(config: dict[str, Any]) -> dict[str, Any]:
     safety = _mapping(config["safety"], "safety")
     compliance = _mapping(force["compliance"], "force.compliance")
     axis_signs = _force_axis_signs(config)
-    source = str(force.get("source", "hkvl_serial")).lower()
+    source = str(force["source"]).lower()
     left_port = str(serial["leftPort"])
     right_port = str(serial["rightPort"])
     if source == "hkvl_serial":
+        # 启动脚本按设备 PnP 身份解析的实际 COM 口通过环境变量覆盖配置值，避免 USB 重枚举后左右错接。
         left_port = os.getenv("APPSTATION_HKVL_LEFT_PORT", left_port).strip().upper()
         right_port = os.getenv("APPSTATION_HKVL_RIGHT_PORT", right_port).strip().upper()
         if not left_port or not right_port or left_port == right_port:

@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：按时间戳组帧、脉冲缓存、原点快照、episode 写入及录制回滚。
+# 先看：hal_motion_fixture → omega_state_fixture → source_sample_fixture → force_source_fixture。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import asyncio
@@ -13,6 +18,8 @@ from types import SimpleNamespace
 import pytest
 
 from backend.core.defaults import default_config
+from backend.core.data_contract import data_contract_metadata
+from backend.core.motion_safety import MotionSafetyGate
 from backend.services import dataset_recorder as dataset_recorder_module
 from backend.services.dataset_recorder import (
     DatasetRecorderService,
@@ -135,117 +142,6 @@ def test_frame_assembler_uses_cached_motion_pulses_when_hal_sample_lacks_pulses(
     ]
 
 
-def test_frame_assembler_swaps_all_left_right_numeric_channels_but_not_cameras() -> None:
-    class FakeTeleop:
-        def status(self) -> dict[str, object]:
-            return {
-                "lastAction": {
-                    "monotonic_s": 10.0,
-                    "deltaVector": [10.0, 0.0, 0.0, 0.5, 0.0, 0.0, -20.0, 0.0, 0.0, 0.0, 0.0, -0.1],
-                }
-            }
-
-    recorder = object.__new__(DatasetRecorderService)
-    recorder.teleop = FakeTeleop()
-    recorder.telemetry = SimpleNamespace(
-        motion_positions=[0.0] * 12,
-        force_left=[0.0] * 6,
-        force_right=[0.0] * 6,
-        gripper_positions=[0.0, 0.0],
-    )
-    recorder._last_motion_pulses = [0.0] * 12
-    recorder._record_fps_hz = 30
-    recorder._episode_index = 0
-    recorder._recording_motion_positions = lambda _config, positions, _pulses: list(positions)
-    recorder._force_values_from_sample = lambda _sample: (
-        [31.0, 32.0, 33.0, 34.0, 35.0, 36.0],
-        [41.0, 42.0, 43.0, 44.0, 45.0, 46.0],
-    )
-
-    def aligned_sample(source: str, target_s: float) -> TimedSample:
-        if source == "hal":
-            return TimedSample(
-                source,
-                target_s,
-                {
-                    "positions": [1, 2, 3, 0.1, 0.2, 0.3, 7, 8, 9, 0.4, 0.5, 0.6],
-                    "pulses": [float(value) for value in range(101, 113)],
-                },
-            )
-        if source == "force":
-            return TimedSample(source, target_s, object())
-        if source == "gripper":
-            return TimedSample(source, target_s, [4.5, 5.5])
-        if source.startswith("camera_"):
-            return TimedSample(source, target_s, f"image-{source}")
-        return TimedSample(source, target_s, None)
-
-    recorder._aligned_sample = aligned_sample
-
-    frame = FrameAssembler(recorder).assemble(
-        {
-            "hal": {"mode": "simulation"},
-            "gripper": {"targetLeftMm": 6.0, "targetRightMm": 7.0},
-        },
-        10.0,
-        0,
-    )
-
-    assert frame["observation.state"] == [
-        7,
-        8,
-        9,
-        400.0,
-        500.0,
-        600.0,
-        5.5,
-        1,
-        2,
-        3,
-        100.0,
-        200.0,
-        300.0,
-        4.5,
-    ]
-    assert frame["action"] == [
-        -13,
-        8,
-        9,
-        400.0,
-        500.0,
-        500.0,
-        7.0,
-        11,
-        2,
-        3,
-        600.0,
-        200.0,
-        300.0,
-        6.0,
-    ]
-    assert frame["observation.pulses"] == [
-        107.0,
-        108.0,
-        109.0,
-        110.0,
-        111.0,
-        112.0,
-        101.0,
-        102.0,
-        103.0,
-        104.0,
-        105.0,
-        106.0,
-    ]
-    assert frame["observation.force_left"] == [41.0, 42.0, 43.0, 44.0, 45.0, 46.0]
-    assert frame["observation.force_right"] == [31.0, 32.0, 33.0, 34.0, 35.0, 36.0]
-    assert frame["images"] == {
-        "observation.images.global": "image-camera_global",
-        "observation.images.wrist_left": "image-camera_wrist_left",
-        "observation.images.wrist_right": "image-camera_wrist_right",
-    }
-
-
 def test_dataset_recorder_persists_episode_origin_and_config_snapshot() -> None:
     source = (Path(__file__).resolve().parents[1] / "services" / "dataset_recorder.py").read_text(encoding="utf-8")
 
@@ -282,11 +178,17 @@ def test_dataset_recorder_appstation_info_writes_motion_calibration(tmp_path: Pa
     recorder._force_sample_hz = 200.0
     dataset_dir = tmp_path / "dataset"
     config = default_config()
+    (dataset_dir / "meta").mkdir(parents=True)
+    (dataset_dir / "meta" / "info.json").write_text('{"fps":30}', encoding="utf-8")
 
     recorder._write_appstation_info(dataset_dir, config)
 
     payload = json.loads((dataset_dir / "meta" / "appstation_info.json").read_text(encoding="utf-8"))
     motion = payload["hardware"]["motion"]
+    assert payload["dataContract"] == data_contract_metadata()
+    native_info = json.loads((dataset_dir / "meta" / "info.json").read_text(encoding="utf-8"))
+    assert native_info["dataContract"] == data_contract_metadata()
+    assert native_info["fps"] == 30
     assert motion["kinematics"]["rightSignedPulsePerUnit"][5] == 333.3333
     assert motion["teleop"]["rightImpulseCoeff"][5] == 3333.333
 
@@ -358,7 +260,12 @@ def test_dataset_recorder_episode_origin_uses_recording_config_snapshot(tmp_path
     recorder._max_force_right = 0.0
     recorder._native_writer_active = lambda: True
 
+    recorder._participation = {"version": "appstation.participation.v1", "arms": ["left"], "grippers": []}
     episode = recorder._finalize_episode_locked(status="review", deleted=False)
+    saved = recorder._read_episodes(dataset_dir)[0]
+    assert saved["participation"] == recorder._participation
+    assert saved["actionMask"] == [True] * 6 + [False] * 8
+    assert saved["observationMask"] == saved["actionMask"]
 
     assert episode["motionOrigin"]["leftPulse"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
     assert episode["motionOrigin"]["rightPulse"] == [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
@@ -409,6 +316,59 @@ def test_dataset_recorder_saves_episode_with_parallel_encoding() -> None:
     source = (Path(__file__).resolve().parents[1] / "services" / "dataset_recorder.py").read_text(encoding="utf-8")
 
     assert "save_episode(parallel_encoding=True)" in source
+
+
+@pytest.mark.parametrize("setting", [None, "", "invalid"])
+def test_video_encoder_defaults_to_bounded_threads(monkeypatch, setting) -> None:
+    if setting is None:
+        monkeypatch.delenv("APPSTATION_LEROBOT_ENCODER_THREADS", raising=False)
+    else:
+        monkeypatch.setenv("APPSTATION_LEROBOT_ENCODER_THREADS", setting)
+    recorder = object.__new__(DatasetRecorderService)
+    assert recorder._native_writer_kwargs()["encoder_threads"] == 2
+
+
+def test_writer_rejects_encoder_drop_error_and_does_not_save() -> None:
+    saved = []
+    written = []
+
+    def add_frame(_frame):
+        raise RuntimeError("video encoder dropped frames: {'observation.images.global': 1}")
+
+    dataset = SimpleNamespace(
+        add_frame=add_frame,
+        save_episode=lambda **_kwargs: saved.append(True),
+    )
+    recorder = SimpleNamespace(
+        _episode_index=0,
+        _native_frame_payload=lambda frame: frame,
+        _mark_frame_written=written.append,
+        logs=SimpleNamespace(error=lambda *_args: None),
+    )
+    work_queue = queue.Queue()
+    writer = LeRobotWriterThread(recorder, work_queue)
+    writer._dataset = dataset
+    work_queue.put(dataset_recorder_module.PendingFrame(0, 0, 0.0, {"episode_index": 0}))
+    future = writer.submit("save_episode")
+    work_queue.put(None)
+    writer.start()
+    writer.join(2)
+    assert not writer.is_alive()
+    with pytest.raises(RuntimeError, match="encoder dropped.*global"):
+        future.result()
+    assert written == []
+    assert saved == []
+    dataset.clear_episode_buffer = lambda: None
+    cleared = Future()
+    writer._handle_command(WriterCommand("clear_episode", cleared))
+    assert cleared.result() is None
+    dataset.add_frame = lambda _frame: None
+    writer._write_frame({"episode_index": 0})
+    assert len(written) == 1
+    saved_future = Future()
+    writer._handle_command(WriterCommand("save_episode", saved_future))
+    assert saved_future.result() == 0
+    assert saved == [True]
 
 
 def test_lerobot_writer_keeps_dataset_open_after_saved_episode() -> None:
@@ -674,6 +634,52 @@ def test_stop_sampler_tasks_fails_and_keeps_threads_when_sampler_does_not_exit()
     asyncio.run(run_case())
 
 
+def test_camera_configuration_stays_busy_until_finish_writer_cleanup_completes() -> None:
+    async def run_case() -> None:
+        recorder = object.__new__(DatasetRecorderService)
+        recorder._lock = asyncio.Lock()
+        recorder._session_starting = True
+        recorder._session_active = False
+        recorder._recording = False
+        recorder._writer_thread = None
+        assert recorder.camera_configuration_busy() is True
+
+        recorder._session_starting = False
+        recorder._session_active = True
+        recorder._writer_thread = object()
+        recorder._loop_task = None
+        recorder.telemetry = SimpleNamespace(recording=False, frame_count=0)
+        recorder.logs = SimpleNamespace(info=lambda *_args: None, error=lambda *_args: None)
+        entered_cleanup = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def noop(*_args: object) -> None:
+            pass
+
+        async def finish_writer() -> None:
+            entered_cleanup.set()
+            await release_cleanup.wait()
+            recorder._writer_thread = None
+
+        recorder.teleop = SimpleNamespace(stop=noop)
+        recorder._stop_assembler_task = noop
+        recorder._stop_sampler_tasks = noop
+        recorder._finalize_native_dataset = noop
+        recorder._stop_writer_task = finish_writer
+        recorder.status = lambda: {"active": recorder._session_active}
+        task = asyncio.create_task(recorder.finish_session())
+        await entered_cleanup.wait()
+        try:
+            assert recorder.origin_mutation_locked() is False
+            assert recorder.camera_configuration_busy() is True
+        finally:
+            release_cleanup.set()
+            await task
+        assert recorder.camera_configuration_busy() is False
+
+    asyncio.run(run_case())
+
+
 def test_finish_session_continues_cleanup_when_sampler_threads_do_not_stop() -> None:
     async def run_case() -> None:
         calls: list[str] = []
@@ -744,6 +750,7 @@ def test_dataset_recorder_configures_native_chunk_settings_for_independent_episo
 
 def test_dataset_recorder_skip_reset_requires_saved_episode_waiting() -> None:
     recorder = object.__new__(DatasetRecorderService)
+    recorder.safety = MotionSafetyGate()
     recorder._session_active = True
     recorder._recording = True
     recorder._reset_pending = False
@@ -758,6 +765,7 @@ def test_dataset_recorder_skip_reset_requires_saved_episode_waiting() -> None:
 def test_dataset_recorder_skip_reset_requires_required_work_origin_side() -> None:
     async def run_case() -> None:
         recorder = object.__new__(DatasetRecorderService)
+        recorder.safety = MotionSafetyGate()
         calls: list[str] = []
         recorder._session_active = True
         recorder._recording = False
@@ -805,7 +813,8 @@ def test_dataset_recorder_skip_reset_requires_required_work_origin_side() -> Non
     asyncio.run(run_case())
 
 
-def test_dataset_recorder_discard_pauses_until_reset() -> None:
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_dataset_recorder_discard_pauses_until_reset(stop_fails) -> None:
     async def run_case() -> None:
         recorder = object.__new__(DatasetRecorderService)
         calls: list[str] = []
@@ -823,17 +832,32 @@ def test_dataset_recorder_discard_pauses_until_reset() -> None:
         recorder.logs = SimpleNamespace(warning=lambda *_args: calls.append("log"))
 
         async def drain() -> None:
+            assert calls == ["stop:recording"]
             calls.append("drain")
 
         async def start(_source: str) -> None:
             pytest.fail("discard should not restart teleop")
 
         async def stop(source: str) -> None:
+            with pytest.raises(RuntimeError, match="still stopping teleop"):
+                recorder.require_discard_complete()
+            with pytest.raises(RuntimeError, match="already in progress"):
+                await recorder.discard_episode()
+            assert recorder._reset_pending is False
             calls.append(f"stop:{source}")
+            if stop_fails:
+                raise RuntimeError("stop unconfirmed")
 
         recorder._drain_recording_queues = drain
         recorder.teleop = SimpleNamespace(start=start, stop=stop)
 
+        if stop_fails:
+            with pytest.raises(RuntimeError, match="stop unconfirmed"):
+                await recorder.discard_episode()
+            assert recorder._reset_pending is False
+            assert calls == ["stop:recording"]
+            recorder.require_discard_complete()
+            return
         result = await recorder.discard_episode()
 
         assert result["recording"] is False
@@ -841,7 +865,8 @@ def test_dataset_recorder_discard_pauses_until_reset() -> None:
         assert recorder._reset_pending is True
         assert recorder._samplers_paused is True
         assert recorder.telemetry.recording is False
-        assert calls == ["drain", "stop:recording", "log"]
+        assert calls == ["stop:recording", "drain", "log"]
+        recorder.require_discard_complete()
 
     asyncio.run(run_case())
 
@@ -881,7 +906,7 @@ def test_dataset_recorder_save_drains_queued_assembly_before_closing_episode() -
 
         recorder._drain_recording_queues = drain
         recorder._finalize_episode_locked = finalize
-        recorder.teleop = SimpleNamespace(stop=stop)
+        recorder.teleop = SimpleNamespace(stop=stop, status=lambda: {})
 
         result = await recorder.save_episode()
 
@@ -933,7 +958,7 @@ def test_dataset_recorder_save_persists_episode_metadata_off_event_loop(
         monkeypatch.setattr(dataset_recorder_module.asyncio, "to_thread", fake_to_thread)
         recorder._drain_recording_queues = drain
         recorder._finalize_episode_locked = finalize_episode
-        recorder.teleop = SimpleNamespace(stop=stop)
+        recorder.teleop = SimpleNamespace(stop=stop, status=lambda: {})
         recorder.status = record_status
 
         result = await recorder.save_episode()
@@ -947,6 +972,7 @@ def test_dataset_recorder_save_persists_episode_metadata_off_event_loop(
 def test_dataset_recorder_save_stops_recording_teleop_before_drain() -> None:
     async def run_case() -> None:
         recorder = object.__new__(DatasetRecorderService)
+        live_status = {"nativeStatus": {"gripperTargets": [7.0, 2.22857]}}
         calls: list[str] = []
         recorder._session_active = True
         recorder._recording = True
@@ -961,6 +987,7 @@ def test_dataset_recorder_save_stops_recording_teleop_before_drain() -> None:
 
         async def drain() -> None:
             calls.append("drain")
+            assert recorder._latest_native_gripper_targets({}) == (7.0, 2.22857)
 
         def finalize_episode(*, status: str, deleted: bool) -> dict[str, object]:
             calls.append(f"finalize:{status}:{deleted}")
@@ -968,13 +995,14 @@ def test_dataset_recorder_save_stops_recording_teleop_before_drain() -> None:
 
         async def stop(source: str) -> None:
             calls.append(f"stop:{source}")
+            live_status["nativeStatus"]["gripperTargets"][1] = 1.02
 
         def record_status() -> dict[str, object]:
             return {"recording": recorder._recording}
 
         recorder._drain_recording_queues = drain
         recorder._finalize_episode_locked = finalize_episode
-        recorder.teleop = SimpleNamespace(stop=stop)
+        recorder.teleop = SimpleNamespace(stop=stop, status=lambda: live_status)
         recorder.status = record_status
 
         await recorder.save_episode()
@@ -1016,7 +1044,7 @@ def test_dataset_recorder_discard_marks_saved_episode_off_event_loop(
 
         monkeypatch.setattr(dataset_recorder_module.asyncio, "to_thread", fake_to_thread)
         recorder._mark_saved_episode_deleted_locked = mark_saved_episode_deleted
-        recorder.teleop = SimpleNamespace(stop=stop)
+        recorder.teleop = SimpleNamespace(stop=stop, status=lambda: {})
         recorder.status = record_status
 
         result = await recorder.discard_episode()
@@ -1058,7 +1086,7 @@ def test_dataset_recorder_save_failure_stops_recording_source() -> None:
         recorder._drain_recording_queues = drain
         recorder._save_native_episode = save_native
         recorder._clear_native_episode_buffer = clear_native
-        recorder.teleop = SimpleNamespace(stop=stop)
+        recorder.teleop = SimpleNamespace(stop=stop, status=lambda: {})
 
         with pytest.raises(DatasetSaveError, match="invalid mp4"):
             await recorder.save_episode()
@@ -1111,6 +1139,7 @@ def test_cleanup_native_tmp_dirs_removes_orphan_streaming_videos(tmp_path: Path)
 def test_dataset_recorder_skip_reset_starts_after_discarded_episode_waiting() -> None:
     async def run_case() -> None:
         recorder = object.__new__(DatasetRecorderService)
+        recorder.safety = MotionSafetyGate()
         calls: list[str] = []
         recorder._session_active = True
         recorder._recording = False
@@ -1164,6 +1193,7 @@ def test_dataset_recorder_skip_reset_transition_uses_single_lock() -> None:
 def test_dataset_recorder_skip_reset_rolls_back_when_teleop_start_fails() -> None:
     async def run_case() -> None:
         recorder = object.__new__(DatasetRecorderService)
+        recorder.safety = MotionSafetyGate()
         calls: list[str] = []
         saved_episode = {"id": "episode_000000"}
         recorder._session_active = True
@@ -1415,7 +1445,7 @@ def test_dataset_recorder_rejects_concurrent_start_while_native_dataset_opens(
         first = asyncio.create_task(recorder.start_session("unit-a", "task"))
         await native_entered.wait()
         try:
-            with pytest.raises(RuntimeError, match="record session already active"):
+            with pytest.raises(RuntimeError, match="motion operation already in progress"):
                 await recorder.start_session("unit-b", "task")
         finally:
             native_release.set()
@@ -1548,6 +1578,45 @@ def test_dataset_recorder_collect_frame_uses_timed_buffers() -> None:
     assert "CAMERA_SOURCE_KEYS" in source
 
 
+@pytest.mark.parametrize("source", ["hal", "omega", "force"])
+def test_dataset_sampler_reuses_event_loop_and_closes_it_on_stop(source, monkeypatch) -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    loops = []
+    recorder._session_active = True
+    recorder._sampler_stop_event = Event()
+    recorder._sampler_start_monotonic_s = time.monotonic()
+    recorder._recording_config_snapshot = {"hal": {"mode": "real"}}
+    recorder._source_sample_indices = {}
+    recorder._sample_buffers = {}
+    recorder.logs = SimpleNamespace(warning=lambda *_args: None)
+    recorder._source_sample_rate_hz = lambda *_args: 100.0
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def read_state():
+        loops.append(asyncio.get_running_loop())
+        if len(loops) == 3:
+            recorder._sampler_stop_event.set()
+        return {"sides": {"left": {"healthy": True}, "right": {"healthy": True}}}
+
+    async def timed_source(name, awaitable, target, **_kwargs):
+        return TimedSample(name, target, await awaitable)
+
+    recorder.hal = SimpleNamespace(motion_state=read_state, omega_state=read_state, force_state=read_state)
+    recorder._timed_source = timed_source
+    thread = Thread(target=recorder._sample_source_loop, args=(source,), daemon=True)
+    thread.start()
+    try:
+        thread.join(2.0)
+        assert not thread.is_alive()
+        assert len(loops) == 3
+        assert all(loop is loops[0] for loop in loops)
+        assert loops[0].is_closed()
+        assert len(recorder._sample_buffers[source]) == 3
+    finally:
+        recorder._sampler_stop_event.set()
+        thread.join(1.0)
+
+
 def test_dataset_sampler_pauses_hardware_sampling_between_episodes() -> None:
     recorder = object.__new__(DatasetRecorderService)
     sampled = Event()
@@ -1562,7 +1631,7 @@ def test_dataset_sampler_pauses_hardware_sampling_between_episodes() -> None:
     recorder.logs = SimpleNamespace(warning=lambda *_args: None)
     recorder._source_sample_rate_hz = lambda _source, _config: 100.0
 
-    def sample_once(source: str, _config: dict[str, object], target_s: float) -> TimedSample:
+    def sample_once(source: str, _config: dict[str, object], target_s: float, **_kwargs) -> TimedSample:
         sampled.set()
         return TimedSample(source, target_s, {"ok": True})
 
@@ -1698,6 +1767,37 @@ def test_dataset_recorder_sample_buffer_covers_warmup_delay_jitter_and_lookback(
     assert retention == pytest.approx(3.0)
 
 
+def test_sample_history_is_bounded_by_assembly_not_encoded_write_backlog() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._record_fps_hz = 30
+    recorder._force_sample_hz = 200
+    config = default_config()
+    config["storage"]["recordFps"] = 30
+    config["cameras"]["fps"] = 30
+    buffers = recorder._new_sample_buffers(config)
+    expected = (
+        dataset_recorder_module.ASSEMBLY_QUEUE_MAX_FRAMES / 30
+        + dataset_recorder_module.WRITE_QUEUE_PUT_TIMEOUT_S
+        + dataset_recorder_module.ASSEMBLY_QUEUE_PUT_TIMEOUT_S
+        + dataset_recorder_module.RECORDER_HARDWARE_WARMUP_S
+        + dataset_recorder_module.MAX_SAMPLE_JITTER_S
+        + dataset_recorder_module.SAMPLE_LOOKBACK_WINDOW_S
+    )
+    assert buffers["camera_global"].retention_s == pytest.approx(expected)
+    # 模拟长录制：采样历史在窗口填满后保持恒定，并保留组帧积压所需的旧帧。
+    sizes = []
+    for index in range(90 * 30):
+        for source in ("camera_global", "camera_wrist_left", "camera_wrist_right"):
+            buffers[source].append(TimedSample(source, index / 30, index))
+        if index in (30 * 30 - 1, 60 * 30 - 1, 90 * 30 - 1):
+            sizes.append(len(buffers["camera_global"]))
+    assert max(sizes) - min(sizes) <= 1
+    assert max(sizes) <= round(expected * 30) + 1
+    target = 89.0 - dataset_recorder_module.ASSEMBLY_QUEUE_MAX_FRAMES / 30
+    assert buffers["camera_global"].nearest(target, 0.001).value == round(target * 30)
+    assert buffers["camera_global"].nearest(40.0, 0.001) is None
+
+
 def test_dataset_recorder_source_sample_time_uses_source_frequency() -> None:
     recorder = object.__new__(DatasetRecorderService)
     recorder._record_fps_hz = 30
@@ -1738,6 +1838,114 @@ def test_dataset_recorder_timed_source_records_timeout_drop() -> None:
     assert sample.message == "hal timeout"
     assert recorder._drop_counts["hal"] == 1
     assert recorder._source_fail_streaks["hal"] == 1
+
+
+def test_dataset_recorder_training_quality_tracks_active_side_and_gripper_protocol() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._episode_frames = 0
+    recorder._record_fps_hz = 30
+    recorder._max_force_left = 0.0
+    recorder._max_force_right = 0.0
+    recorder._reset_training_quality_tracking()
+
+    for frame_index in range(60):
+        state = [0.0] * 14
+        action = [0.0] * 14
+        state[7] = 100.0 + frame_index * 200.0
+        action[7] = 100.0 + frame_index * 200.0
+        state[6] = action[6] = 12.0
+        state[13] = 26.0
+        action[13] = 26.0 if frame_index < 30 else 1.02
+        recorder._mark_frame_written({
+            "observation.state": state,
+            "action": action,
+            "observation.force_left": [0.0] * 6,
+            "observation.force_right": [0.0] * 6,
+        })
+
+    summary = recorder._training_quality_summary()
+
+    assert summary["activeDatasetSides"] == ["right"]
+    right = summary["sides"]["right"]
+    assert right["hardwareSide"] == "left"
+    assert right["startTranslationNormUm"] == 100.0
+    assert right["startStateGripperMm"] == 26.0
+    assert right["startActionGripperMm"] == 26.0
+    assert right["firstSecondMinActionGripperMm"] == 26.0
+    assert right["actionGripperMinMm"] == 1.02
+    assert right["maxTranslationRangeUm"] == 11800.0
+
+
+def _quality_episode_for_assessment(*, frames: int = 600, late: int = 20, right_start_action: float = 26.0) -> dict[str, object]:
+    return {
+        "frames": frames,
+        "lateFrames": late,
+        "cameraDrops": {"global": 2, "wrist_left": 2, "wrist_right": 2},
+        "cameraMinFps": {"global": 29.8, "wrist_left": 29.8, "wrist_right": 29.8},
+        "cameraWorkerFallbacks": [],
+        "maxSkewMs": 100.0,
+        "maxForceLeft": 0.1,
+        "maxForceRight": 1.0,
+        "warnings": ["force stale: 150", "max skew: 100.0ms"],
+        "trainingQuality": {
+            "activeDatasetSides": ["right"],
+            "sides": {
+                "right": {
+                    "hardwareSide": "left",
+                    "startTranslationNormUm": 120.0,
+                    "startStateGripperMm": 26.0,
+                    "startActionGripperMm": right_start_action,
+                    "firstSecondMinActionGripperMm": 26.0,
+                    "endStateGripperMm": 26.0,
+                    "endActionGripperMm": 26.0,
+                }
+            },
+        },
+    }
+
+
+def test_dataset_recorder_quality_assessment_accepts_clean_current_baseline() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+
+    assessment = recorder._quality_assessment(_quality_episode_for_assessment())
+
+    assert assessment["recommendation"] == "accept"
+    assert assessment["lateRate"] == pytest.approx(20 / 600, abs=1e-6)
+    assert assessment["reasons"] == []
+
+
+def test_dataset_recorder_quality_assessment_reviews_local_camera_anomaly() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    episode = _quality_episode_for_assessment(frames=623, late=29)
+    episode["cameraDrops"] = {"global": 13, "wrist_left": 5, "wrist_right": 8}
+
+    assessment = recorder._quality_assessment(episode)
+
+    assert assessment["recommendation"] == "review"
+    assert any(reason["code"] == "camera_global" for reason in assessment["reasons"])
+
+
+@pytest.mark.parametrize(
+    ("frames", "late", "start_action", "expected_code"),
+    [
+        (664, 159, 26.0, "late_frames"),
+        (661, 9, 21.263, "start_gripper_action"),
+    ],
+)
+def test_dataset_recorder_quality_assessment_recommends_rerecord_for_known_bad_patterns(
+    frames: int,
+    late: int,
+    start_action: float,
+    expected_code: str,
+) -> None:
+    recorder = object.__new__(DatasetRecorderService)
+
+    assessment = recorder._quality_assessment(
+        _quality_episode_for_assessment(frames=frames, late=late, right_start_action=start_action)
+    )
+
+    assert assessment["recommendation"] == "rerecord"
+    assert any(reason["code"] == expected_code for reason in assessment["reasons"])
 
 
 def test_dataset_recorder_quality_warnings_summarize_source_latency() -> None:
@@ -1880,6 +2088,26 @@ def test_native_preflight_does_not_import_lerobot_record_script() -> None:
 
     assert "lerobot.scripts.lerobot_record" not in source
     assert "lerobot.datasets.lerobot_dataset" in source
+
+
+def test_native_preflight_keeps_event_loop_responsive(monkeypatch) -> None:
+    async def run_case() -> None:
+        recorder = object.__new__(DatasetRecorderService)
+        heartbeat = Event()
+        observed = []
+
+        def preflight() -> str:
+            observed.append(heartbeat.wait(0.3))
+            return "missing test dependency"
+
+        monkeypatch.setattr(recorder, "_native_recording_requested", lambda: True)
+        monkeypatch.setattr(recorder, "_native_preflight", preflight)
+        asyncio.get_running_loop().call_later(0.02, heartbeat.set)
+        assert not await recorder._try_begin_native_dataset({})
+        assert observed == [True], "依赖预检阻塞了心跳事件循环"
+        assert recorder._native_error == "missing test dependency"
+
+    asyncio.run(run_case())
 
 
 def test_dataset_recorder_falls_back_when_native_lerobot_unavailable(monkeypatch) -> None:
@@ -2372,3 +2600,114 @@ def test_dataset_recorder_applies_work_origin_pulse_conversion() -> None:
 
     assert relative[:4] == [1800.0, -2000.0, 1000.0, 1.0]
     assert relative[6] == 42.0
+
+
+def test_frame_assembler_swaps_all_left_right_numeric_channels_but_not_cameras() -> None:
+    class FakeTeleop:
+        def status(self) -> dict[str, object]:
+            return {
+                "lastAction": {
+                    "monotonic_s": 10.0,
+                    "deltaVector": [10.0, 0.0, 0.0, 0.5, 0.0, 0.0, -20.0, 0.0, 0.0, 0.0, 0.0, -0.1],
+                }
+            }
+
+    recorder = object.__new__(DatasetRecorderService)
+    recorder.teleop = FakeTeleop()
+    recorder.telemetry = SimpleNamespace(
+        motion_positions=[0.0] * 12,
+        force_left=[0.0] * 6,
+        force_right=[0.0] * 6,
+        gripper_positions=[0.0, 0.0],
+    )
+    recorder._last_motion_pulses = [0.0] * 12
+    recorder._record_fps_hz = 30
+    recorder._episode_index = 0
+    recorder._recording_motion_positions = lambda _config, positions, _pulses: list(positions)
+    recorder._force_values_from_sample = lambda _sample: (
+        [31.0, 32.0, 33.0, 34.0, 35.0, 36.0],
+        [41.0, 42.0, 43.0, 44.0, 45.0, 46.0],
+    )
+
+    def aligned_sample(source: str, target_s: float) -> TimedSample:
+        if source == "hal":
+            return TimedSample(
+                source,
+                target_s,
+                {
+                    "positions": [1, 2, 3, 0.1, 0.2, 0.3, 7, 8, 9, 0.4, 0.5, 0.6],
+                    "pulses": [float(value) for value in range(101, 113)],
+                },
+            )
+        if source == "force":
+            return TimedSample(source, target_s, object())
+        if source == "gripper":
+            return TimedSample(source, target_s, [4.5, 5.5])
+        if source.startswith("camera_"):
+            return TimedSample(source, target_s, f"image-{source}")
+        return TimedSample(source, target_s, None)
+
+    recorder._aligned_sample = aligned_sample
+
+    frame = FrameAssembler(recorder).assemble(
+        {
+            "hal": {"mode": "simulation"},
+            "gripper": {"targetLeftMm": 6.0, "targetRightMm": 7.0},
+        },
+        10.0,
+        0,
+    )
+
+    assert frame["observation.state"] == [
+        7,
+        8,
+        9,
+        400.0,
+        500.0,
+        600.0,
+        5.5,
+        1,
+        2,
+        3,
+        100.0,
+        200.0,
+        300.0,
+        4.5,
+    ]
+    assert frame["action"] == [
+        -13,
+        8,
+        9,
+        400.0,
+        500.0,
+        500.0,
+        7.0,
+        11,
+        2,
+        3,
+        600.0,
+        200.0,
+        300.0,
+        6.0,
+    ]
+    assert frame["observation.pulses"] == [
+        107.0,
+        108.0,
+        109.0,
+        110.0,
+        111.0,
+        112.0,
+        101.0,
+        102.0,
+        103.0,
+        104.0,
+        105.0,
+        106.0,
+    ]
+    assert frame["observation.force_left"] == [41.0, 42.0, 43.0, 44.0, 45.0, 46.0]
+    assert frame["observation.force_right"] == [31.0, 32.0, 33.0, 34.0, 35.0, 36.0]
+    assert frame["images"] == {
+        "observation.images.global": "image-camera_global",
+        "observation.images.wrist_left": "image-camera_wrist_left",
+        "observation.images.wrist_right": "image-camera_wrist_right",
+    }

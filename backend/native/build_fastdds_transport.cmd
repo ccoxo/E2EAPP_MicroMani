@@ -1,4 +1,8 @@
 @echo off
+rem 阅读导航 08｜启动、部署与工具
+rem 职责：调用本机 C++ 工具链构建 Python 使用的 Fast-DDS 传输 DLL。
+rem 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 setlocal
 rem Build the small C ABI DLL used by backend\hal_client\dds_runtime.py.
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul

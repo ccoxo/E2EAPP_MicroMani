@@ -1,18 +1,10 @@
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：安装 DOM 测试断言和浏览器 API 替身，并统一测试环境清理。
+ * 先看：ResizeObserverMock。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import '@testing-library/jest-dom/vitest'
-import { createElement } from 'react'
-import { vi } from 'vitest'
-
-vi.mock('echarts-for-react', () => ({
-  default: ({ option }: { option: unknown }) => {
-    const captureOptions = Boolean(
-      (globalThis as { __captureEchartOptions?: boolean }).__captureEchartOptions,
-    )
-    return createElement('div', {
-      'data-testid': 'echart-mock',
-      ...(captureOptions ? { 'data-chart-option': JSON.stringify(option) } : {}),
-    })
-  },
-}))
 
 Object.defineProperty(window, 'matchMedia', {
   writable: true,
@@ -68,6 +60,11 @@ Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
   configurable: true,
   value: 768,
 })
+
+// jsdom 无 Canvas 2D 实现；图表只做布局与数据属性断言。
+HTMLCanvasElement.prototype.getContext = function getContext() {
+  return null
+} as typeof HTMLCanvasElement.prototype.getContext
 
 const originalGetComputedStyle = window.getComputedStyle.bind(window)
 Object.defineProperty(window, 'getComputedStyle', {

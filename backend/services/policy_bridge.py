@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：在界面状态和 14 维 LeRobot 状态/动作之间转换，生成限幅后的分侧执行计划。
+# 先看：lerobot_state_from_ui → build_policy_action_plan。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from typing import Any

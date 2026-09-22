@@ -67,3 +67,27 @@ def test_open_applies_fixed_fps_only_to_auto_exposed_wrists(monkeypatch, role, a
     config = {'cameras': {'tuning': {role: {'autoExposure': auto}}}}
     driver._get_capture(object(), 2, 640, 480, 30, role, config)
     assert calls == expected
+
+
+@pytest.mark.parametrize('role,auto,fixed_fps', [
+    ('wrist_left', True, True), ('wrist_right', True, True),
+    ('wrist_left', False, False), ('global', True, False),
+])
+def test_tuning_existing_direct_capture_reapplies_fixed_fps_after_exposure(monkeypatch, role, auto, fixed_fps):
+    driver = camera_opencv.OpenCVCameraDriver()
+    capture = object()
+    driver._captures[2] = capture
+    calls = []
+    monkeypatch.setattr(camera_opencv, 'import_module', lambda name: object())
+    monkeypatch.setattr(driver, '_resolved_indices', lambda *args: {role: 2})
+    monkeypatch.setattr(driver, '_capture_size', lambda *args: (640, 480))
+    monkeypatch.setattr(driver, '_get_capture', lambda *args: capture)
+    monkeypatch.setattr(driver, '_apply_tuning', lambda cv2, cap, profile: (
+        calls.append(('autoExposure', profile['autoExposure'])) or {}
+    ))
+    monkeypatch.setattr(driver, '_disable_low_light_compensation', lambda index: calls.append(('fixed_fps', index)))
+
+    driver.apply_tuning({'cameras': {'tuning': {role: {'autoExposure': auto}}}}, role)
+
+    assert calls == [('autoExposure', auto)] + ([('fixed_fps', 2)] if fixed_fps else [])
+    assert driver._captures[2] is capture

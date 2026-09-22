@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 05｜DDS 传输
+ * 职责：向 Python 暴露 Fast-DDS 的 C ABI；维护主题缓存、命令发布与应答同步。
+ * 先看：JsonEnvelopeSample → HalCommandRequestSample → HalCommandReplySample → AppStationTopicDataType。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include <fastcdr/Cdr.h>
 #include <fastcdr/FastBuffer.h>
 #include <fastdds/dds/core/LoanableSequence.hpp>
@@ -15,16 +21,14 @@
 #include <fastdds/dds/topic/TopicDataType.hpp>
 #include <fastdds/dds/topic/TypeSupport.hpp>
 #include <fastdds/rtps/common/SerializedPayload.h>
-#include <fastdds/rtps/transport/UDPv4TransportDescriptor.h>
+#include "../../hal/include/LocalDdsTransport.h"
 #include <fastrtps/types/TypesBase.h>
 
 #include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
-#include <cctype>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -109,18 +113,6 @@ struct HalCommandReplySample {
   std::string result_json;
   std::string error;
 };
-
-bool envBoolValue(const char* key, bool fallback) {
-  const char* raw = std::getenv(key);
-  if (!raw || !*raw) {
-    return fallback;
-  }
-  std::string value(raw);
-  for (char& ch : value) {
-    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-  }
-  return value == "1" || value == "true" || value == "yes" || value == "on";
-}
 
 std::uint32_t stringPayloadSize(const std::string& value) {
   return static_cast<std::uint32_t>(value.size() + 8);
@@ -359,13 +351,7 @@ struct AppStationFastDdsTransport {
     DomainParticipantQos participantQos;
     check(DomainParticipantFactory::get_instance()->get_default_participant_qos(participantQos), "get_default_participant_qos");
     participantQos.name("AppStationBackendFastDds");
-    // 默认 localhost-only，和 HAL C++ participant 保持相同安全边界。
-    if (!envBoolValue("APPSTATION_DDS_LAN_DISCOVERY", false)) {
-      auto udp = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
-      udp->interfaceWhiteList.push_back("127.0.0.1");
-      participantQos.transport().use_builtin_transports = false;
-      participantQos.transport().user_transports.push_back(udp);
-    }
+    appstation::dds::configureLocalTransport(participantQos);
 
     participant = DomainParticipantFactory::get_instance()->create_participant(
         static_cast<eprosima::fastdds::dds::DomainId_t>(domainId),
@@ -424,6 +410,20 @@ struct AppStationFastDdsTransport {
       return;
     }
     readerThread = std::thread([this]() { readLoop(); });
+    // VOLATILE 命令在发现对端前发布会丢失；启动清理不能抢在端点匹配之前。
+    // 有界等待只用于启动，运行中的命令超时与隔离保护保持不变。
+    const auto discoveryDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (running && std::chrono::steady_clock::now() < discoveryDeadline) {
+      eprosima::fastdds::dds::PublicationMatchedStatus commandMatch, emergencyMatch;
+      eprosima::fastdds::dds::SubscriptionMatchedStatus replyMatch;
+      if (commandRequestWriter->get_publication_matched_status(commandMatch) == ReturnCode_t::RETCODE_OK
+          && emergencyStopWriter->get_publication_matched_status(emergencyMatch) == ReturnCode_t::RETCODE_OK
+          && commandReplyReader->get_subscription_matched_status(replyMatch) == ReturnCode_t::RETCODE_OK
+          && commandMatch.current_count > 0 && emergencyMatch.current_count > 0 && replyMatch.current_count > 0) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
   }
 
   void close() {

@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：所有夹爪操作选择 HAL-native 并生成正确载荷。
+# 先看：FakeHal → FakeTeleopMapper → build_router → test_router_always_selects_hal_native。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import asyncio

@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：封装 Jodell DLL 的端口选择、读写和开口换算；保留给驱动测试及独立探测脚本。
+# 先看：GripperResult → Rs485GripperDriver。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import ctypes

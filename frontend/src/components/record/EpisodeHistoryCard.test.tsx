@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：验证后端历史倒序、实时记录去重优先级与请求失败回退。
+ * 先看：episode → dataset。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { cleanup, render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'

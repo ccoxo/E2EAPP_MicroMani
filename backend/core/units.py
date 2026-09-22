@@ -1,3 +1,8 @@
+# 阅读导航 03｜后端契约与配置
+# 职责：在运动脉冲、界面单位和 LeRobot 状态单位之间换算；旋转角度与毫度须区分。
+# 先看：pulse_to_lerobot → pulse_to_ui → ui_to_lerobot_state → lerobot_to_ui_state。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from typing import Any
@@ -15,6 +20,7 @@ def pulse_to_lerobot(pulse: float, axis_idx: int, pulse_per_unit: float) -> floa
     return pulse / pulse_per_unit * 1000.0
 
 
+# 界面平移使用 μm、旋转使用 degree；LeRobot 旋转分量使用 0.001 degree，不能直接混用。
 def pulse_to_ui(pulse: float, axis_idx: int, pulse_per_unit: float) -> float:
     """Convert pulse count to frontend TelemetryFrame units: um or degree."""
     value = pulse_to_lerobot(pulse, axis_idx, pulse_per_unit)

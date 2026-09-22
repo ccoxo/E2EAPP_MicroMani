@@ -1,3 +1,8 @@
+# 阅读导航 03｜后端契约与配置
+# 职责：定义 API 请求、响应、配置及遥测的 Pydantic 模型，是前后端字段契约的后端入口。
+# 先看：ApiEnvelope → ErrorEnvelope → LogEntry → ProcessStatus。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 from typing import Any, Literal
@@ -189,7 +194,7 @@ class ManualAxisMoveRequest(BaseModel):
     side: ManualSide
     axis: ManualAxis
     direction: Literal[-1, 1]
-    step: float
+    step: float = Field(allow_inf_nan=False, ge=0)
     speedMode: ManualSpeedMode
 
 

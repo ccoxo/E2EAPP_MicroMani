@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 02｜前端契约与状态
+ * 职责：从当前配置和遥测推导硬件状态行；遥测过期后撤销实时成功状态。
+ * 先看：HardwareStatusTone → HardwareStatusRow → telemetryLinkIsLive → telemetryLinkLabel。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import type {
   AppConfig,
   CameraTelemetry,
@@ -43,7 +49,13 @@ function configuredHalPort(config: AppConfig) {
   }
 }
 
-function unknownRows(frame: TelemetryFrame, config: AppConfig): HardwareStatusRow[] {
+/** 硬件状态行只依赖这些 frame 字段，便于细粒度订阅。 */
+export type HardwareStatusFrameInput = Pick<
+  TelemetryFrame,
+  'halOk' | 'wsOk' | 'cameras' | 'forceStatus' | 'gripperStatus' | 'teleopHands'
+>
+
+function unknownRows(frame: HardwareStatusFrameInput, config: AppConfig): HardwareStatusRow[] {
   const port = configuredHalPort(config)
   const forceIsHkvl = config.force.source === 'hkvl_serial' || frame.forceStatus?.source === 'hkvl_serial'
   return [
@@ -80,7 +92,7 @@ function cameraRow(key: string, name: string, camera: CameraTelemetry | undefine
   return { key, name, value, tone: camera.fps >= 25 ? 'ok' : 'warn' }
 }
 
-function omegaRow(frame: TelemetryFrame): HardwareStatusRow {
+function omegaRow(frame: Pick<TelemetryFrame, 'teleopHands'>): HardwareStatusRow {
   const hands = frame.teleopHands
   if (hands.length < 2) return { key: 'omega7', name: 'Omega.7 左/右', value: '--', tone: 'unknown' }
   const ready = hands.filter((hand) => hand.connected && hand.lastReadOk).length
@@ -99,26 +111,32 @@ function omegaRow(frame: TelemetryFrame): HardwareStatusRow {
   }
 }
 
-function gripperRow(frame: TelemetryFrame): HardwareStatusRow {
+/** HAL worker 入队即置 ok=true，该消息尚不代表串口执行或位置反馈。 */
+export function gripperFeedbackIsQueued(side: GripperSideStatus | undefined) {
+  return side?.message === 'queued native gripper command'
+}
+
+function gripperRow(frame: Pick<TelemetryFrame, 'gripperStatus'>): HardwareStatusRow {
   const status = frame.gripperStatus
   const sides: Array<GripperSideStatus | undefined> = [status?.sides?.left, status?.sides?.right]
+  const ready = sides.filter((side) => side?.ok === true && !gripperFeedbackIsQueued(side)).length
   if (sides.some((side) => side?.ok === false)) {
-    const ready = sides.filter((side) => side?.ok === true).length
     return { key: 'gripper', name: '夹爪 左/右', value: `反馈 ${ready}/2`, tone: 'error' }
   }
-  if (status?.running === true && sides.every((side) => side?.ok === true)) {
+  // 反馈健康 ≠ 使能：排队接受不能计入两侧正常反馈。
+  if (status?.running === true && ready === 2) {
     return { key: 'gripper', name: '夹爪 左/右', value: '反馈 2/2', tone: 'ok' }
   }
   return {
     key: 'gripper',
     name: '夹爪 左/右',
-    value: status?.running ? `反馈 ${sides.filter((side) => side?.ok === true).length}/2 · 待确认` : '未激活 · 未验证',
+    value: status?.running ? `反馈 ${ready}/2 · 待确认` : '未激活 · 未验证',
     tone: 'warn',
   }
 }
 
 export function deriveHardwareStatusRows(
-  frame: TelemetryFrame,
+  frame: HardwareStatusFrameInput,
   config: AppConfig,
   link: TelemetryLinkStatus,
 ): HardwareStatusRow[] {

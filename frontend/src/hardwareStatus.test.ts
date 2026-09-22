@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：验证硬件状态投影、过期遥测降级与夹爪真实反馈条件。
+ * 先看：liveLink → healthyFrame。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { describe, expect, it } from 'vitest'
 import { defaultConfig } from './data'
 import { deriveHardwareStatusRows } from './hardwareStatus'
@@ -122,5 +128,24 @@ describe('hardware status projection', () => {
       tone: 'warn',
       value: '未激活 · 未验证',
     })
+  })
+
+  it.each([
+    { other: { ok: true, message: 'position read complete' }, tone: 'warn', value: '反馈 1/2 · 待确认' },
+    { other: { ok: true, message: 'queued native gripper command' }, tone: 'warn', value: '反馈 0/2 · 待确认' },
+    { other: { ok: false, message: 'Jodell worker response timeout' }, tone: 'error', value: '反馈 0/2' },
+  ])('仅入队的夹爪不计入正常反馈：$value', ({ other, tone, value }) => {
+    const frame = healthyFrame()
+    frame.gripperStatus = {
+      nativeManaged: true,
+      running: true,
+      sides: {
+        left: { ok: true, message: 'queued native gripper command', lastCommandTs: 1_000 },
+        right: other,
+      },
+    }
+
+    const rows = deriveHardwareStatusRows(frame, defaultConfig, liveLink())
+    expect(rows.find((row) => row.key === 'gripper')).toMatchObject({ tone, value })
   })
 })

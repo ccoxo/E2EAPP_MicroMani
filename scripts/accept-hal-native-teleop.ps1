@@ -1,3 +1,7 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：已停用的旧 HTTP 遥操作验收入口；执行即提示改用后端/UI 的 DDS 路径。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 param(
   [int]$Port = 8091,
   [int]$ObserveSeconds = 0,

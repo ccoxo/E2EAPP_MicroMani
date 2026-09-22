@@ -1,3 +1,8 @@
+# 阅读导航 05｜DDS 传输
+# 职责：定义 DDS 主题名、域默认值以及 JSON 信封和命令请求/应答的数据结构。
+# 先看：JsonEnvelope → HalCommandRequest → HalCommandReply → now_unix_ms。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import json

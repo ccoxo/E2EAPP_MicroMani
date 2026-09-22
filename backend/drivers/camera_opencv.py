@@ -1,3 +1,8 @@
+# 阅读导航 04｜后端业务与采集
+# 职责：管理相机身份绑定、OpenCV 采集、编码与最新帧缓存；可使用子进程隔离阻塞驱动。
+# 先看：CameraProbeResult → CameraFrameSnapshot → OpenCVCameraDriver。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 """OpenCV camera access with process isolation for fragile capture backends.
 
 Several Windows camera drivers can block or crash inside OpenCV. The driver
@@ -194,7 +199,12 @@ public static class AppstationDirectShowCameraEnum
                     object filter;
                     Guid iid = new Guid("56A86895-0AD4-11CE-B03A-0020AF0BA770");
                     monikers[0].BindToObject(null, null, ref iid, out filter);
-                    try { return DisableLowLightCompensation((IKsControl)filter); }
+                    try
+                    {
+                        var control = (IKsControl)filter;
+                        EnableAutoExposure(control);
+                        return DisableLowLightCompensation(control);
+                    }
                     finally { Marshal.ReleaseComObject(filter); }
                 }
                 finally { Marshal.ReleaseComObject(monikers[0]); }
@@ -208,6 +218,26 @@ public static class AppstationDirectShowCameraEnum
         }
     }
 
+    static void EnableAutoExposure(IKsControl control)
+    {
+        // 自动曝光优先级属性仅在曝光已为 Auto 时有效。
+        IntPtr data = Marshal.AllocCoTaskMem(40);
+        try
+        {
+            for (int i = 0; i < 40; i += 4) Marshal.WriteInt32(data, i, 0);
+            ControlHeader(data, 4, 1); // KSPROPERTY_CAMERACONTROL_EXPOSURE, GET
+            int returned;
+            Marshal.ThrowExceptionForHR(control.KsProperty(data, 40, data, 40, out returned));
+            if ((Marshal.ReadInt32(data, 28) & 1) == 0)
+            {
+                ControlHeader(data, 4, 2);
+                Marshal.WriteInt32(data, 28, 1); // KSPROPERTY_CAMERACONTROL_FLAGS_AUTO
+                Marshal.ThrowExceptionForHR(control.KsProperty(data, 40, data, 40, out returned));
+            }
+        }
+        finally { Marshal.FreeCoTaskMem(data); }
+    }
+
     static string DisableLowLightCompensation(IKsControl control)
     {
         // KSPROPERTY_CAMERACONTROL_S is 40 bytes with 8-byte alignment on Windows.
@@ -215,19 +245,19 @@ public static class AppstationDirectShowCameraEnum
         try
         {
             for (int i = 0; i < 40; i += 4) Marshal.WriteInt32(data, i, 0);
-            PriorityHeader(data, 1);
+            ControlHeader(data, 19, 1);
             int returned;
             Marshal.ThrowExceptionForHR(control.KsProperty(data, 40, data, 40, out returned));
             int before = Marshal.ReadInt32(data, 24);
             if (before != 0)
             {
-                PriorityHeader(data, 2);
+                ControlHeader(data, 19, 2);
                 Marshal.WriteInt32(data, 24, 0);
                 Marshal.WriteInt32(data, 28, 2); // KSPROPERTY_CAMERACONTROL_FLAGS_MANUAL
                 Marshal.ThrowExceptionForHR(control.KsProperty(data, 40, data, 40, out returned));
             }
             // Get may overwrite the property header, so rebuild it for each call.
-            PriorityHeader(data, 1);
+            ControlHeader(data, 19, 1);
             Marshal.ThrowExceptionForHR(control.KsProperty(data, 40, data, 40, out returned));
             if (Marshal.ReadInt32(data, 24) != 0)
                 throw new InvalidOperationException("Low-light compensation remained enabled");
@@ -236,10 +266,10 @@ public static class AppstationDirectShowCameraEnum
         finally { Marshal.FreeCoTaskMem(data); }
     }
 
-    static void PriorityHeader(IntPtr data, int operation)
+    static void ControlHeader(IntPtr data, int property, int operation)
     {
         Marshal.StructureToPtr(new Guid("C6E13370-30AC-11D0-A18C-00A0C9118956"), data, false);
-        Marshal.WriteInt32(data, 16, 19); // KSPROPERTY_CAMERACONTROL_AUTO_EXPOSURE_PRIORITY
+        Marshal.WriteInt32(data, 16, property);
         Marshal.WriteInt32(data, 20, operation);
     }
 
@@ -485,6 +515,7 @@ class OpenCVCameraDriver:
         self._frame_locks: dict[int, Lock] = {}
         self._frame_events: dict[int, Event] = {}
         self._last_camera_runtime_log_ms: dict[int, int] = {}
+        self._last_mapping_log: dict[str, dict[str, Any]] = {}
         self._resolved_cache_key: tuple[object, ...] | None = None
         self._resolved_cache_at = 0.0
         self._resolved_cache: dict[str, int] | None = None
@@ -508,7 +539,7 @@ class OpenCVCameraDriver:
     def _event(self, level: str, event: str, **fields: Any) -> None:
         if self._logs is None:
             return
-        level_name = "ERROR" if level == "error" else "WARNING" if level == "warning" else "INFO"
+        level_name = "ERROR" if level == "error" else "WARNING" if level == "warning" else "DEBUG" if level == "debug" else "INFO"
         try:
             self._logs.event("[CAMERA]", level_name, event, component="CAMERA", **fields)
         except Exception:
@@ -630,19 +661,20 @@ class OpenCVCameraDriver:
                 with frame_lock:
                     frame = self._latest_frames.get(index)
                     latest_at = self._latest_at.get(index)
+                    cached = self._latest_jpegs.get(index)
                     if frame is not None and hasattr(frame, "copy"):
                         frame = frame.copy()
             else:
                 frame = None
                 latest_at = None
+                cached = None
             if frame is not None:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 return CameraFrameSnapshot(rgb, float(latest_at or time.monotonic()))
-            cached = self._latest_jpegs.get(index)
             if cached is not None:
                 return CameraFrameSnapshot(
                     self._decode_jpeg_to_rgb_frame(cv2, cached),
-                    float(self._latest_at.get(index) or time.monotonic()),
+                    float(latest_at or time.monotonic()),
                 )
             event = self._frame_events.get(index)
             if event is None:
@@ -718,6 +750,9 @@ class OpenCVCameraDriver:
                 }
             else:
                 actual = self._apply_tuning(cv2, capture, profile)
+                if capture is current and camera in {"wrist_left", "wrist_right"} and profile["autoExposure"]:
+                    # 已打开的 direct capture 不经过重开分支，也需同步关闭低光降帧。
+                    self._disable_low_light_compensation(index)
             self._clear_probe_cache()
         self._log("info", f"{camera} tuning applied on index {index}: {profile}")
         return {
@@ -762,6 +797,12 @@ class OpenCVCameraDriver:
         global_identity = str(config["cameras"].get("globalIdentity", "")).strip()
         if not global_identity:
             raise ValueError("请先设置全局相机身份，再识别腕部相机")
+        global_matches = [
+            device for device in identities.values()
+            if not self._is_directshow_software_source(device) and _identity_matches(global_identity, device)
+        ]
+        if len(global_matches) != 1:
+            raise ValueError("无法唯一确认全局相机，请检查全局相机连接和身份配置后重新扫描")
         devices = []
         for index, device in identities.items():
             if self._is_directshow_software_source(device) or not device.get("devicePath"):
@@ -801,7 +842,10 @@ class OpenCVCameraDriver:
 
     def wrist_binding(self, config: dict[str, Any], left: str, right: str) -> dict[str, Any]:
         devices = {device["devicePath"]: device for device in self.wrist_candidates(config)}
-        if left == right or left not in devices or right not in devices:
+        if (
+            left == right or left not in devices or right not in devices
+            or devices[left]["identity"] == devices[right]["identity"]
+        ):
             raise ValueError("请选择两台不同且仍在线的相机；设备变化后请重新扫描")
         cameras = dict(config["cameras"])
         for key, path in (("wristLeft", left), ("wristRight", right)):
@@ -946,11 +990,12 @@ class OpenCVCameraDriver:
         if (
             self._resolved_cache_key == cache_key
             and self._resolved_cache is not None
-            # Keep successful bindings until configuration changes or explicit
-            # reconnect. Periodic enumeration holds the shared resolution lock
-            # for seconds, blocking both preview and recording samplers.
-            and (all(index >= 0 for index in self._resolved_cache.values())
-                 or now - self._resolved_cache_at < 30)
+            # 成功绑定保留到配置变更或显式重连，避免定时枚举持锁阻塞预览和录制。
+            # 尚未找到的设备仍按原有间隔重试，不用其他相机替代绑定身份。
+            and (
+                all(index >= 0 for index in self._resolved_cache.values())
+                or now - self._resolved_cache_at < 30
+            )
         ):
             return dict(self._resolved_cache)
         resolved = {
@@ -985,9 +1030,7 @@ class OpenCVCameraDriver:
         identities = self._camera_identities_by_index()
         for role, resolved_index in resolved.items():
             identity = identities.get(resolved_index, {})
-            self._event(
-                "info",
-                "camera_mapping",
+            fields = dict(
                 role=role,
                 logicalIndex=role,
                 preferredIndex=str(cameras.get(CAMERA_DESCRIPTOR_KEYS[role], "")),
@@ -998,6 +1041,11 @@ class OpenCVCameraDriver:
                 configPath="runtime/config.json",
                 configHash=config_hash,
             )
+            # 未找到设备时会周期性重新解析；只记录映射本身的变化。
+            identity_fields = {key: value for key, value in fields.items() if key != "configHash"}
+            if self._last_mapping_log.get(role) != identity_fields:
+                self._event("info", "camera_mapping", **fields)
+                self._last_mapping_log[role] = identity_fields
         return resolved
 
     def _resolve_indices_by_identity(self, cameras: dict[str, Any]) -> dict[str, int]:
@@ -1287,7 +1335,7 @@ class OpenCVCameraDriver:
             if result.returncode != 0 or "fixed_frame_rate=1" not in result.stdout:
                 self._log("warning", f"camera index {index}: low-light compensation could not be disabled")
             else:
-                self._log("info", f"camera index {index}: low-light compensation disabled; fixed frame rate")
+                self._log("info", f"camera index {index}: low-light compensation disabled; verify measured frame rate")
         except (OSError, subprocess.TimeoutExpired) as exc:
             self._log("warning", f"camera index {index}: fixed frame rate setup failed: {exc}")
 
@@ -1488,7 +1536,7 @@ class OpenCVCameraDriver:
             return
         self._last_camera_runtime_log_ms[index] = now_ms_value
         self._event(
-            "info",
+            "debug",
             "camera_runtime",
             role=role,
             fps=round(self._latest_fps.get(index, 0.0), 1),
@@ -1647,8 +1695,10 @@ class OpenCVCameraDriver:
                     except (TypeError, ValueError):
                         frame_time = time.monotonic()
                     self._record_frame_timestamp(index, frame_time)
-                    self._latest_at[index] = frame_time
-                    self._latest_jpegs[index] = jpeg
+                    # 画面与采集时间必须一起发布，录制不能把旧画面标成下一帧。
+                    with self._frame_locks[index]:
+                        self._latest_at[index] = frame_time
+                        self._latest_jpegs[index] = jpeg
                     self._latest_sequences[index] = int(
                         status.get("sequence") or self._latest_sequences.get(index, 0) + 1
                     )
@@ -1696,8 +1746,8 @@ class OpenCVCameraDriver:
                         consecutive_failures = 0
                         now = time.monotonic()
                         self._record_frame_timestamp(index, now)
-                        self._latest_at[index] = now
                         with frame_lock:
+                            self._latest_at[index] = now
                             self._latest_frames[index] = frame
                         frame_event.set()
                     else:

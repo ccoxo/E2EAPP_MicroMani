@@ -1,6 +1,12 @@
-import { Card, InputNumber, Switch, Tag } from 'antd'
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：编辑遥操作 Kalman 与映射相关参数，并同步到配置状态。
+ * 先看：TeleopConfig → NumericTeleopKey → KalmanParam → formatValue。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { useTelemetryStore } from '../../stores/telemetry'
 import type { AppConfig } from '../../types'
+import { UiCard, UiTag } from '../ui'
 
 type TeleopConfig = AppConfig['teleop']
 type NumericTeleopKey = {
@@ -57,29 +63,34 @@ export default function KalmanFilterCard() {
   const renderParam = (param: KalmanParam) => (
     <label className="record-kalman-param" key={param.key}>
       <span>{param.label}</span>
-      <InputNumber
+      <input
+        className="ui-input"
         aria-label={param.label}
+        type="number"
         min={param.min}
         step={param.step}
         value={teleop[param.key]}
-        onChange={(value) => updateTeleop({ [param.key]: Number(value ?? teleop[param.key]) } as Partial<TeleopConfig>)}
+        onChange={(event) => updateTeleop({ [param.key]: Number(event.target.value || teleop[param.key]) } as Partial<TeleopConfig>)}
       />
     </label>
   )
 
   return (
-    <Card
-      size="small"
+    <UiCard
       title="卡尔曼滤波"
-      extra={<Tag color={teleop.kalmanFilterEnabled ? 'processing' : 'default'}>{teleop.kalmanFilterEnabled ? '开启' : '关闭'}</Tag>}
+      extra={<UiTag tone={teleop.kalmanFilterEnabled ? 'processing' : 'muted'}>{teleop.kalmanFilterEnabled ? '开启' : '关闭'}</UiTag>}
     >
       <div className="record-kalman-head">
         <span></span>
-        <Switch
-          aria-label="卡尔曼滤波开关"
-          checked={teleop.kalmanFilterEnabled}
-          onChange={(checked) => updateTeleop({ kalmanFilterEnabled: checked })}
-        />
+        <label className="ui-switch">
+          <input
+            type="checkbox"
+            aria-label="卡尔曼滤波开关"
+            checked={teleop.kalmanFilterEnabled}
+            onChange={(event) => updateTeleop({ kalmanFilterEnabled: event.target.checked })}
+          />
+          <span />
+        </label>
       </div>
 
       <div className="record-kalman-groups">
@@ -101,6 +112,6 @@ export default function KalmanFilterCard() {
         <span>beta {formatValue(teleop.kalmanBeta)}</span>
         <span>dt {formatValue(teleop.kalmanDtMinSec)}-{formatValue(teleop.kalmanDtMaxSec)}s</span>
       </div>
-    </Card>
+    </UiCard>
   )
 }

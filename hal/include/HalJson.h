@@ -1,3 +1,8 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：声明HalJson 的接口与状态结构；集中完成 HAL 状态序列化和配置/命令 JSON 字段解析。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #pragma once
 
 #include <array>

@@ -1,5 +1,12 @@
-import { Card } from 'antd'
+/*
+ * 阅读导航 01｜入口与界面
+ * 职责：展示双侧力与危险度，辅助观察录制时的安全状态。
+ * 先看：DangerBarProps → DangerBar → ForceValueSummaryProps → ForceValueSummary。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import { useTelemetryStore } from '../../stores/telemetry'
+import { numberArrayEqual, useFrameField } from '../../stores/frameSelectors'
+import { UiCard } from '../ui'
 /** 计算对应的业务值或展示值。 */
 const getDangerColor = (d: number) => {
   if (d < 0.3) return '#3B6D11'
@@ -65,19 +72,19 @@ function forceDanger(values: number[]) {
 /** 渲染当前界面单元，并连接所需数据。 */
 export default function SafetyMonitorCard() {
   const dangerIndex = useTelemetryStore((s) => s.frame.dangerIndex)
-  const forceLeft = useTelemetryStore((s) => s.frame.forceLeft)
-  const forceRight = useTelemetryStore((s) => s.frame.forceRight)
+  const forceLeft = useFrameField((frame) => frame.forceLeft, numberArrayEqual)
+  const forceRight = useFrameField((frame) => frame.forceRight, numberArrayEqual)
   const dangerLeft = Math.max(dangerIndex * 0.82, forceDanger(forceLeft))
   const dangerRight = Math.max(dangerIndex * 0.78, forceDanger(forceRight))
 
   return (
-    <Card title="力觉安全监控" size="small">
+    <UiCard title="力觉安全监控">
       <DangerBar side="左" danger={dangerLeft} />
       <DangerBar side="右" danger={dangerRight} />
       <div style={{ fontSize: 10, color: '#8c8c8c', marginTop: 4 }}>
         D&gt;=1.0 自动急停 / 警告阈值 0.5
       </div>
       <ForceValueSummary forceLeft={forceLeft} forceRight={forceRight} />
-    </Card>
+    </UiCard>
   )
 }

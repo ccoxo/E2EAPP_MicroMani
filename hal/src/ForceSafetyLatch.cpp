@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：根据超限次数、严重超限和数据超时锁存故障；恢复需双侧健康并满足稳定窗口。
+ * 先看：ForceSafetyLatch::configure → ForceSafetyLatch::onSample → ForceSafetyLatch::checkWatchdog → ForceSafetyLatch::latchExternal。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "ForceSafetyLatch.h"
 
 #include <algorithm>
@@ -50,6 +56,7 @@ std::optional<ForceSafetyTrip> ForceSafetyLatch::onSample(
   std::optional<ForceSafetyTrip> newTrip;
   for (std::size_t channel = 0; channel < values.size(); ++channel) {
     const double magnitude = std::abs(values[channel]);
+    // 严重超限单帧触发；普通停机阈值需同一通道连续三帧达到，计数在回落后清零。
     if (magnitude >= config_.stop[channel] * 1.2) {
       consecutiveAtStop_[side][channel] = 0;
       if (!latched_) {
@@ -79,6 +86,7 @@ std::optional<ForceSafetyTrip> ForceSafetyLatch::onSample(
   return newTrip;
 }
 
+// 不仅检查旧数据，也检查启动后未收到样本和断连；任意一侧不健康即可锁存。
 std::optional<ForceSafetyTrip> ForceSafetyLatch::checkWatchdog(double nowMs) {
   for (int side = 0; side < 2; ++side) {
     const double ageMs = hasSample_[side]
@@ -136,6 +144,7 @@ double ForceSafetyLatch::dangerIndex() const {
   return std::clamp(danger, 0.0, 1.2);
 }
 
+// 确认不会跳过安全条件：双侧必须在线、样本新鲜、低于警告阈值，并持续满足稳定窗口。
 bool ForceSafetyLatch::canAcknowledge(
     double nowMs,
     std::string* blocker) {

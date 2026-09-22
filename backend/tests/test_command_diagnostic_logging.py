@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：手动命令、工作原点操作与诊断日志，以及原点切换时的遥操作停止。
+# 先看：FakeSettings → FakeTelemetry → FakeHal → RecordingHal。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import asyncio
@@ -40,6 +45,9 @@ class FakeTelemetry:
     def __init__(self) -> None:
         self.force_tare_calls = 0
 
+    def tare_force(self) -> None:
+        self.force_tare_calls += 1
+
     def apply_axis_move(
         self,
         side: str,
@@ -60,9 +68,6 @@ class FakeTelemetry:
     def set_motion_axis_enabled(self, side: str, values: list[bool | None]) -> None:
         _ = (side, values)
 
-    def tare_force(self) -> None:
-        self.force_tare_calls += 1
-
 
 class FakeHal:
     async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -80,20 +85,6 @@ class RecordingHal(FakeHal):
         active_payload = payload or {}
         self.commands.append((name, active_payload))
         return {"mode": "test", "command": name, "payload": active_payload, "response": {"ok": True}}
-
-
-class CalibrationHal(RecordingHal):
-    async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        active_payload = payload or {}
-        self.commands.append((name, active_payload))
-        return {
-            "ok": True,
-            "calibration": {
-                "state": "ready_for_ack",
-                "progress": 100,
-                "completedAtUnixMs": 1234,
-            },
-        }
 
 
 class DisabledMotionHal(RecordingHal):
@@ -146,23 +137,125 @@ def _set_home_reference_to_origin(config: dict[str, Any]) -> None:
     }
 
 
-def test_hkvl_tare_returns_hal_calibration_result_after_success(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.parametrize("initially_latched", [False, True])
+def test_hkvl_self_check_preserves_latch_and_hal_statistics(monkeypatch: pytest.MonkeyPatch, initially_latched: bool) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+    calibration = {"state": "ready_for_ack", "progress": 100, "completedAtUnixMs": 1234,
+                   "sides": {"left": {"bias": [1.0] * 6, "residualMean": [0.001] * 6}}}
+
+    class CalibrationHal(RecordingHal):
+        async def command(self, name: str, payload=None):
+            self.commands.append((name, payload))
+            return {"mode": "real", "response": {"ok": True, "calibration": calibration}}
+
     config = default_config()
-    config["force"]["source"] = "hkvl_serial"
     config["force"]["tareSamples"] = 200
     logs = LogService(monotonic_ms=lambda: 123, session_id="s", emit_startup=False)
     hal = CalibrationHal()
     telemetry = FakeTelemetry()
     service = CommandService(FakeSettings(config), telemetry, hal, logs)
-
-    result = asyncio.run(service.tare_force())
-
-    assert hal.commands == [("force.tare", {"side": "all", "samples": 200})]
-    assert result["hal"]["calibration"]["state"] == "ready_for_ack"
+    if initially_latched:
+        service.safety.interrupt(emergency=True)
+    checks = []
+    result = asyncio.run(service.tare_force(unloaded_confirmed=True, readiness_check=lambda: checks.append(True)))
+    assert hal.commands == [("force.tare", {"side": "all", "samples": 200, "unloadedConfirmed": True})]
+    assert result["hal"]["response"]["calibration"] == calibration
     assert telemetry.force_tare_calls == 0
+    assert service.safety.latched is initially_latched
+    assert len(checks) == 2
+    assert any("both sides hkvl_serial tare requested" in item.msg for item in logs.list_entries())
+
+
+@pytest.mark.parametrize("side,confirmed,reason", [("left", True, "both sensors"), ("right", True, "both sensors"), (None, False, "unloaded")])
+def test_hkvl_self_check_rejects_single_side_or_missing_confirmation(monkeypatch, side, confirmed, reason) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+    hal = RecordingHal()
+    service = _service_with_hal(default_config(), LogService(emit_startup=False), hal)
+    with pytest.raises(RuntimeError, match=reason):
+        asyncio.run(service.tare_force(side, unloaded_confirmed=confirmed))
+    assert hal.commands == []
+
+
+def test_hkvl_self_check_still_requires_control_lease(monkeypatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+    hal = RecordingHal()
+    service = _service_with_hal(default_config(), LogService(emit_startup=False), hal)
+    service.safety.interrupt(emergency=True)
+
+    def reject():
+        raise RuntimeError("control lease missing")
+
+    with pytest.raises(RuntimeError, match="control lease missing"):
+        asyncio.run(service.tare_force(unloaded_confirmed=True, readiness_check=reject))
+    assert hal.commands == []
+
+
+def test_hkvl_self_check_does_not_accept_result_after_new_estop(monkeypatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    class InterruptedHal(RecordingHal):
+        async def command(self, name, payload=None):
+            service.safety.interrupt(emergency=True)
+            return {"response": {"ok": True, "calibration": {"state": "ready_for_ack"}}}
+
+    service = _service_with_hal(default_config(), LogService(emit_startup=False), InterruptedHal())
+    with pytest.raises(RuntimeError, match="newer stop"):
+        asyncio.run(service.tare_force(unloaded_confirmed=True))
+    assert service.safety.latched
+    assert service.telemetry.force_tare_calls == 0
+
+
+def test_hkvl_self_check_logs_failure_without_resetting_force(monkeypatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    class FailedHal(RecordingHal):
+        async def command(self, name, payload=None):
+            raise RuntimeError("sensor residual unstable")
+
+    logs = LogService(emit_startup=False)
+    service = _service_with_hal(default_config(), logs, FailedHal())
+    with pytest.raises(RuntimeError, match="sensor residual unstable"):
+        asyncio.run(service.tare_force(unloaded_confirmed=True))
+    assert service.telemetry.force_tare_calls == 0
+    assert any(item.level == "ERROR" and "sensor residual unstable" in item.msg for item in logs.list_entries())
+
+
+def test_hkvl_self_check_keeps_motion_resource_exclusive(monkeypatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    async def run():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        class WaitingHal(RecordingHal):
+            async def command(self, name, payload=None):
+                started.set()
+                await release.wait()
+                return {"response": {"ok": True}}
+
+        service = _service_with_hal(default_config(), LogService(emit_startup=False), WaitingHal())
+        first = asyncio.create_task(service.tare_force(unloaded_confirmed=True))
+        await started.wait()
+        try:
+            with pytest.raises(RuntimeError, match="already in progress"):
+                await service.tare_force(unloaded_confirmed=True)
+        finally:
+            release.set()
+            await first
+
+    asyncio.run(run())
+
+
+def test_nidaq_single_side_tare_keeps_existing_safety_gate(monkeypatch) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    config = default_config()
+    config["force"]["source"] = "nidaq"
+    service = _service(config, LogService(emit_startup=False))
+    assert asyncio.run(service.tare_force("right"))["side"] == "right"
+    assert service.telemetry.force_tare_calls == 1
+    service.safety.interrupt(emergency=True)
+    with pytest.raises(RuntimeError, match="emergency stop active"):
+        asyncio.run(service.tare_force("right"))
+    assert service.telemetry.force_tare_calls == 1
 
 
 def test_manual_axis_move_logs_structured_event(monkeypatch: pytest.MonkeyPatch) -> None:

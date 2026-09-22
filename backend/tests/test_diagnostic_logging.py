@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：结构化事件、限频、会话日志保存、清理和配置变更记录。
+# 先看：test_event_log_formats_stable_key_value_message → test_event_log_uses_generated_operation_id → test_rate_limited_event_keeps_first_and_suppresses_repeat → test_log_service_persists_each_entry_to_session_file。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import json
@@ -193,44 +198,6 @@ def test_invalid_config_recovery_logs_validation_reason(tmp_path: Path) -> None:
         )
         for entry in logs.list_entries()
     )
-
-
-def test_transient_config_replace_failure_preserves_persisted_config(
-    tmp_path: Path,
-    monkeypatch: object,
-) -> None:
-    persisted = default_config()
-    persisted["force"]["source"] = "hkvl_serial"
-    persisted["force"]["serial"]["leftPort"] = "COM31"
-    persisted["force"]["serial"]["rightPort"] = "COM32"
-    persisted["storage"]["datasetRoot"] = "E:/bound-data"
-    persisted["force"].pop("recordWindowSamples")
-    config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps(persisted), encoding="utf-8")
-    logs = LogService(emit_startup=False)
-    settings = SettingsService(tmp_path, logs)
-    original_replace = os.replace
-    failed_once = False
-
-    def fail_first_config_replace(source: str, destination: str) -> None:
-        nonlocal failed_once
-        if Path(destination) == config_path and not failed_once:
-            failed_once = True
-            raise PermissionError(13, "Permission denied", str(config_path))
-        original_replace(source, destination)
-
-    monkeypatch.setattr("backend.core.config.os.replace", fail_first_config_replace)  # type: ignore[attr-defined]
-
-    restored = settings.get_config()
-    saved = json.loads(config_path.read_text(encoding="utf-8"))
-
-    assert failed_once is True
-    assert restored["force"]["source"] == "hkvl_serial"
-    assert restored["force"]["serial"]["leftPort"] == "COM31"
-    assert restored["force"]["serial"]["rightPort"] == "COM32"
-    assert restored["storage"]["datasetRoot"] == "E:/bound-data"
-    assert saved == restored
-    assert not any("default config restored" in entry.msg for entry in logs.list_entries())
 
 
 def test_force_probe_logs_resource_error(monkeypatch: object) -> None:

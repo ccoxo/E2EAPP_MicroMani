@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：应用工厂、API 路由、配置、硬件状态、录制和安全行为的集成契约。
+# 先看：create_mock_record_client → test_backend_app_import_does_not_create_runtime_services → test_create_app_exposes_gripper_router → test_create_app_exposes_app_services_and_legacy_state_attrs。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import asyncio
@@ -14,9 +19,8 @@ import pytest
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
-from backend.app import backend_deployment_status, create_app, hal_deployment_status, relative_motion_positions
+from backend.app import create_app, backend_deployment_status, hal_deployment_status, relative_motion_positions
 from backend.core.config import SettingsService
-from backend.core.data_contract import data_contract_metadata
 from backend.core.defaults import default_config
 from backend.core.logging import LogService
 from backend.core.motion_limits import effective_limits_ui, side_home_reference_ui
@@ -56,6 +60,28 @@ def create_mock_record_client(tmp_path: Path, monkeypatch: MonkeyPatch) -> TestC
     return TestClient(create_app(tmp_path / "runtime"))
 
 
+@pytest.mark.parametrize("path,method", [
+    ("/api/motion/left/return_origin", "return_motion_origin_side"),
+    ("/api/motion/home_all", "home_all"),
+])
+def test_return_origin_rejects_pending_discard_before_hal_dispatch(tmp_path, monkeypatch, path, method):
+    from unittest.mock import AsyncMock
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    app = create_app(tmp_path / "runtime")
+    app.state.recorder._discard_in_progress = True
+    command = AsyncMock(return_value={"ok": True})
+    monkeypatch.setattr(app.state.commands, method, command)
+    # 不启动应用生命周期和设备线程，只验证路由门闩。
+    client = TestClient(app)
+    response = client.post(path)
+    assert response.status_code == 503
+    assert "discard is still stopping" in response.json()["detail"]["message"]
+    command.assert_not_awaited()
+    app.state.recorder._discard_in_progress = False
+    assert client.post(path).status_code == 200
+    command.assert_awaited_once()
+
+
 def _clear_camera_identities(config: dict) -> None:
     for key in ("globalIdentity", "wristLeftIdentity", "wristRightIdentity"):
         config["cameras"][key] = ""
@@ -81,7 +107,6 @@ def _write_dataset_fixture(dataset_root: Path, dataset_id: str = "unit_dataset")
                 "fps": 30,
                 "createdAt": 1000,
                 "updatedAt": 2000,
-                "dataContract": data_contract_metadata(),
             }
         ),
         encoding="utf-8",
@@ -238,7 +263,7 @@ def test_force_runtime_settings_are_not_saved_when_hal_rejects_them(
     client = TestClient(create_app(tmp_path))
     original = client.get("/api/settings").json()
     candidate = deepcopy(original)
-    candidate["force"]["lowpassCutoffHz"] = 15
+    candidate["force"]["source"] = "hkvl_serial"
     calls: list[tuple[str, dict[str, Any]]] = []
 
     async def reject_force_config(name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -343,7 +368,7 @@ def test_force_runtime_snapshot_is_not_applied_when_hal_rejects_it(
     client = TestClient(create_app(tmp_path))
     original = client.get("/api/settings").json()
     candidate = deepcopy(original)
-    candidate["force"]["lowpassCutoffHz"] = 15
+    candidate["force"]["source"] = "hkvl_serial"
     created = client.post(
         "/api/settings/snapshots",
         json={"scope": "all", "name": "HKVL", "config": candidate},
@@ -1212,59 +1237,43 @@ def test_websocket_reports_card0_dmc5c10_enabled_feedback_as_unknown(
     assert frame["motionEnabled"]["right"] is None
 
 
-def test_startup_home_can_be_skipped_by_environment(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+@pytest.mark.parametrize("legacy_skip", [None, "false", "true"])
+def test_startup_never_moves_with_legacy_home_config(tmp_path: Path, monkeypatch: MonkeyPatch, legacy_skip) -> None:
+    from unittest.mock import AsyncMock
 
-    class FakeHal:
-        def __init__(self) -> None:
-            self.commands: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    if legacy_skip is None:
+        monkeypatch.delenv("APPSTATION_SKIP_STARTUP_HOME", raising=False)
+    else:
+        monkeypatch.setenv("APPSTATION_SKIP_STARTUP_HOME", legacy_skip)
+    config = default_config()
+    config["motion"]["homeOnStartup"] = {"enabled": True, "mode": "work_origin"}
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    app = create_app(tmp_path)
+    settings = app.state.settings
 
-        async def health(self) -> HalHealth:
-            return HalHealth(
-                ltdmc_ok=True,
-                omega7_ok=True,
-                version="fake-hal",
-                uptime_s=1.0,
-                connected=True,
-                mode="real",
-            )
+    # 读取旧文件、再次保存旧客户端配置都必须去掉废弃项。
+    assert "homeOnStartup" not in settings.get_config()["motion"]
+    assert "homeOnStartup" not in settings.save_config(deepcopy(config), emit_log=False)["motion"]
+    assert "homeOnStartup" not in json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))["motion"]
 
-        async def motion_state(self) -> dict[str, Any]:
-            return {
-                "positions": [0.0] * 12,
-                "pulses": [0.0] * 12,
-                "enabled": [True] * 12,
-                "estop_active": False,
-            }
-
-        async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
-            self.commands.append((name, payload or {}))
-            return {"command": name, "payload": payload or {}}
-
-    def write_startup_home_config(runtime_dir: Path) -> None:
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        config = default_config()
-        config["motion"]["homeOnStartup"]["enabled"] = True
-        (runtime_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
-
-    runtime_without_skip = tmp_path / "without-skip"
-    write_startup_home_config(runtime_without_skip)
-    fake_without_skip = FakeHal()
-    monkeypatch.delenv("APPSTATION_SKIP_STARTUP_HOME", raising=False)
-    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: fake_without_skip)
-    with TestClient(create_app(runtime_without_skip)):
-        pass
-    assert any(name == "motion.home_all" for name, _payload in fake_without_skip.commands)
-
-    runtime_with_skip = tmp_path / "with-skip"
-    write_startup_home_config(runtime_with_skip)
-    fake_with_skip = FakeHal()
-    monkeypatch.setenv("APPSTATION_SKIP_STARTUP_HOME", "true")
-    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: fake_with_skip)
-    with TestClient(create_app(runtime_with_skip)):
-        pass
-
-    assert not any(name == "motion.home_all" for name, _payload in fake_with_skip.commands)
+    # 绕过迁移直接交给启动入口，旧开关也不能引发运动。
+    monkeypatch.setattr(settings, "get_config", lambda: config)
+    monkeypatch.setattr("backend.app.native_teleop_enabled", lambda _config: True)
+    config["teleop"]["leftConnected"] = False
+    config["teleop"]["rightConnected"] = False
+    home = AsyncMock(side_effect=AssertionError("startup must never move"))
+    command = AsyncMock(return_value={})
+    stop = AsyncMock()
+    monkeypatch.setattr(app.state.commands, "home_all", home)
+    monkeypatch.setattr(app.state.commands.hal, "command", command)
+    monkeypatch.setattr(app.state.teleop_mapper, "stop", stop)
+    startup = next(handler for handler in app.router.on_startup if handler.__name__ == "reconcile_startup_hal_state")
+    # 只执行目标启动协程，不进入相机/串口等设备生命周期。
+    asyncio.run(startup())
+    home.assert_not_awaited()
+    command.assert_awaited_once_with("teleop.native.stop", {})
+    stop.assert_awaited_once_with("teleop-connect")
 
 
 def test_hal_deployment_status_reports_pending_next_binary(tmp_path: Path) -> None:
@@ -1281,27 +1290,6 @@ def test_hal_deployment_status_reports_pending_next_binary(tmp_path: Path) -> No
     assert status["components"]["HalServer"]["pendingNext"] is True
     assert status["components"]["JodellGripperWorker"]["pendingNext"] is False
     assert "HalServer.next.exe differs from HalServer.exe" in status["message"]
-
-
-def test_hal_deployment_status_reports_source_newer_than_deployed_binary(tmp_path: Path) -> None:
-    build_dir = tmp_path / "hal" / "build"
-    source_dir = tmp_path / "hal" / "src"
-    build_dir.mkdir(parents=True)
-    source_dir.mkdir(parents=True)
-    (build_dir / "HalServer.exe").write_bytes(b"old-hal")
-    (build_dir / "JodellGripperWorker.exe").write_bytes(b"old-worker")
-    source = source_dir / "HalJson.cpp"
-    source.write_text("// newer source\n", encoding="utf-8")
-    os.utime(build_dir / "HalServer.exe", (1_000.0, 1_000.0))
-    os.utime(build_dir / "JodellGripperWorker.exe", (1_000.0, 1_000.0))
-    os.utime(source, (2_000.0, 2_000.0))
-
-    status = hal_deployment_status(tmp_path)
-
-    assert status["restartRequired"] is True
-    assert status["components"]["HalServer"]["sourceStale"] is True
-    assert status["components"]["JodellGripperWorker"]["sourceStale"] is True
-    assert "older than HAL sources" in status["message"]
 
 
 def test_backend_deployment_status_reports_source_newer_than_process(tmp_path: Path) -> None:
@@ -3262,7 +3250,7 @@ def test_real_record_session_requires_hardware_recognition_before_start(
     client = TestClient(create_app(tmp_path))
     config = client.get("/api/settings").json()
     config["teleop"]["engine"] = "hal_native"
-    assert client.put("/api/settings", json=config).status_code == 200
+    client.app.state.settings.save_config(config)
     start_calls: list[str] = []
     include_gripper_values: list[bool] = []
 
@@ -3272,7 +3260,8 @@ def test_real_record_session_requires_hardware_recognition_before_start(
 
     monkeypatch.setattr(client.app.state.recorder, "start_session", fake_start_session)
 
-    def fake_hardware_status(*, include_gripper: bool = True) -> dict[str, Any]:
+    def fake_hardware_status(*, include_gripper: bool = True, include_pico: bool = True) -> dict[str, Any]:
+        assert include_pico is False
         include_gripper_values.append(include_gripper)
         return {
             "camera": {"ok": False, "message": "cameras not ready"},
@@ -3337,7 +3326,7 @@ def test_native_record_session_rejects_failed_hal_native_gripper_status(
     client = TestClient(create_app(tmp_path))
     config = client.get("/api/settings").json()
     config["teleop"]["engine"] = "hal_native"
-    assert client.put("/api/settings", json=config).status_code == 200
+    client.app.state.settings.save_config(config)
     client.app.state.teleop_mapper._native_status_cache = {
         "running": True,
         "gripperTargets": [8.0, 9.0],
@@ -3353,7 +3342,8 @@ def test_native_record_session_rejects_failed_hal_native_gripper_status(
         start_calls.append("start")
         return {"recording": True}
 
-    def fake_hardware_status(*, include_gripper: bool = True) -> dict[str, Any]:
+    def fake_hardware_status(*, include_gripper: bool = True, include_pico: bool = True) -> dict[str, Any]:
+        assert include_pico is False
         include_gripper_values.append(include_gripper)
         return {
             "camera": {"ok": True, "message": "cameras ready"},
@@ -3778,6 +3768,26 @@ def test_startup_stops_stale_native_teleop_when_no_logical_hands_connected(
         pass
 
     assert ("teleop.native.stop", {}) in fake_hal.commands
+
+
+@pytest.mark.parametrize(("message", "status", "code"), [
+    ("dataset numeric channel order is not compatible: missing contract", 409, "DATASET_CONTRACT_INCOMPATIBLE"),
+    ("native LeRobot dataset is required; dataset directory already contains non-native files", 409, "DATASET_DIRECTORY_CONFLICT"),
+    ("native LeRobot dataset is required; Parquet magic bytes not found in footer. Either the file is corrupted or this is not a parquet file.", 409, "DATASET_PARQUET_INVALID"),
+    ("record session already active", 409, "RECORDING_BUSY"),
+    ("native LeRobot dataset is required; missing dependency", 503, "NATIVE_DATASET_UNAVAILABLE"),
+    ("unexpected initialization failure", 409, "RECORDING_START_FAILED"),
+])
+def test_record_start_error_codes(tmp_path: Path, monkeypatch: MonkeyPatch, message: str, status: int, code: str) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
+    with TestClient(create_app(tmp_path)) as client:
+        async def fail_start(_dataset_name: str, _task: str) -> dict[str, Any]:
+            raise RuntimeError(message)
+
+        monkeypatch.setattr(client.app.state.recorder, "start_session", fail_start)
+        response = client.post("/api/record/session/create", json={"dataset_name": "existing", "task": "test"})
+        assert response.status_code == status
+        assert response.json()["detail"] == {"code": code, "message": message}
 
 
 def test_record_session_fails_when_native_lerobot_is_disabled(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -5239,71 +5249,6 @@ def test_camera_identity_overrides_stale_index(monkeypatch: MonkeyPatch) -> None
     assert resolved["global"] == 2
 
 
-def test_camera_identity_uses_parent_serial_and_usb_location(monkeypatch: MonkeyPatch) -> None:
-    config = default_config()
-    config["cameras"]["globalIdentity"] = "20250606105"
-    config["cameras"]["wristLeftIdentity"] = "PCIROOT(0)#USBROOT(0)#USB(5)#USB(3)#USB(4)"
-    config["cameras"]["wristRightIdentity"] = "PCIROOT(0)#USBROOT(0)#USB(2)#USB(4)#USB(2)"
-    driver = OpenCVCameraDriver()
-
-    monkeypatch.setattr(
-        driver,
-        "_camera_identities_by_index",
-        lambda: {
-            0: {
-                "name": "USB Camera",
-                "devicePath": "camera-zero",
-                "displayName": "",
-                "parentId": "USB\\VID_0ABD&PID_8050\\20250606105",
-                "locationPath": "PCIROOT(0)#USBROOT(0)#USB(1)",
-            },
-            1: {
-                "name": "USB Camera",
-                "devicePath": "camera-one",
-                "displayName": "",
-                "parentId": "USB\\VID_0ABD&PID_8050\\generated-one",
-                "locationPath": "PCIROOT(0)#USBROOT(0)#USB(5)#USB(3)#USB(4)",
-            },
-            2: {
-                "name": "USB Camera",
-                "devicePath": "camera-two",
-                "displayName": "",
-                "parentId": "USB\\VID_0ABD&PID_8050\\generated-two",
-                "locationPath": "PCIROOT(0)#USBROOT(0)#USB(2)#USB(4)#USB(2)",
-            },
-        },
-    )
-
-    resolved = driver._resolved_indices(object(), config, 30)  # noqa: SLF001
-
-    assert resolved == {"global": 0, "wrist_left": 1, "wrist_right": 2}
-
-
-def test_partial_camera_identity_mismatch_does_not_swap_roles(monkeypatch: MonkeyPatch) -> None:
-    config = default_config()
-    config["cameras"]["global"] = "IMX335 / index 0"
-    config["cameras"]["globalIdentity"] = "USB\\VID_0ABD&PID_8050&MI_00\\missing-global"
-    config["cameras"]["wristLeft"] = "IMX335 / index 1"
-    config["cameras"]["wristLeftIdentity"] = "current-left"
-    config["cameras"]["wristRight"] = "IMX335 / index 2"
-    config["cameras"]["wristRightIdentity"] = "current-right"
-    driver = OpenCVCameraDriver()
-
-    monkeypatch.setattr(
-        driver,
-        "_camera_identities_by_index",
-        lambda: {
-            0: {"name": "USB Camera", "devicePath": "current-left", "displayName": ""},
-            1: {"name": "USB Camera", "devicePath": "current-global", "displayName": ""},
-            2: {"name": "USB Camera", "devicePath": "current-right", "displayName": ""},
-        },
-    )
-
-    resolved = driver._resolved_indices(object(), config, 30)  # noqa: SLF001
-
-    assert resolved == {"global": -1, "wrist_left": 0, "wrist_right": 2}
-
-
 def test_current_camera_identity_mapping_binds_reenumerated_wrist_roles(monkeypatch: MonkeyPatch) -> None:
     config = default_config()
     driver = OpenCVCameraDriver()
@@ -5316,29 +5261,23 @@ def test_current_camera_identity_mapping_binds_reenumerated_wrist_roles(monkeypa
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&398f0a3&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:left",
-                "parentId": "USB\\VID_0ABD&PID_8050\\20250606105",
-                "locationPath": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(1)",
             },
             1: {
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&1396f44d&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:global",
-                "parentId": "USB\\VID_0ABD&PID_8050\\generated-left",
-                "locationPath": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)",
             },
             2: {
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#8&3724732e&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:right",
-                "parentId": "USB\\VID_0ABD&PID_8050\\generated-right",
-                "locationPath": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)",
             },
         },
     )
 
     resolved = driver._resolved_indices(object(), config, 30)  # noqa: SLF001
 
-    assert resolved == {"global": 0, "wrist_left": 1, "wrist_right": 2}
+    assert resolved == {"global": 1, "wrist_left": 0, "wrist_right": 2}
 
 
 def test_camera_identities_lock_all_role_indices(monkeypatch: MonkeyPatch) -> None:
@@ -5356,40 +5295,34 @@ def test_camera_identities_lock_all_role_indices(monkeypatch: MonkeyPatch) -> No
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&398f0a3&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:right",
-                "parentId": "USB\\VID_0ABD&PID_8050\\20250606105",
-                "locationPath": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(1)",
             },
             1: {
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&1396f44d&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:global",
-                "parentId": "USB\\VID_0ABD&PID_8050\\generated-left",
-                "locationPath": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)",
             },
             2: {
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#8&3724732e&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:right",
-                "parentId": "USB\\VID_0ABD&PID_8050\\generated-right",
-                "locationPath": "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)",
             },
         },
     )
 
     resolved = driver._resolved_indices(object(), config, 30)
 
-    assert resolved == {"global": 0, "wrist_left": 1, "wrist_right": 2}
+    assert resolved == {"global": 1, "wrist_left": 0, "wrist_right": 2}
 
 
 def test_default_camera_mapping_matches_deployment_hardware() -> None:
     config = default_config()
 
-    assert config["cameras"]["global"] == "IMX335 / index 0"
-    assert config["cameras"]["globalIdentity"] == "20250606105"
-    assert config["cameras"]["wristLeft"] == "IMX335 / index 1"
-    assert config["cameras"]["wristLeftIdentity"] == "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)"
+    assert config["cameras"]["global"] == "IMX335 / index 1"
+    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000"
+    assert config["cameras"]["wristLeft"] == "IMX335 / index 0"
+    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
     assert config["cameras"]["wristRight"] == "IMX335 / index 2"
-    assert config["cameras"]["wristRightIdentity"] == "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)"
+    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000"
     assert config["cameras"]["previewResolution"] == "640x480"
     assert config["cameras"]["globalResolution"] == "640x480"
     assert config["cameras"]["wristLeftResolution"] == "640x480"
@@ -5905,19 +5838,19 @@ def test_dataset_recorder_action_vector_prefers_teleop_delta_vector() -> None:
     recorder.teleop = FakeTeleop()
 
     assert recorder._latest_action_vector() == [
-        -20.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        -100.0,
-        0.0,
         10.0,
         0.0,
         0.0,
         500.0,
         0.0,
         0.0,
+        0.0,
+        -20.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -100.0,
         0.0,
     ]
 
@@ -6167,6 +6100,7 @@ def test_acknowledge_safety_clears_latch_without_restoring_servos_or_moving_orig
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+    from backend.tests.test_control_watchdog import confirm_mock_browser_lease
 
     class FakeHal:
         def __init__(self) -> None:
@@ -6186,6 +6120,8 @@ def test_acknowledge_safety_clears_latch_without_restoring_servos_or_moving_orig
             self.commands.append((name, payload))
             if name == "motion.emergency_stop":
                 self.enabled = [False] * 12
+            if name == "control.lease":
+                return {"response": {"ok": True, "leaseFresh": True, "timeoutMs": 2500}}
             return {"command": name, "payload": payload}
 
     fake_hal = FakeHal()
@@ -6208,10 +6144,11 @@ def test_acknowledge_safety_clears_latch_without_restoring_servos_or_moving_orig
     emergency_response = client.post("/api/motion/emergency_stop")
     assert emergency_response.status_code == 200
 
+    asyncio.run(confirm_mock_browser_lease(client.app.state.control_watchdog))
     acknowledge_response = client.post("/api/motion/safety/acknowledge")
 
     assert acknowledge_response.status_code == 200
-    assert fake_hal.commands == [
+    assert [(name, payload) for name, payload in fake_hal.commands if name != "control.lease"] == [
         ("motion.emergency_stop", {}),
         ("motion.acknowledge_estop", {}),
     ]

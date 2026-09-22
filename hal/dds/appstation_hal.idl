@@ -1,3 +1,8 @@
+/*
+ * 阅读导航 05｜DDS 传输
+ * 职责：定义控制面 DDS 信封与命令请求/应答的线缆数据契约。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 module appstation {
   struct JsonEnvelope {
     uint64 stamp_unix_ms;
@@ -18,6 +23,20 @@ module appstation {
     boolean ok;
     string result_json;
     string error;
+  };
+
+  // 固定布局的高频控制状态；诊断文本最多 255 字节并以零结尾。
+  struct TeleopLeaderHandV2 {
+    uint64 flags;
+    double pose[6];
+    double gripper_gap;
+    int64 read_timestamp_ms;
+    char last_read_error[256];
+  };
+  struct TeleopLeaderStateV2 {
+    uint64 stamp_unix_ms;
+    uint64 stamp_monotonic_ms;
+    TeleopLeaderHandV2 hands[2];
   };
 
   struct TeleopHardwareTarget {

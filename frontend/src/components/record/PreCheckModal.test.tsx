@@ -1,9 +1,24 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+/*
+ * 阅读导航 07｜测试与验证
+ * 职责：验证录制前主手连接、必需原点侧和相机警告的判定。
+ * 先看：makeReadyForRecordPrecheck。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { MemoryRouter } from 'react-router-dom'
 import * as api from '../../api'
 import { defaultConfig, defaultDiagnostics } from '../../data'
 import { useTelemetryStore } from '../../stores/telemetry'
 import PreCheckModal from './PreCheckModal'
+
+function renderPreCheck(onConfirm = vi.fn(), onCancel = vi.fn()) {
+  return render(
+    <MemoryRouter>
+      <PreCheckModal open onConfirm={onConfirm} onCancel={onCancel} />
+    </MemoryRouter>,
+  )
+}
 
 function makeReadyForRecordPrecheck() {
   useTelemetryStore.setState((state) => ({
@@ -31,12 +46,7 @@ function makeReadyForRecordPrecheck() {
       },
       halOk: true,
       wsOk: true,
-      forceStatus: {
-        ...state.frame.forceStatus,
-        source: 'hkvl_serial',
-        calibration: { state: 'ready', progress: 1 },
-        safety: { latched: false, reason: '', canAcknowledge: true },
-      },
+      forceStatus: { source: 'hkvl_serial', calibration: { state: 'ready', progress: 100 }, safety: { latched: false, canAcknowledge: true } },
       cameras: state.frame.cameras.map((camera) => ({ ...camera, fps: 30, health: 'ok' })),
       teleopHands: state.frame.teleopHands.map((hand) =>
         hand.side === 'left'
@@ -53,6 +63,11 @@ function makeReadyForRecordPrecheck() {
               message: '',
             },
       ),
+    },
+    recordSession: {
+      ...state.recordSession,
+      participation: undefined,
+      forceTareActive: false,
     },
   }))
 }
@@ -78,11 +93,38 @@ afterEach(() => {
 })
 
 describe('PreCheckModal', () => {
+  it('HKVL 自检仅收到 ready_for_ack 时仍阻止录制，人工确认反馈 ready 后才能开始', () => {
+    makeReadyForRecordPrecheck()
+    useTelemetryStore.setState((state) => ({
+      recordSession: { ...state.recordSession, resetReturnedSides: ['left'] },
+      frame: { ...state.frame, forceStatus: { source: 'hkvl_serial', calibration: { state: 'ready_for_ack' }, safety: { latched: true, canAcknowledge: true } } },
+    }))
+    renderPreCheck()
+    fireEvent.click(screen.getByRole('checkbox', { name: '已完成' }))
+    expect(screen.getByRole('button', { name: '确认开始' })).toBeDisabled()
+    act(() => useTelemetryStore.setState((state) => ({ frame: {
+      ...state.frame, forceStatus: { source: 'hkvl_serial', calibration: { state: 'ready' }, safety: { latched: false, canAcknowledge: true } },
+    } })))
+    expect(screen.getByRole('button', { name: '确认开始' })).toBeEnabled()
+  })
+
+  it('HKVL 配置下缺失自检遥测不能视为已通过', () => {
+    makeReadyForRecordPrecheck()
+    useTelemetryStore.setState((state) => ({
+      recordSession: { ...state.recordSession, resetReturnedSides: ['left'] },
+      frame: { ...state.frame, forceStatus: undefined },
+    }))
+    renderPreCheck()
+    fireEvent.click(screen.getByRole('checkbox', { name: '已完成' }))
+    expect(screen.getByRole('button', { name: '确认开始' })).toBeDisabled()
+  })
+
   it('allows a single logically connected Omega hand to satisfy the record hardware check', () => {
     const onConfirm = vi.fn()
     makeReadyForRecordPrecheck()
+    useTelemetryStore.setState((state) => ({ recordSession: { ...state.recordSession, resetReturnedSides: ['left'] } }))
 
-    render(<PreCheckModal open onConfirm={onConfirm} onCancel={vi.fn()} />)
+    renderPreCheck(onConfirm)
 
     const confirmButton = screen.getByRole('button', { name: '确认开始' })
     expect(confirmButton).toBeDisabled()
@@ -101,7 +143,7 @@ describe('PreCheckModal', () => {
     const captureOriginSpy = vi.spyOn(api, 'captureMotionOrigin').mockResolvedValue({ ok: true })
     const homeMotionSideSpy = vi.spyOn(api, 'homeMotionSide').mockResolvedValue({ ok: true })
 
-    render(<PreCheckModal open onConfirm={vi.fn()} onCancel={vi.fn()} />)
+    renderPreCheck()
 
     fireEvent.click(screen.getByRole('button', { name: '自动回工作原点' }))
 
@@ -115,6 +157,7 @@ describe('PreCheckModal', () => {
   it('allows low camera fps as a warning-only precheck condition', () => {
     const onConfirm = vi.fn()
     makeReadyForRecordPrecheck()
+    useTelemetryStore.setState((state) => ({ recordSession: { ...state.recordSession, resetReturnedSides: ['left'] } }))
     useTelemetryStore.setState((state) => ({
       frame: {
         ...state.frame,
@@ -122,52 +165,15 @@ describe('PreCheckModal', () => {
       },
     }))
 
-    render(<PreCheckModal open onConfirm={onConfirm} onCancel={vi.fn()} />)
+    renderPreCheck(onConfirm)
 
     fireEvent.click(screen.getByRole('checkbox'))
 
-    const confirmButton = screen.getAllByRole('button').find((button) => button.className.includes('ant-btn-primary'))
+    const confirmButton = screen.getAllByRole('button').find((button) => button.className.includes('ui-btn-primary'))
     if (!confirmButton) throw new Error('confirm button not found')
     expect(confirmButton).toBeEnabled()
     fireEvent.click(confirmButton)
     expect(onConfirm).toHaveBeenCalledTimes(1)
-  })
-
-  it('blocks an HKVL recording session until startup tare is acknowledged', async () => {
-    makeReadyForRecordPrecheck()
-    useTelemetryStore.setState((state) => ({
-      config: {
-        ...state.config,
-        force: { ...state.config.force, source: 'hkvl_serial' },
-      },
-      frame: {
-        ...state.frame,
-        forceStatus: {
-          ...state.frame.forceStatus,
-          source: 'hkvl_serial',
-          calibration: { state: 'waiting_sensors', progress: 0 },
-          safety: { latched: true, canAcknowledge: false },
-        },
-      },
-    }))
-
-    render(<PreCheckModal open onConfirm={vi.fn()} onCancel={vi.fn()} />)
-    fireEvent.click(screen.getByRole('checkbox'))
-    const confirmButton = document.querySelector('.ant-modal-footer .ant-btn-primary') as HTMLButtonElement
-    expect(confirmButton).toBeDisabled()
-
-    useTelemetryStore.setState((state) => ({
-      frame: {
-        ...state.frame,
-        forceStatus: {
-          ...state.frame.forceStatus,
-          calibration: { state: 'ready', progress: 100 },
-          safety: { latched: false, canAcknowledge: true },
-        },
-      },
-    }))
-
-    await vi.waitFor(() => expect(confirmButton).toBeEnabled())
   })
 
   it('does not label direct camera capture as worker fallback', () => {
@@ -185,7 +191,7 @@ describe('PreCheckModal', () => {
       },
     }))
 
-    render(<PreCheckModal open onConfirm={vi.fn()} onCancel={vi.fn()} />)
+    renderPreCheck()
 
     expect(screen.queryByText(/fallback/)).not.toBeInTheDocument()
   })
@@ -199,7 +205,7 @@ describe('PreCheckModal', () => {
       },
     }))
 
-    render(<PreCheckModal open onConfirm={vi.fn()} onCancel={vi.fn()} />)
+    renderPreCheck()
 
     const returnButton = screen.getAllByRole('button').find((button) => button.style.marginTop === '6px')
     if (!returnButton) throw new Error('return-origin button not found')
@@ -219,7 +225,7 @@ describe('PreCheckModal', () => {
       },
     }))
 
-    render(<PreCheckModal open onConfirm={vi.fn()} onCancel={vi.fn()} />)
+    renderPreCheck()
 
     expect(screen.getByRole('button', { name: '自动回工作原点' })).toBeDisabled()
   })
@@ -237,10 +243,24 @@ describe('PreCheckModal', () => {
       },
     }))
 
-    render(<PreCheckModal open onConfirm={vi.fn()} onCancel={vi.fn()} />)
+    renderPreCheck()
 
     const returnButton = screen.getAllByRole('button').find((button) => button.style.marginTop === '6px')
     if (!returnButton) throw new Error('return-origin button not found')
     expect(returnButton).toBeEnabled()
   })
+})
+
+it('single operator-left participation only returns hardware right and ignores the unused master', async () => {
+  makeReadyForRecordPrecheck()
+  const home = vi.spyOn(api, 'returnMotionOriginSide').mockResolvedValue({} as never)
+  useTelemetryStore.setState((state) => ({
+    recordSession: { ...state.recordSession, participation: { version: 'appstation.participation.v1', arms: ['left'], grippers: [] }, resetReturnedSides: [] },
+    frame: { ...state.frame, motionEnabled: { left: false, right: true }, motionAxisEnabled: { left: [false, false, false, false, false, false], right: [true, true, true, true, true, true] },
+      teleopHands: state.frame.teleopHands.map((hand) => ({ ...hand, connected: hand.side === 'left', lastReadOk: hand.side === 'left' })) },
+  }))
+  renderPreCheck()
+  fireEvent.click(screen.getByRole('button', { name: '自动回工作原点' }))
+  await vi.waitFor(() => expect(home).toHaveBeenCalledWith('right'))
+  expect(home).not.toHaveBeenCalledWith('left')
 })

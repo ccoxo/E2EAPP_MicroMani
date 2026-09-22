@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 02｜前端契约与状态
+ * 职责：提供前端默认配置、诊断初值与显示标签；包含操作者侧和硬件侧的转换函数。
+ * 先看：RobotSide → hardwareSideForOperatorSide → operatorSideForHardwareSide → operatorSideLabel。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 import type { AppConfig, DiagnosticItem, LogChannel } from './types'
 
 export const axisNames = [
@@ -31,6 +37,16 @@ export function operatorSideForHardwareSide(side: RobotSide): RobotSide {
 
 export function operatorSideLabel(side: RobotSide) {
   return side === 'left' ? '左臂' : '右臂'
+}
+
+/** 力觉数据源对应的显示型号，随 config.force.source 实时切换。 */
+export function forceSensorModelLabel(source?: string) {
+  return source === 'hkvl_serial' ? 'HKVL-36A' : 'Nano-17'
+}
+
+/** 力觉主通道显示单位：HKVL 用 N，Nano-17 用 mN。 */
+export function forceSensorUnitLabel(source?: string) {
+  return source === 'hkvl_serial' ? 'N / Nm' : 'mN'
 }
 
 export function hardwareChannelLabel(side: RobotSide) {
@@ -136,7 +152,7 @@ export const cameraHardwareSpecs = {
   global: {
     label: '全局相机',
     model: 'IMX335',
-    device: 'IMX335 / index 0',
+    device: 'IMX335 / index 1',
     rawResolution: '1920x1080',
     previewResolution: '640x480',
     fps: 30,
@@ -145,7 +161,7 @@ export const cameraHardwareSpecs = {
   wrist_left: {
     label: '左腕相机',
     model: 'IMX335',
-    device: 'IMX335 / index 1',
+    device: 'IMX335 / index 0',
     rawResolution: '1920x1080',
     previewResolution: '640x480',
     fps: 30,
@@ -390,12 +406,12 @@ export const defaultConfig: AppConfig = {
     apiConfirmed: false,
   },
   cameras: {
-    global: 'IMX335 / index 0',
-    globalIdentity: '20250606105',
-    wristLeft: 'IMX335 / index 1',
-    wristLeftIdentity: 'PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(5)#USB(3)#USB(4)',
+    global: 'IMX335 / index 1',
+    globalIdentity: 'USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000',
+    wristLeft: 'IMX335 / index 0',
+    wristLeftIdentity: 'USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000',
     wristRight: 'IMX335 / index 2',
-    wristRightIdentity: 'PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(4)#USB(2)',
+    wristRightIdentity: 'USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000',
     previewResolution: '640x480',
     globalResolution: '640x480',
     wristLeftResolution: '640x480',
@@ -511,10 +527,6 @@ export const defaultConfig: AppConfig = {
       updatedAt: 1778586070000,
     },
     relativeSoftLimits: structuredClone(defaultRelativeSoftLimits),
-    homeOnStartup: {
-      enabled: false,
-      mode: 'work_origin',
-    },
     leftProfile: structuredClone(defaultMotionProfile),
     rightProfile: structuredClone(defaultMotionProfile),
     leftSoftLimits: structuredClone(defaultLeftSoftLimits),

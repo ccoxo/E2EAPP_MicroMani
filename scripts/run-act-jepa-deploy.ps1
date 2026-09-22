@@ -1,3 +1,8 @@
+# 阅读导航 08｜启动、部署与工具
+# 职责：装配 ACT-JEPA 部署路径、相机、控制侧和动作平滑参数，并启动外部策略程序。
+# 先看：Convert-ToBooleanParameter。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 param(
   [string]$CheckpointDir = "F:\model\grab_screw\act_jepa_tarimg_same_v2\050000",
   [string]$Checkpoint = "pretrained_model",
@@ -43,7 +48,6 @@ param(
   [object]$ClipActionToStats = $true,
   [switch]$PrintNormalizedState,
   [switch]$Send,
-  [switch]$SkipStartupHome,
   [switch]$WithFrontend
 )
 
@@ -101,9 +105,6 @@ if ($WithFrontend) {
     "-BackendPort", "$BackendPort",
     "-FrontendPort", "$FrontendPort"
   )
-  if ($SkipStartupHome) {
-    $stackArgs += "-SkipStartupHome"
-  }
 
   Write-Host "Starting AppStation stack with frontend..."
   & powershell @stackArgs | Out-Host
@@ -128,7 +129,6 @@ if ($WithFrontend) {
 
   $env:APPSTATION_HAL_MODE = "real"
   $env:APPSTATION_HAL_BASE_URL = "http://127.0.0.1:8091"
-  $env:APPSTATION_SKIP_STARTUP_HOME = if ($SkipStartupHome) { "true" } else { "false" }
   $env:APPSTATION_DISABLE_CAMERA_PROBE = "true"
   Write-Host "Starting backend on $backendUrl..."
   $backend = Start-Process `
@@ -144,7 +144,6 @@ if ($WithFrontend) {
     hal = "http://127.0.0.1:8091"
     frontend = "disabled"
     cameraProbe = "disabled"
-    skipStartupHome = [bool]$SkipStartupHome
   } | Format-List | Out-Host
 }
 
@@ -158,8 +157,6 @@ do {
       $response.data.state.Count -eq 14 -and
       $response.data.pulses.Count -eq 12 -and
       $response.data.force_left.Count -eq 6 -and
-      $response.data.dataContract.version -eq "appstation.dual_arm.operator_sides.v2" -and
-      $response.data.dataContract.sideOrder -eq "operator_left_then_operator_right" -and
       $response.data.force_right.Count -eq 6
     ) {
       break
@@ -170,7 +167,7 @@ do {
 } while ((Get-Date) -lt $deadline)
 
 if ((Get-Date) -ge $deadline) {
-  throw "Policy bridge did not expose the required numeric side-order contract at $backendUrl/api/policy/observation"
+  throw "Policy bridge did not become ready at $backendUrl/api/policy/observation"
 }
 
 $env:PYTHONPATH = "$PolicySourceDir;$env:PYTHONPATH"

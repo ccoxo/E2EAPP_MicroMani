@@ -1,3 +1,9 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：独立夹爪工作进程入口；执行父进程发来的 DLL 操作并返回结果。
+ * 先看：main。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "JodellGripperDriver.h"
 
 #include <algorithm>

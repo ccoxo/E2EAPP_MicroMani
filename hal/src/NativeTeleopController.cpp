@@ -1,4 +1,12 @@
+/*
+ * 阅读导航 06｜HAL 硬件与安全
+ * 职责：管理主手采样与遥操作状态机，计算映射、滤波、门控和夹爪跟随。
+ * 先看：NativeTeleopController::configure → NativeTeleopController::configureGripper → NativeTeleopController::configureGripperProtection → NativeTeleopController::start。
+ * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+ */
 #include "NativeTeleopController.h"
+
+#include <cstdio>
 
 #include <algorithm>
 #include <cctype>
@@ -207,9 +215,10 @@ std::array<double, 6> omegaPoseToSemantic(const std::array<double, 6>& raw, cons
 
 NativeTeleopController::NativeTeleopController(
     LTDMCDriver& motion,
+    MotionExecutor& executor,
     Omega7Driver& omega,
     JodellGripperDriver& gripper)
-    : motion_(motion), omega_(omega), gripper_(gripper) {
+    : motion_(motion), executor_(executor), omega_(omega), gripper_(gripper) {
   // 默认软限位使用 UI 单位：平移 um，旋转 degree。后端配置会在 configure 中覆盖。
   for (auto& sideLimits : config_.softLimits) {
     sideLimits = {
@@ -238,7 +247,14 @@ NativeTeleopController::~NativeTeleopController() {
   stop();
 }
 
-void NativeTeleopController::configure(const NativeTeleopConfig& config) {
+void NativeTeleopController::configure(const NativeTeleopConfig& config,
+    std::optional<std::uint64_t> expectedEpoch) {
+  const auto motionEpoch = expectedEpoch.value_or(motion_.commandEpoch());
+  std::scoped_lock lifecycleLock(lifecycleMutex_);
+  if ((config.leftGravityCompensation || config.rightGravityCompensation)
+      && !motion_.commandEpochAllowed(motionEpoch)) {
+    throw std::runtime_error("native force configuration cancelled by emergency stop");
+  }
   NativeTeleopConfig normalized = config;
   // 统一兼容旧字段和非法字段，避免控制环里反复判断多种拼写。
   if (normalized.controlMode == "incremental") {
@@ -357,7 +373,27 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config) {
       normalized.leftGravityCompensation,
       normalized.rightGravityCompensation,
       normalized.leftGravityScale,
-      normalized.rightGravityScale);
+      normalized.rightGravityScale,
+      [&]() { return motion_.commandEpochAllowed(motionEpoch); });
+}
+
+void NativeTeleopController::prepareReplayGripper(const JodellGripperConfig& config, std::uint64_t epoch,
+    const std::array<bool, 2>& participating) {
+  if (running() || !motion_.commandEpochAllowed(epoch)) {
+    throw std::runtime_error("replay gripper preparation blocked by teleop or safety stop");
+  }
+  configureGripper(config);
+  {
+    std::scoped_lock lock(mutex_);
+    config_.gripperParticipating = participating;
+    gripperPositionOk_ = {false, false};
+    gripperPositionSampleTs_ = {0, 0};
+  }
+  startGripperWorker();
+  if (!motion_.commandEpochAllowed(epoch)) {
+    requestEmergencyStop();
+    throw std::runtime_error("replay gripper preparation cancelled by safety stop");
+  }
 }
 
 void NativeTeleopController::configureGripper(const JodellGripperConfig& config) {
@@ -382,7 +418,25 @@ void NativeTeleopController::configureGripperProtection(bool enabled, double min
       std::max(0.001, config_.gripper.strokeMm));
 }
 
-void NativeTeleopController::start(bool leftConnected, bool rightConnected) {
+void NativeTeleopController::start(bool leftConnected, bool rightConnected,
+    std::optional<std::uint64_t> expectedEpoch) {
+  const auto motionEpoch = expectedEpoch.value_or(motion_.commandEpoch());
+  std::scoped_lock lifecycleLock(lifecycleMutex_);
+  if (!motion_.commandEpochAllowed(motionEpoch)) {
+    throw std::runtime_error("emergency stop active; acknowledge safety before native teleop start");
+  }
+  if (running_.load()) return;
+  if (worker_.joinable()) worker_.join();
+  {
+    std::scoped_lock lock(mutex_);
+    executor_.beginNative(hardwareTargetSequence_, motionEpoch);
+  }
+  // 初始化中途失败不能留下有效的 DDS 执行许可；停止/重启再清理持有的控制权。
+  struct StartPermission {
+    MotionExecutor& executor;
+    bool completed{false};
+    ~StartPermission() { if (!completed) executor.revokeNative(); }
+  } permission{executor_};
   bool gripperTeleopEnabled = false;
   {
     std::scoped_lock lock(mutex_);
@@ -428,26 +482,41 @@ void NativeTeleopController::start(bool leftConnected, bool rightConnected) {
   } else {
     stopGripperWorker();
   }
-  if (running_.exchange(true)) {
-    // 控制线程已运行时 start 只更新配置/连接状态，不重复创建线程。
-    return;
+  if (!motion_.commandEpochAllowed(motionEpoch)) {
+    requestEmergencyStop();
+    throw std::runtime_error("native teleop start cancelled by emergency stop");
   }
-  worker_ = std::thread(&NativeTeleopController::loop, this);
+  running_.store(true);
+  try {
+    worker_ = std::thread([this]() {
+      try { loop(); }
+      catch (const std::exception& error) { reportControlFailure(error.what()); }
+      catch (...) { reportControlFailure("unknown C++ exception in native control worker"); }
+    });
+  } catch (...) {
+    reportControlFailure("native control worker could not be created");
+    throw;
+  }
+  if (!motion_.commandEpochAllowed(motionEpoch)) {
+    requestEmergencyStop();
+    throw std::runtime_error("native teleop start cancelled by emergency stop");
+  }
+  permission.completed = true;
 }
 
 void NativeTeleopController::stop() {
+  std::scoped_lock lifecycleLock(lifecycleMutex_);
   // 先停控制线程，再把两侧 teleop 目标同步到当前位置。
-  if (running_.exchange(false)) {
-    if (worker_.joinable()) {
-      worker_.join();
-    }
-  }
+  running_.store(false);
+  executor_.revokeNative();
+  // 急停已把 running 清零，但 std::thread 仍需回收才能重启或析构。
+  if (worker_.joinable()) worker_.join();
   try {
-    motion_.stopTeleopSide(Side::Left);
-    motion_.stopTeleopSide(Side::Right);
+    executor_.endNative();
   } catch (const std::exception& exc) {
-    std::scoped_lock lock(mutex_);
-      lastError_ = exc.what();
+    reportControlFailure(exc.what());
+  } catch (...) {
+    reportControlFailure("unknown C++ exception while releasing native motion control");
   }
   stopGripperWorker();
   std::scoped_lock lock(mutex_);
@@ -476,10 +545,15 @@ void NativeTeleopController::stop() {
     lastOutputDeltaUi_ = {};
 }
 
-void NativeTeleopController::requestEmergencyStop() {
+void NativeTeleopController::latchControlStop() noexcept {
+  executor_.revokeNative();
   running_.store(false);
   gripperWorkerRunning_.store(false);
   gripperCv_.notify_all();
+}
+
+void NativeTeleopController::requestEmergencyStop() {
+  latchControlStop();
   {
     std::scoped_lock gripperLock(gripperMutex_);
     pendingGripperCommands_ = {};
@@ -505,13 +579,45 @@ void NativeTeleopController::requestEmergencyStop() {
   lastOutputDeltaUi_ = {};
 }
 
-void NativeTeleopController::startGripperWorker() {
-  bool expected = false;
-  if (!gripperWorkerRunning_.compare_exchange_strong(expected, true)) {
-    // 已经有 worker 时保持幂等。
-    return;
+void NativeTeleopController::reportControlFailure(const char* message) noexcept {
+  motion_.latchEmergencyStop();
+  latchControlStop();
+  omega_.latchForceStop();
+  // 安全动作相互隔离，诊断分配失败也不能跳过其余停止动作。
+  try { motion_.emergencyStop(); }
+  catch (...) { std::fputs("native control failure: motion emergency-stop action failed\n", stderr); }
+  try { requestEmergencyStop(); }
+  catch (...) { std::fputs("native control failure: pending-command cleanup failed\n", stderr); }
+  try { omega_.requestEmergencyStop(); }
+  catch (...) { std::fputs("native control failure: Omega force shutdown failed\n", stderr); }
+  std::fprintf(stderr, "native control stopped after exception: %s\n", message);
+  try {
+    std::scoped_lock lock(mutex_);
+    lastError_ = message;
+    setBlockerUnlocked(0, "blocked", message);
+    setBlockerUnlocked(1, "blocked", message);
+  } catch (...) {
+    std::fputs("native control failure: diagnostic update failed\n", stderr);
   }
-  gripperWorker_ = std::thread(&NativeTeleopController::gripperLoop, this);
+}
+
+void NativeTeleopController::startGripperWorker() {
+  if (gripperWorker_.joinable()) {
+    if (gripperWorkerRunning_.load()) return;
+    gripperWorker_.join();
+  }
+  if (motion_.estopActive()) return;
+  gripperWorkerRunning_.store(true);
+  try {
+    gripperWorker_ = std::thread([this]() {
+      try { gripperLoop(); }
+      catch (const std::exception& error) { reportControlFailure(error.what()); }
+      catch (...) { reportControlFailure("unknown C++ exception in native gripper worker"); }
+    });
+  } catch (...) {
+    reportControlFailure("native gripper worker could not be created");
+    throw;
+  }
 }
 
 void NativeTeleopController::stopGripperWorker() {
@@ -553,7 +659,8 @@ void NativeTeleopController::gripperLoop() {
       }
     }
     for (const auto& command : commands) {
-      if (!command.pending) {
+      if (!command.pending || !gripperWorkerRunning_.load()
+          || !motion_.commandEpochAllowed(command.motionEpoch)) {
         continue;
       }
       std::string message;
@@ -563,7 +670,8 @@ void NativeTeleopController::gripperLoop() {
           command.speed,
           command.torque,
           &message,
-          false);
+          false,
+          [&]() { return gripperWorkerRunning_.load() && motion_.commandEpochAllowed(command.motionEpoch); });
       {
         std::scoped_lock lock(mutex_);
         // 命令不强制读位置，使用非阻塞快照刷新 UI 状态。
@@ -575,20 +683,27 @@ void NativeTeleopController::gripperLoop() {
       }
     }
     if (shouldSample) {
-      sampleGripperPosition(Side::Left);
-      sampleGripperPosition(Side::Right);
+      std::array<bool, 2> participating;
+      {
+        std::scoped_lock lock(mutex_);
+        participating = config_.gripperParticipating;
+      }
+      if (participating[0]) sampleGripperPosition(Side::Left);
+      if (participating[1]) sampleGripperPosition(Side::Right);
     }
   }
 }
 
 void NativeTeleopController::sampleGripperPosition(Side side) {
-  // 周期性采样夹爪位置，用于 statusJson 展示，不参与运动控制闭环。
+  // 周期性采样供状态显示及回放到位判断；失败不能刷新成功采样时间。
   std::string message;
   const bool ok = gripper_.readPositionMm(side, &message);
   const int index = sideIndex(side);
   std::scoped_lock lock(mutex_);
   gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);
   gripperLastCommandOk_[index] = ok;
+  gripperPositionOk_[index] = ok;
+  if (ok) gripperPositionSampleTs_[index] = unixTimeMs();
   if (!message.empty()) {
     gripperLastMessage_[index] = message;
   }
@@ -613,7 +728,17 @@ bool NativeTeleopController::commandGripperTarget(
     double targetMm,
     int speed,
     int torque,
-    std::string* message) {
+    std::string* message,
+    std::optional<std::uint64_t> expectedEpoch) {
+  if (!std::isfinite(targetMm)) {
+    if (message) *message = "gripper target must be finite";
+    return false;
+  }
+  const auto motionEpoch = expectedEpoch.value_or(motion_.commandEpoch());
+  if (!motion_.commandEpochAllowed(motionEpoch)) {
+    if (message) *message = "emergency stop active; gripper command rejected";
+    return false;
+  }
   const int index = sideIndex(side);
   double bounded = targetMm;
   {
@@ -630,7 +755,7 @@ bool NativeTeleopController::commandGripperTarget(
       gripperLastMessage_[index] = "queued native gripper command";
       gripperLastCommandTs_[index] = unixTimeMs();
     }
-    enqueueGripperCommand(index, side, bounded, speed, torque);
+    enqueueGripperCommand(index, side, bounded, speed, torque, motionEpoch);
     if (message) {
       *message = "queued native gripper command";
     }
@@ -639,7 +764,8 @@ bool NativeTeleopController::commandGripperTarget(
 
   std::string driverMessage;
   // worker 未运行时退回同步调用，主要用于禁用 worker 的调试场景。
-  const bool ok = gripper_.commandTarget(side, bounded, speed, torque, &driverMessage);
+  const bool ok = gripper_.commandTarget(side, bounded, speed, torque, &driverMessage, true,
+      [&]() { return motion_.commandEpochAllowed(motionEpoch); });
   {
     std::scoped_lock lock(mutex_);
     gripperTargetsMm_[index] = bounded;
@@ -740,6 +866,8 @@ std::string NativeTeleopController::statusJson() const {
   out
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[0]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[0]
+      << ",\"positionSampleTs\":" << gripperPositionSampleTs_[0]
+      << ",\"positionOk\":" << (gripperPositionOk_[0] ? "true" : "false")
       << "},\"right\":{\"ok\":" << (gripperLastCommandOk_[1] ? "true" : "false")
       << ",\"targetMm\":" << gripperTargetsMm_[1];
   appendGripperSourceDiagnostics(1);
@@ -752,6 +880,8 @@ std::string NativeTeleopController::statusJson() const {
   out
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[1]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[1]
+      << ",\"positionSampleTs\":" << gripperPositionSampleTs_[1]
+      << ",\"positionOk\":" << (gripperPositionOk_[1] ? "true" : "false")
       << "}}";
   out << ",\"gravityCompensation\":["
       << (config_.leftGravityCompensation ? "true" : "false") << ","
@@ -779,13 +909,8 @@ void NativeTeleopController::loop() {
     const auto started = std::chrono::steady_clock::now();
     const auto dt = std::chrono::duration<double>(started - previous).count();
     previous = started;
-    try {
-      // tick 内部按 best-effort 隔离单侧异常，外层只兜底记录未预期异常。
-      tick(dt > 0.0 ? dt : 0.01);
-    } catch (const std::exception& exc) {
-      std::scoped_lock lock(mutex_);
-      lastError_ = exc.what();
-    }
+    // 未预期异常交给线程边界停车，不能仅记日志后继续下发下一帧。
+    tick(dt > 0.0 ? dt : 0.01);
     int hz = 100;
     {
       std::scoped_lock lock(mutex_);
@@ -815,34 +940,33 @@ void NativeTeleopController::tick(double dtSec) {
 }
 
 void NativeTeleopController::processLeaderState(const std::array<Omega7State, 2>& hands, double dtSec) {
+  if (!running_.load() || motion_.estopActive()) return;
   tickSideBestEffort(0, hands[0], dtSec);
   tickSideBestEffort(1, hands[1], dtSec);
   try {
     tickGrippers(hands);
   } catch (const std::exception& exc) {
-    std::scoped_lock lock(mutex_);
-    lastError_ = exc.what();
+    reportControlFailure(exc.what());
+  } catch (...) {
+    reportControlFailure("unknown C++ exception in native gripper mapping");
   }
 }
 
 void NativeTeleopController::tickSideBestEffort(int sourceIndex, const Omega7State& hand, double dtSec) {
-  // 单侧异常不能终止整个 teleop 线程；记录 blocker 后下一帧继续尝试。
+  // C++ 异常不能逃出 DDS 回调；失败后锁存停车，由显式恢复重新建立会话。
   try {
     tickSide(sourceIndex, hand, dtSec);
   } catch (const std::exception& exc) {
-    std::scoped_lock lock(mutex_);
-    lastError_ = exc.what();
-    setBlockerUnlocked(sourceIndex, "blocked", exc.what());
-    incrementalInputActive_[sourceIndex] = false;
-    lastFilteredDelta_[sourceIndex] = {};
-    lastRequestedPulse_[sourceIndex] = {};
-    lastEmittedPulse_[sourceIndex] = {};
-    lastOutputDeltaUi_[sourceIndex] = {};
+    reportControlFailure(exc.what());
+  } catch (...) {
+    reportControlFailure("unknown C++ exception in native motion mapping");
   }
 }
 
 void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, double dtSec) {
+  const auto motionEpoch = motion_.commandEpoch();
   std::scoped_lock lock(mutex_);
+  if (!running_.load() || !motion_.commandEpochAllowed(motionEpoch)) return;
   const Side sourceSide = sideFromIndex(sourceIndex);
   // 默认左右交叉映射：左主手控制右从端，右主手控制左从端；配置可关闭交换。
   const Side targetSide = config_.swapTeleopChannels ? sideFromIndex(1 - sourceIndex) : sourceSide;
@@ -861,7 +985,7 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
     continuousDirection_[sourceIndex] = {};
     continuousStreak_[sourceIndex] = {};
     if (targetActive_[targetIndex]) {
-      motion_.stopTeleopSide(targetSide);
+      executor_.stopNativeSide(targetSide, hardwareTargetSequence_);
       targetActive_[targetIndex] = false;
     }
     return;
@@ -878,7 +1002,7 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
     continuousDirection_[sourceIndex] = {};
     continuousStreak_[sourceIndex] = {};
     if (targetActive_[targetIndex]) {
-      motion_.stopTeleopSide(targetSide);
+      executor_.stopNativeSide(targetSide, hardwareTargetSequence_);
       targetActive_[targetIndex] = false;
     }
     return;
@@ -895,7 +1019,7 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
     continuousDirection_[sourceIndex] = {};
     continuousStreak_[sourceIndex] = {};
     if (targetActive_[targetIndex]) {
-      motion_.stopTeleopSide(targetSide);
+      executor_.stopNativeSide(targetSide, hardwareTargetSequence_);
       targetActive_[targetIndex] = false;
     }
     return;
@@ -944,29 +1068,30 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
   }
 
   const auto limits = effectiveSoftLimits(targetSide, targetIndex);
+  TeleopHardwareTarget target;
+  target.sequence = ++hardwareTargetSequence_;
+  target.stampUnixMs = static_cast<std::uint64_t>(unixTimeMs());
+  target.stampMonotonicMs = static_cast<std::uint64_t>(monotonicSeconds() * 1000.0);
+  target.side = targetSide == Side::Left ? 0 : 1;
+  target.deltas = deltas;
+  target.translationStepLimitPulse = config_.translationStepLimitPulse;
+  target.rotationStepLimitPulse = config_.rotationStepLimitPulse;
+  target.translationPulseDeadband = config_.translationPulseDeadband;
+  target.rotationPulseDeadband = config_.rotationPulseDeadband;
+  target.enabledAxes = config_.enabledAxes[targetIndex];
+  target.syncZeroDeltaTarget = true;
+  for (size_t i = 0; i < limits.size(); ++i) {
+    target.softLimitMin[i] = limits[i].min;
+    target.softLimitMax[i] = limits[i].max;
+  }
+  target.translationVelocityUiPerSec = config_.translationMaxVelocityUmS;
+  target.rotationVelocityUiPerSec = config_.rotationMaxVelocityDegS;
+  target.translationStartVelocityUiPerSec = config_.translationStartVelocityUmS;
+  target.rotationStartVelocityUiPerSec = config_.rotationStartVelocityDegS;
+  target.accTimeSec = config_.accTimeSec;
+  target.decTimeSec = config_.decTimeSec;
+  if (!running_.load() || !motion_.commandEpochAllowed(motionEpoch)) return;
   if (hardwareTargetPublisher_) {
-    TeleopHardwareTarget target;
-    target.sequence = ++hardwareTargetSequence_;
-    target.stampUnixMs = static_cast<std::uint64_t>(unixTimeMs());
-    target.stampMonotonicMs = static_cast<std::uint64_t>(monotonicSeconds() * 1000.0);
-    target.side = targetSide == Side::Left ? 0 : 1;
-    target.deltas = deltas;
-    target.translationStepLimitPulse = config_.translationStepLimitPulse;
-    target.rotationStepLimitPulse = config_.rotationStepLimitPulse;
-    target.translationPulseDeadband = config_.translationPulseDeadband;
-    target.rotationPulseDeadband = config_.rotationPulseDeadband;
-    target.enabledAxes = config_.enabledAxes[targetIndex];
-    target.syncZeroDeltaTarget = true;
-    for (size_t i = 0; i < limits.size(); ++i) {
-      target.softLimitMin[i] = limits[i].min;
-      target.softLimitMax[i] = limits[i].max;
-    }
-    target.translationVelocityUiPerSec = config_.translationMaxVelocityUmS;
-    target.rotationVelocityUiPerSec = config_.rotationMaxVelocityDegS;
-    target.translationStartVelocityUiPerSec = config_.translationStartVelocityUmS;
-    target.rotationStartVelocityUiPerSec = config_.rotationStartVelocityDegS;
-    target.accTimeSec = config_.accTimeSec;
-    target.decTimeSec = config_.decTimeSec;
     hardwareTargetPublisher_(target);
     recordPublishedTargetActionUnlocked(sourceSide, target, sourceIndex);
     targetActive_[targetIndex] = true;
@@ -977,22 +1102,9 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
     return;
   }
 
-  const auto result = motion_.updateTeleopTargetUi(
-      targetSide,
-      deltas,
-      config_.translationStepLimitPulse,
-      config_.rotationStepLimitPulse,
-      config_.translationPulseDeadband,
-      config_.rotationPulseDeadband,
-      config_.enabledAxes[targetIndex],
-      true,
-      limits,
-      config_.translationMaxVelocityUmS,
-      config_.rotationMaxVelocityDegS,
-      config_.translationStartVelocityUmS,
-      config_.rotationStartVelocityDegS,
-      config_.accTimeSec,
-      config_.decTimeSec);
+  const auto applied = executor_.applyNative(target, target.deltas);
+  if (!applied) return;
+  const auto& result = *applied;
   // 只要成功下发一帧 motion，就标记目标侧处于 teleop 活跃状态。
   targetActive_[targetIndex] = true;
   setBlockerUnlocked(sourceIndex, "active", "");
@@ -1011,7 +1123,7 @@ void NativeTeleopController::syncIncrementalZeroDeltaUnlocked(
   const std::string& message) {
   // 增量模式输入归零时主动 stop，把从端保持在当前位置并重置主手参考。
   if (targetActive_[targetIndex]) {
-    motion_.stopTeleopSide(targetSide);
+    executor_.stopNativeSide(targetSide, hardwareTargetSequence_);
     targetActive_[targetIndex] = false;
     recordZeroStopActionUnlocked(sourceSide, targetSide);
   }
@@ -1286,7 +1398,7 @@ bool NativeTeleopController::suppressIncrementalRotationSpikeUnlocked(
     lastOutputDeltaUi_[sourceIndex] = {};
     lastRawDelta_[sourceIndex][axisIndex] = rawDelta;
     if (targetActive_[targetIndex]) {
-      motion_.stopTeleopSide(targetSide);
+      executor_.stopNativeSide(targetSide, hardwareTargetSequence_);
       targetActive_[targetIndex] = false;
       recordZeroStopActionUnlocked(sourceSide, targetSide);
     }
@@ -1514,12 +1626,14 @@ long NativeTeleopController::applyContinuousPulseGate(
 }
 
 void NativeTeleopController::tickGrippers(const std::array<Omega7State, 2>& hands) {
+  const auto motionEpoch = motion_.commandEpoch();
   std::scoped_lock lock(mutex_);
-  if (!config_.gripperTeleopEnabled) {
+  if (!running_.load() || motion_.estopActive() || !config_.gripperTeleopEnabled) {
     return;
   }
   const auto now = std::chrono::steady_clock::now();
   for (int targetIndex = 0; targetIndex < 2; ++targetIndex) {
+    if (!config_.gripperParticipating[targetIndex]) continue;
     // gripperSourceHand is indexed by target hardware side; defaults follow operator-to-hardware mapping.
     const int sourceIndex = gripperSourceIndex(targetIndex);
     const auto& hand = hands[sourceIndex];
@@ -1560,7 +1674,7 @@ void NativeTeleopController::tickGrippers(const std::array<Omega7State, 2>& hand
       continue;
     }
     const Side targetSide = sideFromIndex(targetIndex);
-    enqueueGripperCommand(targetIndex, targetSide, targetMm, config_.gripper.speed, config_.gripper.torque);
+    enqueueGripperCommand(targetIndex, targetSide, targetMm, config_.gripper.speed, config_.gripper.torque, motionEpoch);
     gripperLastRaw_[targetIndex] = raw;
     gripperLastCommandAt_[targetIndex] = now;
     gripperTargetsMm_[targetIndex] = std::clamp(targetMm, 0.0, config_.gripper.strokeMm);
@@ -1572,7 +1686,8 @@ void NativeTeleopController::enqueueGripperCommand(
     Side side,
     double targetMm,
     int speed,
-    int torque) {
+    int torque,
+    std::uint64_t motionEpoch) {
   if (!gripperWorkerRunning_.load()) {
     // worker 未运行时调用方应走同步 commandGripperTarget 路径。
     return;
@@ -1580,7 +1695,8 @@ void NativeTeleopController::enqueueGripperCommand(
   {
     std::scoped_lock lock(gripperMutex_);
     // 只保存每侧最新目标，避免高频 teleop 造成积压队列。
-    pendingGripperCommands_[targetIndex] = PendingGripperCommand{true, targetIndex, side, targetMm, speed, torque};
+    if (!motion_.commandEpochAllowed(motionEpoch)) return;
+    pendingGripperCommands_[targetIndex] = PendingGripperCommand{true, targetIndex, side, targetMm, speed, torque, motionEpoch};
   }
   gripperCv_.notify_one();
 }

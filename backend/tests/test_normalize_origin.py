@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：数据集原点换算及预演/实际改写行为。
+# 先看：load_normalize_origin_module → test_normalize_frame_to_origin_updates_motion_state_and_action_only → test_normalize_origin_dataset_dry_run_and_apply_rewrite_parquet。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import importlib.util
@@ -166,6 +171,15 @@ def test_normalize_origin_dataset_dry_run_and_apply_rewrite_parquet(tmp_path: Pa
     assert applied["changedRows"] == 1
     rewritten = pq.read_table(parquet_path)
     assert rewritten.column("observation.state").to_pylist()[0][0:7] == [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        999.0,
+    ]
+    assert rewritten.column("observation.state").to_pylist()[0][7:14] == [
         0.0,
         0.0,
         0.0,

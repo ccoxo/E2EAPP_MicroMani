@@ -1,3 +1,8 @@
+# 阅读导航 07｜测试与验证
+# 职责：回归验证：real 模式选择 DDS、test 模式保留替身并拒绝旧 HTTP 配置。
+# 先看：FakeDdsHalClient → test_make_hal_client_defaults_to_dds_real_hal → test_make_hal_client_keeps_test_hal_even_when_dds_transport_is_set → test_make_hal_client_uses_dds_transport_for_real_hal。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import pytest

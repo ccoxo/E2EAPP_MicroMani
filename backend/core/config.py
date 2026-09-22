@@ -1,11 +1,15 @@
+# 阅读导航 03｜后端契约与配置
+# 职责：读取、迁移、校验与原子保存运行配置；管理参数快照和工作原点迁移。
+# 先看：SettingsService → reanchor_motion_soft_limits_to_current_origin。
+# 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
+
 from __future__ import annotations
 
 import json
 import os
 import re
 import tempfile
-import threading
-import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -32,7 +36,7 @@ from backend.core.defaults import (
     default_config,
     rotation_work_limits_from_soft_limits,
 )
-from backend.core.force_config import validate_force_config
+from backend.core.force_config import hkvl_tare_sample_count, validate_force_config
 from backend.core.logging import LogService, now_ms, stable_config_hash
 from backend.core.motion_limits import (
     WorkOriginMissing,
@@ -420,7 +424,6 @@ class SettingsService:
         self.snapshot_dir = runtime_dir / "snapshots"
         self.work_origin_backup_dir = runtime_dir / "_work_origin_backups"
         self.logs = logs
-        self._config_io_lock = threading.RLock()
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
         self.work_origin_backup_dir.mkdir(parents=True, exist_ok=True)
@@ -428,12 +431,8 @@ class SettingsService:
             self.save_config(default_config(), emit_log=False)
 
     def get_config(self) -> dict[str, Any]:
-        with self._config_io_lock:
-            return self._get_config_locked()
-
-    def _get_config_locked(self) -> dict[str, Any]:
         try:
-            data = self._read_json_with_retry(self.config_path)
+            data = json.loads(self.config_path.read_text(encoding="utf-8"))
             raw_teleop = data.get("teleop", {}) if isinstance(data, dict) else {}
             raw_motion = data.get("motion", {}) if isinstance(data, dict) else {}
             raw_cameras = data.get("cameras", {}) if isinstance(data, dict) else {}
@@ -466,17 +465,20 @@ class SettingsService:
                 has_current_camera_tuning_defaults,
                 has_axis_sign_calibration,
             )
+            force = merged.get("force", {})
+            if isinstance(force, dict) and str(force.get("source", "hkvl_serial")).lower() == "hkvl_serial":
+                try:
+                    hkvl_tare_sample_count(force.get("tareSamples", 0))
+                except ValueError:
+                    # 旧版允许不足的样本窗口；只迁移这一项，不能因此重置整份设备配置。
+                    old_samples = force.get("tareSamples")
+                    force["tareSamples"] = 0
+                    self.logs.warning("[FORCE]", f"旧 HKVL Tare 样本数 {old_samples!r} 不再支持，已改为默认 200")
             validated = AppConfig.model_validate(merged).model_dump(mode="json")
             if merged != data:
                 self.save_config(validated, emit_log=False, source="startup")
             return validated
-        except OSError as exc:
-            self.logs.warning(
-                "[BACKEND]",
-                f"config.json was temporarily unavailable; persisted config preserved: {type(exc).__name__}: {exc}",
-            )
-            raise
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
             config = default_config()
             self.save_config(config, source="startup")
             self.logs.warning(
@@ -492,28 +494,20 @@ class SettingsService:
         *,
         source: str = "ui",
         op_id: str | None = None,
-    ) -> dict[str, Any]:
-        with self._config_io_lock:
-            return self._save_config_locked(config, emit_log, source=source, op_id=op_id)
-
-    def _save_config_locked(
-        self,
-        config: dict[str, Any],
-        emit_log: bool = True,
-        *,
-        source: str = "ui",
-        op_id: str | None = None,
+        before_commit: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         old_config: dict[str, Any] = {}
         if self.config_path.exists():
             try:
-                loaded = self._read_json_with_retry(self.config_path)
+                loaded = json.loads(self.config_path.read_text(encoding="utf-8"))
                 old_config = loaded if isinstance(loaded, dict) else {}
             except (OSError, json.JSONDecodeError):
                 old_config = {}
         if isinstance(config, dict):
             _normalize_right_pitch_window(config)
             raw_motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+            # 兼容旧配置/快照，但不再保存已移除的开机自动运动设置。
+            raw_motion.pop("homeOnStartup", None)
             _ensure_home_reference_model(
                 config,
                 isinstance(raw_motion, dict)
@@ -524,7 +518,7 @@ class SettingsService:
         old_hash = stable_config_hash(old_config) if old_config else "-"
         new_hash = stable_config_hash(validated)
         self._backup_current_work_origin(old_config)
-        self._atomic_write_json(self.config_path, validated)
+        self._atomic_write_json(self.config_path, validated, before_commit=before_commit)
         if emit_log:
             changes = _changed_config_leaves(old_config, validated)
             for key, old, new in changes[:50]:
@@ -561,8 +555,11 @@ class SettingsService:
                 )
         return validated
 
-    def apply_config(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        active = self.save_config(config) if config is not None else self.get_config()
+    def apply_config(
+        self, config: dict[str, Any] | None = None, *,
+        before_commit: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        active = self.save_config(config, before_commit=before_commit) if config is not None else self.get_config()
         self.logs.info("[HAL]", "settings applied to backend runtime config")
         return active
 
@@ -594,10 +591,12 @@ class SettingsService:
         self.logs.info("[BACKEND]", f"{self._scope_label(request.scope)}快照已保存：{request.name}")
         return snapshot.model_dump(mode="json")
 
-    def apply_snapshot(self, snapshot_id: str) -> dict[str, Any]:
+    def apply_snapshot(
+        self, snapshot_id: str, *, before_commit: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         snapshot = self._read_snapshot(snapshot_id)
         next_config = self._snapshot_config_for_apply(snapshot)
-        saved = self.save_config(next_config, emit_log=False)
+        saved = self.save_config(next_config, emit_log=False, before_commit=before_commit)
         self.logs.info("[BACKEND]", f"{self._scope_label(snapshot.scope)}快照已应用：{snapshot.name}")
         return saved
 
@@ -692,7 +691,10 @@ class SettingsService:
             payload["workOriginOffset"] = json.loads(json.dumps(work_origin_offset))
         self._atomic_write_json(backup_path, payload)
 
-    def _atomic_write_json(self, path: Path, payload: dict[str, Any]) -> None:
+    def _atomic_write_json(
+        self, path: Path, payload: dict[str, Any], *,
+        before_commit: Callable[[], None] | None = None,
+    ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_name: str | None = None
         try:
@@ -708,29 +710,14 @@ class SettingsService:
                 temp_file.write(json.dumps(payload, ensure_ascii=False, indent=2))
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
-            for attempt in range(3):
-                try:
-                    os.replace(temp_name, path)
-                    break
-                except PermissionError:
-                    if attempt == 2:
-                        raise
-                    time.sleep(0.05)
+            if before_commit is not None:
+                before_commit()
+            os.replace(temp_name, path)
         finally:
             if temp_name is not None:
                 temp_path = Path(temp_name)
                 if temp_path.exists():
                     temp_path.unlink(missing_ok=True)
-
-    def _read_json_with_retry(self, path: Path) -> Any:
-        for attempt in range(3):
-            try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except PermissionError:
-                if attempt == 2:
-                    raise
-                time.sleep(0.05)
-        raise AssertionError("unreachable")
 
     def _read_snapshot(self, snapshot_id: str) -> ParameterSnapshot:
         path = self._snapshot_path(snapshot_id)
@@ -754,7 +741,10 @@ class SettingsService:
                 return result
             return current if current is not None else default
 
-        return cast(dict[str, Any], merge(default_config(), data))
+        merged = cast(dict[str, Any], merge(default_config(), data))
+        if isinstance(merged.get("motion"), dict):
+            merged["motion"].pop("homeOnStartup", None)
+        return merged
 
     def _migrate_config(
         self,
@@ -956,6 +946,11 @@ class SettingsService:
                 teleop["syncImpulseCoeffFromKinematics"] = False
         cameras = config.get("cameras", {})
         if isinstance(cameras, dict):
+            # 新绑定的稳定身份优先于历史 index 标签，重载时不能被默认迁移覆盖。
+            has_explicit_camera_identity = any(
+                cameras.get(key) and cameras[key] != ICF_CAMERA_DEFAULTS[key]
+                for key in ("globalIdentity", "wristLeftIdentity", "wristRightIdentity")
+            )
             has_legacy_reversed_wrist_cameras = (
                 cameras.get("global") == "AR0234 / index 2"
                 and cameras.get("wristLeft") == "IMX258 / index 1"
@@ -976,20 +971,11 @@ class SettingsService:
                 and cameras.get("wristLeft") == "IMX335 / index 2"
                 and cameras.get("wristRight") == "IMX335 / index 0"
             )
-            has_previous_device_path_camera_bindings = (
-                cameras.get("global") == "IMX335 / index 1"
-                and cameras.get("globalIdentity") == "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000"
-                and cameras.get("wristLeft") == "IMX335 / index 0"
-                and cameras.get("wristLeftIdentity") == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
-                and cameras.get("wristRight") == "IMX335 / index 2"
-                and cameras.get("wristRightIdentity") == "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000"
-            )
-            if (
+            if not has_explicit_camera_identity and (
                 has_legacy_reversed_wrist_cameras
                 or has_legacy_cyclic_camera_roles
                 or has_previous_imx258_camera_defaults
                 or has_previous_imx335_camera_defaults
-                or has_previous_device_path_camera_bindings
             ):
                 for key, value in ICF_CAMERA_DEFAULTS.items():
                     if key == "tuning":
