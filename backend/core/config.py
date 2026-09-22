@@ -9,6 +9,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -55,6 +56,13 @@ from backend.core.schemas import (
 
 SNAPSHOT_ID_SAFE = re.compile(r"[^a-zA-Z0-9_.-]+")
 AXIS_KEYS = ("x", "y", "z", "roll", "pitch", "yaw")
+# config.json 可能被上一个实例或杀毒软件短暂占用；瞬时读不到不能当成配置损坏。
+CONFIG_READ_ATTEMPTS = 5
+CONFIG_READ_RETRY_DELAY_S = 0.2
+
+
+class ConfigUnavailableError(RuntimeError):
+    """config.json 存在但持续不可读；此时保留原文件，不用默认配置覆盖。"""
 
 
 def _compact_config_value(value: Any) -> Any:
@@ -443,9 +451,26 @@ class SettingsService:
         if not self.config_path.exists():
             self.save_config(default_config(), emit_log=False)
 
+    def _read_config_json(self) -> Any:
+        """读取 config.json；只对瞬时占用重试，持续不可读时报错而不改写文件。"""
+        last_error: OSError | None = None
+        for attempt in range(CONFIG_READ_ATTEMPTS):
+            try:
+                return json.loads(self.config_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                # 内容损坏交由调用方按默认配置恢复，重试没有意义。
+                raise
+            except OSError as exc:
+                last_error = exc
+                if attempt + 1 < CONFIG_READ_ATTEMPTS:
+                    time.sleep(CONFIG_READ_RETRY_DELAY_S)
+        raise ConfigUnavailableError(
+            f"config.json 持续不可读，保留原文件不改写：{type(last_error).__name__}: {last_error}"
+        )
+
     def get_config(self) -> dict[str, Any]:
         try:
-            data = json.loads(self.config_path.read_text(encoding="utf-8"))
+            data = self._read_config_json()
             raw_teleop = data.get("teleop", {}) if isinstance(data, dict) else {}
             raw_motion = data.get("motion", {}) if isinstance(data, dict) else {}
             raw_cameras = data.get("cameras", {}) if isinstance(data, dict) else {}
@@ -491,7 +516,7 @@ class SettingsService:
             if merged != data:
                 self.save_config(validated, emit_log=False, source="startup")
             return validated
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, ValueError) as exc:
             config = default_config()
             self.save_config(config, source="startup")
             self.logs.warning(

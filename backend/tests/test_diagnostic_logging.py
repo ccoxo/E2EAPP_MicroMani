@@ -9,7 +9,9 @@ import json
 import os
 from pathlib import Path
 
-from backend.core.config import SettingsService
+import pytest
+
+from backend.core.config import ConfigUnavailableError, SettingsService
 from backend.core.defaults import default_config
 from backend.core.logging import LOG_SCHEMA_VERSION, LogService, stable_config_hash
 
@@ -198,6 +200,66 @@ def test_invalid_config_recovery_logs_validation_reason(tmp_path: Path) -> None:
         )
         for entry in logs.list_entries()
     )
+
+
+def test_transient_config_read_failure_retries_without_overwriting(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """config.json 被瞬时占用时应重试并保留用户配置，不能写成默认值。"""
+    logs = LogService(emit_startup=False)
+    settings = SettingsService(tmp_path, logs)
+    config = settings.get_config()
+    config["cameras"]["wristLeft"] = "IMX335 / index 2"
+    config["cameras"]["wristLeftIdentity"] = "user-confirmed-left"
+    settings.save_config(config, emit_log=False)
+
+    path = tmp_path / "config.json"
+    before = path.read_text(encoding="utf-8")
+    real_read_text = Path.read_text
+    attempts = {"count": 0}
+
+    def flaky_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self == path and attempts["count"] == 0:
+            attempts["count"] += 1
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)  # type: ignore[attr-defined]
+    monkeypatch.setattr("backend.core.config.CONFIG_READ_RETRY_DELAY_S", 0)  # type: ignore[attr-defined]
+
+    loaded = settings.get_config()
+
+    assert attempts["count"] == 1
+    assert loaded["cameras"]["wristLeft"] == "IMX335 / index 2"
+    assert loaded["cameras"]["wristLeftIdentity"] == "user-confirmed-left"
+    assert path.read_text(encoding="utf-8") == before
+    assert not any("default config restored" in entry.msg for entry in logs.list_entries())
+
+
+def test_persistent_config_read_failure_keeps_file(tmp_path: Path, monkeypatch: object) -> None:
+    """config.json 持续不可读时必须保留原文件，而不是写回默认配置。"""
+    logs = LogService(emit_startup=False)
+    settings = SettingsService(tmp_path, logs)
+    config = settings.get_config()
+    config["cameras"]["wristLeftIdentity"] = "user-confirmed-left"
+    settings.save_config(config, emit_log=False)
+
+    path = tmp_path / "config.json"
+    before = path.read_text(encoding="utf-8")
+
+    def denied_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(Path, "read_text", denied_read_text)  # type: ignore[attr-defined]
+    monkeypatch.setattr("backend.core.config.CONFIG_READ_RETRY_DELAY_S", 0)  # type: ignore[attr-defined]
+
+    with pytest.raises(ConfigUnavailableError):
+        settings.get_config()
+
+    with path.open(encoding="utf-8") as handle:
+        after = handle.read()
+    assert after == before
+    assert not any("default config restored" in entry.msg for entry in logs.list_entries())
 
 
 def test_force_probe_logs_resource_error(monkeypatch: object) -> None:
