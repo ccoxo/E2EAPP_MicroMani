@@ -1,5 +1,6 @@
 #include "OfflineMotion.h"
 #include "HalCommandDispatcher.h"
+#include "HalJson.h"
 
 #include <chrono>
 #include <cmath>
@@ -257,8 +258,33 @@ void replayAbsoluteTargetsDoNotAccumulate() {
   rejects([&] { f.executor.applyExternal(target, f.epoch(), true); });
 }
 
+void failedGripperReadKeepsSuccessTimestampAndReportsTiming() {
+  Fixture f;
+  Omega7Driver omega;
+  JodellGripperDriver gripper;
+  NativeTeleopController native(f.motion, f.executor, omega, gripper);
+  JodellGripperConfig config;
+  config.enabled = false; // 离线失败读回，不加载 SDK，不连接设备。
+  native.prepareReplayGripper(config, f.epoch(), {true, false});
+  std::string status;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  do {
+    status = native.statusJson();
+    if (jsonNumberValue(status, "lastReadAttemptTs", 0) > 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  } while (std::chrono::steady_clock::now() < deadline);
+  native.stop();
+  require(jsonNumberValue(status, "lastReadAttemptTs", 0) > 0, "read attempt diagnostic missing");
+  require(jsonNumberValue(status, "lastReadDurationMs", -1) >= 0, "read duration missing");
+  require(jsonNumberValue(status, "lastCommandDurationMs", -1) == 0, "read changed command duration");
+  require(jsonNumberValue(status, "positionSampleTs", -1) == 0, "failed read fabricated fresh feedback");
+  require(!jsonBoolValue(status, "positionOk", true), "failed read reported valid feedback");
+  require(jsonStringValue(status, "lastReadMessage") == "native gripper teleop disabled", "read failure reason lost");
+}
+
 int main() {
   try {
+    failedGripperReadKeepsSuccessTimestampAndReportsTiming();
     replayAbsoluteTargetsDoNotAccumulate();
     nativeExcludesOtherSources();
     externalOwnershipIsPerSide();
@@ -272,7 +298,7 @@ int main() {
     revokeRejectsAlreadyWaitingFollower();
     dispatcherEmergencyBypassesBothExecutionAndDriverLocks();
     emergencyCancelsCommandAlreadyAdmittedBeforeDriverAccess();
-    std::cout << "MotionExecutorTests passed (13 cases, offline)\n";
+    std::cout << "MotionExecutorTests passed (14 cases, offline)\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "MotionExecutorTests failed: " << error.what() << '\n';

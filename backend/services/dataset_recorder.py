@@ -179,6 +179,10 @@ class TimedSample:
     timed_out: bool = False
     stale: bool = False
     cache_used: bool = False
+    poll_diagnostic: dict[str, Any] | None = None
+    alignment_exceeded: bool = False
+    valid_until_unix_ms: float = 0.0
+    measurement_unix_ms: dict[str, float] | None = None
 
 
 SourceSample = TimedSample
@@ -369,10 +373,20 @@ class FrameAssembler:
         gripper_sample = recorder._aligned_sample("gripper", target_monotonic_s)
         recorder._aligned_sample("omega", target_monotonic_s)
         selected = getattr(recorder, "_participation", None)
+        alignment_exceptions = []
         if selected and recorder._real_hardware_mode(config):
             required = [hal_sample] + ([gripper_sample] if selected["grippers"] else [])
-            if any(not sample.ok or sample.stale for sample in required):
-                raise RuntimeError("参与采集设备反馈无效，拒绝写入伪造观测")
+            if any(not recorder._feedback_is_valid(sample) for sample in required):
+                diagnostic = recorder._feedback_failure_diagnostic(required, target_monotonic_s, frame_index)
+                raise RuntimeError("参与采集设备反馈无效，拒绝写入伪造观测 diagnostic="
+                                   + json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":")))
+            alignment_exceptions = [{
+                "frameIndex": frame_index, "source": sample.source,
+                "targetMonotonicS": target_monotonic_s, "sampleMonotonicS": sample.monotonic_s,
+                "skewMs": round((sample.monotonic_s - target_monotonic_s) * 1000., 3),
+                "maxSkewMs": SOURCE_MAX_SKEW_S[sample.source] * 1000.,
+                "measurementUnixMs": sample.measurement_unix_ms,
+            } for sample in required if sample.alignment_exceeded]
 
         motion_state = hal_sample.value if hal_sample.ok and isinstance(hal_sample.value, dict) else {}
         raw_positions = motion_state.get("positions") if isinstance(motion_state, dict) else None
@@ -409,6 +423,7 @@ class FrameAssembler:
             )
         return {
             "timestamp": frame_index / max(1, recorder._record_fps_hz),
+            "alignmentExceptions": alignment_exceptions,
             "frame_index": frame_index,
             "episode_index": recorder._episode_index,
             "observation.state": observation_state,
@@ -447,12 +462,19 @@ class TimedRingBuffer:
             while len(self._samples) > self.maxlen:
                 self._samples.popleft()
 
-    def nearest(self, target_s: float, max_skew_s: float) -> TimedSample | None:
+    def nearest(self, target_s: float, max_skew_s: float, *, valid_only: bool = False,
+                valid_at_unix_ms: float | None = None) -> TimedSample | None:
         """查找距离目标时间最近且不超过允许偏差的样本。"""
         with self._lock:
             if not self._samples:
                 return None
             samples = list(self._samples)
+        if valid_only:
+            samples = [sample for sample in samples
+                       if sample.ok and not sample.stale and not sample.timed_out and sample.value is not None]
+        if valid_at_unix_ms is not None:
+            samples = [sample for sample in samples if math.isfinite(sample.valid_until_unix_ms)
+                       and sample.valid_until_unix_ms >= valid_at_unix_ms]
         times = [sample.monotonic_s for sample in samples]
         index = bisect_left(times, target_s)
         candidates = []
@@ -469,6 +491,21 @@ class TimedRingBuffer:
         """判断缓存是否已有达到或晚于目标时间的样本。"""
         with self._lock:
             return bool(self._samples and self._samples[-1].monotonic_s >= target_s)
+
+    def failure_timeline(self, target_s: float) -> dict[str, Any]:
+        """只在失败时提取前后三个样本及最新样本，不复制观测数据。"""
+        with self._lock:
+            samples = list(self._samples)
+        index = bisect_left([sample.monotonic_s for sample in samples], target_s)
+
+        def describe(sample: TimedSample) -> dict[str, Any]:
+            return {"sampleMonotonicS": sample.monotonic_s,
+                    "skewMs": round((sample.monotonic_s - target_s) * 1000., 3),
+                    "ok": sample.ok, "stale": sample.stale, "poll": sample.poll_diagnostic}
+
+        return {"count": len(samples),
+                "nearby": [describe(sample) for sample in samples[max(0, index - 3):index + 3]],
+                "latest": describe(samples[-1]) if samples else None}
 
     def _prune_locked(self, before_s: float) -> None:
         """在持锁状态下移除早于指定时间的旧样本。"""
@@ -1930,9 +1967,17 @@ class DatasetRecorderService:
                         return
                 target_s = sample_epoch_s + self._source_sample_timestamp_s(source, sample_index, config)
                 diagnostic = getattr(self, "_recording_diagnostics", None)
-                read_started = time.monotonic() if diagnostic is not None else 0.0
+                trace_poll = source in {"hal", "gripper"}
+                read_started = time.monotonic() if diagnostic is not None or trace_poll else 0.0
                 sample = self._sample_source_once_sync(source, config, target_s, runner=runner)
-                read_finished = time.monotonic() if diagnostic is not None else 0.0
+                read_finished = time.monotonic() if diagnostic is not None or trace_poll else 0.0
+                if trace_poll:
+                    sample = replace(sample, poll_diagnostic={
+                        "sampleIndex": sample_index, "scheduledMonotonicS": next_schedule_s,
+                        "startedMonotonicS": read_started, "finishedMonotonicS": read_finished,
+                        "readMs": (read_finished - read_started) * 1000.,
+                        "wakeLatenessMs": max(0., read_started - original_schedule_s) * 1000.,
+                    })
                 if diagnostic is not None and (source in CAMERA_KEY_BY_SOURCE or read_finished - original_schedule_s > 0.02):
                     diagnostic.emit("sample", source=source, episode=self._episode_index,
                                     sample_index=sample_index, target_s=target_s, capture_s=sample.monotonic_s,
@@ -2025,6 +2070,15 @@ class DatasetRecorderService:
         if source == "force":
             return self._sample_force_source_sync(config, target_s, runner=runner)
         if source == "gripper":
+            selected = getattr(self, "_participation", None)
+            if selected and selected["grippers"] and self._using_real_hal_native_teleop(config):
+                # 采集直接读取 native DDS 状态，避免依赖界面状态循环的二次缓存。
+                result = run(self.hal.command("teleop.native.status", {}))
+                native_status = result.get("response") if isinstance(result, dict) else None
+                if not isinstance(native_status, dict):
+                    raise RuntimeError("参与采集的夹爪 native 状态缺失")
+                return self._gripper_source_sync(
+                    config, target_s, record_quality=False, native_status=native_status)
             return self._gripper_source_sync(config, target_s, record_quality=False)
         camera = CAMERA_KEY_BY_SOURCE.get(source)
         if camera is not None:
@@ -2138,6 +2192,14 @@ class DatasetRecorderService:
         buffer = self._sample_buffers.get(source)
         max_skew_s = SOURCE_MAX_SKEW_S.get(source, 0.020)
         sample = buffer.nearest(target_s, max_skew_s) if buffer is not None else None
+        if buffer is not None and source in {"hal", "gripper"} and getattr(self, "_participation", None):
+            # 对齐目标与源有效期独立；只从未过期的真实测量中选择，不使用超时占位。
+            valid_sample = buffer.nearest(target_s, math.inf, valid_only=True, valid_at_unix_ms=now_ms())
+            if valid_sample is not None:
+                sample = valid_sample
+                if abs(sample.monotonic_s - target_s) > max_skew_s:
+                    sample = replace(sample, alignment_exceeded=True, stale=True,
+                                     message=f"{source} alignment exceeded")
         if sample is None and buffer is not None:
             sample = buffer.nearest(target_s, math.inf)
             if sample is not None:
@@ -2407,14 +2469,28 @@ class DatasetRecorderService:
         target_monotonic_s: float,
         *,
         record_quality: bool = True,
+        native_status: dict[str, Any] | None = None,
     ) -> SourceSample:
         """同步读取夹爪位置，优先使用 native teleop 缓存并记录陈旧状态。"""
         selected = getattr(self, "_participation", None)
         if selected and not selected["grippers"]:
             return SourceSample("gripper", target_monotonic_s, [0., 0.], True, "masked inactive grippers", target_monotonic_s=target_monotonic_s)
-        native_sample = self._latest_native_gripper_sample(config)
+        if selected and native_status is None:
+            teleop = getattr(self, "teleop", None)
+            native_status = teleop.status().get("nativeStatus", {}) if teleop is not None else {}
+        native_sample = self._latest_native_gripper_sample(config, native_status=native_status)
         if native_sample is not None:
             native_positions, sampled_at = native_sample
+            measurement_times = None
+            valid_until = 0.
+            if selected and native_status is not None:
+                measurement_times = {side: float(native_status["grippers"][side]["positionSampleTs"])
+                                     for side in hardware_sides(selected, "grippers")}
+                source_ts = self._coerce_float(native_status.get("dds_stamp_unix_ms")) or 0.
+                valid_until = min(source_ts + 500., min(measurement_times.values()) + 1000.)
+                # 将实际读回时刻映射到同一个 HAL 单调时钟，保留双侧各自的原始时间。
+                if source_ts > 0 and sampled_at > 0:
+                    sampled_at -= (source_ts - min(measurement_times.values())) / 1000.
             if sampled_at <= 0.0:
                 sampled_at = target_monotonic_s
             self._last_native_gripper_sample = (native_positions, sampled_at)
@@ -2427,6 +2503,8 @@ class DatasetRecorderService:
                 target_monotonic_s=target_monotonic_s,
                 started_monotonic_s=sampled_at,
                 finished_monotonic_s=sampled_at,
+                valid_until_unix_ms=valid_until,
+                measurement_unix_ms=measurement_times,
             )
             if record_quality:
                 self._record_source_quality(sample, target_monotonic_s, 0.0)
@@ -2492,18 +2570,67 @@ class DatasetRecorderService:
             self._record_source_quality(sample, target_monotonic_s, 0.0)
         return sample
 
+    def _feedback_failure_diagnostic(self, samples, target_s: float, frame_index: int) -> dict[str, Any]:
+        """在停止遥操作清除缓存前捕获失败源；只读诊断，不更改采样或拒绝条件。"""
+        teleop = getattr(self, "teleop", None)
+        status = teleop.status() if teleop is not None else {}
+        native = status.get("nativeStatus", {}) if isinstance(status, dict) else {}
+        return {
+            "observedAtUnixMs": now_ms(), "frameIndex": frame_index, "targetMonotonicS": target_s,
+            "failedSources": [sample.source for sample in samples if not self._feedback_is_valid(sample)],
+            "timelines": {sample.source: buffer.failure_timeline(target_s)
+                          for sample in samples
+                          if (buffer := getattr(self, "_sample_buffers", {}).get(sample.source)) is not None},
+            "samples": [{
+                "source": sample.source, "sampleMonotonicS": sample.monotonic_s,
+                "skewMs": round((sample.monotonic_s - target_s) * 1000., 3),
+                "maxSkewMs": SOURCE_MAX_SKEW_S[sample.source] * 1000.,
+                "ok": sample.ok, "stale": sample.stale, "timedOut": sample.timed_out,
+                "elapsedMs": sample.elapsed_ms, "message": sample.message,
+                "alignmentExceeded": sample.alignment_exceeded,
+                "validUntilUnixMs": sample.valid_until_unix_ms,
+            } for sample in samples],
+            # 这是异常发生时的最新 native 快照，不能冒充上面的历史对齐样本。
+            "nativeGrippers": native.get("grippers", {}) if isinstance(native, dict) else {},
+        }
+
+    def _feedback_is_valid(self, sample: TimedSample) -> bool:
+        """历史样本在组帧时重新检查有效期；对齐告警不代替测量有效性。"""
+        if (not sample.ok or sample.timed_out or (sample.stale and not sample.alignment_exceeded)
+                or not math.isfinite(sample.valid_until_unix_ms) or sample.valid_until_unix_ms < now_ms()
+                or not math.isfinite(sample.monotonic_s) or sample.monotonic_s <= 0):
+            return False
+        if sample.source == "hal":
+            if not isinstance(sample.value, dict):
+                return False
+            groups = [sample.value.get("positions"), sample.value.get("pulses")]
+            if any(not isinstance(values, list) or len(values) != 12 for values in groups):
+                return False
+            values = groups[0] + groups[1]
+        else:
+            values = sample.value
+            if not isinstance(values, list) or len(values) != 2:
+                return False
+        try:
+            return all(math.isfinite(float(v)) and (sample.source != "gripper" or float(v) >= 0) for v in values)
+        except (ValueError, TypeError):
+            return False
+
     def _latest_native_gripper_positions(self, config: dict[str, Any]) -> tuple[float, float] | None:
         """从 hal_native teleop 状态中提取最新左右夹爪当前位置。"""
         native_sample = self._latest_native_gripper_sample(config)
         return native_sample[0] if native_sample is not None else None
 
-    def _latest_native_gripper_sample(self, config: dict[str, Any]) -> tuple[tuple[float, float], float] | None:
+    def _latest_native_gripper_sample(
+        self, config: dict[str, Any], *, native_status: dict[str, Any] | None = None,
+    ) -> tuple[tuple[float, float], float] | None:
         """从 hal_native teleop 状态中提取夹爪位置和 native status 时间戳。"""
-        teleop = getattr(self, "teleop", None)
-        if teleop is None:
-            return None
-        status = teleop.status()
-        native_status = status.get("nativeStatus") if isinstance(status, dict) else None
+        if native_status is None:
+            teleop = getattr(self, "teleop", None)
+            if teleop is None:
+                return None
+            status = teleop.status()
+            native_status = status.get("nativeStatus") if isinstance(status, dict) else None
         if not isinstance(native_status, dict):
             return None
         grippers = native_status.get("grippers")
@@ -2519,8 +2646,10 @@ class DatasetRecorderService:
                 detail = grippers.get(side, {})
                 gap = self._coerce_float(detail.get("positionMm"))
                 age = time.time() * 1000 - float(detail.get("positionSampleTs", 0))
-                if gap is None or gap < 0 or detail.get("positionOk") is not True or not 0 <= age <= 1000:
-                    raise RuntimeError(f"参与采集的 {side} 夹爪反馈无效或过期")
+                if gap is None or not math.isfinite(gap) or gap < 0 or detail.get("positionOk") is not True or not 0 <= age <= 1000:
+                    raise RuntimeError(f"参与采集的 {side} 夹爪反馈无效或过期 "
+                                       f"ageMs={age:.3f} diagnostic="
+                                       + json.dumps(detail, ensure_ascii=False, separators=(",", ":")))
                 values.append(gap)
             return tuple(values), self._source_sample_monotonic(native_status, 0.0)
         left = grippers.get("left")
@@ -2572,6 +2701,7 @@ class DatasetRecorderService:
         finished = time.monotonic()
         elapsed_ms = (finished - started) * 1000.0
         fallback_sample_time = finished if ok else target_monotonic_s
+        source_ts = (self._coerce_float(value.get("dds_stamp_unix_ms")) or 0.) if isinstance(value, dict) else 0.
         sample = SourceSample(
             source,
             self._source_sample_monotonic(value, fallback_sample_time),
@@ -2584,6 +2714,8 @@ class DatasetRecorderService:
             elapsed_ms=elapsed_ms,
             timed_out=timed_out,
             stale=not ok,
+            valid_until_unix_ms=source_ts + 500. if source == "hal" and source_ts > 0 else 0.,
+            measurement_unix_ms={"source": source_ts} if source == "hal" and source_ts > 0 else None,
         )
         if record_quality:
             self._record_source_quality(sample, target_monotonic_s, elapsed_ms)
@@ -2766,12 +2898,14 @@ class DatasetRecorderService:
     def _mark_frame_written(self, frame: dict[str, Any]) -> None:
         """记录写线程已落盘帧数，并更新左右最大力值与训练质量摘要。"""
         self._track_training_quality_frame(frame)
+        self._alignment_exceptions.extend(frame.get("alignmentExceptions", []))
         self._episode_frames += 1
         self._max_force_left = max(self._max_force_left, self._force_norm(frame["observation.force_left"]))
         self._max_force_right = max(self._max_force_right, self._force_norm(frame["observation.force_right"]))
 
     def _reset_training_quality_tracking(self) -> None:
         """初始化不影响训练数据本身的首尾状态与动作范围统计。"""
+        self._alignment_exceptions: list[dict[str, Any]] = []
         self._quality_first_state: list[float] | None = None
         self._quality_first_action: list[float] | None = None
         self._quality_last_state: list[float] | None = None
@@ -3005,6 +3139,7 @@ class DatasetRecorderService:
             "maxForceRight": round(self._max_force_right, 6),
             "warnings": self._quality_warnings(),
             "trainingQuality": training_quality,
+            "alignmentExceptions": deepcopy(getattr(self, "_alignment_exceptions", [])),
             "participation": deepcopy(getattr(self, "_participation", None)),
             "actionMask": action_mask(self._participation) if getattr(self, "_participation", None) else None,
             "observationMask": action_mask(self._participation) if getattr(self, "_participation", None) else None,
@@ -3719,6 +3854,7 @@ class DatasetRecorderService:
             "cameraMinFps": episode.get("cameraMinFps", {}),
             "cameraWorkerFallbacks": episode.get("cameraWorkerFallbacks", []),
             "trainingQuality": episode.get("trainingQuality", {}),
+            "alignmentExceptions": episode.get("alignmentExceptions", []),
             "qualityAssessment": episode.get("qualityAssessment", {}),
             "maxForceLeft": float(episode.get("maxForceLeft", 0.0)),
             "maxForceRight": float(episode.get("maxForceRight", 0.0)),
@@ -4184,6 +4320,8 @@ class DatasetRecorderService:
             reasons.append({"severity": level, "code": code, "message": message})
 
         frames = max(1, int(episode.get("frames", 0) or 0))
+        if episode.get("alignmentExceptions"):
+            add("review", "alignment_exceeded", "存在真实测量时间对齐超限的帧，请复核时序后用于训练")
         late_frames = max(0, int(episode.get("lateFrames", 0) or 0))
         late_rate = late_frames / frames
         if late_rate >= QUALITY_LATE_RERECORD_RATE:

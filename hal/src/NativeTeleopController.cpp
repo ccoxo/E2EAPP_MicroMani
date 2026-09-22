@@ -664,6 +664,7 @@ void NativeTeleopController::gripperLoop() {
         continue;
       }
       std::string message;
+      const auto commandStarted = std::chrono::steady_clock::now();
       const bool ok = gripper_.commandTarget(
           command.side,
           command.targetMm,
@@ -672,9 +673,12 @@ void NativeTeleopController::gripperLoop() {
           &message,
           false,
           [&]() { return gripperWorkerRunning_.load() && motion_.commandEpochAllowed(command.motionEpoch); });
+      const double commandMs = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - commandStarted).count();
       {
         std::scoped_lock lock(mutex_);
         // 命令不强制读位置，使用非阻塞快照刷新 UI 状态。
+        gripperCommandDurationMs_[command.targetIndex] = commandMs;
         const auto gripperPositions = gripper_.positionMmSnapshot(gripperPositionsMm_);
         gripperPositionsMm_ = gripperPositions;
         gripperLastCommandOk_[command.targetIndex] = ok;
@@ -697,9 +701,15 @@ void NativeTeleopController::gripperLoop() {
 void NativeTeleopController::sampleGripperPosition(Side side) {
   // 周期性采样供状态显示及回放到位判断；失败不能刷新成功采样时间。
   std::string message;
+  const auto readStarted = std::chrono::steady_clock::now();
   const bool ok = gripper_.readPositionMm(side, &message);
+  const double readMs = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - readStarted).count();
   const int index = sideIndex(side);
   std::scoped_lock lock(mutex_);
+  gripperReadDurationMs_[index] = readMs;
+  gripperReadAttemptTs_[index] = unixTimeMs();
+  gripperReadMessage_[index] = message;
   gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);
   gripperLastCommandOk_[index] = ok;
   gripperPositionOk_[index] = ok;
@@ -867,6 +877,10 @@ std::string NativeTeleopController::statusJson() const {
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[0]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[0]
       << ",\"positionSampleTs\":" << gripperPositionSampleTs_[0]
+      << ",\"lastCommandDurationMs\":" << gripperCommandDurationMs_[0]
+      << ",\"lastReadDurationMs\":" << gripperReadDurationMs_[0]
+      << ",\"lastReadAttemptTs\":" << gripperReadAttemptTs_[0]
+      << ",\"lastReadMessage\":\"" << jsonEscape(gripperReadMessage_[0]) << "\""
       << ",\"positionOk\":" << (gripperPositionOk_[0] ? "true" : "false")
       << "},\"right\":{\"ok\":" << (gripperLastCommandOk_[1] ? "true" : "false")
       << ",\"targetMm\":" << gripperTargetsMm_[1];
@@ -881,6 +895,10 @@ std::string NativeTeleopController::statusJson() const {
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[1]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[1]
       << ",\"positionSampleTs\":" << gripperPositionSampleTs_[1]
+      << ",\"lastCommandDurationMs\":" << gripperCommandDurationMs_[1]
+      << ",\"lastReadDurationMs\":" << gripperReadDurationMs_[1]
+      << ",\"lastReadAttemptTs\":" << gripperReadAttemptTs_[1]
+      << ",\"lastReadMessage\":\"" << jsonEscape(gripperReadMessage_[1]) << "\""
       << ",\"positionOk\":" << (gripperPositionOk_[1] ? "true" : "false")
       << "}}";
   out << ",\"gravityCompensation\":["
