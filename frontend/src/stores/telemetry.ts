@@ -1343,6 +1343,15 @@ function rejectUnsafeControl(get: TelemetryStoreGet, set: TelemetryStoreSet): bo
   return true
 }
 
+function rejectRecordingOriginReturn(get: TelemetryStoreGet, set: TelemetryStoreSet): boolean {
+  const state = get()
+  if (!state.recording && ['idle', 'resetting', 'reviewing'].includes(state.recordSession.phase)) return false
+  set((current) => ({
+    logs: appendLog(current.logs, makeLog('WARNING', '请先保存或丢弃当前录制片段，等待处理完成后再返回工作原点', '[LEROBOT]')),
+  }))
+  return true
+}
+
 function assertControlGeneration(get: TelemetryStoreGet, generation: number) {
   if (get().controlSafety.generation !== generation) throw new Error('控制流程已被安全事件取消，请重新操作')
   const reason = controlSafetyBlockReason(get(), !mockMode)
@@ -2246,7 +2255,7 @@ setRecordSpeedMode: (mode) => {
 
 /** 发送或封装对应的后端命令。 */
 homeRecordArms: () => {
-    if (get().recordSession.phase === 'discarding') return
+    if (rejectRecordingOriginReturn(get, set)) return
     if (rejectUnsafeControl(get, set)) return
     const generation = get().controlSafety.generation
     if (recordMotionOriginInFlight) {
@@ -2314,7 +2323,7 @@ homeRecordArms: () => {
 
 /** 描述当前方法的功能边界。 */
 returnRecordMotionOrigin: async (side) => {
-    if (get().recordSession.phase === 'discarding') return
+    if (rejectRecordingOriginReturn(get, set)) return
     if (rejectUnsafeControl(get, set)) return
     const generation = get().controlSafety.generation
     const operatorLabel = operatorSideLabel(operatorSideForHardwareSide(side))

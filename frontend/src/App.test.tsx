@@ -658,17 +658,22 @@ describe('AppStation M0 frontend', () => {
     }))
 
     await renderApp()
-    useTelemetryStore.getState().stopMock()
-    useTelemetryStore.setState((state) => ({
-      frame: {
-        ...state.frame,
-        motionEnabled: { left: false, right: true },
-        motionAxisEnabled: {
-          left: [false, false, false, false, false, false],
-          right: [true, true, true, true, true, true],
+    act(() => {
+      useTelemetryStore.getState().stopMock()
+      useTelemetryStore.setState((state) => ({
+        telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
+        frame: {
+          ...state.frame,
+          wsOk: true,
+          halOk: true,
+          motionEnabled: { left: false, right: true },
+          motionAxisEnabled: {
+            left: [false, false, false, false, false, false],
+            right: [true, true, true, true, true, true],
+          },
         },
-      },
-    }))
+      }))
+    })
 
     expect(screen.getByText('左从臂回工作原点').closest('button')).toBeEnabled()
     expect(screen.getByText('右从臂回工作原点').closest('button')).toBeDisabled()
@@ -1307,6 +1312,23 @@ describe('AppStation M0 frontend', () => {
     resolveReturnOrigin({ ok: true })
     await Promise.all([first, second])
   })
+
+  it.each(['starting', 'recording', 'interrupted', 'saving', 'discarding', 'finishing'] as const)(
+    'blocks work-origin return while recording is %s without processing data', async (phase) => {
+      const returnSpy = vi.spyOn(api, 'returnMotionOriginSide').mockResolvedValue({ ok: true })
+      useTelemetryStore.setState((state) => ({
+        recordSession: { ...state.recordSession, phase, recorderFrameCount: 180 },
+        frame: { ...state.frame, motionEnabled: { left: true, right: true },
+          motionAxisEnabled: { left: [true, true, true, true, true, true], right: [true, true, true, true, true, true] } },
+      }))
+      useTelemetryStore.getState().homeRecordArms()
+      await useTelemetryStore.getState().returnRecordMotionOrigin('left')
+      expect(returnSpy).not.toHaveBeenCalled()
+      expect(useTelemetryStore.getState().recordSession.phase).toBe(phase)
+      expect(useTelemetryStore.getState().recordSession.recorderFrameCount).toBe(180)
+      expect(JSON.stringify(useTelemetryStore.getState().logs)).toContain('保存或丢弃')
+    },
+  )
 
   it('returns only required record arms through recorded-origin side commands', async () => {
     const returnOriginSpy = vi.spyOn(api, 'returnMotionOriginSide').mockResolvedValue({ ok: true })

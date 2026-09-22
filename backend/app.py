@@ -52,7 +52,7 @@ from backend.services.command_service import (
     MotionOriginDriftConfirmationRequired,
     normalize_motion_axis_enabled,
 )
-from backend.services.dataset_recorder import DatasetSaveError
+from backend.services.dataset_recorder import DatasetSaveError, RecordingBlocksOriginReturn
 from backend.services.dataset_replay import DatasetReplayService
 from backend.services.control_watchdog import ControlLeaseUnavailable, ControlWatchdog
 from backend.services.gripper_backend import native_teleop_enabled
@@ -1201,10 +1201,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/motion/home_all")
     async def home_all() -> ApiEnvelope:
         try:
-            recorder.require_discard_complete()
+            recorder.require_work_origin_return_allowed()
             result = await commands.home_all()
             recorder.mark_reset_origin_all_returned()
             return envelope(result)
+        except RecordingBlocksOriginReturn as exc:
+            raise HTTPException(status_code=409, detail={"code": "RECORDING_ACTIVE", "message": str(exc)}) from exc
         except ControlLeaseUnavailable as exc:
             raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
@@ -1371,10 +1373,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         try:
-            recorder.require_discard_complete()
+            recorder.require_work_origin_return_allowed()
             result = await commands.return_motion_origin_side(side)
             recorder.mark_reset_origin_returned(side)
             return envelope(result)
+        except RecordingBlocksOriginReturn as exc:
+            raise HTTPException(status_code=409, detail={"code": "RECORDING_ACTIVE", "message": str(exc)}) from exc
         except ControlLeaseUnavailable as exc:
             raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:

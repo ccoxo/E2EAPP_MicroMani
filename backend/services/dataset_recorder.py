@@ -160,6 +160,10 @@ NATIVE_DATA_FILE_SIZE_MB = 0.000001
 NATIVE_VIDEO_FILE_SIZE_MB = 0.000001
 
 
+class RecordingBlocksOriginReturn(RuntimeError):
+    """录制尚未处理完成，不能让回原点停止其反馈源。"""
+
+
 class DatasetSaveError(RuntimeError):
     """Raised when an episode cannot be persisted in the declared dataset format."""
 
@@ -825,6 +829,11 @@ class DatasetRecorderService:
     def require_discard_complete(self) -> None:
         if getattr(self, "_discard_in_progress", False):
             raise RuntimeError("record episode discard is still stopping teleop; wait before returning to origin")
+
+    def require_work_origin_return_allowed(self) -> None:
+        if (self._session_starting or self._recording or getattr(self, "_discard_in_progress", False)
+                or (self._session_active and not self._reset_pending)):
+            raise RecordingBlocksOriginReturn("请先保存或丢弃当前录制片段，等待处理完成后再返回工作原点")
 
     async def _discard_episode(self) -> dict[str, Any]:
         """丢弃正在录制或刚保存的 episode，并暂停到复位等待。"""
