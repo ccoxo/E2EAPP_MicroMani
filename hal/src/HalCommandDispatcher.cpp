@@ -251,8 +251,13 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     const auto side = parseSide(jsonStringValue(bodyText, "side"));
     nativeTeleop_.stop();
     ensureCurrentMotionCommand();
-    executor_.homeSide(side, jsonBoolArray6(bodyText, "enabledAxes", {}), commandEpoch);
-    return "{\"ok\":true,\"homeCompleted\":true}";
+    const auto limitReferenceAxes = executor_.homeSide(side, jsonBoolArray6(bodyText, "enabledAxes", {}), commandEpoch);
+    std::string response = "{\"ok\":true,\"homeCompleted\":true,\"limitReferenceAxes\":[";
+    for (std::size_t index = 0; index < limitReferenceAxes.size(); ++index) {
+      if (index) response += ',';
+      response += limitReferenceAxes[index] ? "true" : "false";
+    }
+    return response + "]}";
   }
   if (name == "motion.manual_axis_move") {
     const auto side = parseSide(jsonStringValue(bodyText, "side"));

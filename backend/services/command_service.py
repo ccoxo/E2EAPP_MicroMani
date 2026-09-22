@@ -461,9 +461,12 @@ class CommandService:
         pulse_key = f"{side}Pulse"
         # 开始前持久化撤销所选轴的确认；失败、急停、断连不能保留旧成功标记。
         confirmed = cast(list[bool], home_reference[f"{side}AxisConfirmed"])
+        limit_key = f"{side}AxisLimitReference"
         for index, selected in enumerate(enabled_axes):
             if selected:
                 confirmed[index] = False
+                if limit_key in home_reference:
+                    home_reference[limit_key][index] = False
         config["motion"]["homeReference"] = home_reference
         await self._save_config_async(config, emit_log=False, home_reference_update=True)
         self.safety.check(safety_token)
@@ -473,6 +476,14 @@ class CommandService:
         )
         if self._real_hardware_mode(config) and result.get("response", {}).get("homeCompleted") is not True:
             raise RuntimeError("HAL did not confirm hardware home completion; deploy matching HAL binaries")
+        limit_reference_axes = result.get("response", {}).get("limitReferenceAxes", [False] * 6)
+        if (
+            not isinstance(limit_reference_axes, list) or len(limit_reference_axes) != 6
+            or any(type(value) is not bool for value in limit_reference_axes)
+            or any(value and (index not in ((0, 2) if side == "right" else (0, 1)) or not enabled_axes[index])
+                   for index, value in enumerate(limit_reference_axes))
+        ):
+            raise RuntimeError("invalid HAL limit reference axes; reference not saved")
         completed_at = now_ms()
         deadline = time.monotonic() + 2.0
         while True:
@@ -503,12 +514,27 @@ class CommandService:
             if not selected:
                 pulses[offset + index] = home_reference[pulse_key][index]
         self._set_home_reference_side(home_reference, side, pulses, updated_at, enabled_axes)
+        limit_sources = list(home_reference.get(limit_key, [False] * 6))
+        for index, selected in enumerate(enabled_axes):
+            if selected:
+                limit_sources[index] = limit_reference_axes[index]
+        home_reference[limit_key] = limit_sources
         valid_key = "leftValid" if side == "left" else "rightValid"
-        if bool(work_origin_offset.get(valid_key)):
+        if bool(work_origin_offset.get(valid_key)) and any(
+            selected and not limit_reference_axes[index] for index, selected in enumerate(enabled_axes)
+        ):
             self._apply_home_reference_offset(origin, home_reference, work_origin_offset, side, updated_at)
             for index, selected in enumerate(enabled_axes):
-                if not selected:
+                if not selected or limit_reference_axes[index]:
                     origin[pulse_key][index] = previous_origin_pulse[index]
+        if any(limit_reference_axes):
+            # 限位参考未重置控制卡计数，保留原工作位置，只重算到新参考点的偏移。
+            for index, is_limit in enumerate(limit_reference_axes):
+                if is_limit:
+                    work_origin_offset[f"{side}PulseDelta"][index] = (
+                        previous_origin_pulse[index] - home_reference[pulse_key][index]
+                    )
+            work_origin_offset["updatedAt"] = updated_at
         config["motion"]["origin"] = origin
         config["motion"]["homeReference"] = home_reference
         config["motion"]["workOriginOffset"] = work_origin_offset
@@ -533,9 +559,14 @@ class CommandService:
                 )
         self.safety.check(safety_token)
         saved = await self._save_config_async(config, emit_log=False, home_reference_update=True)
-        self.telemetry.home_side(side, enabled_axes)
+        self.telemetry.home_side(side, [selected and not limit_reference_axes[index]
+                                       for index, selected in enumerate(enabled_axes)])
         side_label = "left" if side == "left" else "right"
-        self.logs.info("[HAL]", f"{side_label} motion hardware zero refreshed")
+        if any(limit_reference_axes):
+            limit_names = ", ".join(axis for index, axis in enumerate(AXIS_ORDER) if limit_reference_axes[index])
+            self.logs.info("[HAL]", f"{side_label} positive-limit reference saved: {limit_names}; pulse counters unchanged")
+        else:
+            self.logs.info("[HAL]", f"{side_label} motion hardware zero refreshed")
         return {
             **result,
             "origin": saved["motion"]["origin"],
@@ -1614,7 +1645,7 @@ class CommandService:
             updated_at = int(updated_at)
         except (TypeError, ValueError):
             updated_at = 0
-        return {
+        normalized = {
             "valid": bool(left_valid and right_valid),
             "leftValid": left_valid,
             "rightValid": right_valid,
@@ -1624,6 +1655,15 @@ class CommandService:
             "rightAxisConfirmed": right_confirmed,
             "updatedAt": updated_at,
         }
+        for side, confirmed in (("left", left_confirmed), ("right", right_confirmed)):
+            key = f"{side}AxisLimitReference"
+            if key in reference:
+                raw = reference[key]
+                normalized[key] = [
+                    index in ((0, 2) if side == "right" else (0, 1)) and confirmed[index] and value is True
+                    for index, value in enumerate(raw)
+                ] if isinstance(raw, list) and len(raw) == 6 else [False] * 6
+        return normalized
 
     def _normalized_work_origin_offset(self, config: dict[str, Any]) -> dict[str, object]:
         raw_offset = config.get("motion", {}).get("workOriginOffset", {})

@@ -119,13 +119,13 @@ void MotionExecutor::stopSide(Side side) {
   if (owners_[index(side)] != MotionOwner::NativeTeleop) owners_[index(side)] = MotionOwner::Idle;
 }
 
-void MotionExecutor::homeSide(Side side, const std::array<bool, 6>& axes, std::uint64_t epoch) {
+std::array<bool, 6> MotionExecutor::homeSide(Side side, const std::array<bool, 6>& axes, std::uint64_t epoch) {
   std::unique_lock lock(mutex_, std::try_to_lock);
   if (!lock.owns_lock()) throw std::runtime_error("motion executor busy; request was not queued");
   refresh(epoch);
   requireAvailable(side, MotionOwner::Homing);
   owners_[index(side)] = MotionOwner::Homing;
-  motion_.homeSide(side, axes, epoch);
+  return motion_.homeSide(side, axes, epoch);
 }
 
 void MotionExecutor::homeAll(const std::array<double, 12>& origin,

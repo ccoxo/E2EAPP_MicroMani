@@ -145,7 +145,7 @@ def test_hal_home_all_requires_work_origin_payload() -> None:
 
 def test_hal_hardware_home_logs_per_axis_diagnostics() -> None:
     source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
-    body = source.split("void LTDMCDriver::homeSide(", 1)[
+    body = source.split("LTDMCDriver::homeSide(", 1)[
         1
     ].split("void LTDMCDriver::homeAll", 1)[0]
 

@@ -219,6 +219,31 @@ describe('直接 API 页面入口的安全约束', () => {
 
 
 describe('机械参考点选轴', () => {
+  it('限位建立的参考点在完成信息中明确标识', async () => {
+    const reference = {
+      ...useTelemetryStore.getState().config.motion.homeReference,
+      rightAxisLimitReference: [true, false, true, false, false, false],
+    }
+    vi.spyOn(api, 'homeMotionSide').mockResolvedValue({ ok: true, data: { homeReference: reference } })
+    vi.spyOn(api, 'fetchMotionOrigin').mockResolvedValue({ ok: true, data: { homeReference: reference } })
+    const { requestComparison } = renderMotionCard()
+    fireEvent.click(screen.getByRole('button', { name: '机械寻零' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'X' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Z' }))
+    fireEvent.click(screen.getByRole('button', { name: '审阅寻零动作' }))
+    await act(async () => { await requestComparison.mock.calls[0][0].onConfirm() })
+    expect(screen.getByRole('status', { name: '左臂原点操作状态' })).toHaveTextContent('限位参考点：X、Z')
+  })
+
+  it('限位参考点统一显示已确认，失效后显示待确认', () => {
+    const reference = useTelemetryStore.getState().config.motion.homeReference
+    reference.rightAxisLimitReference = [true, false, true, false, false, false]
+    reference.rightAxisConfirmed[2] = false
+    renderMotionCard()
+    expect(screen.getByText('X：已确认')).toBeInTheDocument()
+    expect(screen.getByText('Z：待确认')).toBeInTheDocument()
+  })
+
   it('默认不选轴，机械寻零可全选六轴且只在确认后发送', async () => {
     const home = vi.spyOn(api, 'homeMotionSide').mockResolvedValue({ ok: true })
     vi.spyOn(api, 'fetchMotionOrigin').mockResolvedValue({ ok: true })

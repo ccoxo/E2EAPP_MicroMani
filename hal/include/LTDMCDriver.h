@@ -52,8 +52,8 @@ class LTDMCDriver {
   std::string enableSide(Side side, bool enabled = true);
   std::string enableSide(Side side, bool enabled, const std::array<bool, 6>& enabledAxes,
       std::optional<std::uint64_t> expectedEpoch = std::nullopt);
-  // 使用控制卡原点回零模式回单侧机械原点。
-  void homeSide(Side side, const std::array<bool, 6>& enabledAxes,
+  // 返回逐轴限位参考标记；原点信号完成的轴为 false，限位参考保留原始脉冲计数。
+  std::array<bool, 6> homeSide(Side side, const std::array<bool, 6>& enabledAxes,
       std::optional<std::uint64_t> expectedEpoch = std::nullopt);
   // 两侧回工作原点。workOriginPulse 是 12 轴目标脉冲，顺序与 MotionState::axes 一致。
   void homeAll(

@@ -845,7 +845,7 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bo
   return message.str();
 }
 
-void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes,
+std::array<bool, 6> LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes,
     std::optional<std::uint64_t> expectedEpoch) {
   const auto estopSequenceAtStart = expectedEpoch.value_or(commandEpoch());
   std::unique_lock lock(mutex_);
@@ -855,6 +855,7 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes,
   if (std::none_of(enabledAxes.begin(), enabledAxes.end(), [](bool enabled) { return enabled; })) {
     throw std::runtime_error("hardware home requires at least one selected axis");
   }
+  std::array<bool, 6> limitReferenceAxes{};
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   if (!dmcHomeMove || !dmcGetHomeResult || !dmcCheckDone || !dmcGetPosition || !dmcStop
       || !dmcSetPulseOutmode || !dmcSetElMode || !dmcSetHomeMode || !dmcSetHomePinLogic) {
@@ -879,6 +880,7 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes,
     }
   }
   std::array<long, 6> beforePulses{};
+  std::array<std::optional<unsigned long>, 6> beforeAxisIo{};
   try {
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
       checkMotionCommand(estopSequenceAtStart);
@@ -889,6 +891,10 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes,
       const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
       const auto beforePulse = dmcGetPosition ? dmcGetPosition(card, axisNo) : static_cast<long>(pulse_[stateIndex(side, axis)]);
       beforePulses[axisIndex] = beforePulse;
+      if (((side == Side::Right && (axis == SemanticAxis::X || axis == SemanticAxis::Z)) ||
+           (side == Side::Left && (axis == SemanticAxis::X || axis == SemanticAxis::Y))) && dmcAxisIoStatus) {
+        beforeAxisIo[axisIndex] = dmcAxisIoStatus(card, axisNo);
+      }
       const auto beforeUi = pulseToUi(static_cast<double>(beforePulse), side, axis);
       logHardwareHomeDiagnostic(
           "home_start",
@@ -912,12 +918,15 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes,
     }
     // SDK 启动成功不代表寻零成功；未完成、异常停止和超时均不能写入原点。
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    std::array<std::optional<std::chrono::steady_clock::time_point>, 6> stoppedWithoutHomeSince{};
+    std::array<std::optional<long>, 6> stoppedPulses{};
     while (true) {
       checkMotionCommand(estopSequenceAtStart);
       bool allHomed = true;
       for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
         if (!enabledAxes[axisIndex]) continue;
-        const auto axisNo = static_cast<unsigned short>(physicalAxis(side, static_cast<SemanticAxis>(axisIndex)));
+        const auto axis = static_cast<SemanticAxis>(axisIndex);
+        const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
         unsigned short homed = 0;
         const auto ret = dmcGetHomeResult(card, axisNo, &homed);
         if (ret != 0 || homed > 1) {
@@ -927,7 +936,79 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes,
         if (done != 0 && done != 1) {
           throw std::runtime_error(dmcAxisFailureMessage("dmc_check_done", done, card, axisNo));
         }
-        allHomed = allHomed && homed == 1 && done == 1;
+        // 操作者左侧（硬件 Right）X/Z、右侧（硬件 Left）X/Y；短暂停止或反馈不同步仍继续等待。
+        if ((side == Side::Right && (axis == SemanticAxis::X || axis == SemanticAxis::Z)) ||
+            (side == Side::Left && (axis == SemanticAxis::X || axis == SemanticAxis::Y))) {
+          auto& stoppedSince = stoppedWithoutHomeSince[axisIndex];
+          auto& stoppedPulse = stoppedPulses[axisIndex];
+          const auto now = std::chrono::steady_clock::now();
+          const auto currentPulse = dmcGetPosition(card, axisNo);
+          if (homed != 0 || done != 1) {
+            stoppedSince.reset();
+            stoppedPulse.reset();
+            limitReferenceAxes[axisIndex] = false;
+          } else if (!stoppedSince || stoppedPulse != currentPulse) {
+            stoppedSince = now;
+            stoppedPulse = currentPulse;
+            limitReferenceAxes[axisIndex] = false;
+          } else if (now - *stoppedSince >= std::chrono::milliseconds(500)) {
+            std::ostringstream message;
+            message << "hardware home stopped without completion side=" << sideName(side)
+                    << " card=" << card << " semanticAxis=" << axisName(axis)
+                    << " physicalAxis=" << axisNo << " homeResult=0 done=1 stopReason=";
+            // 先读取原始停止原因，再由外层 catch 急停，避免原因被软件停止命令覆盖。
+            long reason = 0;
+            bool reasonAvailable = false;
+            if (!dmcGetStopReason) {
+              message << "unavailable export=missing";
+            } else if (const auto readRet = dmcGetStopReason(card, axisNo, &reason); readRet != 0) {
+              message << "unavailable readRet=" << readRet;
+            } else {
+              reasonAvailable = true;
+              const char* explanation = "未列出的控制卡停止原因";
+              switch (reason) {
+                case 0: explanation = "正常停止，但未确认寻零完成"; break;
+                case 5: explanation = "正硬限位立即停止"; break;
+                case 6: explanation = "负硬限位立即停止"; break;
+                case 7: explanation = "正硬限位减速停止"; break;
+                case 8: explanation = "负硬限位减速停止"; break;
+                case 13: explanation = "命令立即停止"; break;
+                case 14: explanation = "命令减速停止"; break;
+                case 21: explanation = "原点不在两个限位之间"; break;
+                case 22: explanation = "回零方向和当前有效限位端相反"; break;
+                case 23: explanation = "正负限位同时有效"; break;
+                case 24: explanation = "没有找到 EZ 信号"; break;
+                case 25: explanation = "回零位置溢出停止"; break;
+                case 27: explanation = "双原点停止"; break;
+                case 201: explanation = "正负限位之间全程没找到原点信号"; break;
+              }
+              message << reason << " (" << explanation << ")";
+            }
+            // 保留控制卡原始输入位，便于对照 ORG/EL+/EL-；缺少导出时不伪装为全零。
+            const auto stopAxisIo = dmcAxisIoStatus
+                ? std::optional<unsigned long>(dmcAxisIoStatus(card, axisNo)) : std::nullopt;
+            message << " startAxisIo=" << (beforeAxisIo[axisIndex] ? std::to_string(*beforeAxisIo[axisIndex]) : "unavailable")
+                    << " stopAxisIo=" << (stopAxisIo ? std::to_string(*stopAxisIo) : "unavailable")
+                    << " startPulse=" << beforePulses[axisIndex]
+                    << " stopPulse=" << currentPulse;
+            checkMotionCommand(estopSequenceAtStart);
+            // 操作者右侧 X/Y 实测以 22 停在正限位，也只记录限位参考点，不宣称找到原点信号。
+            const bool acceptedLimitStop = reason == 201 ||
+                (side == Side::Left && (axis == SemanticAxis::X || axis == SemanticAxis::Y) && reason == 22);
+            // ALM/EMG/EL-/软限位/DSTP 均须无效。
+            constexpr unsigned long kLimitAndStopInputs = 0x8cf;
+            if (reasonAvailable && acceptedLimitStop && stopAxisIo && (*stopAxisIo & kLimitAndStopInputs) == 0x2) {
+              if (!limitReferenceAxes[axisIndex]) {
+                std::cout << "[HAL] WARNING component=MOTION event=home_limit_reference "
+                          << message.str() << " reference=positive_limit pulseCounterReset=false" << std::endl;
+              }
+              limitReferenceAxes[axisIndex] = true;
+            } else {
+              throw std::runtime_error(message.str());
+            }
+          }
+        }
+        allHomed = allHomed && (homed == 1 || limitReferenceAxes[axisIndex]) && done == 1;
       }
       checkMotionCommand(estopSequenceAtStart);
       if (allHomed) break;
@@ -949,7 +1030,7 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes,
       pulse_[stateIndex(side, axis)] = afterPulse;
       const auto afterUi = pulseToUi(static_cast<double>(afterPulse), side, axis);
       logHardwareHomeDiagnostic(
-          "home_done",
+          limitReferenceAxes[axisIndex] ? "limit_reference_done" : "home_done",
           side,
           axis,
           card,
@@ -974,6 +1055,7 @@ void LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes,
     active = false;
   }
   publishStateSnapshotLocked();
+  return limitReferenceAxes;
 }
 
 void LTDMCDriver::homeAll(

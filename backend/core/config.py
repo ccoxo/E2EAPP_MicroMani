@@ -178,6 +178,13 @@ def _ensure_home_reference_model(config: dict[str, Any], has_current_home_refere
         confirmed = ([value is True for value in raw_confirmed]
                      if isinstance(raw_confirmed, list) and len(raw_confirmed) == 6 else [False] * 6)
         next_reference[f"{side}AxisConfirmed"] = confirmed
+        limit_key = f"{side}AxisLimitReference"
+        if limit_key in reference:
+            raw_limits = reference[limit_key]
+            next_reference[limit_key] = [
+                index in ((0, 2) if side == "right" else (0, 1)) and confirmed[index] and value is True
+                for index, value in enumerate(raw_limits)
+            ] if isinstance(raw_limits, list) and len(raw_limits) == 6 else [False] * 6
         # 旧 valid 仅保留给既有偏移/限位计算；返回权限单独检查 AxisConfirmed。
         next_reference[valid_key] = side_reference_valid
         next_offset[delta_key] = side_offset
@@ -532,6 +539,14 @@ class SettingsService:
                         and index < len(old_pulses) and old_pulses[index] == reference[f"{side}Pulse"][index]
                         for index in range(6)
                     ]
+                    limit_key = f"{side}AxisLimitReference"
+                    old_limits = previous.get(limit_key, [])
+                    if limit_key in previous or limit_key in reference:
+                        reference[limit_key] = [
+                            reference[f"{side}AxisConfirmed"][index]
+                            and index < len(old_limits) and old_limits[index] is True
+                            for index in range(6)
+                        ]
         validate_force_config(config)
         validated = AppConfig.model_validate(config).model_dump(mode="json")
         old_hash = stable_config_hash(old_config) if old_config else "-"

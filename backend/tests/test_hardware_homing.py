@@ -57,6 +57,143 @@ def test_selected_homing_preserves_other_references(tmp_path, monkeypatch):
     assert client.app.state.telemetry.axis_offsets == list(range(1, 10)) + [0., 0., 0.]
 
 
+def test_limit_reference_preserves_work_origin_and_records_source(tmp_path, monkeypatch):
+    client, hal, _ = setup_homing(tmp_path, monkeypatch)
+    before = deepcopy(client.app.state.settings.get_config()["motion"])
+    client.app.state.telemetry.axis_offsets = list(range(1, 13))
+    hal.command.return_value = {"response": {
+        "homeCompleted": True, "limitReferenceAxes": [True, False, True, False, False, False]}}
+    response = client.post("/api/motion/right/home", json={"axes": ["X", "Z", "Pitch"]})
+    assert response.status_code == 200, response.text
+    after = client.app.state.settings.get_config()["motion"]
+    assert after["homeReference"]["rightPulse"] == [106., 20., 108., 40., 110., 60.]
+    assert after["homeReference"]["rightAxisLimitReference"] == [True, False, True, False, False, False]
+    assert after["origin"]["rightPulse"] == [11., 22., 33., 44., 115., 66.]
+    assert after["workOriginOffset"]["rightPulseDelta"] == [-95., 2., -75., 4., 5., 6.]
+    assert after["origin"]["leftPulse"] == before["origin"]["leftPulse"]
+    assert response.json()["data"]["homeReference"]["rightAxisLimitReference"][0] is True
+    assert client.app.state.telemetry.axis_offsets == list(range(1, 11)) + [0., 12]
+
+
+def test_limit_only_home_preserves_complete_work_origin(tmp_path, monkeypatch):
+    client, hal, _ = setup_homing(tmp_path, monkeypatch)
+    before = deepcopy(client.app.state.settings.get_config()["motion"]["origin"])
+    hal.command.return_value = {"response": {
+        "homeCompleted": True, "limitReferenceAxes": [True, False, True, False, False, False]}}
+    assert client.post("/api/motion/right/home", json={"axes": ["X", "Z"]}).status_code == 200
+    assert client.app.state.settings.get_config()["motion"]["origin"] == before
+
+
+@pytest.mark.parametrize("outcome", ["signal", "failure", "stale", "estop"])
+def test_limit_reference_source_is_cleared_by_new_seek(tmp_path, monkeypatch, outcome):
+    client, hal, state = setup_homing(tmp_path, monkeypatch)
+    settings = client.app.state.settings
+    config = settings.get_config()
+    config["motion"]["homeReference"]["rightAxisLimitReference"] = [True, False, True, False, False, False]
+    settings.save_config(config, emit_log=False, home_reference_update=True)
+    if outcome == "failure":
+        hal.command.side_effect = RuntimeError("home failed")
+    elif outcome in ("stale", "estop"):
+        hal.command.return_value = {"response": {
+            "homeCompleted": True, "limitReferenceAxes": [True, False, False, False, False, False]}}
+        if outcome == "stale":
+            async def stale():
+                return {**state, "timestamp_ms": now_ms() - 5000}
+            hal.motion_state = stale
+        else:
+            state["estop_active"] = True
+    response = client.post("/api/motion/right/home", json={"axes": ["X"]})
+    assert response.status_code == (200 if outcome == "signal" else 503)
+    ref = settings.get_config()["motion"]["homeReference"]
+    assert ref["rightAxisLimitReference"] == [False, False, True, False, False, False]
+    assert ref["rightAxisConfirmed"][0] is (outcome == "signal")
+
+
+def test_settings_cannot_forge_or_erase_limit_reference_source(tmp_path, monkeypatch):
+    client, _, _ = setup_homing(tmp_path, monkeypatch)
+    settings = client.app.state.settings
+    config = settings.get_config()
+    config["motion"]["homeReference"]["rightAxisLimitReference"] = [True, False, False, False, False, False]
+    saved = settings.save_config(config, emit_log=False)
+    assert saved["motion"]["homeReference"]["rightAxisLimitReference"] == [False] * 6
+    saved["motion"]["homeReference"]["rightAxisLimitReference"][0] = True
+    settings.save_config(saved, emit_log=False, home_reference_update=True)
+    stale = deepcopy(saved)
+    stale["motion"]["homeReference"].pop("rightAxisLimitReference")
+    restored = settings.save_config(stale, emit_log=False)
+    assert restored["motion"]["homeReference"]["rightAxisLimitReference"][0] is True
+    restored["motion"]["homeReference"]["rightPulse"][0] += 1
+    changed = settings.save_config(restored, emit_log=False)
+    assert changed["motion"]["homeReference"]["rightAxisConfirmed"][0] is False
+    assert changed["motion"]["homeReference"]["rightAxisLimitReference"][0] is False
+
+
+@pytest.mark.parametrize("axes,mask", [(["X"], [True, False, False, False, False, False]),
+                                      (["Y"], [False, True, False, False, False, False]),
+                                      (["X", "Y"], [True, True, False, False, False, False])])
+def test_operator_right_xy_limit_reference_preserves_origin(tmp_path, monkeypatch, axes, mask):
+    client, hal, _ = setup_homing(tmp_path, monkeypatch)
+    before = deepcopy(client.app.state.settings.get_config()["motion"])
+    hal.command.return_value = {"response": {"homeCompleted": True, "limitReferenceAxes": mask}}
+    response = client.post("/api/motion/left/home", json={"axes": axes})
+    assert response.status_code == 200, response.text
+    after = client.app.state.settings.get_config()["motion"]
+    assert after["origin"] == before["origin"]
+    assert after["homeReference"]["leftAxisLimitReference"] == mask
+    assert after["homeReference"]["rightPulse"] == before["homeReference"]["rightPulse"]
+    for index, selected in enumerate(mask):
+        assert after["homeReference"]["leftPulse"][index] == (100 + index if selected else 0)
+        if selected:
+            assert after["workOriginOffset"]["leftPulseDelta"][index] == before["origin"]["leftPulse"][index] - 100 - index
+    saved = client.app.state.settings.save_config(client.app.state.settings.get_config(), emit_log=False)
+    assert saved["motion"]["homeReference"]["leftAxisLimitReference"] == mask
+
+
+def test_limit_reference_sources_survive_sequential_axes_and_other_side_home(tmp_path, monkeypatch):
+    client, hal, _ = setup_homing(tmp_path, monkeypatch)
+    origin_before = deepcopy(client.app.state.settings.get_config()["motion"]["origin"])
+    for side, axis, mask, expected_left in [
+        ("left", "X", [True, False, False, False, False, False], [True, False, False, False, False, False]),
+        ("left", "Y", [False, True, False, False, False, False], [True, True, False, False, False, False]),
+        ("right", "X", [True, False, False, False, False, False], [True, True, False, False, False, False]),
+    ]:
+        hal.command.return_value = {"response": {"homeCompleted": True, "limitReferenceAxes": mask}}
+        response = client.post(f"/api/motion/{side}/home", json={"axes": [axis]})
+        assert response.status_code == 200, response.text
+        assert response.json()["data"]["homeReference"]["leftAxisLimitReference"] == expected_left
+        reference = client.get("/api/motion/origin").json()["data"]["homeReference"]
+        assert reference["leftAxisLimitReference"] == expected_left
+        motion = client.app.state.settings.get_config()["motion"]
+        assert motion["homeReference"]["leftAxisLimitReference"] == expected_left
+        assert motion["origin"] == origin_before
+
+
+def test_operator_right_z_cannot_claim_limit_reference(tmp_path, monkeypatch):
+    client, hal, _ = setup_homing(tmp_path, monkeypatch)
+    hal.command.return_value = {"response": {
+        "homeCompleted": True, "limitReferenceAxes": [False, False, True, False, False, False]}}
+    response = client.post("/api/motion/left/home", json={"axes": ["Z"]})
+    assert response.status_code == 503
+    assert client.app.state.settings.get_config()["motion"]["homeReference"]["leftAxisConfirmed"][2] is False
+
+
+@pytest.mark.parametrize("mask", [
+    [True], [1, False, False, False, False, False],
+    [False, True, False, False, False, False],
+    [False, False, True, False, False, False],
+])
+def test_invalid_limit_reference_reply_does_not_confirm(tmp_path, monkeypatch, mask):
+    client, hal, _ = setup_homing(tmp_path, monkeypatch)
+    before = deepcopy(client.app.state.settings.get_config()["motion"])
+    hal.command.return_value = {"response": {"homeCompleted": True, "limitReferenceAxes": mask}}
+    response = client.post("/api/motion/right/home", json={"axes": ["X"]})
+    assert response.status_code == 503
+    after = client.app.state.settings.get_config()["motion"]
+    assert after["homeReference"]["rightAxisConfirmed"][0] is False
+    assert after["homeReference"]["rightPulse"] == before["homeReference"]["rightPulse"]
+    assert after["origin"] == before["origin"]
+
+
 @pytest.mark.parametrize("axes", [[], ["Pitch", "Pitch"], ["pitch"], ["Bogus"]])
 def test_invalid_homing_selection_never_dispatches(tmp_path, monkeypatch, axes):
     client, hal, _ = setup_homing(tmp_path, monkeypatch)

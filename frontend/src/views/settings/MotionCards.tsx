@@ -521,6 +521,7 @@ export function MotionCard({
   }
  const handleReferenceAction = async (action: 'return' | 'seek', axes: ManualControlAxis[]) => {
     const label = action === 'seek' ? '机械寻零' : '返回机械参考点'
+    let completionMessage = `${label}完成：${axes.join('、')}`
     const reason = controlSafetyBlockReason(useTelemetryStore.getState())
     if (reason) {
       injectLog('WARNING', `${operatorLabel}${label}受阻：${reason}`, '[HAL]')
@@ -539,6 +540,9 @@ export function MotionCard({
         } } })
         const response = await homeMotionSide(hardwareSide, axes)
         if (response.data?.homeReference) {
+          const limitSources = response.data.homeReference[hardwareSide === 'left' ? 'leftAxisLimitReference' : 'rightAxisLimitReference'] ?? []
+          const limitAxes = axes.filter((axis) => limitSources[REFERENCE_AXES.indexOf(axis)] === true)
+          if (limitAxes.length) completionMessage = `参考点记录完成：${axes.join('、')}（限位参考点：${limitAxes.join('、')}）`
           syncMotionState({ motion: {
             ...useTelemetryStore.getState().config.motion,
             homeReference: response.data.homeReference,
@@ -553,8 +557,8 @@ export function MotionCard({
       if (current.controlSafety.generation !== generation || controlSafetyBlockReason(current)) {
         throw new Error('操作期间发生急停或连接状态变化，请核验执行结果')
       }
-      setReferenceStatus(`${label}完成：${axes.join('、')}`)
-      commandLog(injectLog, '[HAL]', `${operatorLabel}${label}完成：${axes.join('、')}`)
+      setReferenceStatus(completionMessage)
+      commandLog(injectLog, '[HAL]', `${operatorLabel}${completionMessage}`)
     } catch (error) {
       const message = `${label}失败：${commandErrorMessage(error)}`
       setReferenceStatus(message)
