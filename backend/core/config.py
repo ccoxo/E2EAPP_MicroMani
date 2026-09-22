@@ -980,6 +980,22 @@ class SettingsService:
                 teleop["syncImpulseCoeffFromKinematics"] = False
         cameras = config.get("cameras", {})
         if isinstance(cameras, dict):
+            # 只迁移已发布的旧默认路径，保留用户后来确认的稳定绑定。
+            if cameras.get("globalIdentity") in {
+                r"USB\VID_0ABD&PID_8050&MI_00\7&1396F44D&0&0000",
+                r"USB\VID_0ABD&PID_8050&MI_00\7&124CCBA8&0&0000",
+            }:
+                cameras["global"] = ICF_CAMERA_DEFAULTS["global"]
+                cameras["globalIdentity"] = ICF_CAMERA_DEFAULTS["globalIdentity"]
+                old_wrist_identities = {
+                    r"USB\VID_0ABD&PID_8050&MI_00\7&398F0A3&0&0000",
+                    r"USB\VID_0ABD&PID_8050&MI_00\7&7861A93&0&0000",
+                    r"USB\VID_0ABD&PID_8050&MI_00\8&3724732E&0&0000",
+                }
+                for role in ("wristLeft", "wristRight"):
+                    if cameras.get(f"{role}Identity") in old_wrist_identities:
+                        cameras[role] = "index -1"
+                        cameras[f"{role}Identity"] = ""
             # 新绑定的稳定身份优先于历史 index 标签，重载时不能被默认迁移覆盖。
             has_explicit_camera_identity = any(
                 cameras.get(key) and cameras[key] != ICF_CAMERA_DEFAULTS[key]

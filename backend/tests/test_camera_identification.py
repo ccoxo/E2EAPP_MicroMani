@@ -4,6 +4,28 @@ from backend.core.defaults import default_config
 from backend.drivers.camera_opencv import OpenCVCameraDriver
 
 
+def test_top_camera_defaults_use_serial_and_leave_wrists_for_identification():
+    cameras = default_config()["cameras"]
+    assert cameras["globalIdentity"] == "20250606105"
+    assert cameras["wristLeftIdentity"] == cameras["wristRightIdentity"] == ""
+    assert cameras["wristLeft"] == cameras["wristRight"] == "index -1"
+
+
+def test_old_top_binding_is_migrated_without_overwriting_custom_wrists(tmp_path):
+    from backend.core.config import SettingsService
+    from backend.core.logging import LogService
+    settings = SettingsService(tmp_path, LogService(emit_startup=False))
+    config = settings.get_config()
+    config["cameras"].update(globalIdentity="USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000",
+                             wristLeftIdentity="USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000",
+                             wristRightIdentity="custom-confirmed-right")
+    settings.save_config(config, emit_log=False)
+    loaded = SettingsService(tmp_path, LogService(emit_startup=False)).get_config()["cameras"]
+    assert loaded["globalIdentity"] == "20250606105"
+    assert loaded["wristLeftIdentity"] == "" and loaded["wristLeft"] == "index -1"
+    assert loaded["wristRightIdentity"] == "custom-confirmed-right"
+
+
 @pytest.fixture(autouse=True)
 def offline_environment(monkeypatch):
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
@@ -103,7 +125,7 @@ def test_legacy_camera_labels_without_custom_identity_still_migrate(tmp_path):
 
     settings = SettingsService(tmp_path, LogService())
     config = default_config()
-    config["cameras"].update({"wristLeft": "IMX335 / index 2", "wristRight": "IMX335 / index 0"})
+    config["cameras"].update({"global": "IMX335 / index 1", "wristLeft": "IMX335 / index 2", "wristRight": "IMX335 / index 0"})
     settings.save_config(config)
     cameras = settings.get_config()["cameras"]
     expected = default_config()["cameras"]

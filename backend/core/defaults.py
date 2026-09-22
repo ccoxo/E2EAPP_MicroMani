@@ -30,12 +30,12 @@ ICF_HOME_REFERENCE_VERSION = "icf_home_reference_20260602_v1"
 ICF_CAMERA_TUNING_DEFAULTS_VERSION = "auto_awb_exposure_20260616"
 
 ICF_CAMERA_DEFAULTS: dict[str, Any] = {
-    "global": "IMX335 / index 1",
-    "globalIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000",
-    "wristLeft": "IMX335 / index 0",
-    "wristLeftIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000",
-    "wristRight": "IMX335 / index 2",
-    "wristRightIdentity": "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000",
+    "global": "IMX335 / index 0",
+    "globalIdentity": "20250606105",
+    "wristLeft": "index -1",
+    "wristLeftIdentity": "",
+    "wristRight": "index -1",
+    "wristRightIdentity": "",
     "previewResolution": "640x480",
     "globalResolution": "640x480",
     "wristLeftResolution": "640x480",

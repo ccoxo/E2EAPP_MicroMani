@@ -1066,6 +1066,28 @@ export function normalizeConfig(config: AppConfig): AppConfig {
     delete motion.homeOnStartup
     config = { ...config, motion }
   }
+  // 只迁移已发布的旧默认路径，保留用户后来确认的稳定绑定。
+  const oldGlobalIdentities = [
+    'USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000',
+    'USB\\VID_0ABD&PID_8050&MI_00\\7&124CCBA8&0&0000',
+  ]
+  if (oldGlobalIdentities.includes(config.cameras.globalIdentity ?? '')) {
+    const cameras = { ...config.cameras, global: defaultConfig.cameras.global, globalIdentity: defaultConfig.cameras.globalIdentity }
+    const oldWristIdentities = [
+      'USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000',
+      'USB\\VID_0ABD&PID_8050&MI_00\\7&7861A93&0&0000',
+      'USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000',
+    ]
+    for (const role of ['wristLeft', 'wristRight'] as const) {
+      if (oldWristIdentities.includes(cameras[`${role}Identity`] ?? '')) {
+        cameras[role] = 'index -1'
+        cameras[`${role}Identity`] = ''
+      }
+    }
+    config = { ...config, cameras }
+  }
+  const hasExplicitCameraIdentity = (['globalIdentity', 'wristLeftIdentity', 'wristRightIdentity'] as const)
+    .some((key) => config.cameras[key] && config.cameras[key] !== defaultConfig.cameras[key])
   const hasPreviousImx258CameraDefaults =
     config.cameras.global === 'AR0234 / index 1'
     && config.cameras.wristLeft === 'IMX258 / index 2'
@@ -1093,12 +1115,12 @@ export function normalizeConfig(config: AppConfig): AppConfig {
     return config
   }
   const next = cloneConfig(config)
-  if (
+  if (!hasExplicitCameraIdentity && (
     hasPreviousImx258CameraDefaults
     || hasPreviousImx335CameraDefaults
     || hasLegacyReversedWristCameras
     || hasLegacyCyclicCameraRoles
-  ) {
+  )) {
     next.cameras = {
       ...next.cameras,
       global: defaultConfig.cameras.global,

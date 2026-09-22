@@ -9,6 +9,31 @@ import { defaultConfig, defaultDiagnostics } from '../data'
 import { diagnosticsFromHardwareStatus, normalizeConfig, useTelemetryStore } from './telemetry'
 
 describe('telemetry config normalization', () => {
+  it('恢复顶部序列号时保留自定义腕部绑定，且不修改输入', () => {
+    const config = structuredClone(defaultConfig)
+    config.cameras.globalIdentity = 'USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000'
+    config.cameras.wristLeftIdentity = 'USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000'
+    config.cameras.wristRightIdentity = 'custom-confirmed-right'
+    const before = structuredClone(config)
+    const normalized = normalizeConfig(config)
+    expect(normalized.cameras.globalIdentity).toBe('20250606105')
+    expect(normalized.cameras.wristLeftIdentity).toBe('')
+    expect(normalized.cameras.wristLeft).toBe('index -1')
+    expect(normalized.cameras.wristRightIdentity).toBe('custom-confirmed-right')
+    expect(config).toEqual(before)
+    expect(normalizeConfig(normalized)).toEqual(normalized)
+  })
+
+  it('旧索引标签不覆盖已经确认的稳定身份', () => {
+    const config = structuredClone(defaultConfig)
+    Object.assign(config.cameras, {
+      global: 'IMX335 / index 1', globalIdentity: 'custom-top',
+      wristLeft: 'IMX335 / index 2', wristLeftIdentity: 'confirmed-left',
+      wristRight: 'IMX335 / index 0', wristRightIdentity: 'confirmed-right',
+    })
+    expect(normalizeConfig(config).cameras).toEqual(config.cameras)
+  })
+
   it('保留用户显式选择的 NI-DAQ 备用数据源及通道', () => {
     const config = structuredClone(defaultConfig)
     config.force.source = 'nidaq'
@@ -37,9 +62,9 @@ describe('telemetry config normalization', () => {
     const normalized = normalizeConfig(staleConfig)
 
     expect(normalized.picoVision.ip).toBe('10.90.129.166')
-    expect(normalized.cameras.global).toBe('IMX335 / index 1')
-    expect(normalized.cameras.wristLeft).toBe('IMX335 / index 0')
-    expect(normalized.cameras.wristRight).toBe('IMX335 / index 2')
+    expect(normalized.cameras.global).toBe('IMX335 / index 0')
+    expect(normalized.cameras.wristLeft).toBe('index -1')
+    expect(normalized.cameras.wristRight).toBe('index -1')
   })
 
   it('migrates previous IMX335 wrist identity binding', () => {
@@ -53,11 +78,11 @@ describe('telemetry config normalization', () => {
 
     const normalized = normalizeConfig(staleConfig)
 
-    expect(normalized.cameras.globalIdentity).toBe('USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000')
-    expect(normalized.cameras.wristLeft).toBe('IMX335 / index 0')
-    expect(normalized.cameras.wristLeftIdentity).toBe('USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000')
-    expect(normalized.cameras.wristRight).toBe('IMX335 / index 2')
-    expect(normalized.cameras.wristRightIdentity).toBe('USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000')
+    expect(normalized.cameras.globalIdentity).toBe('20250606105')
+    expect(normalized.cameras.wristLeft).toBe('index -1')
+    expect(normalized.cameras.wristLeftIdentity).toBe('')
+    expect(normalized.cameras.wristRight).toBe('index -1')
+    expect(normalized.cameras.wristRightIdentity).toBe('')
   })
 })
 

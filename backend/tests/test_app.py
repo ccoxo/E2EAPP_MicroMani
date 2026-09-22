@@ -5262,6 +5262,8 @@ def test_camera_identity_overrides_stale_index(monkeypatch: MonkeyPatch) -> None
 
 def test_current_camera_identity_mapping_binds_reenumerated_wrist_roles(monkeypatch: MonkeyPatch) -> None:
     config = default_config()
+    config["cameras"]["wristLeftIdentity"] = "confirmed-left-port"
+    config["cameras"]["wristRightIdentity"] = "confirmed-right-port"
     driver = OpenCVCameraDriver()
 
     monkeypatch.setattr(
@@ -5271,16 +5273,19 @@ def test_current_camera_identity_mapping_binds_reenumerated_wrist_roles(monkeypa
             0: {
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&398f0a3&0&0000#{guid}\\global",
+                "locationPath": "confirmed-left-port",
                 "displayName": "@device:pnp:left",
             },
             1: {
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&1396f44d&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:global",
+                "parentId": r"USB\VID_0ABD&PID_8050\20250606105",
             },
             2: {
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#8&3724732e&0&0000#{guid}\\global",
+                "locationPath": "confirmed-right-port",
                 "displayName": "@device:pnp:right",
             },
         },
@@ -5293,6 +5298,8 @@ def test_current_camera_identity_mapping_binds_reenumerated_wrist_roles(monkeypa
 
 def test_camera_identities_lock_all_role_indices(monkeypatch: MonkeyPatch) -> None:
     config = default_config()
+    config["cameras"]["wristLeftIdentity"] = "confirmed-left-port"
+    config["cameras"]["wristRightIdentity"] = "confirmed-right-port"
     config["cameras"]["global"] = "AR0234 / index 2"
     config["cameras"]["wristLeft"] = "IMX258 / index 0"
     config["cameras"]["wristRight"] = "IMX258 / index 1"
@@ -5305,16 +5312,19 @@ def test_camera_identities_lock_all_role_indices(monkeypatch: MonkeyPatch) -> No
             0: {
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&398f0a3&0&0000#{guid}\\global",
+                "locationPath": "confirmed-left-port",
                 "displayName": "@device:pnp:right",
             },
             1: {
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#7&1396f44d&0&0000#{guid}\\global",
                 "displayName": "@device:pnp:global",
+                "parentId": r"USB\VID_0ABD&PID_8050\20250606105",
             },
             2: {
                 "name": "USB Camera",
                 "devicePath": "\\\\?\\usb#vid_0abd&pid_8050&mi_00#8&3724732e&0&0000#{guid}\\global",
+                "locationPath": "confirmed-right-port",
                 "displayName": "@device:pnp:right",
             },
         },
@@ -5328,12 +5338,12 @@ def test_camera_identities_lock_all_role_indices(monkeypatch: MonkeyPatch) -> No
 def test_default_camera_mapping_matches_deployment_hardware() -> None:
     config = default_config()
 
-    assert config["cameras"]["global"] == "IMX335 / index 1"
-    assert config["cameras"]["globalIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000"
-    assert config["cameras"]["wristLeft"] == "IMX335 / index 0"
-    assert config["cameras"]["wristLeftIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000"
-    assert config["cameras"]["wristRight"] == "IMX335 / index 2"
-    assert config["cameras"]["wristRightIdentity"] == "USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000"
+    assert config["cameras"]["global"] == "IMX335 / index 0"
+    assert config["cameras"]["globalIdentity"] == "20250606105"
+    assert config["cameras"]["wristLeft"] == "index -1"
+    assert config["cameras"]["wristLeftIdentity"] == ""
+    assert config["cameras"]["wristRight"] == "index -1"
+    assert config["cameras"]["wristRightIdentity"] == ""
     assert config["cameras"]["previewResolution"] == "640x480"
     assert config["cameras"]["globalResolution"] == "640x480"
     assert config["cameras"]["wristLeftResolution"] == "640x480"
