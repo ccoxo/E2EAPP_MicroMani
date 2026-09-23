@@ -280,6 +280,10 @@ class LeRobotWriterThread:
                 if self._dataset is not None:
                     self._dataset.save_episode(parallel_encoding=True)
                 command.future.set_result(self._native_total_frames())
+            elif command.kind == "latest_episode_metadata":
+                meta = getattr(self._dataset, "meta", None) if self._dataset is not None else None
+                latest = getattr(meta, "latest_episode", None)
+                command.future.set_result(deepcopy(latest) if isinstance(latest, dict) else {})
             elif command.kind == "clear_episode":
                 if self._dataset is not None:
                     self._dataset.clear_episode_buffer()
@@ -370,10 +374,11 @@ class FrameAssembler:
         recorder = self._recorder
         motion_positions = list(recorder.telemetry.motion_positions)
         motion_pulses = recorder._latest_motion_pulses()
-        force_left = list(recorder.telemetry.force_left)
-        force_right = list(recorder.telemetry.force_right)
+        record_force = recorder._record_force_enabled(config)
+        force_left = [0.0] * 6
+        force_right = [0.0] * 6
         hal_sample = recorder._aligned_sample("hal", target_monotonic_s)
-        force_sample = recorder._aligned_sample("force", target_monotonic_s)
+        force_sample = recorder._aligned_sample("force", target_monotonic_s) if record_force else None
         gripper_sample = recorder._aligned_sample("gripper", target_monotonic_s)
         recorder._aligned_sample("omega", target_monotonic_s)
         selected = getattr(recorder, "_participation", None)
@@ -405,7 +410,7 @@ class FrameAssembler:
             recorder._remember_motion_pulses(motion_pulses)
         motion_positions = recorder._recording_motion_positions(config, motion_positions, motion_pulses)
         recording_motion_pulses = hardware_to_dataset_motion(motion_pulses)
-        force_values = recorder._force_values_from_sample(force_sample.value)
+        force_values = recorder._force_values_from_sample(force_sample.value) if force_sample is not None else None
         if force_values is not None:
             force_left, force_right = force_values
         gripper_positions = (
@@ -603,6 +608,10 @@ class DatasetRecorderService:
         self._native_use_videos = False
         self._native_dataset_from_index = 0
         self._native_total_frames_cached = 0
+        # LeRobot keeps meta/episodes parquet open until dataset.finalize().
+        # Keep just-saved episode video mappings in memory so review can preview
+        # frames before the session is finalized without reopening that parquet.
+        self._native_live_episode_metadata: dict[int, dict[str, Any]] = {}
         self._last_native_camera_frames: dict[str, Any] = {}
         self._last_native_gripper_sample: tuple[tuple[float, float], float] | None = None
         self._record_fps_hz = 30
@@ -683,6 +692,7 @@ class DatasetRecorderService:
                 self._native_dataset = None
                 self._native_error = ""
                 self._native_total_frames_cached = 0
+                self._native_live_episode_metadata = {}
                 self._last_native_camera_frames = {}
                 self._last_native_gripper_sample = None
                 self._assembly_queue = asyncio.Queue(maxsize=ASSEMBLY_QUEUE_MAX_FRAMES)
@@ -740,6 +750,7 @@ class DatasetRecorderService:
                 await self._refresh_gripper_cache(config)
             self.safety.check(safety_token)
             await self.teleop.start("recording", pre_home=False)
+            await self._wait_for_fresh_native_gripper_feedback(config)
             await self._wait_for_episode_warmup()
             self.safety.check(safety_token)
         except (asyncio.CancelledError, Exception):
@@ -877,7 +888,8 @@ class DatasetRecorderService:
             await validator()
         safety_token = self.safety.capture()
         self.safety.check(safety_token)
-        sample_clock_now_s, schedule_now_s = await self._episode_clock_pair(self._recording_config())
+        config = self._recording_config()
+        sample_clock_now_s, schedule_now_s = await self._episode_clock_pair(config)
         pending = getattr(self, "_interruption_task", None)
         if pending is not None:
             await asyncio.shield(pending)
@@ -912,6 +924,7 @@ class DatasetRecorderService:
         try:
             self.safety.check(safety_token)
             await self.teleop.start("recording", pre_home=False)
+            await self._wait_for_fresh_native_gripper_feedback(config)
             await self._wait_for_episode_warmup()
             self.safety.check(safety_token)
         except (asyncio.CancelledError, Exception):
@@ -1635,6 +1648,11 @@ class DatasetRecorderService:
                         return self._decode_video_frame_to_jpeg(path, frame)
                     return path.read_bytes()
             raise FileNotFoundError(data_path)
+        live_metadata = self._live_native_episode_metadata(dataset_id, episode)
+        if live_metadata is not None:
+            return self._native_video_frame_to_jpeg(
+                dataset_dir, episode, camera, frame, live_metadata=live_metadata
+            )
         imports = self._native_imports()
         if imports is None:
             raise FileNotFoundError("lerobot")
@@ -1650,29 +1668,74 @@ class DatasetRecorderService:
         image = item.get(CAMERA_FEATURE_KEYS[camera])
         return self._encode_rgb_tensor_to_jpeg(image, np)
 
-    def _native_video_frame_to_jpeg(self, dataset_dir: Path, episode: dict[str, Any], camera: str, frame: int) -> bytes:
-        """按 episode 的视频分片和时间偏移定位，缺少映射时拒绝显示其他片段。"""
-        if frame < 0 or frame >= int(episode.get("frames", 0)):
-            raise FileNotFoundError(str(frame))
-        pq = importlib.import_module("pyarrow.parquet")
+    def _live_native_episode_metadata(self, dataset_id: str, episode: dict[str, Any]) -> dict[str, Any] | None:
+        """返回当前 session 内尚未写 parquet footer 的 episode 视频映射副本。"""
+        if dataset_id != getattr(self, "_dataset_id", ""):
+            return None
+        try:
+            episode_index = int(episode.get("episodeIndex"))
+        except (TypeError, ValueError):
+            return None
+        metadata = self._native_live_episode_metadata.get(episode_index)
+        return deepcopy(metadata) if isinstance(metadata, dict) else None
+
+    @staticmethod
+    def _native_metadata_scalar(row: dict[str, Any], key: str) -> Any:
+        value = row[key]
+        if isinstance(value, list) and len(value) == 1:
+            value = value[0]
+        if hasattr(value, "item") and callable(value.item):
+            value = value.item()
+        return value
+
+    def _native_video_row_to_jpeg(
+        self,
+        dataset_dir: Path,
+        episode: dict[str, Any],
+        camera: str,
+        frame: int,
+        row: dict[str, Any],
+    ) -> bytes:
         feature_key = CAMERA_FEATURE_KEYS[camera]
         prefix = f"videos/{feature_key}"
+        try:
+            chunk = int(self._native_metadata_scalar(row, f"{prefix}/chunk_index"))
+            file_index = int(self._native_metadata_scalar(row, f"{prefix}/file_index"))
+            start = float(self._native_metadata_scalar(row, f"{prefix}/from_timestamp"))
+            stop = float(self._native_metadata_scalar(row, f"{prefix}/to_timestamp"))
+            fps = float(episode["fps"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise FileNotFoundError("episode video mapping missing") from exc
+        if (
+            not all(math.isfinite(value) for value in (start, stop, fps))
+            or fps <= 0
+            or start < 0
+            or start + frame / fps >= stop
+        ):
+            raise FileNotFoundError("episode video timestamp out of range")
+        path = dataset_dir / "videos" / feature_key / f"chunk-{chunk:03d}" / f"file-{file_index:03d}.mp4"
+        return self._decode_video_frame_to_jpeg(path, round(start * fps) + frame)
+
+    def _native_video_frame_to_jpeg(
+        self,
+        dataset_dir: Path,
+        episode: dict[str, Any],
+        camera: str,
+        frame: int,
+        *,
+        live_metadata: dict[str, Any] | None = None,
+    ) -> bytes:
+        """按 live writer 映射或已 finalize parquet 定位 episode 视频帧。"""
+        if frame < 0 or frame >= int(episode.get("frames", 0)):
+            raise FileNotFoundError(str(frame))
+        if live_metadata is not None:
+            return self._native_video_row_to_jpeg(dataset_dir, episode, camera, frame, live_metadata)
+        pq = importlib.import_module("pyarrow.parquet")
         for meta_path in sorted((dataset_dir / "meta" / "episodes").glob("chunk-*/file-*.parquet")):
             for row in pq.read_table(meta_path).to_pylist():
                 if row.get("episode_index") != episode.get("episodeIndex"):
                     continue
-                try:
-                    chunk = int(row[f"{prefix}/chunk_index"])
-                    file_index = int(row[f"{prefix}/file_index"])
-                    start = float(row[f"{prefix}/from_timestamp"])
-                    stop = float(row[f"{prefix}/to_timestamp"])
-                    fps = float(episode["fps"])
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise FileNotFoundError("episode video mapping missing") from exc
-                if not all(math.isfinite(value) for value in (start, stop, fps)) or fps <= 0 or start < 0 or start + frame / fps >= stop:
-                    raise FileNotFoundError("episode video timestamp out of range")
-                path = dataset_dir / "videos" / feature_key / f"chunk-{chunk:03d}" / f"file-{file_index:03d}.mp4"
-                return self._decode_video_frame_to_jpeg(path, round(start * fps) + frame)
+                return self._native_video_row_to_jpeg(dataset_dir, episode, camera, frame, row)
         raise FileNotFoundError("episode video mapping missing")
 
     # 内部说明。
@@ -1738,6 +1801,38 @@ class DatasetRecorderService:
         if delay_s > 0.0:
             await asyncio.sleep(delay_s)
 
+    async def _wait_for_fresh_native_gripper_feedback(self, config: dict[str, Any]) -> None:
+        """录制起点先等参与夹爪拿到一笔新的 native 位置反馈。"""
+        if not self._real_hardware_mode(config) or not self._using_real_hal_native_teleop(config):
+            return
+        selected = getattr(self, "_participation", None)
+        required_sides = tuple(hardware_sides(selected, "grippers")) if selected else ()
+        if not required_sides:
+            return
+        async with self._lock:
+            self._accepting_frame_jobs = False
+        deadline = time.monotonic() + 3.0
+        try:
+            while time.monotonic() < deadline:
+                result = await self.hal.command("teleop.native.status", {})
+                native = result.get("response") if isinstance(result, dict) else None
+                grippers = native.get("grippers", {}) if isinstance(native, dict) else {}
+                now_ms = time.time() * 1000.0
+                fresh = all(
+                    isinstance(grippers.get(side), dict)
+                    and grippers[side].get("positionOk") is True
+                    and 0.0 <= now_ms - float(grippers[side].get("positionSampleTs", 0.0)) <= 1000.0
+                    for side in required_sides
+                )
+                if fresh:
+                    return
+                await asyncio.sleep(0.02)
+            raise RuntimeError("参与采集的夹爪在录制开始前没有获得新鲜位置反馈")
+        finally:
+            if getattr(self, "_recording", False):
+                async with self._lock:
+                    self._accepting_frame_jobs = True
+
     async def _native_writer_command(self, kind: str) -> Any:
         """向 native 写线程发送控制命令，并异步等待执行结果。"""
         writer = self._writer_thread
@@ -1778,10 +1873,13 @@ class DatasetRecorderService:
             return False
 
     async def _save_native_episode(self) -> None:
-        """请求写线程保存当前 native episode 并更新累计帧数缓存。"""
+        """保存当前 native episode，并缓存尚未 finalize 的视频元数据映射。"""
         try:
             total_frames = await self._native_writer_command("save_episode")
             self._native_total_frames_cached = int(total_frames or 0)
+            latest = await self._native_writer_command("latest_episode_metadata")
+            if isinstance(latest, dict) and latest:
+                self._native_live_episode_metadata[self._episode_index] = deepcopy(latest)
         except Exception as exc:  # noqa: BLE001
             self._native_error = str(exc)
             raise DatasetSaveError(f"native LeRobot save_episode failed: {exc}") from exc
@@ -1794,16 +1892,20 @@ class DatasetRecorderService:
             self._native_error = str(exc)
 
     async def _finalize_native_dataset(self) -> None:
-        """请求写线程 finalize native 数据集并清理服务侧引用。"""
+        """Finalize native metadata; after success, on-disk parquet is safe for review reads."""
         if self._writer_thread is None:
             self._native_dataset = None
             return
+        finalized = False
         try:
             await self._native_writer_command("finalize")
+            finalized = True
         except Exception as exc:  # noqa: BLE001
             self._native_error = str(exc)
         finally:
             self._native_dataset = None
+            if finalized:
+                self._native_live_episode_metadata.clear()
 
     def _start_sampler_tasks_locked(self) -> None:
         """在持锁状态下启动每个硬件源对应的后台采样线程。"""
@@ -1814,7 +1916,10 @@ class DatasetRecorderService:
             self._recording_diagnostics.start()
             self.logs.info("[LEROBOT]", f"recording diagnostics (180s): {path}")
         self._sampler_stop_event.clear()
+        config = self._recording_config()
         for source in SOURCE_KEYS:
+            if source == "force" and not self._record_force_enabled(config):
+                continue
             thread = self._sampler_threads.get(source)
             if thread is None or not thread.is_alive():
                 self._sampler_threads[source] = Thread(
@@ -2023,6 +2128,19 @@ class DatasetRecorderService:
         """计算目标帧在对齐延迟之后的本机唤醒时间。"""
         return self._record_schedule_timestamp_s(frame_index) + self._alignment_delay_s(config)
 
+    def _record_force_enabled(self, config: dict[str, Any]) -> bool:
+        """判断当前录制是否需要采样和对齐力反馈。"""
+        if not self._real_hardware_mode(config):
+            return True
+        storage = config.get("storage", {}) if isinstance(config.get("storage"), dict) else {}
+        return bool(storage.get("recordForce", False))
+
+    def _critical_alignment_sources(self, config: dict[str, Any]) -> tuple[str, ...]:
+        """按录制配置选择必须追上的实时源。"""
+        if self._record_force_enabled(config):
+            return CRITICAL_ALIGNMENT_SOURCE_KEYS
+        return tuple(source for source in CRITICAL_ALIGNMENT_SOURCE_KEYS if source != "force")
+
     def _alignment_delay_s(self, config: dict[str, Any]) -> float:
         """读取配置中的源对齐延迟并转换为秒。"""
         storage = config.get("storage", {}) if isinstance(config.get("storage"), dict) else {}
@@ -2038,9 +2156,10 @@ class DatasetRecorderService:
         config: dict[str, Any],
         target_monotonic_s: float,
         *,
-        sources: tuple[str, ...] = CRITICAL_ALIGNMENT_SOURCE_KEYS,
+        sources: tuple[str, ...] | None = None,
     ) -> set[str]:
         """等待关键采样源至少有样本到达目标时间，超时返回缺失源。"""
+        sources = self._critical_alignment_sources(config) if sources is None else sources
         missing = self._sources_missing_at_or_after(sources, target_monotonic_s)
         timeout_s = self._settle_timeout_s(config)
         if not missing or timeout_s <= 0:

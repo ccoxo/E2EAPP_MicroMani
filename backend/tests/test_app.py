@@ -4079,6 +4079,8 @@ def test_create_dataset_can_resume_native_lerobot_recording(tmp_path: Path, monk
     monkeypatch.setenv("APPSTATION_LEROBOT_USE_VIDEOS", "0")
     dataset_root = tmp_path / "datasets"
     with TestClient(create_app(tmp_path / "runtime")) as client:
+        _attach_mock_control_lease(client)
+        client.app.state.recorder.validate_start_origin = AsyncMock()
         config = client.get("/api/settings").json()
         config["storage"]["datasetRoot"] = str(dataset_root)
         config["cameras"]["previewResolution"] = "160x120"
@@ -4100,7 +4102,7 @@ def test_create_dataset_can_resume_native_lerobot_recording(tmp_path: Path, monk
             "/api/record/session/create",
             json={"dataset_name": "created_native_dataset", "task": "pytest resume native"},
         )
-        assert start_response.status_code == 200
+        assert start_response.status_code == 200, start_response.text
         assert start_response.json()["data"]["format"] == "lerobot-v3-native"
         time.sleep(0.2)
 

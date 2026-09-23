@@ -582,6 +582,7 @@ export const defaultConfig: AppConfig = {
   storage: {
     datasetRoot: '~/.appstation/datasets',
     recordFps: 30,
+    recordForce: false,
     videoCrf: 23,
     pushToHub: false,
   },

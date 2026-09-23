@@ -693,6 +693,7 @@ export interface AppConfig {
   storage: {
     datasetRoot: string
     recordFps: number
+    recordForce: boolean
     videoCrf: number
     pushToHub: boolean
   }

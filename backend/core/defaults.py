@@ -475,6 +475,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "storage": {
         "datasetRoot": "~/.appstation/datasets",
         "recordFps": 30,
+        "recordForce": False,
         "videoCrf": 23,
         "pushToHub": False,
     },

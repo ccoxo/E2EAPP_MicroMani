@@ -658,6 +658,15 @@ void NativeTeleopController::gripperLoop() {
         nextSampleAt = now + kGripperPositionSampleInterval;
       }
     }
+    if (shouldSample) {
+      std::array<bool, 2> participating;
+      {
+        std::scoped_lock lock(mutex_);
+        participating = config_.gripperParticipating;
+      }
+      if (participating[0]) sampleGripperPosition(Side::Left);
+      if (participating[1]) sampleGripperPosition(Side::Right);
+    }
     for (const auto& command : commands) {
       if (!command.pending || !gripperWorkerRunning_.load()
           || !motion_.commandEpochAllowed(command.motionEpoch)) {
@@ -685,15 +694,6 @@ void NativeTeleopController::gripperLoop() {
         gripperLastMessage_[command.targetIndex] = message;
         gripperLastCommandTs_[command.targetIndex] = unixTimeMs();
       }
-    }
-    if (shouldSample) {
-      std::array<bool, 2> participating;
-      {
-        std::scoped_lock lock(mutex_);
-        participating = config_.gripperParticipating;
-      }
-      if (participating[0]) sampleGripperPosition(Side::Left);
-      if (participating[1]) sampleGripperPosition(Side::Right);
     }
   }
 }
