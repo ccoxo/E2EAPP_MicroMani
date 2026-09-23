@@ -2400,7 +2400,7 @@ def test_dataset_recorder_appstation_info_records_hkvl_configuration_and_tare(
 
 def test_dataset_recorder_composes_14d_state_and_absolute_action() -> None:
     class FakeTeleop:
-        def status(self) -> dict[str, object]:
+        def status(self, _config: dict[str, object] | None = None) -> dict[str, object]:
             return {
                 "lastAction": {
                     "ts": int(time.time() * 1000),
@@ -2422,9 +2422,21 @@ def test_dataset_recorder_composes_14d_state_and_absolute_action() -> None:
     ) == [-13, 8, 9, 400.0, 500.0, 500.0, 7.0, 11, 2, 3, 600.0, 200.0, 300.0, 6.0]
 
 
+def test_dataset_recorder_action_status_reuses_frozen_recording_config() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    config = {"hal": {"mode": "real"}}
+    calls: list[dict[str, object]] = []
+    recorder._recording_config_snapshot = config
+    recorder.settings = SimpleNamespace(get_config=lambda: pytest.fail("config.json reloaded during frame assembly"))
+    recorder.teleop = SimpleNamespace(status=lambda passed_config: calls.append(passed_config) or {"nativeStatus": {}})
+
+    assert recorder._recording_action_status() == {"nativeStatus": {}}
+    assert calls == [config]
+
+
 def test_dataset_recorder_uses_native_gripper_targets_for_action() -> None:
     class FakeTeleop:
-        def status(self) -> dict[str, object]:
+        def status(self, _config: dict[str, object] | None = None) -> dict[str, object]:
             return {
                 "lastAction": {
                     "ts": int(time.time() * 1000),
@@ -2448,7 +2460,7 @@ def test_dataset_recorder_real_hal_native_action_ignores_config_targets_when_nat
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeTeleop:
-        def status(self) -> dict[str, object]:
+        def status(self, _config: dict[str, object] | None = None) -> dict[str, object]:
             return {
                 "lastAction": {
                     "ts": int(time.time() * 1000),
@@ -2579,7 +2591,7 @@ def test_dataset_recorder_real_hal_native_gripper_observation_reuses_native_posi
 
 def test_dataset_recorder_action_vector_uses_last_action_before_target() -> None:
     class FakeTeleop:
-        def status(self) -> dict[str, object]:
+        def status(self, _config: dict[str, object] | None = None) -> dict[str, object]:
             return {
                 "lastAction": {
                     "ts": int(time.time() * 1000),
@@ -2623,7 +2635,7 @@ def test_dataset_recorder_action_vector_uses_last_action_before_target() -> None
 
 def test_dataset_recorder_action_vector_uses_hal_steady_clock_over_host_monotonic() -> None:
     class FakeTeleop:
-        def status(self) -> dict[str, object]:
+        def status(self, _config: dict[str, object] | None = None) -> dict[str, object]:
             return {
                 "lastAction": {
                     "ts": int(time.time() * 1000),
@@ -2666,7 +2678,7 @@ def test_dataset_recorder_action_vector_uses_hal_steady_clock_over_host_monotoni
 
 def test_dataset_recorder_action_vector_combines_latest_action_per_side() -> None:
     class FakeTeleop:
-        def status(self) -> dict[str, object]:
+        def status(self, _config: dict[str, object] | None = None) -> dict[str, object]:
             return {
                 "lastAction": {
                     "ts": int(time.time() * 1000),
@@ -2742,7 +2754,7 @@ def test_dataset_recorder_applies_work_origin_pulse_conversion() -> None:
 
 def test_frame_assembler_swaps_all_left_right_numeric_channels_but_not_cameras() -> None:
     class FakeTeleop:
-        def status(self) -> dict[str, object]:
+        def status(self, _config: dict[str, object] | None = None) -> dict[str, object]:
             return {
                 "lastAction": {
                     "monotonic_s": 10.0,

@@ -5962,7 +5962,7 @@ def test_real_hal_client_uses_long_no_retry_policy_for_motion_home(monkeypatch: 
 
 def test_dataset_recorder_action_vector_prefers_teleop_delta_vector() -> None:
     class FakeTeleop:
-        def status(self) -> dict[str, object]:
+        def status(self, _config: dict[str, object] | None = None) -> dict[str, object]:
             return {
                 "lastAction": {
                     "ts": int(time.time() * 1000),

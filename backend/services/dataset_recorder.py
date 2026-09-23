@@ -4760,7 +4760,8 @@ class DatasetRecorderService:
     def _recording_action_status(self) -> dict[str, Any]:
         # 保存时设备先停止；排队尾帧使用停止前快照，避免读到复位目标。
         snapshot = getattr(self, "_final_action_status", None)
-        return snapshot if snapshot is not None else self.teleop.status()
+        # 组帧复用会话配置，避免 teleop.status 每帧重读 config.json。
+        return snapshot if snapshot is not None else self.teleop.status(self._recording_config())
 
     def _teleop_actions_for_target(self, target_monotonic_s: float | None) -> list[dict[str, Any]]:
         """选择目标时间之前仍新鲜的 teleop 动作列表。"""
