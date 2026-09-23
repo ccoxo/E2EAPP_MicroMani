@@ -59,7 +59,7 @@ void nativeExcludesOtherSources() {
   rejects([&] { f.manual(); });
   rejects([&] { f.manual(Side::Right); });
   rejects([&] { f.executor.applyExternal(f.target(1), f.epoch()); });
-  rejects([&] { f.executor.homeSide(Side::Left, allAxes, f.epoch()); });
+  rejects([&] { f.executor.homeSide(Side::Left, allAxes, HardwareHomeConfig{}, f.epoch()); });
   rejects([&] { f.executor.homeAll({}, {allAxes, allAxes}, f.epoch()); });
   auto target = f.target(1);
   require(f.executor.applyNative(target, target.deltas).has_value(), "active native target rejected");
@@ -172,7 +172,7 @@ void busyExecutorRejectsInsteadOfQueueingAndCannotBlockEmergencyLatch() {
   Fixture f;
   auto held = MotionExecutorTestAccess::holdExecutor(f.executor);
   rejects([&] { f.manual(); });
-  rejects([&] { f.executor.homeSide(Side::Left, allAxes, f.epoch()); });
+  rejects([&] { f.executor.homeSide(Side::Left, allAxes, HardwareHomeConfig{}, f.epoch()); });
   rejects([&] { f.executor.applyExternal(f.target(1), f.epoch()); });
   // 不等待执行器锁，模拟阻塞驱动调用期间撤销运动许可。
   f.motion.latchEmergencyStop();

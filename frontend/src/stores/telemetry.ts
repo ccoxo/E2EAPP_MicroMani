@@ -453,6 +453,7 @@ const emptyFrame: TelemetryFrame = {
   gripperPositions: [-1, -1],
   motionEnabled: { left: null, right: null },
   motionAxisEnabled: { left: Array.from({ length: 6 }, () => null), right: Array.from({ length: 6 }, () => null) },
+  motionAxisEnabledConfirmed: { left: Array.from({ length: 6 }, () => false), right: Array.from({ length: 6 }, () => false) },
   forceLeft: [0, 0, 0, 0, 0, 0],
   forceRight: [0, 0, 0, 0, 0, 0],
   forceStatus: {
@@ -629,6 +630,10 @@ function buildFrame(state: TelemetryStore): TelemetryFrame {
     ],
     motionEnabled: { left: false, right: false },
     motionAxisEnabled: {
+      left: Array.from({ length: 6 }, () => false),
+      right: Array.from({ length: 6 }, () => false),
+    },
+    motionAxisEnabledConfirmed: {
       left: Array.from({ length: 6 }, () => false),
       right: Array.from({ length: 6 }, () => false),
     },
@@ -901,6 +906,8 @@ function backendFrameCommitIsUrgent(previous: TelemetryFrame, next: TelemetryFra
     || previous.motionEnabled.right !== next.motionEnabled.right
     || previous.motionAxisEnabled.left.some((value, index) => value !== next.motionAxisEnabled.left[index])
     || previous.motionAxisEnabled.right.some((value, index) => value !== next.motionAxisEnabled.right[index])
+    || (previous.motionAxisEnabledConfirmed?.left ?? []).some((value, index) => value !== (next.motionAxisEnabledConfirmed?.left ?? [])[index])
+    || (previous.motionAxisEnabledConfirmed?.right ?? []).some((value, index) => value !== (next.motionAxisEnabledConfirmed?.right ?? [])[index])
     || (previous.dangerIndex < 1 && next.dangerIndex >= 1)
 }
 /** 当前 UI 提交节流间隔：隐藏页降频，可见页约 15Hz。 */

@@ -186,6 +186,12 @@ def _ensure_home_reference_model(config: dict[str, Any], has_current_home_refere
         confirmed = ([value is True for value in raw_confirmed]
                      if isinstance(raw_confirmed, list) and len(raw_confirmed) == 6 else [False] * 6)
         next_reference[f"{side}AxisConfirmed"] = confirmed
+        raw_instance_ids = reference.get(f"{side}AxisInstanceId")
+        next_reference[f"{side}AxisInstanceId"] = [
+            str(raw_instance_ids[index]) if confirmed[index] and isinstance(raw_instance_ids, list)
+            and len(raw_instance_ids) == 6 and raw_instance_ids[index] else ""
+            for index in range(6)
+        ]
         limit_key = f"{side}AxisLimitReference"
         if limit_key in reference:
             raw_limits = reference[limit_key]
@@ -562,6 +568,13 @@ class SettingsService:
                     reference[f"{side}AxisConfirmed"] = [
                         index < len(old_flags) and old_flags[index] is True
                         and index < len(old_pulses) and old_pulses[index] == reference[f"{side}Pulse"][index]
+                        for index in range(6)
+                    ]
+                    old_instance_ids = previous.get(f"{side}AxisInstanceId", [])
+                    reference[f"{side}AxisInstanceId"] = [
+                        str(old_instance_ids[index]) if reference[f"{side}AxisConfirmed"][index]
+                        and isinstance(old_instance_ids, list) and index < len(old_instance_ids)
+                        and old_instance_ids[index] else ""
                         for index in range(6)
                     ]
                     limit_key = f"{side}AxisLimitReference"

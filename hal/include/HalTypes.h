@@ -33,19 +33,43 @@ struct MotionProfile {
   double decTimeSec{};
 };
 
+enum class ReferenceSeekMode { OriginSignal, PositiveLimit };
+
+struct HardwareHomeAxisConfig {
+  unsigned short direction{0};
+  unsigned short velocityMode{1};
+  unsigned short mode{0};
+  unsigned short ezCount{1};
+  unsigned short logic{1};
+  double lowVelocityUi{300.0};
+  double highVelocityUi{1000.0};
+  double accTimeSec{0.2};
+  double decTimeSec{0.2};
+  double maxSearchUi{50000.0};
+};
+
+struct HardwareHomeConfig {
+  ReferenceSeekMode referenceMode{ReferenceSeekMode::OriginSignal};
+  std::array<HardwareHomeAxisConfig, 6> axes{};
+};
+
 // 单个语义轴的实时状态。pulse 是控制卡脉冲，uiPosition 是换算后的 UI 单位。
 struct AxisState {
   double pulse{};
   double uiPosition{};
   bool moving{};
   bool enabled{};
+  // True only when enabled came from a readable servo feedback pin, not software intent.
+  bool enabledConfirmed{};
 };
 
 // 两侧共 12 个语义轴的运动状态快照。
 struct MotionState {
   std::array<AxisState, 12> axes{};
   bool estopActive{};
+  // Timestamp of the last real controller sample. Cached responses must preserve it.
   std::int64_t readTimestampMs{};
+  bool sampleCached{};
 };
 
 // 遥操作目标更新的诊断结果。数组下标仍按 X/Y/Z/Roll/Pitch/Yaw 排列，
@@ -78,6 +102,8 @@ struct HalHealth {
   bool omega7Ok{};
   std::string version{"hal-skeleton/0.1"};
   double uptimeS{};
+  // Changes on every LTDMC initialization; persisted pulse references are scoped to this instance.
+  std::string instanceId{};
 };
 
 // 语义轴到控制卡物理轴的映射。左侧控制卡只使用部分轴号，右侧有不同接线顺序。

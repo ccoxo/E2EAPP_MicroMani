@@ -141,6 +141,8 @@ class CommandService:
     def require_stationary_motion(self, state: dict[str, Any]) -> None:
         moving = state.get("moving")
         stamp = state.get("timestamp_ms")
+        if state.get("sample_cached") is True:
+            raise RuntimeError("stationary motion feedback is cached; fresh controller sample required")
         if not isinstance(stamp, (int, float)) or not math.isfinite(stamp) or not -100 <= now_ms() - stamp <= 500:
             raise RuntimeError("stationary motion feedback is stale or unavailable")
         if not isinstance(moving, list) or len(moving) != 12 or any(value is not False for value in moving):
@@ -157,7 +159,9 @@ class CommandService:
             pulses = self._motion_state_pulses(state)
             moving = state.get("moving")
             stamp = state.get("timestamp_ms")
-            fresh = isinstance(stamp, (float, int)) and math.isfinite(stamp) and requested_at <= stamp <= now_ms() + 100 and now_ms() - stamp <= 500
+            fresh = (state.get("sample_cached") is not True and isinstance(stamp, (float, int))
+                     and math.isfinite(stamp) and requested_at <= stamp <= now_ms() + 100
+                     and now_ms() - stamp <= 500)
             confirmed = fresh and not state.get("estop_active", False) and isinstance(moving, list) and len(moving) == 12
             for side, target in targets.items():
                 offset = 0 if side == "left" else 6
@@ -399,6 +403,80 @@ class CommandService:
         self.logs.warning("[HAL]", f"{side_label} motion stop requested")
         return result
 
+    def _hardware_home_payload(
+        self, config: dict[str, Any], side: str, enabled_axes: list[bool], reference_mode: str
+    ) -> dict[str, object]:
+        if reference_mode not in {"origin", "positive_limit"}:
+            raise RuntimeError("invalid hardware reference mode")
+        if reference_mode == "positive_limit":
+            allowed = {0, 2} if side == "right" else {0, 1}
+            invalid = [AXIS_ORDER[index] for index, selected in enumerate(enabled_axes) if selected and index not in allowed]
+            if invalid:
+                raise RuntimeError(f"{side} positive-limit reference is not configured for {', '.join(invalid)}")
+        motion = config.get("motion", {}) if isinstance(config.get("motion"), dict) else {}
+        root = motion.get("hardwareHome", {}) if isinstance(motion.get("hardwareHome"), dict) else {}
+        side_cfg = root.get(side, {}) if isinstance(root.get(side), dict) else {}
+        defaults: dict[str, list[float | int]] = {
+            "direction": [0] * 6,
+            "velocityMode": [1] * 6,
+            "mode": [0] * 6,
+            "ezCount": [1] * 6,
+            "logic": [1] * 6,
+            "lowVelocityUi": [300.0, 300.0, 300.0, 0.5, 0.5, 0.5],
+            "highVelocityUi": [1000.0, 1000.0, 1000.0, 2.0, 2.0, 2.0],
+            "accTimeSec": [0.2] * 6,
+            "decTimeSec": [0.2] * 6,
+            "maxSearchUi": [55000.0, 82500.0, 82500.0, 90.0, 90.0, 90.0],
+        }
+        values: dict[str, list[float | int]] = {}
+        for key, fallback in defaults.items():
+            raw = side_cfg.get(key)
+            if not isinstance(raw, list) or len(raw) != 6:
+                raw = fallback
+            parsed: list[float | int] = []
+            for value in raw:
+                if isinstance(fallback[0], int):
+                    if type(value) not in {int, float} or not math.isfinite(float(value)) or float(value).is_integer() is False:
+                        raise RuntimeError(f"invalid motion.hardwareHome.{side}.{key}")
+                    parsed.append(int(value))
+                else:
+                    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                        raise RuntimeError(f"invalid motion.hardwareHome.{side}.{key}")
+                    parsed.append(float(value))
+            values[key] = parsed
+        for index in range(6):
+            if values["direction"][index] not in (0, 1) or values["velocityMode"][index] not in (0, 1) or values["logic"][index] not in (0, 1):
+                raise RuntimeError(f"invalid binary hardware HOME parameter for {side} {AXIS_ORDER[index]}")
+            if not 0 <= int(values["mode"][index]) <= 16 or not 0 <= int(values["ezCount"][index]) <= 1000:
+                raise RuntimeError(f"invalid hardware HOME mode/EZ count for {side} {AXIS_ORDER[index]}")
+            low = float(values["lowVelocityUi"][index]); high = float(values["highVelocityUi"][index])
+            acc = float(values["accTimeSec"][index]); dec = float(values["decTimeSec"][index]); search = float(values["maxSearchUi"][index])
+            if low <= 0 or high <= 0 or low > high or acc <= 0 or dec <= 0 or search <= 0:
+                raise RuntimeError(f"hardware HOME velocity/ramp/search must be positive and ordered for {side} {AXIS_ORDER[index]}")
+        return {
+            "side": side,
+            "enabledAxes": enabled_axes,
+            "referenceMode": reference_mode,
+            "homeDirection": values["direction"],
+            "homeVelocityMode": values["velocityMode"],
+            "homeMode": values["mode"],
+            "homeEzCount": values["ezCount"],
+            "homeLogic": values["logic"],
+            "homeLowVelocityUi": values["lowVelocityUi"],
+            "homeHighVelocityUi": values["highVelocityUi"],
+            "homeAccTimeSec": values["accTimeSec"],
+            "homeDecTimeSec": values["decTimeSec"],
+            "homeMaxSearchUi": values["maxSearchUi"],
+        }
+
+    async def _current_reference_instance_id(self, config: dict[str, Any]) -> str:
+        if not self._real_hardware_mode(config):
+            return "test-hal-instance"
+        health = await self.hal.health()
+        if not health.connected or not health.ltdmc_ok or not health.instance_id:
+            raise RuntimeError("HAL instance identity is unavailable; hardware reference cannot be trusted")
+        return health.instance_id
+
     @motion_operation("side")
     async def return_hardware_reference_side(self, side: str, axes: list[str]) -> dict[str, object]:
         self._validate_side(side)
@@ -414,6 +492,14 @@ class CommandService:
         missing = [axis for index, axis in enumerate(AXIS_ORDER) if enabled_axes[index] and not confirmed[index]]
         if missing:
             raise RuntimeError(f"{side} hardware reference unconfirmed for {', '.join(missing)}; entire return refused")
+        instance_id = await self._current_reference_instance_id(config)
+        instance_ids = cast(list[str], reference[f"{side}AxisInstanceId"])
+        stale = [axis for index, axis in enumerate(AXIS_ORDER)
+                 if enabled_axes[index] and instance_ids[index] != instance_id]
+        if stale:
+            raise RuntimeError(
+                f"{side} hardware reference belongs to another HAL/controller instance for {', '.join(stale)}; re-home required"
+            )
         target = cast(list[float], reference[f"{side}Pulse"])
         await self._stop_manual_teleop_connect_before_motion_return()
         self.safety.check(token)
@@ -443,11 +529,15 @@ class CommandService:
         if self._real_hardware_mode(config) and result.get("response", {}).get("referenceReturnCompleted") is not True:
             raise RuntimeError("HAL did not confirm hardware reference return completion; deploy matching HAL binaries")
         await self._confirm_work_origin({side: target}, requested_at, token, enabled_axes)
+        if await self._current_reference_instance_id(config) != instance_id:
+            raise RuntimeError("HAL/controller instance changed during hardware reference return; completion is untrusted")
         self.logs.info("[HAL]", f"{side} returned to saved hardware reference; calibration unchanged")
         return result
 
     @motion_operation("side")
-    async def home_motion_side(self, side: str, axes: list[str] | None = None) -> dict[str, object]:
+    async def home_motion_side(
+        self, side: str, axes: list[str] | None = None, *, reference_mode: str = "origin"
+    ) -> dict[str, object]:
         self._validate_side(side)
         safety_token = self.safety.capture(side)
         self.safety.check(safety_token)
@@ -459,12 +549,14 @@ class CommandService:
         enabled_axes = [axis in axes for axis in AXIS_ORDER] if axes is not None else self._home_enabled_axes(side, config)
         home_reference = self._normalized_home_reference(config)
         pulse_key = f"{side}Pulse"
+        instance_id = await self._current_reference_instance_id(config)
         # 开始前持久化撤销所选轴的确认；失败、急停、断连不能保留旧成功标记。
         confirmed = cast(list[bool], home_reference[f"{side}AxisConfirmed"])
         limit_key = f"{side}AxisLimitReference"
         for index, selected in enumerate(enabled_axes):
             if selected:
                 confirmed[index] = False
+                home_reference[f"{side}AxisInstanceId"][index] = ""
                 if limit_key in home_reference:
                     home_reference[limit_key][index] = False
         config["motion"]["homeReference"] = home_reference
@@ -472,10 +564,12 @@ class CommandService:
         self.safety.check(safety_token)
         result = await self.hal.command(
             "motion.home_side",
-            {"side": side, "enabledAxes": enabled_axes},
+            self._hardware_home_payload(config, side, enabled_axes, reference_mode),
         )
         if self._real_hardware_mode(config) and result.get("response", {}).get("homeCompleted") is not True:
             raise RuntimeError("HAL did not confirm hardware home completion; deploy matching HAL binaries")
+        if await self._current_reference_instance_id(config) != instance_id:
+            raise RuntimeError("HAL/controller instance changed during hardware home; reference not saved")
         limit_reference_axes = result.get("response", {}).get("limitReferenceAxes", [False] * 6)
         if (
             not isinstance(limit_reference_axes, list) or len(limit_reference_axes) != 6
@@ -484,6 +578,12 @@ class CommandService:
                    for index, value in enumerate(limit_reference_axes))
         ):
             raise RuntimeError("invalid HAL limit reference axes; reference not saved")
+        if reference_mode == "origin" and any(limit_reference_axes):
+            raise RuntimeError("strict hardware home returned a limit reference; reference not saved")
+        if reference_mode == "positive_limit" and any(
+            enabled_axes[index] != limit_reference_axes[index] for index in range(6)
+        ):
+            raise RuntimeError("positive-limit reference did not confirm every selected axis; reference not saved")
         completed_at = now_ms()
         deadline = time.monotonic() + 2.0
         while True:
@@ -495,7 +595,8 @@ class CommandService:
             moving = state.get("moving")
             offset = 0 if side == "left" else 6
             if not self._real_hardware_mode(config) or (
-                isinstance(stamp, (int, float)) and completed_at <= stamp <= now_ms() + 100 and now_ms() - stamp <= 500
+                state.get("sample_cached") is not True
+                and isinstance(stamp, (int, float)) and completed_at <= stamp <= now_ms() + 100 and now_ms() - stamp <= 500
                 and isinstance(moving, list) and len(moving) == 12
                 and all(moving[offset + index] is False for index, selected in enumerate(enabled_axes) if selected)
             ):
@@ -503,6 +604,8 @@ class CommandService:
             if time.monotonic() >= deadline:
                 raise RuntimeError("fresh stationary feedback missing after hardware home completion")
             await asyncio.sleep(0.02)
+        if await self._current_reference_instance_id(config) != instance_id:
+            raise RuntimeError("HAL/controller instance changed before hardware reference commit; reference not saved")
         pulses = self._motion_state_pulses(state)
         origin = self._normalized_motion_origin(config)
         previous_origin_pulse = list(origin[pulse_key])
@@ -513,7 +616,7 @@ class CommandService:
         for index, selected in enumerate(enabled_axes):
             if not selected:
                 pulses[offset + index] = home_reference[pulse_key][index]
-        self._set_home_reference_side(home_reference, side, pulses, updated_at, enabled_axes)
+        self._set_home_reference_side(home_reference, side, pulses, updated_at, enabled_axes, instance_id)
         limit_sources = list(home_reference.get(limit_key, [False] * 6))
         for index, selected in enumerate(enabled_axes):
             if selected:
@@ -562,11 +665,11 @@ class CommandService:
         self.telemetry.home_side(side, [selected and not limit_reference_axes[index]
                                        for index, selected in enumerate(enabled_axes)])
         side_label = "left" if side == "left" else "right"
-        if any(limit_reference_axes):
+        if reference_mode == "positive_limit":
             limit_names = ", ".join(axis for index, axis in enumerate(AXIS_ORDER) if limit_reference_axes[index])
             self.logs.info("[HAL]", f"{side_label} positive-limit reference saved: {limit_names}; pulse counters unchanged")
         else:
-            self.logs.info("[HAL]", f"{side_label} motion hardware zero refreshed")
+            self.logs.info("[HAL]", f"{side_label} strict ORG hardware home completed")
         return {
             **result,
             "origin": saved["motion"]["origin"],
@@ -938,7 +1041,7 @@ class CommandService:
                     "chunkSteps": chunk_steps,
                 },
             )
-        return {"hal": hal_result, "chunkCount": len(chunk_steps), "chunkSteps": chunk_steps}
+            return {"hal": hal_result, "chunkCount": len(chunk_steps), "chunkSteps": chunk_steps}
         applied = self.telemetry.apply_axis_move(request.side, request.axis, effective_direction, request.step, config)
         self.logs.event(
             "[HAL]",
@@ -1638,6 +1741,14 @@ class CommandService:
             return [value is True for value in raw] if isinstance(raw, list) and len(raw) == 6 else [False] * 6
         left_confirmed = axis_confirmed("left")
         right_confirmed = axis_confirmed("right")
+        def axis_instance_ids(side: str, confirmed: list[bool]) -> list[str]:
+            raw = reference.get(f"{side}AxisInstanceId")
+            return [
+                str(raw[index]) if confirmed[index] and isinstance(raw, list) and len(raw) == 6 and raw[index] else ""
+                for index in range(6)
+            ]
+        left_instance_ids = axis_instance_ids("left", left_confirmed)
+        right_instance_ids = axis_instance_ids("right", right_confirmed)
         left_valid = bool(reference.get("leftValid", reference.get("valid", False)))
         right_valid = bool(reference.get("rightValid", reference.get("valid", False)))
         updated_at = reference.get("updatedAt", 0)
@@ -1653,6 +1764,8 @@ class CommandService:
             "rightPulse": right_pulse,
             "leftAxisConfirmed": left_confirmed,
             "rightAxisConfirmed": right_confirmed,
+            "leftAxisInstanceId": left_instance_ids,
+            "rightAxisInstanceId": right_instance_ids,
             "updatedAt": updated_at,
         }
         for side, confirmed in (("left", left_confirmed), ("right", right_confirmed)):
@@ -1693,15 +1806,18 @@ class CommandService:
         pulses: list[float],
         updated_at: int,
         enabled_axes: list[bool],
+        instance_id: str,
     ) -> None:
         offset = 0 if side == "left" else 6
         pulse_key = "leftPulse" if side == "left" else "rightPulse"
         valid_key = "leftValid" if side == "left" else "rightValid"
         home_reference[pulse_key] = list(pulses[offset : offset + 6])
         confirmed = cast(list[bool], home_reference[f"{side}AxisConfirmed"])
+        instance_ids = cast(list[str], home_reference[f"{side}AxisInstanceId"])
         for index, selected in enumerate(enabled_axes):
             if selected:
                 confirmed[index] = True
+                instance_ids[index] = instance_id
         home_reference[valid_key] = True
         home_reference["valid"] = bool(home_reference["leftValid"] and home_reference["rightValid"])
         home_reference["updatedAt"] = updated_at

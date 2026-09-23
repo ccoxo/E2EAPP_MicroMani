@@ -516,9 +516,15 @@ export const defaultConfig: AppConfig = {
       rightValid: true,
       leftAxisConfirmed: [false, false, false, false, false, false],
       rightAxisConfirmed: [false, false, false, false, false, false],
+      leftAxisInstanceId: ['', '', '', '', '', ''],
+      rightAxisInstanceId: ['', '', '', '', '', ''],
       leftPulse: [100000, 0, -35179, 64833, 64839, -2947],
       rightPulse: [-233, -19221, 593101, 4427, -81110, -180],
       updatedAt: 1778586070000,
+    },
+    hardwareHome: {
+      left: { direction: [0,0,0,0,0,0], velocityMode: [1,1,1,1,1,1], mode: [0,0,0,0,0,0], ezCount: [1,1,1,1,1,1], logic: [1,1,1,1,1,1], lowVelocityUi: [300,300,300,0.5,0.5,0.5], highVelocityUi: [1000,1000,1000,2,2,2], accTimeSec: [0.2,0.2,0.2,0.2,0.2,0.2], decTimeSec: [0.2,0.2,0.2,0.2,0.2,0.2], maxSearchUi: [55000,82500,82500,90,90,90] },
+      right: { direction: [0,0,0,0,0,0], velocityMode: [1,1,1,1,1,1], mode: [0,0,0,0,0,0], ezCount: [1,1,1,1,1,1], logic: [1,1,1,1,1,1], lowVelocityUi: [300,300,300,0.5,0.5,0.5], highVelocityUi: [1000,1000,1000,2,2,2], accTimeSec: [0.2,0.2,0.2,0.2,0.2,0.2], decTimeSec: [0.2,0.2,0.2,0.2,0.2,0.2], maxSearchUi: [55000,82500,82500,90,90,90] },
     },
     workOriginOffset: {
       valid: true,

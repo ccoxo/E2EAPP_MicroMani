@@ -556,6 +556,13 @@ struct HalDdsControlServer::Impl {
 
   void handleCommand(const HalCommandRequestSample& request) {
     const auto commandEpoch = motion_.commandEpoch();
+    const auto receivedAt = std::chrono::steady_clock::now();
+    const bool trace = request.name != "motion.teleop_target_update"
+        && request.name != "motion.replay_absolute_target";
+    if (trace) {
+      std::cout << "[HAL] DEBUG component=DDS event=command_received request_id="
+                << request.request_id << " name=" << request.name << std::endl;
+    }
     HalCommandReplySample reply;
     reply.request_id = request.request_id;
     try {
@@ -584,9 +591,20 @@ struct HalDdsControlServer::Impl {
       reply.error = exc.what();
     }
     writeReply(reply);
+    if (trace) {
+      const auto durationMs = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - receivedAt).count();
+      std::cout << "[HAL] DEBUG component=DDS event=command_replied request_id="
+                << request.request_id << " name=" << request.name
+                << " ok=" << (reply.ok ? "true" : "false")
+                << " durationMs=" << durationMs << std::endl;
+    }
   }
 
   void handleEmergencyStopCommand(const HalCommandRequestSample& request) {
+    const auto receivedAt = std::chrono::steady_clock::now();
+    std::cout << "[HAL] DEBUG component=DDS event=command_received request_id="
+              << request.request_id << " name=" << request.name << std::endl;
     HalCommandReplySample reply;
     reply.request_id = request.request_id;
     try {
@@ -606,6 +624,12 @@ struct HalDdsControlServer::Impl {
       reply.error = exc.what();
     }
     writeReply(reply);
+    const auto durationMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - receivedAt).count();
+    std::cout << "[HAL] DEBUG component=DDS event=command_replied request_id="
+              << request.request_id << " name=" << request.name
+              << " ok=" << (reply.ok ? "true" : "false")
+              << " durationMs=" << durationMs << std::endl;
   }
 
   void writeReply(HalCommandReplySample& reply) {

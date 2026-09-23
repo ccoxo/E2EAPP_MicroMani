@@ -32,6 +32,10 @@ def _default_motion_enabled() -> dict[ManualSide, bool | None]:
 
 def _default_motion_axis_enabled() -> dict[ManualSide, list[bool | None]]:
     return {"left": [None] * 6, "right": [None] * 6}
+
+
+def _default_motion_axis_enabled_confirmed() -> dict[ManualSide, list[bool]]:
+    return {"left": [False] * 6, "right": [False] * 6}
 ManualAxis = Literal["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
 ManualSpeedMode = Literal["fine", "medium", "coarse"]
 ManualGripperCommand = Literal["enable", "disable", "open", "close", "home", "target", "stop"]
@@ -106,6 +110,9 @@ class TelemetryFrame(BaseModel):
     )
     motionAxisEnabled: dict[Literal["left", "right"], list[bool | None]] = Field(
         default_factory=_default_motion_axis_enabled
+    )
+    motionAxisEnabledConfirmed: dict[Literal["left", "right"], list[bool]] = Field(
+        default_factory=_default_motion_axis_enabled_confirmed
     )
     forceLeft: list[float] = Field(min_length=6, max_length=6)
     forceRight: list[float] = Field(min_length=6, max_length=6)

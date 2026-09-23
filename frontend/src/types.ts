@@ -179,6 +179,7 @@ export interface TelemetryFrame {
   gripperPositions: number[]
   motionEnabled: { left: boolean | null; right: boolean | null }
   motionAxisEnabled: { left: Array<boolean | null>; right: Array<boolean | null> }
+  motionAxisEnabledConfirmed?: { left: boolean[]; right: boolean[] }
   forceLeft: number[]
   forceRight: number[]
   forceStatus?: ForceStatus
@@ -299,6 +300,8 @@ export interface MotionHomeReferenceConfig {
   rightPulse: number[]
   leftAxisConfirmed: boolean[]
   rightAxisConfirmed: boolean[]
+  leftAxisInstanceId?: string[]
+  rightAxisInstanceId?: string[]
   leftAxisLimitReference?: boolean[]
   rightAxisLimitReference?: boolean[]
   updatedAt: number
@@ -558,6 +561,19 @@ export interface ManualControlState {
   axisOffsets: Record<string, number>
 }
 
+export interface HardwareHomeSideConfig {
+  direction: number[]
+  velocityMode: number[]
+  mode: number[]
+  ezCount: number[]
+  logic: number[]
+  lowVelocityUi: number[]
+  highVelocityUi: number[]
+  accTimeSec: number[]
+  decTimeSec: number[]
+  maxSearchUi: number[]
+}
+
 export interface AppConfig {
   hal: {
     baseUrl: string
@@ -627,6 +643,7 @@ export interface AppConfig {
     homeReferenceVersion: string
     origin: MotionOriginConfig
     homeReference: MotionHomeReferenceConfig
+    hardwareHome?: { left: HardwareHomeSideConfig; right: HardwareHomeSideConfig }
     workOriginOffset: MotionWorkOriginOffsetConfig
     relativeSoftLimits: MotionRelativeSoftLimitsConfig
     leftProfile: ArmMotionProfile

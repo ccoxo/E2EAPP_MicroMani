@@ -80,6 +80,7 @@ def test_ack_readiness_requires_confirmed_current_session_and_rejects_trip_befor
 def test_second_controller_is_rejected_and_owner_disconnect_trips_control() -> None:
     async def exercise() -> None:
         watchdog, _now, hal, invalidate, stop = make_watchdog()
+        watchdog.disconnect_grace_s = 0.0
         messages = [[], []]
 
         async def send_first(message):
@@ -104,6 +105,31 @@ def test_second_controller_is_rejected_and_owner_disconnect_trips_control() -> N
             await watchdog.cycle()
             assert hal.command.call_count == 1
             assert not watchdog.clients
+        finally:
+            await watchdog.close()
+
+    asyncio.run(exercise())
+
+
+def test_owner_disconnect_allows_quick_reconnect_before_fail_safe_stop() -> None:
+    async def exercise() -> None:
+        watchdog, _now, _hal, invalidate, stop = make_watchdog()
+        watchdog.disconnect_grace_s = 0.05
+
+        async def send(_message):
+            return None
+
+        first = await confirm_mock_browser_lease(watchdog)
+        watchdog.remove(first)
+        await asyncio.sleep(0.01)
+        second = watchdog.register(send)
+        try:
+            await watchdog.cycle()
+            await flush()
+            watchdog.require_ready()
+            invalidate.assert_not_called()
+            stop.assert_not_awaited()
+            assert second in watchdog.clients
         finally:
             await watchdog.close()
 
@@ -136,6 +162,7 @@ def test_hal_renewal_failure_never_reports_active_or_automatically_acknowledges(
 def test_late_successful_renewal_cannot_reactivate_disconnected_session() -> None:
     async def exercise() -> None:
         watchdog, _now, hal, invalidate, stop = make_watchdog()
+        watchdog.disconnect_grace_s = 0.0
         messages = []
         entered, release = asyncio.Event(), asyncio.Event()
 
@@ -276,6 +303,7 @@ def test_app_websocket_lease_confirmation_allows_ack_and_disconnect_blocks_it(tm
     app = create_app(tmp_path)
     app.state.telemetry.hardware = None
     watchdog = app.state.control_watchdog
+    watchdog.disconnect_grace_s = 0.0
 
     async def exercise() -> None:
         inbox = asyncio.Queue()

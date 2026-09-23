@@ -13,7 +13,7 @@ for %%S in (LTDMCDriver MotionControlThread MotionExecutor NativeTeleopControlle
 )
 set OBJECTS=LTDMCDriver.obj MotionControlThread.obj MotionExecutor.obj NativeTeleopController.obj Omega7Driver.obj JodellGripperDriver.obj ForceControlRuntime.obj ForceSafetyLatch.obj ForceComplianceController.obj HkvlForceDriver.obj HkvlForceProtocol.obj HalJson.obj HalCommandDispatcher.obj TeleopHardwareTargetExecutor.obj
 set TEST_RESULT=0
-for %%T in (MotionExecutorTests EmergencyStopTests ControlLeaseTests ThreadStabilityTests WorkerResilienceTests ForceTareRuntimeTests ForceCoreTests) do (
+for %%T in (MotionExecutorTests EmergencyStopTests ControlLeaseTests ThreadStabilityTests WorkerResilienceTests ForceTareRuntimeTests ForceCoreTests StateSemanticsTests) do (
   cl %FLAGS% "%HAL_ROOT%\tests\%%T.cpp" %OBJECTS% /Fe"%%T.exe" || goto :failed
   call :run_test %%T
   if errorlevel 1 set TEST_RESULT=1

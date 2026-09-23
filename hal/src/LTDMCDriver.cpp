@@ -48,6 +48,14 @@ std::int64_t unixTimeMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
 }
 
+std::string makeHalInstanceId() {
+#ifdef _WIN32
+  return std::to_string(unixTimeMs()) + "-" + std::to_string(GetCurrentProcessId());
+#else
+  return std::to_string(unixTimeMs());
+#endif
+}
+
 #ifdef _WIN32
 // LTDMC SDK 通过 DLL 导出 C 接口。这里用函数指针动态绑定，避免构建时强依赖 import lib。
 using DmcBoardInit = short(__stdcall*)();
@@ -453,6 +461,7 @@ void waitForAxesDone(
 
 bool LTDMCDriver::initialize() {
   std::scoped_lock lock(mutex_);
+  instanceId_ = makeHalInstanceId();
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   // HalServer 运行目录或 PATH 中必须能找到 LTDMC.dll；所有导出在启动时一次性绑定。
   ltdmcModule = LoadLibraryA("LTDMC.dll");
@@ -529,6 +538,7 @@ HalHealth LTDMCDriver::health(double uptimeS) const {
     return cachedHealth(uptimeS);
   }
   HalHealth health{initialized_, false, kHalVersion, uptimeS};
+  health.instanceId = instanceId_;
   if (!lastError_.empty()) {
     health.version += " " + lastError_;
   }
@@ -555,6 +565,7 @@ MotionState LTDMCDriver::readState() {
   MotionState state;
   state.readTimestampMs = unixTimeMs();
   state.estopActive = estop_.active();
+  state.sampleCached = false;
   for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
     const auto card = cardForSide(side);
@@ -567,9 +578,13 @@ MotionState LTDMCDriver::readState() {
       // 无可靠伺服反馈的轴使用 commandedEnabled_，防止 UI 把不可读误判为未使能。
       if (!hasReadableSevonFeedback(side, axis)) {
         enabled_[index] = commandedEnabled_[index];
+        state.axes[index].enabledConfirmed = false;
       } else if (dmcReadSevonPin) {
         enabled_[index] = dmcReadSevonPin(card, axisNo) > 0;
         commandedEnabled_[index] = enabled_[index];
+        state.axes[index].enabledConfirmed = true;
+      } else {
+        state.axes[index].enabledConfirmed = false;
       }
       state.axes[index].moving = dmcCheckDone(card, axisNo) == 0;
 #endif
@@ -583,17 +598,17 @@ MotionState LTDMCDriver::readState() {
 }
 
 MotionState LTDMCDriver::cachedStateSnapshot() const {
-  // 缓存返回时更新时间戳和急停状态，表示“响应时间”仍是当前时刻。
+  // Preserve the real controller sample timestamp; cache age must remain observable.
   std::scoped_lock snapshotLock(snapshotMutex_);
   auto state = cachedState_;
-  state.readTimestampMs = unixTimeMs();
   state.estopActive = estop_.active();
+  state.sampleCached = true;
   return state;
 }
-
 HalHealth LTDMCDriver::cachedHealth(double uptimeS) const {
   std::scoped_lock snapshotLock(snapshotMutex_);
   HalHealth health{cachedInitialized_, false, kHalVersion, uptimeS};
+  health.instanceId = instanceId_;
   if (!cachedLastError_.empty()) {
     health.version += " " + cachedLastError_;
   }
@@ -605,6 +620,7 @@ void LTDMCDriver::publishStateSnapshotLocked() {
   MotionState state;
   state.readTimestampMs = unixTimeMs();
   state.estopActive = estop_.active();
+  state.sampleCached = false;
   for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
@@ -613,6 +629,7 @@ void LTDMCDriver::publishStateSnapshotLocked() {
       state.axes[index].pulse = pulse_[index];
       state.axes[index].uiPosition = pulseToUi(pulse_[index], side, axis);
       state.axes[index].enabled = enabled_[index];
+      state.axes[index].enabledConfirmed = false;
     }
   }
   publishStateSnapshotLocked(state);
@@ -626,32 +643,48 @@ void LTDMCDriver::publishStateSnapshotLocked(const MotionState& state) {
   cachedLastError_ = lastError_;
 }
 
+void LTDMCDriver::clearEmergencyStateLocked() {
+  teleopTargetActive_.fill(false);
+  enabled_.fill(false);
+  commandedEnabled_.fill(false);
+  publishStateSnapshotLocked();
+}
+
+std::string LTDMCDriver::stopAttemptFailureMessage(
+    const StopAttemptSummary& stop,
+    const StopAttemptSummary& disable) {
+  if (stop.failed == 0 && disable.failed == 0) return {};
+  std::ostringstream out;
+  out << "hardware emergency action reported failures"
+      << " stopFailed=" << stop.failed << "/" << stop.attempted
+      << " disableFailed=" << disable.failed << "/" << disable.attempted;
+  const auto append = [&out](const char* label, const StopAttemptSummary& value) {
+    if (value.failed == 0) return;
+    out << " " << label << "First=" << value.firstOperation
+        << " ret=" << value.firstRet
+        << " card=" << value.firstCard;
+    if (value.firstAxis >= 0) out << " axis=" << value.firstAxis;
+  };
+  append("stop", stop);
+  append("disable", disable);
+  return out.str();
+}
+
 void LTDMCDriver::emergencyStop() {
   stopsInProgress_.fetch_add(1, std::memory_order_acq_rel);
   struct StopCompletion {
     std::atomic_uint32_t& count;
     ~StopCompletion() { count.fetch_sub(1, std::memory_order_acq_rel); }
   } completion{stopsInProgress_};
-  // sequence 用于区分多次急停/解除路径，避免旧操作完成后误清新急停。
   latchEmergencyStop();
-  stopAllAxesBestEffort();
-  disableAllAxesBestEffort();
+  const auto stopResult = stopAllAxesBestEffort();
+  const auto disableResult = disableAllAxesBestEffort();
 
-  // 急停路径不能等待主控制锁；抢不到锁时硬件已尽力停止，软件缓存下次再刷新。
   std::unique_lock<std::mutex> stateLock(mutex_, std::try_to_lock);
-  if (!stateLock.owns_lock()) {
-    return;
-  }
-  for (auto& active : teleopTargetActive_) {
-    active = false;
-  }
-  for (auto& enabled : enabled_) {
-    enabled = false;
-  }
-  for (auto& commanded : commandedEnabled_) {
-    commanded = false;
-  }
-  publishStateSnapshotLocked();
+  if (stateLock.owns_lock()) clearEmergencyStateLocked();
+
+  const auto failure = stopAttemptFailureMessage(stopResult, disableResult);
+  if (!failure.empty()) throw std::runtime_error(failure);
 }
 
 void LTDMCDriver::latchEmergencyStop() noexcept {
@@ -681,9 +714,7 @@ void LTDMCDriver::acknowledgeEmergencyStop(std::uint64_t expectedEpoch) {
   }
   controlLease_.acknowledge(estop_, expectedEpoch);
   std::unique_lock<std::mutex> stateLock(mutex_, std::try_to_lock);
-  if (stateLock.owns_lock()) {
-    publishStateSnapshotLocked();
-  }
+  if (stateLock.owns_lock()) publishStateSnapshotLocked();
 }
 
 std::uint64_t LTDMCDriver::commandEpoch() const { return estop_.epoch(); }
@@ -694,51 +725,74 @@ std::int64_t LTDMCDriver::lastEmergencyStopUnixMs() const {
   return lastEmergencyStopUnixMs_.load(std::memory_order_acquire);
 }
 
-void LTDMCDriver::stopAllAxesBestEffort() noexcept {
+LTDMCDriver::StopAttemptSummary LTDMCDriver::stopAllAxesBestEffort() noexcept {
+  StopAttemptSummary result;
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
-  // 先尝试整卡急停，再逐轴 stop，尽可能覆盖不同 LTDMC 固件行为。
+  const auto record = [&result](const char* operation, short ret, unsigned short card, int axis) {
+    ++result.attempted;
+    if (ret == 0) return;
+    ++result.failed;
+    if (result.failed == 1) {
+      result.firstRet = ret;
+      result.firstCard = card;
+      result.firstAxis = axis;
+      result.firstOperation = operation;
+    }
+  };
   if (dmcEmgStop) {
     for (const auto side : {Side::Left, Side::Right}) {
       const auto card = cardForSide(side);
-      dmcEmgStop(card);
+      record("dmc_emg_stop", dmcEmgStop(card), card, -1);
     }
   }
   if (dmcStop) {
     for (const auto side : {Side::Left, Side::Right}) {
       const auto card = cardForSide(side);
       for (int axisNo = 0; axisNo < stageAxisCount(side); ++axisNo) {
-        dmcStop(card, static_cast<unsigned short>(axisNo), 1);
+        record("dmc_stop", dmcStop(card, static_cast<unsigned short>(axisNo), 1), card, axisNo);
       }
     }
   }
 #endif
+  return result;
 }
 
-void LTDMCDriver::disableAllAxesBestEffort() noexcept {
+LTDMCDriver::StopAttemptSummary LTDMCDriver::disableAllAxesBestEffort() noexcept {
+  StopAttemptSummary result;
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
-  // 急停后尽力关闭所有实际轴的伺服输出；该函数禁止抛异常。
   if (dmcWriteSevonPin) {
     for (const auto side : {Side::Left, Side::Right}) {
       const auto card = cardForSide(side);
-      for (int axisNo = 0; axisNo < stageAxisCount(side); ++axisNo) {
-        dmcWriteSevonPin(card, static_cast<unsigned short>(axisNo), 0);
+      for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+        const auto axis = static_cast<SemanticAxis>(axisIndex);
+        const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
+        const auto ret = dmcWriteSevonPin(card, axisNo, 0);
+        ++result.attempted;
+        if (ret == 0 || ignoreUnsupportedSevonWriteFailure(side, axis, ret)) continue;
+        ++result.failed;
+        if (result.failed == 1) {
+          result.firstRet = ret;
+          result.firstCard = card;
+          result.firstAxis = axisNo;
+          result.firstOperation = "dmc_write_sevon_pin";
+        }
       }
     }
   }
 #endif
+  return result;
 }
 
 void LTDMCDriver::checkMotionCommand(std::uint64_t epoch) {
   controlLease_.poll(estop_);
   if (commandEpochAllowed(epoch)) return;
-  // SDK 调用可能在急停发生后才返回；再次停车/断使能，禁止继续下一轴或恢复旧缓存。
-  stopAllAxesBestEffort();
-  disableAllAxesBestEffort();
-  teleopTargetActive_.fill(false);
-  enabled_.fill(false);
-  commandedEnabled_.fill(false);
-  publishStateSnapshotLocked();
-  throw std::runtime_error("motion command cancelled by emergency stop; submit a new command after acknowledgement");
+  const auto stopResult = stopAllAxesBestEffort();
+  const auto disableResult = disableAllAxesBestEffort();
+  clearEmergencyStateLocked();
+  const auto hardwareFailure = stopAttemptFailureMessage(stopResult, disableResult);
+  std::string message = "motion command cancelled by emergency stop; submit a new command after acknowledgement";
+  if (!hardwareFailure.empty()) message += "; " + hardwareFailure;
+  throw std::runtime_error(message);
 }
 
 std::string LTDMCDriver::enableSide(Side side, bool enabled) {
@@ -845,7 +899,10 @@ std::string LTDMCDriver::enableSide(Side side, bool enabled, const std::array<bo
   return message.str();
 }
 
-std::array<bool, 6> LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& enabledAxes,
+std::array<bool, 6> LTDMCDriver::homeSide(
+    Side side,
+    const std::array<bool, 6>& enabledAxes,
+    const HardwareHomeConfig& homeConfig,
     std::optional<std::uint64_t> expectedEpoch) {
   const auto estopSequenceAtStart = expectedEpoch.value_or(commandEpoch());
   std::unique_lock lock(mutex_);
@@ -858,202 +915,200 @@ std::array<bool, 6> LTDMCDriver::homeSide(Side side, const std::array<bool, 6>& 
   std::array<bool, 6> limitReferenceAxes{};
 #if defined(_WIN32) && defined(APPSTATION_ENABLE_VENDOR_SDKS)
   if (!dmcHomeMove || !dmcGetHomeResult || !dmcCheckDone || !dmcGetPosition || !dmcStop
-      || !dmcSetPulseOutmode || !dmcSetElMode || !dmcSetHomeMode || !dmcSetHomePinLogic) {
+      || !dmcSetPulseOutmode || !dmcSetElMode || !dmcSetHomeMode || !dmcSetHomePinLogic || !dmcSetProfile) {
     throw std::runtime_error("required LTDMC home exports missing");
   }
-  // 回机械原点前重新配置脉冲、限位和原点模式，保证控制卡处于预期状态。
-  configureStageAxes(side);
+  // Selected axes are configured individually below; do not rewrite HOME parameters on unselected axes.
   const auto card = cardForSide(side);
-  for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-    checkMotionCommand(estopSequenceAtStart);
-    const auto axis = static_cast<SemanticAxis>(axisIndex);
-    if (!enabledAxes[axisIndex]) {
-      continue;
+  constexpr unsigned long kElPositive = 0x2;
+  constexpr unsigned long kUnsafeLimitInputs = 0x8cf;
+  const auto supportsPositiveLimitReference = [](Side activeSide, SemanticAxis axis) {
+    return (activeSide == Side::Right && (axis == SemanticAxis::X || axis == SemanticAxis::Z))
+        || (activeSide == Side::Left && (axis == SemanticAxis::X || axis == SemanticAxis::Y));
+  };
+  if (homeConfig.referenceMode == ReferenceSeekMode::PositiveLimit) {
+    for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+      if (!enabledAxes[axisIndex]) continue;
+      if (!supportsPositiveLimitReference(side, static_cast<SemanticAxis>(axisIndex))) {
+        throw std::runtime_error("positive-limit reference is not configured for the selected axis");
+      }
     }
-    const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
+  }
+  for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+    if (!enabledAxes[axisIndex]) continue;
+    const auto axis = static_cast<SemanticAxis>(axisIndex);
     if (!axisMotionEnabled(side, axis)) {
       throw std::runtime_error("hardware home axis is not servo-enabled");
     }
+    const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
     if (dmcCheckDone(card, axisNo) != 1) {
-      // homing 不与现有运动叠加，必须等轴空闲。
       throw std::runtime_error(dmcAxisFailureMessage("axis busy before dmc_home_move", -1, card, axisNo));
     }
   }
-  std::array<long, 6> beforePulses{};
-  std::array<std::optional<unsigned long>, 6> beforeAxisIo{};
+
   try {
+    // True sequential seek: only one selected axis is moving at a time.
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+      if (!enabledAxes[axisIndex]) continue;
       checkMotionCommand(estopSequenceAtStart);
       const auto axis = static_cast<SemanticAxis>(axisIndex);
-      if (!enabledAxes[axisIndex]) {
-        continue;
-      }
       const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
-      const auto beforePulse = dmcGetPosition ? dmcGetPosition(card, axisNo) : static_cast<long>(pulse_[stateIndex(side, axis)]);
-      beforePulses[axisIndex] = beforePulse;
-      if (((side == Side::Right && (axis == SemanticAxis::X || axis == SemanticAxis::Z)) ||
-           (side == Side::Left && (axis == SemanticAxis::X || axis == SemanticAxis::Y))) && dmcAxisIoStatus) {
-        beforeAxisIo[axisIndex] = dmcAxisIoStatus(card, axisNo);
-      }
+      const auto& config = homeConfig.axes[axisIndex];
+      const auto beforePulse = dmcGetPosition(card, axisNo);
       const auto beforeUi = pulseToUi(static_cast<double>(beforePulse), side, axis);
-      logHardwareHomeDiagnostic(
-          "home_start",
-          side,
-          axis,
-          card,
-          axisNo,
-          kHomeDirection,
-          beforePulse,
-          beforeUi,
-          enabledAxes,
-          beforePulse,
-          beforeUi,
-          0);
-      checkMotionCommand(estopSequenceAtStart);
-      const auto ret = dmcHomeMove(card, axisNo);
-      checkMotionCommand(estopSequenceAtStart);
-      if (ret != 0) {
-        throw std::runtime_error(dmcAxisFailureMessage("dmc_home_move", ret, card, axisNo));
+      const auto startAxisIo = dmcAxisIoStatus
+          ? std::optional<unsigned long>(dmcAxisIoStatus(card, axisNo)) : std::nullopt;
+      if (homeConfig.referenceMode == ReferenceSeekMode::PositiveLimit) {
+        if (!startAxisIo) throw std::runtime_error("positive-limit reference requires dmc_axis_io_status");
+        if ((*startAxisIo & kElPositive) != 0U) {
+          throw std::runtime_error("positive-limit reference requires EL+ to be inactive before seek; move off the limit first");
+        }
+        if ((*startAxisIo & kUnsafeLimitInputs) != 0U) {
+          throw std::runtime_error("positive-limit reference blocked by an active safety/limit input before seek");
+        }
       }
-    }
-    // SDK 启动成功不代表寻零成功；未完成、异常停止和超时均不能写入原点。
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
-    std::array<std::optional<std::chrono::steady_clock::time_point>, 6> stoppedWithoutHomeSince{};
-    std::array<std::optional<long>, 6> stoppedPulses{};
-    while (true) {
+
+      const auto retPulse = dmcSetPulseOutmode(card, axisNo, 5);
+      if (retPulse != 0) throw std::runtime_error(dmcAxisFailureMessage("dmc_set_pulse_outmode", retPulse, card, axisNo));
+      const auto retEl = dmcSetElMode(card, axisNo, 1, 1, 0);
+      if (retEl != 0) throw std::runtime_error(dmcAxisFailureMessage("dmc_set_el_mode", retEl, card, axisNo));
+      const auto retHome = dmcSetHomeMode(card, axisNo, config.direction,
+          static_cast<double>(config.velocityMode), config.mode, config.ezCount);
+      if (retHome != 0) throw std::runtime_error(dmcAxisFailureMessage("dmc_set_homemode", retHome, card, axisNo));
+      const auto retLogic = dmcSetHomePinLogic(card, axisNo, config.logic, 0.0);
+      if (retLogic != 0) throw std::runtime_error(dmcAxisFailureMessage("dmc_set_home_pin_logic", retLogic, card, axisNo));
+      const auto lowPulse = velocityToPulsePerSec(side, axis, config.lowVelocityUi);
+      const auto highPulse = velocityToPulsePerSec(side, axis, config.highVelocityUi);
+      const auto retProfile = dmcSetProfile(card, axisNo, lowPulse, highPulse,
+          config.accTimeSec, config.decTimeSec, 0.0);
+      if (retProfile != 0) throw std::runtime_error(dmcAxisFailureMessage("dmc_set_profile hardware home", retProfile, card, axisNo));
+      if (dmcSetSProfile) dmcSetSProfile(card, axisNo, 0, 0.0);
+
+      logHardwareHomeDiagnostic("home_start", side, axis, card, axisNo, config.direction,
+          beforePulse, beforeUi, enabledAxes, beforePulse, beforeUi, 0);
       checkMotionCommand(estopSequenceAtStart);
-      bool allHomed = true;
-      for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-        if (!enabledAxes[axisIndex]) continue;
-        const auto axis = static_cast<SemanticAxis>(axisIndex);
-        const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
+      const auto retStart = dmcHomeMove(card, axisNo);
+      checkMotionCommand(estopSequenceAtStart);
+      if (retStart != 0) throw std::runtime_error(dmcAxisFailureMessage("dmc_home_move", retStart, card, axisNo));
+
+      const auto maxSearchPulse = std::abs(checkedMotionPulse(uiToPulse(config.maxSearchUi, side, axis)));
+      const auto selectedVelocity = config.velocityMode == 0 ? config.lowVelocityUi : config.highVelocityUi;
+      const auto timeoutSeconds = std::clamp(config.maxSearchUi / selectedVelocity + 5.0, 5.0, 120.0);
+      const auto deadline = std::chrono::steady_clock::now()
+          + std::chrono::milliseconds(static_cast<long long>(std::ceil(timeoutSeconds * 1000.0)));
+      std::optional<std::chrono::steady_clock::time_point> stoppedSince;
+      std::optional<long> stoppedPulse;
+      bool complete = false;
+      while (!complete) {
+        checkMotionCommand(estopSequenceAtStart);
         unsigned short homed = 0;
-        const auto ret = dmcGetHomeResult(card, axisNo, &homed);
-        if (ret != 0 || homed > 1) {
-          throw std::runtime_error(dmcAxisFailureMessage("dmc_get_home_result", ret, card, axisNo));
+        const auto homeRet = dmcGetHomeResult(card, axisNo, &homed);
+        if (homeRet != 0 || homed > 1) {
+          throw std::runtime_error(dmcAxisFailureMessage("dmc_get_home_result", homeRet, card, axisNo));
         }
         const auto done = dmcCheckDone(card, axisNo);
         if (done != 0 && done != 1) {
           throw std::runtime_error(dmcAxisFailureMessage("dmc_check_done", done, card, axisNo));
         }
-        // 操作者左侧（硬件 Right）X/Z、右侧（硬件 Left）X/Y；短暂停止或反馈不同步仍继续等待。
-        if ((side == Side::Right && (axis == SemanticAxis::X || axis == SemanticAxis::Z)) ||
-            (side == Side::Left && (axis == SemanticAxis::X || axis == SemanticAxis::Y))) {
-          auto& stoppedSince = stoppedWithoutHomeSince[axisIndex];
-          auto& stoppedPulse = stoppedPulses[axisIndex];
+        const auto currentPulse = dmcGetPosition(card, axisNo);
+        if (homed == 1 && done == 1) {
+          if (homeConfig.referenceMode == ReferenceSeekMode::PositiveLimit) {
+            throw std::runtime_error("positive-limit reference ended on ORG instead of EL+; reference not saved");
+          }
+          complete = true;
+          break;
+        }
+        if (maxSearchPulse > 0 && std::llabs(static_cast<long long>(currentPulse) - beforePulse) > maxSearchPulse) {
+          (void)dmcStop(card, axisNo, 1);
+          std::ostringstream message;
+          message << "hardware reference search exceeded configured travel"
+                  << " side=" << sideName(side) << " semanticAxis=" << axisName(axis)
+                  << " startPulse=" << beforePulse << " currentPulse=" << currentPulse
+                  << " maxSearchPulse=" << maxSearchPulse;
+          throw std::runtime_error(message.str());
+        }
+        if (done == 1 && homed == 0) {
           const auto now = std::chrono::steady_clock::now();
-          const auto currentPulse = dmcGetPosition(card, axisNo);
-          if (homed != 0 || done != 1) {
-            stoppedSince.reset();
-            stoppedPulse.reset();
-            limitReferenceAxes[axisIndex] = false;
-          } else if (!stoppedSince || stoppedPulse != currentPulse) {
+          if (!stoppedSince || !stoppedPulse || *stoppedPulse != currentPulse) {
             stoppedSince = now;
             stoppedPulse = currentPulse;
-            limitReferenceAxes[axisIndex] = false;
           } else if (now - *stoppedSince >= std::chrono::milliseconds(500)) {
-            std::ostringstream message;
-            message << "hardware home stopped without completion side=" << sideName(side)
-                    << " card=" << card << " semanticAxis=" << axisName(axis)
-                    << " physicalAxis=" << axisNo << " homeResult=0 done=1 stopReason=";
-            // 先读取原始停止原因，再由外层 catch 急停，避免原因被软件停止命令覆盖。
             long reason = 0;
-            bool reasonAvailable = false;
-            if (!dmcGetStopReason) {
-              message << "unavailable export=missing";
-            } else if (const auto readRet = dmcGetStopReason(card, axisNo, &reason); readRet != 0) {
-              message << "unavailable readRet=" << readRet;
-            } else {
-              reasonAvailable = true;
-              const char* explanation = "未列出的控制卡停止原因";
-              switch (reason) {
-                case 0: explanation = "正常停止，但未确认寻零完成"; break;
-                case 5: explanation = "正硬限位立即停止"; break;
-                case 6: explanation = "负硬限位立即停止"; break;
-                case 7: explanation = "正硬限位减速停止"; break;
-                case 8: explanation = "负硬限位减速停止"; break;
-                case 13: explanation = "命令立即停止"; break;
-                case 14: explanation = "命令减速停止"; break;
-                case 21: explanation = "原点不在两个限位之间"; break;
-                case 22: explanation = "回零方向和当前有效限位端相反"; break;
-                case 23: explanation = "正负限位同时有效"; break;
-                case 24: explanation = "没有找到 EZ 信号"; break;
-                case 25: explanation = "回零位置溢出停止"; break;
-                case 27: explanation = "双原点停止"; break;
-                case 201: explanation = "正负限位之间全程没找到原点信号"; break;
-              }
-              message << reason << " (" << explanation << ")";
-            }
-            // 保留控制卡原始输入位，便于对照 ORG/EL+/EL-；缺少导出时不伪装为全零。
+            if (!dmcGetStopReason) throw std::runtime_error("hardware reference stopped without completion; stop reason export missing");
+            const auto reasonRet = dmcGetStopReason(card, axisNo, &reason);
+            if (reasonRet != 0) throw std::runtime_error(dmcAxisFailureMessage("dmc_get_stop_reason", reasonRet, card, axisNo));
             const auto stopAxisIo = dmcAxisIoStatus
                 ? std::optional<unsigned long>(dmcAxisIoStatus(card, axisNo)) : std::nullopt;
-            message << " startAxisIo=" << (beforeAxisIo[axisIndex] ? std::to_string(*beforeAxisIo[axisIndex]) : "unavailable")
-                    << " stopAxisIo=" << (stopAxisIo ? std::to_string(*stopAxisIo) : "unavailable")
-                    << " startPulse=" << beforePulses[axisIndex]
-                    << " stopPulse=" << currentPulse;
-            checkMotionCommand(estopSequenceAtStart);
-            // 操作者右侧 X/Y 实测以 22 停在正限位，也只记录限位参考点，不宣称找到原点信号。
-            const bool acceptedLimitStop = reason == 201 ||
-                (side == Side::Left && (axis == SemanticAxis::X || axis == SemanticAxis::Y) && reason == 22);
-            // ALM/EMG/EL-/软限位/DSTP 均须无效。
-            constexpr unsigned long kLimitAndStopInputs = 0x8cf;
-            if (reasonAvailable && acceptedLimitStop && stopAxisIo && (*stopAxisIo & kLimitAndStopInputs) == 0x2) {
-              if (!limitReferenceAxes[axisIndex]) {
-                std::cout << "[HAL] WARNING component=MOTION event=home_limit_reference "
-                          << message.str() << " reference=positive_limit pulseCounterReset=false" << std::endl;
+            if (homeConfig.referenceMode == ReferenceSeekMode::PositiveLimit) {
+              const bool expectedReason = reason == 201
+                  || (side == Side::Left && (axis == SemanticAxis::X || axis == SemanticAxis::Y) && reason == 22);
+              const bool edgeObserved = startAxisIo && ((*startAxisIo & kElPositive) == 0U)
+                  && stopAxisIo && ((*stopAxisIo & kUnsafeLimitInputs) == kElPositive);
+              if (!expectedReason || !edgeObserved) {
+                std::ostringstream message;
+                message << "positive-limit reference stopped without a valid EL+ edge"
+                        << " side=" << sideName(side) << " semanticAxis=" << axisName(axis)
+                        << " stopReason=" << reason
+                        << " startAxisIo=" << (startAxisIo ? std::to_string(*startAxisIo) : "unavailable")
+                        << " stopAxisIo=" << (stopAxisIo ? std::to_string(*stopAxisIo) : "unavailable");
+                throw std::runtime_error(message.str());
               }
               limitReferenceAxes[axisIndex] = true;
-            } else {
-              throw std::runtime_error(message.str());
+              complete = true;
+              break;
             }
+            std::ostringstream message;
+            message << "hardware home stopped without completion"
+                    << " side=" << sideName(side) << " semanticAxis=" << axisName(axis)
+                    << " physicalAxis=" << axisNo << " stopReason=" << reason
+                    << " startAxisIo=" << (startAxisIo ? std::to_string(*startAxisIo) : "unavailable")
+                    << " stopAxisIo=" << (stopAxisIo ? std::to_string(*stopAxisIo) : "unavailable")
+                    << " startPulse=" << beforePulse << " stopPulse=" << currentPulse;
+            throw std::runtime_error(message.str());
           }
+        } else {
+          stoppedSince.reset();
+          stoppedPulse.reset();
         }
-        allHomed = allHomed && (homed == 1 || limitReferenceAxes[axisIndex]) && done == 1;
+        if (std::chrono::steady_clock::now() >= deadline) {
+          (void)dmcStop(card, axisNo, 1);
+          throw std::runtime_error("hardware reference search timeout");
+        }
+        // Release the driver mutex so telemetry can collect real controller samples during the seek.
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        lock.lock();
       }
-      checkMotionCommand(estopSequenceAtStart);
-      if (allHomed) break;
-      if (std::chrono::steady_clock::now() >= deadline) {
-        throw std::runtime_error("hardware home completion timeout");
-      }
-      // 允许状态线程读取真实位置，避免整个寻零期间重复发布旧的停止状态。
-      lock.unlock();
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      lock.lock();
-    }
-    for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
-      if (!enabledAxes[axisIndex]) continue;
-      const auto axis = static_cast<SemanticAxis>(axisIndex);
-      const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
-      const auto beforePulse = beforePulses[axisIndex];
-      const auto beforeUi = pulseToUi(static_cast<double>(beforePulse), side, axis);
-      const auto afterPulse = dmcGetPosition ? dmcGetPosition(card, axisNo) : static_cast<long>(pulse_[stateIndex(side, axis)]);
-      pulse_[stateIndex(side, axis)] = afterPulse;
+
+      const auto afterPulse = dmcGetPosition(card, axisNo);
+      pulse_[stateIndex(side, axis)] = static_cast<double>(afterPulse);
       const auto afterUi = pulseToUi(static_cast<double>(afterPulse), side, axis);
       logHardwareHomeDiagnostic(
           limitReferenceAxes[axisIndex] ? "limit_reference_done" : "home_done",
-          side,
-          axis,
-          card,
-          axisNo,
-          kHomeDirection,
-          beforePulse,
-          beforeUi,
-          enabledAxes,
-          afterPulse,
-          afterUi,
-          0);
+          side, axis, card, axisNo, config.direction, beforePulse, beforeUi,
+          enabledAxes, afterPulse, afterUi, 0);
+      checkMotionCommand(estopSequenceAtStart);
     }
+  } catch (const std::exception& original) {
+    latchEmergencyStop();
+    const auto stopResult = stopAllAxesBestEffort();
+    const auto disableResult = disableAllAxesBestEffort();
+    clearEmergencyStateLocked();
+    const auto hardwareFailure = stopAttemptFailureMessage(stopResult, disableResult);
+    if (!hardwareFailure.empty()) {
+      throw std::runtime_error(std::string(original.what()) + "; " + hardwareFailure);
+    }
+    throw;
   } catch (...) {
-    // 某轴启动失败时其余轴也可能已经在运动；必须停机，不能仅返回错误。
-    emergencyStop();
+    latchEmergencyStop();
+    (void)stopAllAxesBestEffort();
+    (void)disableAllAxesBestEffort();
+    clearEmergencyStateLocked();
     throw;
   }
 #endif
   checkMotionCommand(estopSequenceAtStart);
-  // 机械回零会改变坐标参考，全部 teleop 目标都必须失效。
-  for (auto& active : teleopTargetActive_) {
-    active = false;
-  }
+  teleopTargetActive_.fill(false);
   publishStateSnapshotLocked();
   return limitReferenceAxes;
 }

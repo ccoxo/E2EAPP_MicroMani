@@ -1,7 +1,13 @@
-// 直接注入 SDK 函数指针覆盖真实回零分支；不调用 initialize、不加载 DLL 或连接设备。
+// Offline vendor-branch hardware-home tests. SDK entry points are replaced with in-memory fakes;
+// this executable never loads LTDMC.dll or communicates with hardware.
 #define APPSTATION_ENABLE_VENDOR_SDKS 1
 #include "../src/LTDMCDriver.cpp"
 
+#include <algorithm>
+#include <array>
+#include <iostream>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace appstation::hal {
@@ -16,299 +22,313 @@ struct MotionExecutorTestAccess {
 
 using namespace appstation::hal;
 namespace {
-std::vector<unsigned short> started;
-std::array<int, 12> polls{};
-int stops = 0;
-int failure = 0;
-long reportedStopReason = 21;
-short stopReasonReadRet = 0;
-int stopReasonReads = 0;
-int axisIoReads = 0;
-unsigned long startAxisIo = 16;
-unsigned long stoppedAxisIo = 18;
-unsigned short expectedCard = 0;
-int interruptOnStopInput = 0;
-bool unstableStoppedPulse = false;
-LTDMCDriver* current = nullptr;
 
-void require(bool condition, const char* message) {
-  if (!condition) throw std::runtime_error(message);
+enum class Behavior { Success, StoppedNoHome, HomeReadError, DoneError, StartSecondFails, TripEstop, FailLease, Travel };
+Behavior behavior = Behavior::Success;
+std::vector<unsigned short> started;
+std::array<int, 16> polls{};
+long stopReasonValue = 201;
+unsigned long startIo = 4112;
+unsigned long stopIo = 4114;
+int stopCalls = 0;
+int emergencyCalls = 0;
+int disableCalls = 0;
+short stopReturn = 0;
+short emergencyReturn = 0;
+short disableReturn = 0;
+unsigned short expectedCard = 0;
+LTDMCDriver* current = nullptr;
+std::array<unsigned short, 16> configuredDirection{};
+std::array<double, 16> configuredVelocityMode{};
+std::array<unsigned short, 16> configuredHomeMode{};
+std::array<unsigned short, 16> configuredEzCount{};
+std::array<unsigned short, 16> configuredLogic{};
+std::array<double, 16> configuredLowVelocity{};
+std::array<double, 16> configuredHighVelocity{};
+
+void require(bool value, const char* message) {
+  if (!value) throw std::runtime_error(message);
 }
-short __stdcall setPulse(unsigned short, unsigned short, unsigned short) { return 0; }
-short __stdcall setEl(unsigned short, unsigned short, unsigned short, unsigned short, unsigned short) { return 0; }
-short __stdcall setHome(unsigned short, unsigned short, unsigned short, double, unsigned short, unsigned short) { return 0; }
-short __stdcall setLogic(unsigned short, unsigned short, unsigned short, double) { return 0; }
-short __stdcall stop(unsigned short, unsigned short, unsigned short) { ++stops; return 0; }
-short __stdcall start(unsigned short card, unsigned short axis) {
-  require(card == expectedCard, "wrong hardware side");
-  started.push_back(axis);
-  if (failure == 2 && started.size() == 2) return -1;
-  return 0;
-}
-bool active(unsigned short axis) {
+
+bool wasStarted(unsigned short axis) {
   return std::find(started.begin(), started.end(), axis) != started.end();
 }
-short __stdcall done(unsigned short, unsigned short axis) {
-  if (!active(axis)) return 1;
-  if (failure == 4) return -1;
-  if (failure == 6) return 1; // 已停但未寻到原点，不能视作回零成功。
-  if (failure == 7) return polls[axis] >= 3 ? 1 : 0;
-  if (failure == 8) return polls[axis] < 20 || polls[axis] >= 45 ? 1 : 0;
+
+short __stdcall setPulse(unsigned short, unsigned short, unsigned short) { return 0; }
+short __stdcall setEl(unsigned short, unsigned short, unsigned short, unsigned short, unsigned short) { return 0; }
+short __stdcall setHome(unsigned short card, unsigned short axis, unsigned short direction, double velocityMode,
+    unsigned short mode, unsigned short ezCount) {
+  require(card == expectedCard, "HOME configured on wrong card");
+  configuredDirection[axis] = direction;
+  configuredVelocityMode[axis] = velocityMode;
+  configuredHomeMode[axis] = mode;
+  configuredEzCount[axis] = ezCount;
+  return 0;
+}
+short __stdcall setLogic(unsigned short card, unsigned short axis, unsigned short logic, double) {
+  require(card == expectedCard, "HOME logic configured on wrong card");
+  configuredLogic[axis] = logic;
+  return 0;
+}
+short __stdcall setProfile(unsigned short card, unsigned short axis, double low, double high, double, double, double) {
+  require(card == expectedCard, "HOME profile configured on wrong card");
+  configuredLowVelocity[axis] = low;
+  configuredHighVelocity[axis] = high;
+  return 0;
+}
+short __stdcall setSProfile(unsigned short, unsigned short, unsigned short, double) { return 0; }
+short __stdcall startHome(unsigned short card, unsigned short axis) {
+  require(card == expectedCard, "HOME started on wrong card");
+  if (!started.empty()) {
+    const auto previous = started.back();
+    require(polls[previous] >= 3, "next HOME axis started before previous axis completed");
+  }
+  started.push_back(axis);
+  if (behavior == Behavior::StartSecondFails && started.size() == 2) return -7;
+  return 0;
+}
+short __stdcall checkDone(unsigned short, unsigned short axis) {
+  if (!wasStarted(axis)) return 1;
+  if (behavior == Behavior::DoneError) return -8;
+  if (behavior == Behavior::StoppedNoHome) return polls[axis] >= 3 ? 1 : 0;
+  if (behavior == Behavior::Travel) return 0;
   return polls[axis] >= 3 ? 1 : 0;
 }
 long __stdcall position(unsigned short, unsigned short axis) {
-  if (unstableStoppedPulse && active(axis)) return 1000 + axis + polls[axis];
-  return active(axis) && polls[axis] >= 3 ? 1000 + axis : 90000 + axis;
+  if (!wasStarted(axis)) return 90000 + axis;
+  if (behavior == Behavior::Travel) return 90000 + axis + polls[axis] * 1000;
+  return polls[axis] >= 3 ? 1000 + axis : 90000 + axis;
 }
 short __stdcall homeResult(unsigned short, unsigned short axis, unsigned short* result) {
   ++polls[axis];
-  if (failure == 1) return -1;
-  if (failure == 3) current->latchEmergencyStop();
-  if (failure == 5) current->failControlLease();
-  // 防止缺少提前失败处理的旧代码让回归测试等待完整 60 秒。
-  if (failure == 7 && polls[axis] >= 200) current->latchEmergencyStop();
-  if (failure == 7 || failure == 8) {
-    *result = failure == 8 && polls[axis] >= 46 ? 1 : 0;
+  if (behavior == Behavior::HomeReadError) return -9;
+  if (behavior == Behavior::TripEstop) current->latchEmergencyStop();
+  if (behavior == Behavior::FailLease) current->failControlLease();
+  if (behavior == Behavior::StoppedNoHome || behavior == Behavior::Travel) {
+    *result = 0;
     return 0;
   }
-  if (failure == 9 && (axis == 2 || axis == 5)) { *result = 0; return 0; }
-  *result = failure == 6 ? 0 : (polls[axis] >= 3 ? 1 : 0);
+  *result = polls[axis] >= 3 ? 1 : 0;
   return 0;
 }
-short __stdcall stopReason(unsigned short card, unsigned short axis, long* reason) {
-  require((card == 0 && (axis == 2 || axis == 5)) || (card == 1 && (axis == 0 || axis == 1)), "stop reason read for an unrelated axis");
-  require(stops == 0, "stop reason was overwritten by our emergency stop");
-  ++stopReasonReads;
-  *reason = reportedStopReason;
-  return stopReasonReadRet;
-}
 unsigned long __stdcall axisIo(unsigned short card, unsigned short axis) {
-  require((card == 0 && (axis == 2 || axis == 5)) || (card == 1 && (axis == 0 || axis == 1)), "home inputs read for an unrelated axis");
-  require(stops == 0, "home inputs read after emergency stop");
-  ++axisIoReads;
-  if (active(axis) && interruptOnStopInput == 1) current->latchEmergencyStop();
-  if (active(axis) && interruptOnStopInput == 2) current->failControlLease();
-  return active(axis) ? stoppedAxisIo : startAxisIo;
+  require(card == expectedCard, "axis IO read from wrong card");
+  return wasStarted(axis) ? stopIo : startIo;
 }
-void setup(LTDMCDriver& motion, int mode = 0) {
-  started.clear(); polls.fill(0); stops = 0; failure = mode; current = &motion;
-  reportedStopReason = 21; stopReasonReadRet = 0; stopReasonReads = 0;
-  axisIoReads = 0; startAxisIo = 16; stoppedAxisIo = 18;
-  expectedCard = 0; interruptOnStopInput = 0; unstableStoppedPulse = false;
+short __stdcall getStopReason(unsigned short card, unsigned short, long* reason) {
+  require(card == expectedCard, "stop reason read from wrong card");
+  *reason = stopReasonValue;
+  return 0;
+}
+short __stdcall stopAxis(unsigned short, unsigned short, unsigned short) { ++stopCalls; return stopReturn; }
+short __stdcall emergencyStopCard(unsigned short) { ++emergencyCalls; return emergencyReturn; }
+short __stdcall writeSevon(unsigned short, unsigned short, unsigned short value) {
+  if (value == 0) ++disableCalls;
+  return disableReturn;
+}
+
+HardwareHomeConfig config(ReferenceSeekMode mode = ReferenceSeekMode::OriginSignal) {
+  HardwareHomeConfig result;
+  result.referenceMode = mode;
+  for (std::size_t i = 0; i < result.axes.size(); ++i) {
+    auto& axis = result.axes[i];
+    axis.direction = 0;
+    axis.velocityMode = 1;
+    axis.mode = 0;
+    axis.ezCount = 1;
+    axis.logic = 1;
+    axis.lowVelocityUi = i < 3 ? 300.0 : 0.5;
+    axis.highVelocityUi = i < 3 ? 1000.0 : 2.0;
+    axis.accTimeSec = 0.2;
+    axis.decTimeSec = 0.2;
+    axis.maxSearchUi = i < 3 ? 55000.0 : 90.0;
+  }
+  return result;
+}
+
+void setup(LTDMCDriver& motion, Behavior next = Behavior::Success) {
+  behavior = next;
+  started.clear();
+  polls.fill(0);
+  configuredDirection.fill(999);
+  configuredVelocityMode.fill(-1);
+  configuredHomeMode.fill(999);
+  configuredEzCount.fill(999);
+  configuredLogic.fill(999);
+  configuredLowVelocity.fill(-1);
+  configuredHighVelocity.fill(-1);
+  stopReasonValue = 201;
+  startIo = 4112;
+  stopIo = 4114;
+  stopCalls = emergencyCalls = disableCalls = 0;
+  stopReturn = emergencyReturn = disableReturn = 0;
+  expectedCard = 0;
+  current = &motion;
   MotionExecutorTestAccess::initialize(motion);
-  dmcSetPulseOutmode = setPulse; dmcSetElMode = setEl;
-  dmcSetHomeMode = setHome; dmcSetHomePinLogic = setLogic;
-  dmcHomeMove = start; dmcGetHomeResult = homeResult;
-  dmcCheckDone = done; dmcGetPosition = position; dmcStop = stop;
-  dmcGetStopReason = stopReason;
+  dmcSetPulseOutmode = setPulse;
+  dmcSetElMode = setEl;
+  dmcSetHomeMode = setHome;
+  dmcSetHomePinLogic = setLogic;
+  dmcSetProfile = setProfile;
+  dmcSetSProfile = setSProfile;
+  dmcHomeMove = startHome;
+  dmcGetHomeResult = homeResult;
+  dmcCheckDone = checkDone;
+  dmcGetPosition = position;
   dmcAxisIoStatus = axisIo;
+  dmcGetStopReason = getStopReason;
+  dmcStop = stopAxis;
+  dmcEmgStop = emergencyStopCard;
+  dmcWriteSevonPin = writeSevon;
 }
-constexpr std::array<bool, 6> rotations{false, false, false, true, true, true};
-void stoppedXZReportsReason(int axisIndex, long reason, short readRet = 0, bool missingExport = false,
-    bool missingIoExport = false, unsigned long inputs = 16) {
-  LTDMCDriver motion; setup(motion, 7);
-  reportedStopReason = reason; stopReasonReadRet = readRet;
-  if (reason == 201) stoppedAxisIo = inputs;
-  if (reason == 0) startAxisIo = stoppedAxisIo = 0;
-  if (missingExport) dmcGetStopReason = nullptr;
-  if (missingIoExport) dmcAxisIoStatus = nullptr;
-  std::array<bool, 6> selection{};
-  selection[axisIndex] = true;
-  std::string error;
-  try { motion.homeSide(Side::Right, selection); }
-  catch (const std::runtime_error& failure) { error = failure.what(); }
-  require(error.find("hardware home stopped without completion") != std::string::npos,
-      "stopped X/Z waited until cancellation instead of reporting the controller reason");
-  require(error.find(axisIndex == 0 ? "semanticAxis=X physicalAxis=2" : "semanticAxis=Z physicalAxis=5")
-      != std::string::npos, "stopped axis was not identified");
-  const auto expected = missingExport ? "stopReason=unavailable export=missing"
-      : readRet ? "stopReason=unavailable readRet=" + std::to_string(readRet)
-      : "stopReason=" + std::to_string(reason) + " ";
-  require(error.find(expected) != std::string::npos, "stop reason/error was lost or fabricated");
-  if (reason == 201 && !missingExport && !readRet) {
-    require(error.find("正负限位之间全程没找到原点信号") != std::string::npos,
-        "observed stop reason 201 is missing its documented explanation");
-  }
-  const auto expectedInputs = missingIoExport ? std::string("startAxisIo=unavailable stopAxisIo=unavailable")
-      : "startAxisIo=" + std::to_string(startAxisIo) + " stopAxisIo=" + std::to_string(stoppedAxisIo);
-  require(error.find(expectedInputs) != std::string::npos, "start/stop input samples were lost or fabricated");
-  require(error.find(axisIndex == 0 ? "startPulse=90002 stopPulse=1002" : "startPulse=90005 stopPulse=1005")
-      != std::string::npos, "start/stop pulses were lost");
-  require(axisIoReads == (missingIoExport ? 0 : 2), "home input getter was called unexpectedly");
-  require(stopReasonReads == (missingExport ? 0 : 1), "stop reason getter was called unexpectedly");
-  require(polls[axisIndex == 0 ? 2 : 5] < 200 && stops > 0 && motion.estopActive(),
-      "stopped home was not promptly failed and latched");
-}
-void stoppedXZAtPositiveLimitDefinesReference(int axisIndex) {
-  LTDMCDriver motion; setup(motion, 7);
-  reportedStopReason = 201; startAxisIo = 4112; stoppedAxisIo = 4114;
-  std::array<bool, 6> selection{};
-  selection[axisIndex] = true;
-  const auto references = motion.homeSide(Side::Right, selection);
-  require(references == selection, "limit reference result was lost or applied to another axis");
-  require(stops == 0 && !motion.estopActive(), "confirmed positive limit reference was rejected");
-  const auto state = motion.readState();
-  require(state.axes[6 + axisIndex].pulse == (axisIndex == 0 ? 1002 : 1005),
-      "limit reference reset the pulse counter or retained an old position");
-}
-void limitReferenceStillRejectsInterruption(int interruption) {
-  LTDMCDriver motion; setup(motion, 7);
-  reportedStopReason = 201; stoppedAxisIo = 4114;
-  interruptOnStopInput = interruption;
-  bool rejected = false;
-  try { motion.homeSide(Side::Right, {true, false, false, false, false, false}); }
-  catch (const std::runtime_error&) { rejected = true; }
-  require(rejected && motion.estopActive() && stops > 0,
-      "limit reference ignored an emergency stop or expired control lease");
-}
-void limitReferenceRequiresStablePulse() {
-  LTDMCDriver motion; setup(motion, 7);
-  reportedStopReason = 201; stoppedAxisIo = 4114; unstableStoppedPulse = true;
-  bool rejected = false;
-  try { motion.homeSide(Side::Right, {true, false, false, false, false, false}); }
-  catch (const std::runtime_error&) { rejected = true; }
-  require(rejected && stops > 0 && stopReasonReads == 0,
-      "changing pulse counter was accepted as a stable reference");
-}
-void operatorRightXYLimitReference(int axisIndex, unsigned long inputs = 4114, long reason = 201,
-    int interruption = 0, bool unstable = false) {
-  LTDMCDriver motion; setup(motion, 7);
-  expectedCard = 1; reportedStopReason = reason; stoppedAxisIo = inputs;
-  interruptOnStopInput = interruption; unstableStoppedPulse = unstable;
-  std::array<bool, 6> selection{};
-  selection[axisIndex] = true;
-  bool rejected = false;
-  std::array<bool, 6> references{};
-  try { references = motion.homeSide(Side::Left, selection); }
-  catch (const std::runtime_error&) { rejected = true; }
-  const bool accepted = inputs == 4114 && (reason == 201 || reason == 22)
-      && interruption == 0 && !unstable;
-  require(started == std::vector<unsigned short>{static_cast<unsigned short>(axisIndex)},
-      "operator right X/Y selected the wrong physical axis");
-  if (accepted) {
-    require(!rejected && references == selection && stops == 0 && !motion.estopActive(),
-        "operator right X/Y positive limit reference was not accepted");
-    require(motion.readState().axes[axisIndex].pulse == 1000 + axisIndex,
-        "operator right X/Y reference changed raw pulses");
-  } else {
-    require(rejected && stops > 0 && motion.estopActive(), "unsafe operator right X/Y reference accepted");
-  }
-}
-void operatorRightZCannotUseLimitReference() {
-  LTDMCDriver motion; setup(motion, 7);
-  expectedCard = 1; reportedStopReason = 201; stoppedAxisIo = 4114;
-  bool rejected = false;
-  try { motion.homeSide(Side::Left, {false, false, true, false, false, false}); }
-  catch (const std::runtime_error&) { rejected = true; }
-  require(rejected && started == std::vector<unsigned short>{3} && stops > 0
-      && axisIoReads == 0 && stopReasonReads == 0, "fallback affected the other hardware side");
-}
-void mixedSignalHomeAndLimitReferenceRemainDistinct() {
-  LTDMCDriver motion; setup(motion, 9);
-  reportedStopReason = 201; stoppedAxisIo = 4114;
-  const auto references = motion.homeSide(Side::Right, {true, true, true, true, true, true});
-  require(references == std::array<bool, 6>{true, false, true, false, false, false},
-      "mixed home mislabeled origin signals as limit references");
-  require(started == std::vector<unsigned short>{2, 0, 5, 8, 1, 7} && stops == 0,
-      "mixed home skipped an axis or unexpectedly stopped");
-}
-void transientStopAndCompletionReadRaceDoNotFail() {
-  LTDMCDriver motion; setup(motion, 8);
-  motion.homeSide(Side::Right, {true, false, true, false, false, false});
-  require(stops == 0 && stopReasonReads == 0 && !motion.estopActive(),
-      "transient stopped state was mistaken for failed homing");
-  require(polls[2] >= 46 && polls[5] >= 46, "home completed before confirmation");
-}
-void unrelatedAxisKeepsExistingHandling() {
-  LTDMCDriver motion; setup(motion, 7);
-  std::string error;
-  try { motion.homeSide(Side::Right, {false, true, false, false, false, false}); }
-  catch (const std::runtime_error& failure) { error = failure.what(); }
-  require(stopReasonReads == 0 && axisIoReads == 0 && error.find("stopped without completion") == std::string::npos,
-      "X/Z change affected Y");
-  require(stops > 0 && motion.estopActive(), "Y cancellation no longer stops");
-}
-void succeedsOnlyAfterAllSelectedAxesHome() {
+
+void strictHomeIsSequentialAndConfiguresOnlySelectedAxes() {
   LTDMCDriver motion; setup(motion);
-  motion.homeSide(Side::Right, rotations);
-  require(started == std::vector<unsigned short>{8, 1, 7}, "unselected axis moved");
-  require(polls[8] >= 3 && polls[1] >= 3 && polls[7] >= 3, "returned before completion");
-  const auto state = motion.readState();
-  require(state.axes[9].pulse == 1008 && state.axes[10].pulse == 1001 && state.axes[11].pulse == 1007,
-      "completion snapshot contains pre-home positions");
-  require(stops == 0, "unexpected stop on success");
+  auto home = config();
+  home.axes[0].direction = 1;
+  home.axes[0].velocityMode = 0;
+  home.axes[0].mode = 3;
+  home.axes[0].ezCount = 2;
+  home.axes[0].logic = 0;
+  home.axes[0].lowVelocityUi = 111;
+  home.axes[0].highVelocityUi = 222;
+  const auto refs = motion.homeSide(Side::Right, {true, false, true, false, false, false}, home);
+  require(refs == std::array<bool, 6>{}, "strict ORG HOME must not claim limit references");
+  require(started == std::vector<unsigned short>{2, 5}, "selected right X/Z physical axes or sequential order is wrong");
+  require(polls[2] >= 3 && polls[5] >= 3, "HOME returned before each selected axis completed");
+  require(configuredDirection[2] == 1 && configuredVelocityMode[2] == 0
+      && configuredHomeMode[2] == 3 && configuredEzCount[2] == 2 && configuredLogic[2] == 0,
+      "per-axis HOME mode was not applied");
+  require(configuredLowVelocity[2] > 0 && configuredHighVelocity[2] > configuredLowVelocity[2],
+      "per-axis HOME profile was not applied");
+  require(configuredDirection[0] == 999 && configuredDirection[8] == 999,
+      "unselected axes had their HOME configuration rewritten");
 }
-void rejectsAndStops(int mode) {
-  LTDMCDriver motion; setup(motion, mode);
+
+void strictHomeStoppedWithoutHomeFailsPromptly() {
+  LTDMCDriver motion; setup(motion, Behavior::StoppedNoHome);
+  std::string error;
+  try { motion.homeSide(Side::Right, {false, true, false, false, false, false}, config()); }
+  catch (const std::runtime_error& exc) { error = exc.what(); }
+  require(error.find("hardware home stopped without completion") != std::string::npos,
+      "done=1/homeResult=0 did not fail explicitly");
+  require(motion.estopActive() && stopCalls > 0 && polls[0] < 100,
+      "failed HOME did not stop/latch promptly");
+}
+
+void positiveLimitReferenceRequiresExplicitModeAndEdge() {
+  LTDMCDriver motion; setup(motion, Behavior::StoppedNoHome);
+  auto positive = config(ReferenceSeekMode::PositiveLimit);
+  const auto selection = std::array<bool, 6>{true, false, false, false, false, false};
+  const auto refs = motion.homeSide(Side::Right, selection, positive);
+  require(refs == selection && !motion.estopActive(), "valid explicit positive-limit reference was rejected");
+
+  setup(motion, Behavior::StoppedNoHome);
+  startIo = 4114;
   bool rejected = false;
-  try { motion.homeSide(Side::Right, rotations); }
-  catch (const std::runtime_error&) { rejected = true; }
-  require(rejected && stops > 0 && motion.estopActive(), "failed homing did not stop and latch");
+  try { motion.homeSide(Side::Right, selection, positive); } catch (const std::runtime_error&) { rejected = true; }
+  require(rejected && started.empty(), "positive-limit seek started while EL+ was already active");
+
+  setup(motion, Behavior::StoppedNoHome);
+  stopIo = 4112;
+  rejected = false;
+  try { motion.homeSide(Side::Right, selection, positive); } catch (const std::runtime_error&) { rejected = true; }
+  require(rejected && motion.estopActive(), "positive-limit reference accepted without EL+ OFF->ON edge");
+
+  setup(motion, Behavior::StoppedNoHome);
+  rejected = false;
+  try { motion.homeSide(Side::Right, selection, config()); } catch (const std::runtime_error&) { rejected = true; }
+  require(rejected && motion.estopActive(), "strict ORG HOME silently fell back to positive-limit reference");
 }
-void missingExportAndEmptyMaskNeverStart() {
+
+void positiveLimitModeRejectsUnsupportedAxis() {
+  LTDMCDriver motion; setup(motion, Behavior::StoppedNoHome);
+  bool rejected = false;
+  try { motion.homeSide(Side::Right, {false, true, false, false, false, false},
+      config(ReferenceSeekMode::PositiveLimit)); }
+  catch (const std::runtime_error&) { rejected = true; }
+  require(rejected && started.empty(), "unsupported axis entered positive-limit reference mode");
+}
+
+void maxSearchTravelStopsRunaway() {
+  LTDMCDriver motion; setup(motion, Behavior::Travel);
+  auto home = config();
+  home.axes[0].maxSearchUi = 100.0;  // right X ~= 500 pulse with current calibration
+  std::string error;
+  try { motion.homeSide(Side::Right, {true, false, false, false, false, false}, home); }
+  catch (const std::runtime_error& exc) { error = exc.what(); }
+  require(error.find("exceeded configured travel") != std::string::npos,
+      "HOME runaway was not bounded by maxSearchUi");
+  require(motion.estopActive() && stopCalls > 0, "travel watchdog did not stop and latch");
+}
+
+void failuresStopAndLatch() {
+  for (const auto mode : {Behavior::HomeReadError, Behavior::DoneError, Behavior::StartSecondFails,
+                           Behavior::TripEstop, Behavior::FailLease}) {
+    LTDMCDriver motion; setup(motion, mode);
+    bool rejected = false;
+    try { motion.homeSide(Side::Right, {false, false, false, true, true, true}, config()); }
+    catch (const std::runtime_error&) { rejected = true; }
+    require(rejected && motion.estopActive() && stopCalls > 0,
+        "HOME failure/interruption did not stop all motion and latch safety");
+  }
+}
+
+void missingExportsAndEmptyMaskNeverMove() {
   LTDMCDriver motion; setup(motion);
   dmcGetHomeResult = nullptr;
   bool rejected = false;
-  try { motion.homeSide(Side::Right, rotations); } catch (const std::runtime_error&) { rejected = true; }
-  require(rejected && started.empty(), "missing completion export allowed motion");
-  setup(motion); rejected = false;
-  try { motion.homeSide(Side::Right, {}); } catch (const std::runtime_error&) { rejected = true; }
-  require(rejected && started.empty(), "empty selection allowed motion");
+  try { motion.homeSide(Side::Right, {true, false, false, false, false, false}, config()); }
+  catch (const std::runtime_error&) { rejected = true; }
+  require(rejected && started.empty(), "missing completion export allowed HOME to start");
+  setup(motion);
+  rejected = false;
+  try { motion.homeSide(Side::Right, {}, config()); } catch (const std::runtime_error&) { rejected = true; }
+  require(rejected && started.empty(), "empty HOME selection allowed motion");
 }
-void allSixAxesCanHome() {
+
+void emergencyVendorFailuresAreReported() {
   LTDMCDriver motion; setup(motion);
-  motion.homeSide(Side::Right, {true, true, true, true, true, true});
-  require(started == std::vector<unsigned short>{2, 0, 5, 8, 1, 7}, "six-axis home selection incorrect");
-  for (auto axis : started) require(polls[axis] >= 3, "six-axis home returned before completion");
+  stopReturn = -5;
+  emergencyReturn = -6;
+  disableReturn = -7;
+  std::string error;
+  try { motion.emergencyStop(); } catch (const std::runtime_error& exc) { error = exc.what(); }
+  require(motion.estopActive(), "vendor stop failure cleared software emergency latch");
+  require(error.find("hardware emergency action reported failures") != std::string::npos,
+      "vendor stop/disable failure was reported as successful emergency stop");
+  require(emergencyCalls > 0 && stopCalls > 0 && disableCalls > 0,
+      "best-effort emergency path abandoned remaining safety actions after one failure");
 }
+
+void homeFailureIncludesEmergencyVendorFailure() {
+  LTDMCDriver motion; setup(motion, Behavior::StoppedNoHome);
+  stopReturn = -5;
+  std::string error;
+  try { motion.homeSide(Side::Right, {false, true, false, false, false, false}, config()); }
+  catch (const std::runtime_error& exc) { error = exc.what(); }
+  require(error.find("hardware home stopped without completion") != std::string::npos
+      && error.find("hardware emergency action reported failures") != std::string::npos,
+      "HOME error lost the secondary emergency-stop hardware failure");
 }
+
+}  // namespace
+
 int main() {
   try {
-    for (const auto axis : {0, 1}) {
-      operatorRightXYLimitReference(axis, 4114, 22);
-      for (const auto inputs : {0UL, 16UL, 4UL, 6UL, 3UL, 10UL, 0x42UL, 0x82UL, 0x802UL, 0xffffffffUL})
-        operatorRightXYLimitReference(axis, inputs, 22);
-      operatorRightXYLimitReference(axis, 4114, 22, 1);
-      operatorRightXYLimitReference(axis, 4114, 22, 2);
-      operatorRightXYLimitReference(axis, 4114, 22, 0, true);
-    }
-    stoppedXZAtPositiveLimitDefinesReference(0);
-    stoppedXZAtPositiveLimitDefinesReference(2);
-    limitReferenceStillRejectsInterruption(1);
-    limitReferenceStillRejectsInterruption(2);
-    limitReferenceRequiresStablePulse();
-    operatorRightZCannotUseLimitReference();
-    for (const auto axis : {0, 1}) {
-      operatorRightXYLimitReference(axis);
-      for (const auto inputs : {0UL, 16UL, 4UL, 6UL, 3UL, 10UL, 0x42UL, 0x82UL, 0x802UL, 0xffffffffUL})
-        operatorRightXYLimitReference(axis, inputs);
-      operatorRightXYLimitReference(axis, 4114, 5);
-      operatorRightXYLimitReference(axis, 4114, 201, 1);
-      operatorRightXYLimitReference(axis, 4114, 201, 2);
-      operatorRightXYLimitReference(axis, 4114, 201, 0, true);
-    }
-    mixedSignalHomeAndLimitReferenceRemainDistinct();
-    for (const auto inputs : {0UL, 16UL, 4UL, 6UL, 3UL, 10UL, 0x42UL, 0x82UL, 0x802UL, 0xffffffffUL}) {
-      stoppedXZReportsReason(0, 201, 0, false, false, inputs);
-      stoppedXZReportsReason(2, 201, 0, false, false, inputs);
-    }
-    for (const auto reason : {0L, 5L, 6L, 21L, 22L, 201L, 999L}) {
-      stoppedXZReportsReason(0, reason);
-      stoppedXZReportsReason(2, reason);
-    }
-    stoppedXZReportsReason(0, 21, -9);
-    stoppedXZReportsReason(2, 21, 0, true);
-    stoppedXZReportsReason(0, 201, 0, false, true);
-    transientStopAndCompletionReadRaceDoNotFail();
-    unrelatedAxisKeepsExistingHandling();
-    succeedsOnlyAfterAllSelectedAxesHome();
-    allSixAxesCanHome();
-    missingExportAndEmptyMaskNeverStart();
-    for (int mode = 1; mode <= 6; ++mode) rejectsAndStops(mode);
-    std::cout << "HardwareHomingTests passed (SDK fakes only, including 60s timeout)" << std::endl;
+    strictHomeIsSequentialAndConfiguresOnlySelectedAxes();
+    strictHomeStoppedWithoutHomeFailsPromptly();
+    positiveLimitReferenceRequiresExplicitModeAndEdge();
+    positiveLimitModeRejectsUnsupportedAxis();
+    maxSearchTravelStopsRunaway();
+    failuresStopAndLatch();
+    missingExportsAndEmptyMaskNeverMove();
+    emergencyVendorFailuresAreReported();
+    homeFailureIncludesEmergencyVendorFailure();
+    std::cout << "HardwareHomingTests passed (9 offline vendor-fake cases)" << std::endl;
     return 0;
   } catch (const std::exception& error) {
-    std::cerr << error.what() << std::endl;
+    std::cerr << "HardwareHomingTests failed: " << error.what() << std::endl;
     return 1;
   }
 }

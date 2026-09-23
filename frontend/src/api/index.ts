@@ -528,6 +528,9 @@ export const stopMotionSide = (side: ManualControlSide) =>
 export const homeMotionSide = (side: ManualControlSide, axes: ManualControlAxis[]) =>
   postCommand(`/motion/${side}/home`, { axes }) as Promise<MotionOriginResponse>
 
+export const referencePositiveLimitSide = (side: ManualControlSide, axes: ManualControlAxis[]) =>
+  postCommand(`/motion/${side}/positive_limit_reference`, { axes }) as Promise<MotionOriginResponse>
+
 export const returnHardwareReferenceSide = (side: ManualControlSide, axes: ManualControlAxis[]) =>
   postCommand(`/motion/${side}/return_home_reference`, { axes })
 /** 发送或封装对应的后端命令。 */

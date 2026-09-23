@@ -39,6 +39,7 @@ class ControlWatchdog:
         clock: Callable[[], float] = time.monotonic,
         renew_interval_s: float = 0.5,
         hal_timeout_ms: int = 2500,
+        disconnect_grace_s: float = 0.0,
     ) -> None:
         self.hal = hal
         self.logs = logs
@@ -47,6 +48,7 @@ class ControlWatchdog:
         self.clock = clock
         self.renew_interval_s = renew_interval_s
         self.hal_timeout_ms = hal_timeout_ms
+        self.disconnect_grace_s = max(0.0, float(disconnect_grace_s))
         self.session_id = uuid.uuid4().hex
         self.clients: dict[str, BrowserLease] = {}
         self.last_browser_session: str | None = None
@@ -55,6 +57,7 @@ class ControlWatchdog:
         self._next_renew_at = 0.0
         self._task: asyncio.Task[None] | None = None
         self._stop_task: asyncio.Task[None] | None = None
+        self._disconnect_task: asyncio.Task[None] | None = None
         self._stop_confirmed = True
         self._tripped = False
         self._closed = False
@@ -86,6 +89,10 @@ class ControlWatchdog:
             raise ControlLeaseUnavailable("control watchdog is closed")
         if self.clients:
             raise ControlLeaseUnavailable("another browser already owns control; use observer mode")
+        if self._disconnect_task is not None and not self._disconnect_task.done():
+            self._disconnect_task.cancel()
+        self._disconnect_task = None
+        self._next_renew_at = 0.0
         session_id = uuid.uuid4().hex
         self.last_browser_session = session_id
         self.clients[session_id] = BrowserLease(session_id, send)
@@ -100,10 +107,30 @@ class ControlWatchdog:
             return
         if client.sending is not None:
             client.sending.cancel()
-        if not client.expired:
+        if not client.expired and not self.clients:
+            if self.disconnect_grace_s <= 0.0:
+                self.trip("browser WebSocket disconnected")
+                return
+            generation = self._generation
+            self._disconnect_task = asyncio.create_task(
+                self._trip_after_disconnect_grace(generation),
+                name="control-watchdog-disconnect-grace",
+            )
+
+    async def _trip_after_disconnect_grace(self, generation: int) -> None:
+        try:
+            await asyncio.sleep(self.disconnect_grace_s)
+            if self._closed or self.clients or generation != self._generation:
+                return
             self.trip("browser WebSocket disconnected")
+        except asyncio.CancelledError:
+            return
 
     def trip(self, reason: str) -> None:
+        disconnect_task = self._disconnect_task
+        self._disconnect_task = None
+        if disconnect_task is not None and disconnect_task is not asyncio.current_task():
+            disconnect_task.cancel()
         self._generation += 1
         self._confirmed_until = 0.0
         self._next_renew_at = 0.0
@@ -212,6 +239,9 @@ class ControlWatchdog:
 
     async def close(self) -> None:
         self._closed = True
+        if self._disconnect_task is not None:
+            self._disconnect_task.cancel()
+            self._disconnect_task = None
         if self.clients:
             self.trip("backend control watchdog shutdown")
         for client in self.clients.values():

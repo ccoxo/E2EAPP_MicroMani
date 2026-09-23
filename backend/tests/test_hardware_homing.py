@@ -8,16 +8,22 @@ from fastapi.testclient import TestClient
 
 from backend.app import create_app
 from backend.core.logging import now_ms
+from backend.hal_client.client import HalHealth
 
 
 def setup_homing(tmp_path, monkeypatch):
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
     state = {"pulses": list(range(100, 112)), "moving": [False] * 12,
-             "enabled": [True] * 12, "estop_active": False}
+             "enabled": [True] * 12, "enabled_confirmed": [True] * 12,
+             "sample_cached": False, "estop_active": False}
+    instance = {"id": "test-hal-instance"}
     async def motion_state():
         return {**state, "timestamp_ms": now_ms()}
+    async def health():
+        return HalHealth(ltdmc_ok=True, omega7_ok=True, version="test", uptime_s=1.0,
+                         connected=True, mode="real", instance_id=instance["id"])
     hal = SimpleNamespace(command=AsyncMock(return_value={"response": {"homeCompleted": True}}),
-                          motion_state=motion_state)
+                          motion_state=motion_state, health=health, instance=instance)
     monkeypatch.setattr("backend.app.make_hal_client", lambda *_: hal)
     app = create_app(tmp_path)
     config = app.state.settings.get_config()
@@ -25,6 +31,7 @@ def setup_homing(tmp_path, monkeypatch):
     config["motion"]["homeReference"].update(
         valid=True, leftValid=True, rightValid=True,
         leftAxisConfirmed=[True] * 6, rightAxisConfirmed=[True] * 6,
+        leftAxisInstanceId=["test-hal-instance"] * 6, rightAxisInstanceId=["test-hal-instance"] * 6,
         leftPulse=[0.] * 6, rightPulse=[10., 20., 30., 40., 50., 60.])
     config["motion"]["workOriginOffset"].update(
         valid=True, leftValid=True, rightValid=True,
@@ -47,8 +54,13 @@ def test_selected_homing_preserves_other_references(tmp_path, monkeypatch):
     client.app.state.telemetry.axis_offsets = list(range(1, 13))
     response = client.post("/api/motion/right/home", json={"axes": ["Roll", "Pitch", "Yaw"]})
     assert response.status_code == 200, response.text
-    hal.command.assert_awaited_once_with("motion.home_side", {
-        "side": "right", "enabledAxes": [False, False, False, True, True, True]})
+    hal.command.assert_awaited_once()
+    command_name, payload = hal.command.await_args.args
+    assert command_name == "motion.home_side"
+    assert payload["side"] == "right"
+    assert payload["enabledAxes"] == [False, False, False, True, True, True]
+    assert payload["referenceMode"] == "origin"
+    assert payload["homeMaxSearchUi"] == [55000.0, 82500.0, 82500.0, 90.0, 90.0, 90.0]
     after = client.app.state.settings.get_config()["motion"]
     assert after["homeReference"]["rightPulse"] == [10., 20., 30., 109., 110., 111.]
     assert after["origin"]["rightPulse"] == [11., 22., 33., 113., 115., 117.]
@@ -63,16 +75,16 @@ def test_limit_reference_preserves_work_origin_and_records_source(tmp_path, monk
     client.app.state.telemetry.axis_offsets = list(range(1, 13))
     hal.command.return_value = {"response": {
         "homeCompleted": True, "limitReferenceAxes": [True, False, True, False, False, False]}}
-    response = client.post("/api/motion/right/home", json={"axes": ["X", "Z", "Pitch"]})
+    response = client.post("/api/motion/right/positive_limit_reference", json={"axes": ["X", "Z"]})
     assert response.status_code == 200, response.text
     after = client.app.state.settings.get_config()["motion"]
-    assert after["homeReference"]["rightPulse"] == [106., 20., 108., 40., 110., 60.]
+    assert after["homeReference"]["rightPulse"] == [106., 20., 108., 40., 50., 60.]
     assert after["homeReference"]["rightAxisLimitReference"] == [True, False, True, False, False, False]
-    assert after["origin"]["rightPulse"] == [11., 22., 33., 44., 115., 66.]
+    assert after["origin"] == before["origin"]
     assert after["workOriginOffset"]["rightPulseDelta"] == [-95., 2., -75., 4., 5., 6.]
     assert after["origin"]["leftPulse"] == before["origin"]["leftPulse"]
     assert response.json()["data"]["homeReference"]["rightAxisLimitReference"][0] is True
-    assert client.app.state.telemetry.axis_offsets == list(range(1, 11)) + [0., 12]
+    assert client.app.state.telemetry.axis_offsets == list(range(1, 13))
 
 
 def test_limit_only_home_preserves_complete_work_origin(tmp_path, monkeypatch):
@@ -80,7 +92,7 @@ def test_limit_only_home_preserves_complete_work_origin(tmp_path, monkeypatch):
     before = deepcopy(client.app.state.settings.get_config()["motion"]["origin"])
     hal.command.return_value = {"response": {
         "homeCompleted": True, "limitReferenceAxes": [True, False, True, False, False, False]}}
-    assert client.post("/api/motion/right/home", json={"axes": ["X", "Z"]}).status_code == 200
+    assert client.post("/api/motion/right/positive_limit_reference", json={"axes": ["X", "Z"]}).status_code == 200
     assert client.app.state.settings.get_config()["motion"]["origin"] == before
 
 
@@ -95,7 +107,7 @@ def test_limit_reference_source_is_cleared_by_new_seek(tmp_path, monkeypatch, ou
         hal.command.side_effect = RuntimeError("home failed")
     elif outcome in ("stale", "estop"):
         hal.command.return_value = {"response": {
-            "homeCompleted": True, "limitReferenceAxes": [True, False, False, False, False, False]}}
+            "homeCompleted": True, "limitReferenceAxes": [False] * 6}}
         if outcome == "stale":
             async def stale():
                 return {**state, "timestamp_ms": now_ms() - 5000}
@@ -135,7 +147,7 @@ def test_operator_right_xy_limit_reference_preserves_origin(tmp_path, monkeypatc
     client, hal, _ = setup_homing(tmp_path, monkeypatch)
     before = deepcopy(client.app.state.settings.get_config()["motion"])
     hal.command.return_value = {"response": {"homeCompleted": True, "limitReferenceAxes": mask}}
-    response = client.post("/api/motion/left/home", json={"axes": axes})
+    response = client.post("/api/motion/left/positive_limit_reference", json={"axes": axes})
     assert response.status_code == 200, response.text
     after = client.app.state.settings.get_config()["motion"]
     assert after["origin"] == before["origin"]
@@ -158,7 +170,7 @@ def test_limit_reference_sources_survive_sequential_axes_and_other_side_home(tmp
         ("right", "X", [True, False, False, False, False, False], [True, True, False, False, False, False]),
     ]:
         hal.command.return_value = {"response": {"homeCompleted": True, "limitReferenceAxes": mask}}
-        response = client.post(f"/api/motion/{side}/home", json={"axes": [axis]})
+        response = client.post(f"/api/motion/{side}/positive_limit_reference", json={"axes": [axis]})
         assert response.status_code == 200, response.text
         assert response.json()["data"]["homeReference"]["leftAxisLimitReference"] == expected_left
         reference = client.get("/api/motion/origin").json()["data"]["homeReference"]
@@ -172,7 +184,7 @@ def test_operator_right_z_cannot_claim_limit_reference(tmp_path, monkeypatch):
     client, hal, _ = setup_homing(tmp_path, monkeypatch)
     hal.command.return_value = {"response": {
         "homeCompleted": True, "limitReferenceAxes": [False, False, True, False, False, False]}}
-    response = client.post("/api/motion/left/home", json={"axes": ["Z"]})
+    response = client.post("/api/motion/left/positive_limit_reference", json={"axes": ["Z"]})
     assert response.status_code == 503
     assert client.app.state.settings.get_config()["motion"]["homeReference"]["leftAxisConfirmed"][2] is False
 
@@ -186,7 +198,7 @@ def test_invalid_limit_reference_reply_does_not_confirm(tmp_path, monkeypatch, m
     client, hal, _ = setup_homing(tmp_path, monkeypatch)
     before = deepcopy(client.app.state.settings.get_config()["motion"])
     hal.command.return_value = {"response": {"homeCompleted": True, "limitReferenceAxes": mask}}
-    response = client.post("/api/motion/right/home", json={"axes": ["X"]})
+    response = client.post("/api/motion/right/positive_limit_reference", json={"axes": ["X"]})
     assert response.status_code == 503
     after = client.app.state.settings.get_config()["motion"]
     assert after["homeReference"]["rightAxisConfirmed"][0] is False
@@ -421,3 +433,40 @@ def test_stale_feedback_after_homing_cannot_confirm_reference(tmp_path, monkeypa
     reference = client.app.state.settings.get_config()["motion"]["homeReference"]
     assert reference["rightPulse"] == before
     assert reference["rightAxisConfirmed"] == [True, True, True, True, False, True]
+
+
+def test_positive_limit_reference_sends_explicit_mode_and_requires_all_selected_axes(tmp_path, monkeypatch):
+    client, hal, _ = setup_homing(tmp_path, monkeypatch)
+    mask = [True, False, True, False, False, False]
+    hal.command.return_value = {"response": {"homeCompleted": True, "limitReferenceAxes": mask}}
+    response = client.post("/api/motion/right/positive_limit_reference", json={"axes": ["X", "Z"]})
+    assert response.status_code == 200, response.text
+    name, payload = hal.command.await_args.args
+    assert name == "motion.home_side"
+    assert payload["referenceMode"] == "positive_limit"
+    assert payload["enabledAxes"] == mask
+
+
+def test_hardware_reference_return_rejects_reference_from_old_hal_instance(tmp_path, monkeypatch):
+    client, hal, _ = setup_homing(tmp_path, monkeypatch)
+    config = client.app.state.settings.get_config()
+    config["motion"]["homeReference"]["rightAxisInstanceId"][4] = "old-hal-instance"
+    client.app.state.settings.save_config(config, emit_log=False, home_reference_update=True)
+    response = client.post("/api/motion/right/return_home_reference", json={"axes": ["Pitch"]})
+    assert response.status_code == 503
+    assert "another HAL/controller instance" in response.json()["detail"]["message"]
+    hal.command.assert_not_awaited()
+
+
+def test_hardware_home_rejects_instance_change_before_reference_commit(tmp_path, monkeypatch):
+    client, hal, _ = setup_homing(tmp_path, monkeypatch)
+    async def change_instance(name, payload):
+        assert name == "motion.home_side"
+        hal.instance["id"] = "replacement-hal-instance"
+        return {"response": {"homeCompleted": True, "limitReferenceAxes": [False] * 6}}
+    hal.command.side_effect = change_instance
+    response = client.post("/api/motion/right/home", json={"axes": ["Pitch"]})
+    assert response.status_code == 503
+    reference = client.app.state.settings.get_config()["motion"]["homeReference"]
+    assert reference["rightAxisConfirmed"][4] is False
+    assert reference["rightAxisInstanceId"][4] == ""

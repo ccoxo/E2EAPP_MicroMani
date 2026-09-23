@@ -7,6 +7,7 @@
 #include "HalVersion.h"
 
 #include <algorithm>
+#include <iomanip>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
@@ -63,6 +64,7 @@ std::string jsonHealth(const appstation::hal::HalHealth& motionHealth, bool omeg
       << ",\"omega7_ok\":" << (omegaOk ? "true" : "false")
       << ",\"version\":\"" << motionHealth.version << "\""
       << ",\"uptime_s\":" << motionHealth.uptimeS
+      << ",\"instance_id\":\"" << jsonEscape(motionHealth.instanceId) << "\""
       << ",\"capabilities\":[";
   for (size_t index = 0; index < kHalCapabilities.size(); ++index) {
     if (index > 0) out << ",";
@@ -75,7 +77,9 @@ std::string jsonHealth(const appstation::hal::HalHealth& motionHealth, bool omeg
 std::string jsonMotionState(const appstation::hal::MotionState& state) {
   // positions/pulses/enabled/moving 都按 MotionState::axes 的 12 轴顺序返回。
   std::ostringstream out;
+  out << std::setprecision(17);
   out << "{\"timestamp_ms\":" << timestampOrNow(state.readTimestampMs)
+      << ",\"sample_cached\":" << (state.sampleCached ? "true" : "false")
       << ",\"estop_active\":" << (state.estopActive ? "true" : "false") << ",\"positions\":[";
   for (size_t i = 0; i < state.axes.size(); ++i) {
     if (i > 0) {
@@ -96,6 +100,11 @@ std::string jsonMotionState(const appstation::hal::MotionState& state) {
       out << ",";
     }
     out << (state.axes[i].enabled ? "true" : "false");
+  }
+  out << "],\"enabled_confirmed\":[";
+  for (size_t i = 0; i < state.axes.size(); ++i) {
+    if (i > 0) out << ",";
+    out << (state.axes[i].enabledConfirmed ? "true" : "false");
   }
   out << "],\"moving\":[";
   for (size_t i = 0; i < state.axes.size(); ++i) {
@@ -518,6 +527,58 @@ std::array<bool, 6> jsonBoolArray6(
     }
   }
   return values;
+}
+
+HardwareHomeConfig jsonHardwareHomeConfig(const std::string& body) {
+  HardwareHomeConfig config;
+  const auto mode = lowercase(jsonStringValueOr(body, "referenceMode", "origin"));
+  if (mode == "origin") config.referenceMode = ReferenceSeekMode::OriginSignal;
+  else if (mode == "positive_limit") config.referenceMode = ReferenceSeekMode::PositiveLimit;
+  else throw std::runtime_error("invalid hardware home referenceMode");
+
+  const std::array<double, 6> zero{};
+  const std::array<double, 6> one{1, 1, 1, 1, 1, 1};
+  const std::array<double, 6> low{300, 300, 300, 0.5, 0.5, 0.5};
+  const std::array<double, 6> high{1000, 1000, 1000, 2, 2, 2};
+  const std::array<double, 6> ramp{0.2, 0.2, 0.2, 0.2, 0.2, 0.2};
+  const std::array<double, 6> maxSearch{55000, 82500, 82500, 90, 90, 90};
+  const auto direction = jsonNumberArray6(body, "homeDirection", zero);
+  const auto velocityMode = jsonNumberArray6(body, "homeVelocityMode", one);
+  const auto homeMode = jsonNumberArray6(body, "homeMode", zero);
+  const auto ezCount = jsonNumberArray6(body, "homeEzCount", one);
+  const auto logic = jsonNumberArray6(body, "homeLogic", one);
+  const auto lowVelocity = jsonNumberArray6(body, "homeLowVelocityUi", low);
+  const auto highVelocity = jsonNumberArray6(body, "homeHighVelocityUi", high);
+  const auto acc = jsonNumberArray6(body, "homeAccTimeSec", ramp);
+  const auto dec = jsonNumberArray6(body, "homeDecTimeSec", ramp);
+  const auto search = jsonNumberArray6(body, "homeMaxSearchUi", maxSearch);
+  const auto word = [](double value, const char* name, double maxValue) -> unsigned short {
+    if (!std::isfinite(value) || std::floor(value) != value || value < 0 || value > maxValue) {
+      throw std::runtime_error(std::string("invalid hardware home ") + name);
+    }
+    return static_cast<unsigned short>(value);
+  };
+  for (size_t i = 0; i < config.axes.size(); ++i) {
+    auto& axis = config.axes[i];
+    axis.direction = word(direction[i], "direction", 1);
+    axis.velocityMode = word(velocityMode[i], "velocityMode", 1);
+    axis.mode = word(homeMode[i], "mode", 16);
+    axis.ezCount = word(ezCount[i], "ezCount", 1000);
+    axis.logic = word(logic[i], "logic", 1);
+    for (const auto value : {lowVelocity[i], highVelocity[i], acc[i], dec[i], search[i]}) {
+      if (!std::isfinite(value)) throw std::runtime_error("hardware home numeric values must be finite");
+    }
+    if (lowVelocity[i] <= 0 || highVelocity[i] <= 0 || lowVelocity[i] > highVelocity[i]
+        || acc[i] <= 0 || dec[i] <= 0 || search[i] <= 0) {
+      throw std::runtime_error("hardware home velocity/ramp/search values must be positive and ordered");
+    }
+    axis.lowVelocityUi = lowVelocity[i];
+    axis.highVelocityUi = highVelocity[i];
+    axis.accTimeSec = acc[i];
+    axis.decTimeSec = dec[i];
+    axis.maxSearchUi = search[i];
+  }
+  return config;
 }
 
 std::array<std::array<bool, 6>, 2> jsonHomeAllEnabledAxes(const std::string& body) {

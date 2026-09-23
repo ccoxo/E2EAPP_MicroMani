@@ -251,7 +251,9 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     const auto side = parseSide(jsonStringValue(bodyText, "side"));
     nativeTeleop_.stop();
     ensureCurrentMotionCommand();
-    const auto limitReferenceAxes = executor_.homeSide(side, jsonBoolArray6(bodyText, "enabledAxes", {}), commandEpoch);
+    const auto homeConfig = jsonHardwareHomeConfig(bodyText);
+    const auto limitReferenceAxes = executor_.homeSide(
+        side, jsonBoolArray6(bodyText, "enabledAxes", {}), homeConfig, commandEpoch);
     std::string response = "{\"ok\":true,\"homeCompleted\":true,\"limitReferenceAxes\":[";
     for (std::size_t index = 0; index < limitReferenceAxes.size(); ++index) {
       if (index) response += ',';

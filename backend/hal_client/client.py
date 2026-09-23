@@ -33,6 +33,7 @@ class HalHealth:
     capabilities: list[str] | None = None
     # DDS 源样本的有效期；上层缓存不能延长底层健康样本的寿命。
     source_valid_until_ms: int | None = None
+    instance_id: str | None = None
 
 
 class HalClient:
@@ -80,6 +81,7 @@ class TestHalClient(HalClient):
             connected=True,
             mode="test",
             message="hardware SDKs are not loaded in test fixture mode",
+            instance_id="test-hal-instance",
         )
 
     async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -140,6 +142,7 @@ class TestHalClient(HalClient):
         now_monotonic_ms = int(time.monotonic() * 1000)
         return {
             "timestamp_ms": now_unix_ms,
+            "sample_cached": False,
             "received_timestamp_ms": now_unix_ms,
             "received_monotonic_ms": now_monotonic_ms,
             "estop_active": self._estop,
@@ -147,6 +150,7 @@ class TestHalClient(HalClient):
             "positions": [0.0] * 12,
             "pulses": list(self._pulses),
             "enabled": [self.motion_enabled["left"]] * 6 + [self.motion_enabled["right"]] * 6,
+            "enabled_confirmed": [False] * 12,
         }
 
     async def omega_state(self) -> dict[str, Any]:
@@ -256,6 +260,7 @@ class RealHalClient(HalClient):
                 if isinstance(payload.get("capabilities"), list)
                 else None
             ),
+            instance_id=str(payload.get("instance_id")) if payload.get("instance_id") else None,
         )
 
     async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:

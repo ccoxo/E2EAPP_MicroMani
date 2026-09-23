@@ -28,7 +28,8 @@ class MotionExecutor {
   std::string enableSide(Side side, bool enabled, const std::array<bool, 6>& axes,
       std::uint64_t epoch);
   void stopSide(Side side);
-  std::array<bool, 6> homeSide(Side side, const std::array<bool, 6>& axes, std::uint64_t epoch);
+  std::array<bool, 6> homeSide(
+      Side side, const std::array<bool, 6>& axes, const HardwareHomeConfig& homeConfig, std::uint64_t epoch);
   void homeAll(const std::array<double, 12>& origin,
       const std::array<std::array<bool, 6>, 2>& axes, std::uint64_t epoch);
   void homeOriginSide(Side side, const std::array<double, 6>& origin,

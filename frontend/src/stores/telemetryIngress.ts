@@ -44,18 +44,23 @@ export function parseTelemetryFrame(value: unknown): TelemetryFrame {
 
   const motionEnabled = value.motionEnabled ?? { left: null, right: null }
   const motionAxisEnabled = value.motionAxisEnabled ?? { left: Array(6).fill(null), right: Array(6).fill(null) }
+  const motionAxisEnabledConfirmed = value.motionAxisEnabledConfirmed ?? { left: Array(6).fill(false), right: Array(6).fill(false) }
   if (!isWireRecord(motionEnabled) || !['left', 'right'].every(side => nullableBoolean(motionEnabled[side]))) fail('motionEnabled')
   if (!isWireRecord(motionAxisEnabled) || !['left', 'right'].every(side => {
     const axes = motionAxisEnabled[side]
     return Array.isArray(axes) && axes.length === 6 && axes.every(nullableBoolean)
   })) fail('motionAxisEnabled')
+  if (!isWireRecord(motionAxisEnabledConfirmed) || !['left', 'right'].every(side => {
+    const axes = motionAxisEnabledConfirmed[side]
+    return Array.isArray(axes) && axes.length === 6 && axes.every(value => typeof value === 'boolean')
+  })) fail('motionAxisEnabledConfirmed')
   if (value.forceStatus !== undefined) {
     if (!isWireRecord(value.forceStatus)) fail('forceStatus')
     const safety = (value.forceStatus as Record<string, unknown>).safety
     if (safety !== undefined && (!isWireRecord(safety)
       || ['latched', 'canAcknowledge'].some(key => safety[key] !== undefined && typeof safety[key] !== 'boolean'))) fail('forceStatus.safety')
   }
-  return { ...value, motionEnabled, motionAxisEnabled } as unknown as TelemetryFrame
+  return { ...value, motionEnabled, motionAxisEnabled, motionAxisEnabledConfirmed } as unknown as TelemetryFrame
 }
 
 /** 即使同一帧其他字段损坏，明确的力急停仍应立即阻断控制。 */

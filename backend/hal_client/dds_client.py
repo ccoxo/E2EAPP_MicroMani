@@ -138,6 +138,7 @@ class DdsHalClient(HalClient):
                 else None
             ),
             source_valid_until_ms=payload["dds_stamp_unix_ms"] + _DDS_STATE_MAX_AGE_MS,
+            instance_id=str(payload.get("instance_id")) if payload.get("instance_id") else None,
         )
 
     async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:

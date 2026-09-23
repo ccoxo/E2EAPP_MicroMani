@@ -34,6 +34,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -334,6 +335,9 @@ struct AppStationFastDdsTransport {
   std::condition_variable replyCv;
   std::map<int, JsonEnvelopeSample> latest;
   std::map<std::string, HalCommandReplySample> replies;
+  // Only retain replies for requests published by this transport and still awaiting a result.
+  // This prevents replies from other DDS participants or late timed-out commands accumulating forever.
+  std::set<std::string> pendingReplies;
 
   explicit AppStationFastDdsTransport(int domainId) {
     initialize(domainId);
@@ -482,7 +486,7 @@ struct AppStationFastDdsTransport {
     {
       std::lock_guard<std::mutex> lock(mutex);
       for (int32_t i = 0; i < samples.length(); ++i) {
-        if (infos[i].valid_data) {
+        if (infos[i].valid_data && pendingReplies.contains(samples[i].request_id)) {
           replies[samples[i].request_id] = samples[i];
           updated = true;
         }
@@ -591,8 +595,15 @@ __declspec(dllexport) int appstation_fastdds_publish_command_request(
     sample.stamp_unix_ms = stampUnixMs;
     sample.name = name ? name : "";
     sample.payload_json = payloadJson ? payloadJson : "{}";
+    {
+      std::lock_guard<std::mutex> lock(handle->mutex);
+      handle->pendingReplies.insert(sample.request_id);
+    }
     const bool written = handle->commandRequestWriter->write(&sample);
     if (!written) {
+      std::lock_guard<std::mutex> lock(handle->mutex);
+      handle->pendingReplies.erase(sample.request_id);
+      handle->replies.erase(sample.request_id);
       setError(error, errorCapacity, "Fast-DDS command request write failed");
       return kResultError;
     }
@@ -621,8 +632,15 @@ __declspec(dllexport) int appstation_fastdds_publish_emergency_stop(
     sample.stamp_unix_ms = stampUnixMs;
     sample.name = name ? name : "";
     sample.payload_json = payloadJson ? payloadJson : "{}";
+    {
+      std::lock_guard<std::mutex> lock(handle->mutex);
+      handle->pendingReplies.insert(sample.request_id);
+    }
     const bool written = handle->emergencyStopWriter->write(&sample);
     if (!written) {
+      std::lock_guard<std::mutex> lock(handle->mutex);
+      handle->pendingReplies.erase(sample.request_id);
+      handle->replies.erase(sample.request_id);
       setError(error, errorCapacity, "Fast-DDS emergency stop write failed");
       return kResultError;
     }
@@ -666,12 +684,17 @@ __declspec(dllexport) int appstation_fastdds_wait_for_command_reply(
         return kResultBufferTooSmall;
       }
       handle->replies.erase(found);
+      handle->pendingReplies.erase(key);
       return kResultOk;
     }
     if (handle->replyCv.wait_until(lock, deadline) == std::cv_status::timeout) {
+      handle->pendingReplies.erase(key);
+      handle->replies.erase(key);
       return kResultNoData;
     }
   }
+  handle->pendingReplies.erase(key);
+  handle->replies.erase(key);
   return kResultNoData;
 }
 
