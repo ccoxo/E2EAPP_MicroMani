@@ -886,7 +886,7 @@ def test_hal_stage_axis_and_direction_signs_match_icf_mapping() -> None:
     assert "kLeftPhysicalAxis{0, 1, 3, 5, 4, 2}" in normalized
     assert "kRightPhysicalAxis{2, 0, 5, 8, 1, 7}" in normalized
     assert "-5000.0, 5000.0, -10000.0, 1666.666667, -2500.0, -3333.333" in normalized
-    assert "-5000.0, -10000.0, -5000.0, 1666.666667, 2500.0, 333.3333" in normalized
+    assert "-5000.0, -10000.0, -5000.0, 1666.666667, 2500.0, 3333.3333" in normalized
 
 
 def test_runtime_launch_disables_pagehide_auto_shutdown_and_stop_stack_kills_all_listener_trees() -> None:

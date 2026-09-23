@@ -14,6 +14,12 @@ def test_rotation_ui_uses_degrees_not_millidegrees() -> None:
     assert pulse_to_ui(3333.333333, 5, 3333.333333) == 1.0
 
 
+def test_card0_yaw_uses_updated_pulse_equivalent() -> None:
+    config = default_config()
+    assert motion_pulse_per_unit(config)[11] == 3333.3333
+    assert pulses_to_ui_state([0.0] * 11 + [3333.3333], config)[11] == 1.0
+
+
 def test_translation_ui_uses_micrometers() -> None:
     assert pulse_to_ui(9000, 0, 9000) == 1000.0
 

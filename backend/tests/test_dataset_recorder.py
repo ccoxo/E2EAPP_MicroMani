@@ -161,9 +161,9 @@ def test_dataset_recorder_motion_calibration_snapshot_records_current_pulse_equi
     assert kinematics["axisOrder"] == ["x", "y", "z", "roll", "pitch", "yaw"]
     assert kinematics["axisUnitSpec"] == ["mm", "mm", "mm", "deg", "deg", "deg"]
     assert kinematics["leftPulsePerUnit"] == [5000.0, 5000.0, 10000.0, 1666.666667, 2500.0, 3333.333]
-    assert kinematics["rightPulsePerUnit"] == [5000.0, 10000.0, 5000.0, 1666.666667, 2500.0, 333.3333]
+    assert kinematics["rightPulsePerUnit"] == [5000.0, 10000.0, 5000.0, 1666.666667, 2500.0, 3333.3333]
     assert kinematics["leftSignedPulsePerUnit"] == [-5000.0, 5000.0, -10000.0, 1666.666667, -2500.0, -3333.333]
-    assert kinematics["rightSignedPulsePerUnit"] == [-5000.0, -10000.0, -5000.0, 1666.666667, 2500.0, 333.3333]
+    assert kinematics["rightSignedPulsePerUnit"] == [-5000.0, -10000.0, -5000.0, 1666.666667, 2500.0, 3333.3333]
     assert snapshot["teleop"]["leftImpulseCoeff"] == [-5000000.0, -5000000.0, -10000000.0, 1667.0, 2500.0, -333.3333]
     assert snapshot["teleop"]["rightImpulseCoeff"] == [-5000000.0, 10000000.0, -5000000.0, 1667.0, -2500.0, 3333.333]
     assert snapshot["stateUnitSpec"] == ["um", "um", "um", "mdeg", "mdeg", "mdeg"]
@@ -189,7 +189,7 @@ def test_dataset_recorder_appstation_info_writes_motion_calibration(tmp_path: Pa
     native_info = json.loads((dataset_dir / "meta" / "info.json").read_text(encoding="utf-8"))
     assert native_info["dataContract"] == data_contract_metadata()
     assert native_info["fps"] == 30
-    assert motion["kinematics"]["rightSignedPulsePerUnit"][5] == 333.3333
+    assert motion["kinematics"]["rightSignedPulsePerUnit"][5] == 3333.3333
     assert motion["teleop"]["rightImpulseCoeff"][5] == 3333.333
 
 

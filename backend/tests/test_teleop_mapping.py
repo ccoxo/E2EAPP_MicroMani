@@ -1710,7 +1710,7 @@ def test_settings_migration_updates_existing_runtime_to_icf_teleop_strategy(tmp_
         -5000.0,
         1666.666667,
         2500.0,
-        333.3333,
+        3333.3333,
     ]
     assert config["motion"]["kinematics"]["leftSignedPulsePerUnit"] == [
         -5000.0,

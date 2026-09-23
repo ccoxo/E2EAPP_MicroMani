@@ -1059,6 +1059,13 @@ class SettingsService:
             _normalize_camera_tuning_defaults(config, has_current_camera_tuning_defaults)
         motion = config.get("motion", {})
         if isinstance(motion, dict):
+            # 仅迁移 Card 0 Yaw 的旧默认当量，保留用户自定义标定。
+            kinematics = motion.get("kinematics")
+            if isinstance(kinematics, dict):
+                for key in ("rightPulsePerUnit", "rightSignedPulsePerUnit"):
+                    values = kinematics.get(key)
+                    if isinstance(values, list) and len(values) == 6 and values[5] == 333.3333:
+                        kinematics[key] = [*values[:5], 3333.3333]
             if self._uses_legacy_motion_profile(motion.get("leftProfile")):
                 motion["leftProfile"] = json.loads(json.dumps(default_config()["motion"]["leftProfile"]))
             if self._uses_legacy_motion_profile(motion.get("rightProfile")):

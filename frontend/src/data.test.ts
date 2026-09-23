@@ -9,9 +9,9 @@ import { axisHardwareSpecs, defaultConfig, defaultKinematics } from './data'
 describe('motion calibration defaults', () => {
   it('keeps frontend default kinematics aligned with backend runtime defaults', () => {
     const leftPulsePerUnit = [5000, 5000, 10000, 1666.666667, 2500, 3333.333]
-    const rightPulsePerUnit = [5000, 10000, 5000, 1666.666667, 2500, 333.3333]
+    const rightPulsePerUnit = [5000, 10000, 5000, 1666.666667, 2500, 3333.3333]
     const leftSignedPulsePerUnit = [-5000, 5000, -10000, 1666.666667, -2500, -3333.333]
-    const rightSignedPulsePerUnit = [-5000, -10000, -5000, 1666.666667, 2500, 333.3333]
+    const rightSignedPulsePerUnit = [-5000, -10000, -5000, 1666.666667, 2500, 3333.3333]
 
     expect(defaultKinematics.leftPulsePerUnit).toEqual(leftPulsePerUnit)
     expect(defaultKinematics.rightPulsePerUnit).toEqual(rightPulsePerUnit)

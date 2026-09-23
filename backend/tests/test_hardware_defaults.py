@@ -5,9 +5,13 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from backend.core.config import SettingsService
 from backend.core.defaults import default_config
+from backend.core.logging import LogService
 
 
 def _target_arm_gain(config: dict, side: str, axis_index: int) -> float:
@@ -136,8 +140,26 @@ def test_motion_kinematics_defaults_match_icf_mapping() -> None:
         -5000.0,
         1666.666667,
         2500.0,
-        333.3333,
+        3333.3333,
     ]
+
+
+@pytest.mark.parametrize("stored_yaw, expected_yaw", [(333.3333, 3333.3333), (4000.0, 4000.0)])
+def test_card0_yaw_calibration_updates_only_legacy_default(tmp_path, stored_yaw, expected_yaw) -> None:
+    settings = SettingsService(tmp_path, LogService(emit_startup=False))
+    config = settings.get_config()
+    kinematics = config["motion"]["kinematics"]
+    kinematics["rightPulsePerUnit"][5] = stored_yaw
+    kinematics["rightSignedPulsePerUnit"][5] = stored_yaw
+    settings.config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    restored = settings.get_config()["motion"]["kinematics"]
+
+    assert restored["rightPulsePerUnit"][5] == expected_yaw
+    assert restored["rightSignedPulsePerUnit"][5] == expected_yaw
+    assert restored["leftSignedPulsePerUnit"][5] == -3333.333
+    persisted = json.loads(settings.config_path.read_text(encoding="utf-8"))["motion"]["kinematics"]
+    assert persisted["rightSignedPulsePerUnit"][5] == expected_yaw
 
 
 def test_work_origin_defaults_match_icf_reference_position() -> None:
@@ -269,6 +291,7 @@ def test_native_teleop_axis_scales_match_requested_left_boost_and_right_feel() -
 
     for axis_index, expected in enumerate(expected_left_gains):
         assert _target_arm_gain(config, "left", axis_index) == pytest.approx(expected, rel=5e-4)
-        assert _target_arm_gain(config, "right", axis_index) == pytest.approx(expected, rel=5e-4)
+        right_expected = expected / 10 if axis_index == 5 else expected
+        assert _target_arm_gain(config, "right", axis_index) == pytest.approx(right_expected, rel=5e-4)
 
     assert teleop["rightEnabledAxes"][5] is True

@@ -901,7 +901,7 @@ def test_startup_emits_session_and_axis_config_logs(tmp_path: Path) -> None:
         for message in messages
         if "event=axis_config_snapshot" in message and "side=right" in message and "axisName=Yaw" in message
     )
-    assert "pulsePerUnit=333.333" in right_yaw
+    assert "pulsePerUnit=3333.33" in right_yaw
     assert "sourceSide=left" in right_yaw
     assert "impulseCoeff=-333.333" in right_yaw
     assert "targetImpulseCoeff=3333.33" in right_yaw

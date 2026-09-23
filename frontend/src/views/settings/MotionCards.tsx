@@ -270,7 +270,7 @@ function AxisMappingTable({
                   <span className="axis-travel">{axis.travel}</span>
                 </td>
                 <td className="numeric-cell">{formatAxisValue(positions[sideSpec.stateOffset + index] ?? 0, index)}</td>
-                <td className="numeric-cell">{pulse.toFixed(axis.axis === 'X' || axis.axis === 'Z' ? 4 : 3)}</td>
+                <td className="numeric-cell">{pulse.toFixed(axis.axis === 'X' || axis.axis === 'Z' || (side === 'right' && axis.axis === 'Yaw') ? 4 : 3)}</td>
                 <td>{renderProfileInput(group, 'startSpeed', group === 'translation' ? 0.1 : 0.01)}</td>
                 <td>{renderProfileInput(group, 'maxSpeed', group === 'translation' ? 0.1 : 0.01)}</td>
                 <td>{renderProfileInput(group, 'accTimeSec', 0.01)}</td>

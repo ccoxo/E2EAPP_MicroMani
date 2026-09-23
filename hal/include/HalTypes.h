@@ -91,7 +91,7 @@ constexpr std::array<double, 6> kRightPulsePerUnit{
     -5000.0,
     1666.666667,
     2500.0,
-    333.3333};
+    3333.3333};
 
 // 将 Side + SemanticAxis 压成 MotionState::axes 的 0-11 下标。
 inline int stateIndex(Side side, SemanticAxis axis) {

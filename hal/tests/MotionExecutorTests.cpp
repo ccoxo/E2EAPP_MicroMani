@@ -46,6 +46,13 @@ struct Fixture {
   }
 };
 
+void cardZeroYawUsesUpdatedPulseEquivalent() {
+  require(std::abs(uiToPulse(1.0, Side::Right, SemanticAxis::Yaw) - 3333.3333) < 1e-6,
+      "Card 0 Yaw pulse equivalent is incorrect");
+  require(std::abs(pulseToUi(3333.3333, Side::Right, SemanticAxis::Yaw) - 1.0) < 1e-9,
+      "Card 0 Yaw pulse feedback is incorrect");
+}
+
 void nativeExcludesOtherSources() {
   Fixture f;
   f.executor.beginNative(0, f.epoch());
@@ -284,6 +291,7 @@ void failedGripperReadKeepsSuccessTimestampAndReportsTiming() {
 
 int main() {
   try {
+    cardZeroYawUsesUpdatedPulseEquivalent();
     failedGripperReadKeepsSuccessTimestampAndReportsTiming();
     replayAbsoluteTargetsDoNotAccumulate();
     nativeExcludesOtherSources();
@@ -298,7 +306,7 @@ int main() {
     revokeRejectsAlreadyWaitingFollower();
     dispatcherEmergencyBypassesBothExecutionAndDriverLocks();
     emergencyCancelsCommandAlreadyAdmittedBeforeDriverAccess();
-    std::cout << "MotionExecutorTests passed (14 cases, offline)\n";
+    std::cout << "MotionExecutorTests passed (15 cases, offline)\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "MotionExecutorTests failed: " << error.what() << '\n';

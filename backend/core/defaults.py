@@ -100,11 +100,11 @@ ICF_KINEMATICS_DEFAULTS: dict[str, Any] = {
     "rightPhysicalAxis": [2, 0, 5, 8, 1, 7],
     "axisUnitSpec": ["mm", "mm", "mm", "deg", "deg", "deg"],
     "leftPulsePerUnit": [5000.0, 5000.0, 10000.0, 1666.666667, 2500.0, 3333.333],
-    "rightPulsePerUnit": [5000.0, 10000.0, 5000.0, 1666.666667, 2500.0, 333.3333],
+    "rightPulsePerUnit": [5000.0, 10000.0, 5000.0, 1666.666667, 2500.0, 3333.3333],
     "leftDirectionSign": [-1, 1, -1, 1, -1, -1],
     "rightDirectionSign": [-1, -1, -1, 1, 1, 1],
     "leftSignedPulsePerUnit": [-5000.0, 5000.0, -10000.0, 1666.666667, -2500.0, -3333.333],
-    "rightSignedPulsePerUnit": [-5000.0, -10000.0, -5000.0, 1666.666667, 2500.0, 333.3333],
+    "rightSignedPulsePerUnit": [-5000.0, -10000.0, -5000.0, 1666.666667, 2500.0, 3333.3333],
     "syncActionPulseCoeff": True,
     "updatedAt": "2026-04-17T00:00:00",
 }
