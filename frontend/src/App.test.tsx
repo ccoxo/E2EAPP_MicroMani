@@ -49,6 +49,7 @@ afterEach(() => {
   useTelemetryStore.getState().clearRecordSession()
   useTelemetryStore.setState({
     config: structuredClone(defaultConfig),
+    recording: false,
     motionCommand: { left: initialMotionCommand(), right: initialMotionCommand() },
     controlSafety: initialControlSafety(),
     controlLease: initialControlLease(false),
@@ -260,6 +261,9 @@ describe('AppStation M0 frontend', () => {
   })
 
   it('keeps the global emergency stop available across pages', async () => {
+    useTelemetryStore.setState((state) => ({
+      config: { ...state.config, force: { ...state.config.force, source: 'nidaq' } },
+    }))
     let resolveEmergency!: (value: unknown) => void
     vi.spyOn(api, 'emergencyStop').mockImplementationOnce(() => new Promise((resolve) => {
       resolveEmergency = resolve
@@ -642,6 +646,7 @@ describe('AppStation M0 frontend', () => {
     await waitFor(() => expect(rightButton()).toBeEnabled(), { timeout: 1000 })
     fireEvent.click(rightButton())
     expect(returnOriginSpy.mock.calls).toEqual([['right'], ['left']])
+    await waitFor(() => expect(useTelemetryStore.getState().recordSession.returnOriginInFlight).toBe(false))
   })
 
   it('disables record return-to-origin buttons when the motion side is not enabled', async () => {
@@ -949,6 +954,7 @@ describe('AppStation M0 frontend', () => {
     await waitFor(() => expect(getReturnButton('right')).toBeEnabled(), { timeout: 1000 })
     fireEvent.click(getReturnButton('right'))
     expect(returnOriginSpy.mock.calls).toEqual([['right'], ['left']])
+    await waitFor(() => expect(useTelemetryStore.getState().recordSession.returnOriginInFlight).toBe(false))
     expect(homeAllSpy).not.toHaveBeenCalled()
     expect(captureOriginSpy).not.toHaveBeenCalled()
   })
@@ -1137,6 +1143,7 @@ describe('AppStation M0 frontend', () => {
       telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
       config: {
         ...state.config,
+        force: { ...state.config.force, source: 'nidaq' },
         teleop: { ...state.config.teleop, leftConnected: true, rightConnected: true },
       },
       frame: {
@@ -1452,6 +1459,7 @@ describe('AppStation M0 frontend', () => {
     window.history.pushState({}, '', '/record')
     useTelemetryStore.setState((state) => ({
       telemetryLink: { state: 'live', lastFrameReceivedAt: Date.now() },
+      config: { ...state.config, force: { ...state.config.force, source: 'nidaq' } },
       diagnostics: state.diagnostics.map((item) =>
         item.key === 'omega7' || item.key === 'gripper' ? { ...item, status: 'error' } : item,
       ),
@@ -1868,9 +1876,9 @@ describe('AppStation M0 frontend', () => {
       expect(card).toHaveTextContent('IMX335')
       expect(card?.querySelector('.camera-status-strip')).toBeTruthy()
     }
-    expect(defaultConfig.cameras.global).toBe('IMX335 / index 1')
-    expect(defaultConfig.cameras.wristLeft).toBe('IMX335 / index 0')
-    expect(defaultConfig.cameras.wristRight).toBe('IMX335 / index 2')
+    expect(defaultConfig.cameras.global).toBe('IMX335 / index 0')
+    expect(defaultConfig.cameras.wristLeft).toBe('index -1')
+    expect(defaultConfig.cameras.wristRight).toBe('index -1')
   })
 
   it('syncs PICO connection results into the global status bar', async () => {
@@ -2365,6 +2373,9 @@ describe('AppStation M0 frontend', () => {
   it('runs test fixture hardware commands without backend calls', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('fixture 禁止真实网络'))
     window.history.pushState({}, '', '/settings#force-left')
+    useTelemetryStore.setState((state) => ({
+      config: { ...state.config, force: { ...state.config.force, source: 'nidaq' } },
+    }))
     await renderApp()
     const before = useTelemetryStore.getState().logs.length
     const tareButton = document.querySelector<HTMLButtonElement>('#force-left .hardware-config-actions button')

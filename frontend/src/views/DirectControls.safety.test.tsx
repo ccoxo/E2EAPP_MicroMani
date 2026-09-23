@@ -224,15 +224,18 @@ describe('机械参考点选轴', () => {
       ...useTelemetryStore.getState().config.motion.homeReference,
       rightAxisLimitReference: [true, false, true, false, false, false],
     }
-    vi.spyOn(api, 'homeMotionSide').mockResolvedValue({ ok: true, data: { homeReference: reference } })
+    const home = vi.spyOn(api, 'homeMotionSide')
+    const limit = vi.spyOn(api, 'referencePositiveLimitSide').mockResolvedValue({ ok: true, data: { homeReference: reference } })
     vi.spyOn(api, 'fetchMotionOrigin').mockResolvedValue({ ok: true, data: { homeReference: reference } })
     const { requestComparison } = renderMotionCard()
-    fireEvent.click(screen.getByRole('button', { name: '机械寻零' }))
+    fireEvent.click(screen.getByRole('button', { name: '正限位建参考' }))
     fireEvent.click(screen.getByRole('checkbox', { name: 'X' }))
     fireEvent.click(screen.getByRole('checkbox', { name: 'Z' }))
-    fireEvent.click(screen.getByRole('button', { name: '审阅寻零动作' }))
+    fireEvent.click(screen.getByRole('button', { name: '审阅限位参考动作' }))
     await act(async () => { await requestComparison.mock.calls[0][0].onConfirm() })
-    expect(screen.getByRole('status', { name: '左臂原点操作状态' })).toHaveTextContent('限位参考点：X、Z')
+    expect(limit).toHaveBeenCalledWith('right', ['X', 'Z'])
+    expect(home).not.toHaveBeenCalled()
+    expect(screen.getByRole('status', { name: '左臂原点操作状态' })).toHaveTextContent('正限位参考记录完成：X、Z')
   })
 
   it('限位参考点统一显示已确认，失效后显示待确认', () => {
@@ -280,7 +283,7 @@ describe('机械参考点选轴', () => {
     fireEvent.click(screen.getByRole('button', { name: '返回机械参考点' }))
     fireEvent.click(screen.getByRole('button', { name: '全选六轴' }))
     expect(screen.getByRole('button', { name: '审阅返回动作' })).toBeDisabled()
-    expect(screen.getByText('待确认的所选轴：X、Y、Z')).toBeInTheDocument()
+    expect(screen.getByText('未确认的已选轴：X、Y、Z')).toBeInTheDocument()
     expect(requestComparison).not.toHaveBeenCalled()
     expect(move).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: '机械寻零' }))
