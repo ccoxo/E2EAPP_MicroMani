@@ -2194,7 +2194,12 @@ def test_hal_native_gripper_uses_isolated_jodell_worker_processes() -> None:
     assert "sampleGripperPosition(Side::Left);" in normalized_loop
     assert "sampleGripperPosition(Side::Right);" in normalized_loop
     assert "sampleGripperPosition(sideFromIndex(sampleIndex));" not in normalized_loop
+    assert normalized_loop.index("if (shouldSample)") < normalized_loop.index("for (const auto& command : commands)")
     assert "const bool ok = gripper_.readPositionMm(side, &message);" in normalized_sample
+    assert "const auto sampleMidpoint = readStarted + (readFinished - readStarted) / 2;" in normalized_sample
+    assert "gripperPositionSampleMonotonicMs_[index] = sampleMonotonicMs;" in normalized_sample
+    assert "std::array<std::int64_t, 2> gripperPositionSampleMonotonicMs_" in controller_header
+    assert 'positionSampleMonotonicMs' in controller_source
     assert "gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);" in normalized_sample
     assert "gripperLastCommandOk_[index] = ok;" in normalized_sample
     assert "gripperLastMessage_[index] = message;" in normalized_sample

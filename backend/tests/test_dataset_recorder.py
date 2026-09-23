@@ -2083,6 +2083,25 @@ def test_dataset_recorder_gripper_source_uses_assigned_sample_time() -> None:
     assert sample.monotonic_s > 3.5
 
 
+def test_dataset_recorder_native_gripper_prefers_direct_monotonic_measurement_time() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    recorder._participation = None
+    native_status = {
+        "dds_stamp_monotonic_ms": 500000.0,
+        "grippers": {
+            "left": {"positionMm": 12.0, "positionSampleMonotonicMs": 499920.0},
+            "right": {"positionMm": 13.0, "positionSampleMonotonicMs": 499930.0},
+        },
+    }
+
+    sample = recorder._latest_native_gripper_sample({}, native_status=native_status)
+
+    assert sample is not None
+    positions, sampled_at = sample
+    assert positions == (12.0, 13.0)
+    assert sampled_at == pytest.approx(499.92)
+
+
 def test_native_preflight_does_not_import_lerobot_record_script() -> None:
     source = (Path(__file__).resolve().parents[1] / "services" / "dataset_recorder.py").read_text(encoding="utf-8")
 
