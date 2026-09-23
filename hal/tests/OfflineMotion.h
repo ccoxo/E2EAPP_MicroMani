@@ -12,6 +12,14 @@ struct MotionExecutorTestAccess {
   static std::unique_lock<std::mutex> holdDriver(LTDMCDriver& motion) {
     return std::unique_lock<std::mutex>(motion.mutex_);
   }
+  static void markEnabled(LTDMCDriver& motion, Side side) {
+    std::scoped_lock lock(motion.mutex_);
+    for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
+      const auto index = stateIndex(side, static_cast<SemanticAxis>(axisIndex));
+      motion.enabled_[index] = true;
+      motion.commandedEnabled_[index] = true;
+    }
+  }
   static bool executorBusy(MotionExecutor& executor) {
     std::unique_lock lock(executor.mutex_, std::try_to_lock);
     return !lock.owns_lock();

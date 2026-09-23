@@ -145,6 +145,7 @@ class LTDMCDriver {
   EmergencyStopState estop_;
   ControlLeaseState controlLease_;
   std::atomic_uint32_t stopsInProgress_{0};
+  std::atomic_bool emergencyStateNeedsClear_{false};
   std::atomic_int64_t lastEmergencyStopUnixMs_{0};
   std::string lastError_;
   std::string instanceId_;

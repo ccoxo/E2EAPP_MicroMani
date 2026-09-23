@@ -654,22 +654,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     )
                 except RuntimeError as exc:
                     logs.warning("[HAL]", f"Omega.7 force output apply failed: {exc}")
-            native_started = False
-            try:
-                commands.safety.check(safety_token)
-                await teleop_mapper.start("teleop-connect", pre_home=False, home_side=hardware_side)
-                native_started = True
-            except Exception:
-                if native_started:
-                    try:
-                        await teleop_mapper.stop("teleop-connect")
-                    except RuntimeError as cleanup_exc:
-                        logs.error("[HAL]", f"teleop connect rollback native stop failed: {cleanup_exc}")
-                try:
-                    await commands.stop_motion_side(hardware_side)
-                except RuntimeError as cleanup_exc:
-                    logs.error("[HAL]", f"teleop connect rollback stop mapped {hardware_side} failed: {cleanup_exc}")
-                raise
+            commands.safety.check(safety_token)
+            await teleop_mapper.start("teleop-connect", pre_home=False, home_side=hardware_side)
             logs.info("[HAL]", f"{side} Omega.7 logical connect background sync completed")
             return
 
@@ -1761,7 +1747,28 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             await sync_teleop_logical_connection(side_name, True, config, safety_token)
             commands.safety.check(safety_token)
         except Exception:
-            await asyncio.to_thread(set_teleop_logical_connection, side_name, False)
+            rollback_saved = False
+            try:
+                await asyncio.to_thread(set_teleop_logical_connection, side_name, False)
+                rollback_saved = True
+            except Exception as cleanup_exc:
+                logs.error("[HAL]", f"teleop connect rollback config failed: {cleanup_exc}")
+            sources: list[str] = []
+            if rollback_saved:
+                try:
+                    await teleop_mapper.stop("teleop-connect")
+                    sources = teleop_mapper.status().get("sources", [])
+                except Exception as cleanup_exc:
+                    logs.error("[HAL]", f"teleop connect rollback mapper stop failed: {cleanup_exc}")
+            if not rollback_saved or not sources:
+                try:
+                    await hal.command("teleop.native.stop", {})
+                except Exception as cleanup_exc:
+                    logs.error("[HAL]", f"teleop connect rollback native stop failed: {cleanup_exc}")
+            try:
+                await commands.stop_motion_side(teleop_hardware_side_for_operator_source(side_name, config))
+            except Exception as cleanup_exc:
+                logs.error("[HAL]", f"teleop connect rollback motion stop failed: {cleanup_exc}")
             raise
         logs.info("[HAL]", f"{side} Omega.7 logical connect completed")
         return envelope({

@@ -6431,9 +6431,11 @@ def test_teleop_connect_rejects_stale_cached_motion_state_and_never_enables_slav
     assert "motion.enable_side" not in [name for name, _ in fake.commands]
 
 
+@pytest.mark.parametrize("partial_start_failure", [False, True])
 def test_teleop_connect_accepts_recent_cached_controller_sample(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    partial_start_failure: bool,
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
 
@@ -6475,6 +6477,8 @@ def test_teleop_connect_accepts_recent_cached_controller_sample(
                 return {"response": {"ok": True, "leaseFresh": True, "timeoutMs": 2500}}
             if name == "teleop.native.status":
                 return {"response": {"running": True}}
+            if name == "teleop.native.start" and partial_start_failure:
+                raise RuntimeError("native start reply lost after partial start")
             return {"response": {}}
 
     fake = FakeHal()
@@ -6487,8 +6491,16 @@ def test_teleop_connect_accepts_recent_cached_controller_sample(
     session = asyncio.run(confirm_mock_browser_lease(client.app.state.control_watchdog))
     client.headers["X-Control-Session"] = session
 
-    response = client.post("/api/teleop/left/connect")
-
-    assert response.status_code == 200, response.text
-    assert client.app.state.settings.get_config()["teleop"]["leftConnected"] is True
+    if partial_start_failure:
+        with pytest.raises(RuntimeError, match="native start reply lost"):
+            client.post("/api/teleop/left/connect")
+        assert client.app.state.settings.get_config()["teleop"]["leftConnected"] is False
+        names = [name for name, _ in fake.commands]
+        assert "teleop.native.start" in names
+        assert "teleop.native.stop" in names
+        assert "motion.teleop_stop_side" in names
+    else:
+        response = client.post("/api/teleop/left/connect")
+        assert response.status_code == 200, response.text
+        assert client.app.state.settings.get_config()["teleop"]["leftConnected"] is True
     assert "motion.enable_side" not in [name for name, _ in fake.commands]

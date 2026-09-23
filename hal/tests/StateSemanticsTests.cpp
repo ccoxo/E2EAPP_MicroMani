@@ -39,6 +39,30 @@ void syntheticStateUpdateInvalidatesHardwareSampleTime() {
       "command-side state update reused an old controller timestamp for synthetic feedback");
 }
 
+void contendedEmergencyStopClearsUnconfirmedEnableBeforeAcknowledgement() {
+  LTDMCDriver motion;
+  MotionExecutorTestAccess::initialize(motion);
+  MotionExecutorTestAccess::markEnabled(motion, Side::Right);
+  const auto before = motion.readState();
+  require(before.axes[6].enabled, "test setup did not mark the right axis enabled");
+  auto driverLock = MotionExecutorTestAccess::holdDriver(motion);
+  auto stopping = std::async(std::launch::async, [&]() { motion.emergencyStop(); });
+  stopping.get();
+  const auto cached = motion.latestState();
+  require(cached.estopActive && !cached.axes[6].enabled,
+      "contended stop exposed stale unconfirmed servo enable state");
+  bool rejected = false;
+  try { motion.acknowledgeEmergencyStop(); }
+  catch (const std::runtime_error&) { rejected = true; }
+  require(rejected && motion.estopActive(), "stop acknowledgement bypassed pending state reconciliation");
+  driverLock.unlock();
+  const auto fresh = motion.readState();
+  require(!fresh.axes[6].enabled, "fresh sample restored stale right-side commanded enable state");
+  motion.acknowledgeEmergencyStop();
+  require(!motion.readState().axes[6].enabled,
+      "acknowledgement restored stale right-side commanded enable state");
+}
+
 void motionJsonDoesNotInventMissingControllerTimestamp() {
   MotionState state;
   state.readTimestampMs = 0;
@@ -72,9 +96,10 @@ int main() {
   try {
     cachedMotionStatePreservesHardwareSampleTime();
     syntheticStateUpdateInvalidatesHardwareSampleTime();
+    contendedEmergencyStopClearsUnconfirmedEnableBeforeAcknowledgement();
     motionJsonDoesNotInventMissingControllerTimestamp();
     motionJsonPreservesIntegerPulsePrecisionAndFeedbackTruth();
-    std::cout << "StateSemanticsTests passed (4 offline cases)" << std::endl;
+    std::cout << "StateSemanticsTests passed (5 offline cases)" << std::endl;
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "StateSemanticsTests failed: " << error.what() << std::endl;

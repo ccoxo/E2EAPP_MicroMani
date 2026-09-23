@@ -562,6 +562,7 @@ MotionState LTDMCDriver::readState() {
     return cachedStateSnapshot();
   }
   ensureInitialized();
+  if (emergencyStateNeedsClear_.load(std::memory_order_acquire)) clearEmergencyStateLocked();
   MotionState state;
   state.estopActive = estop_.active();
   state.sampleCached = false;
@@ -608,6 +609,11 @@ MotionState LTDMCDriver::cachedStateSnapshot() const {
   auto state = cachedState_;
   state.estopActive = estop_.active();
   state.sampleCached = true;
+  if (state.estopActive || emergencyStateNeedsClear_.load(std::memory_order_acquire)) {
+    for (auto& axis : state.axes) {
+      if (!axis.enabledConfirmed) axis.enabled = false;
+    }
+  }
   return state;
 }
 HalHealth LTDMCDriver::cachedHealth(double uptimeS) const {
@@ -653,6 +659,7 @@ void LTDMCDriver::clearEmergencyStateLocked() {
   enabled_.fill(false);
   commandedEnabled_.fill(false);
   publishStateSnapshotLocked();
+  emergencyStateNeedsClear_.store(false, std::memory_order_release);
 }
 
 std::string LTDMCDriver::stopAttemptFailureMessage(
@@ -694,6 +701,7 @@ void LTDMCDriver::emergencyStop() {
 
 void LTDMCDriver::latchEmergencyStop() noexcept {
   estop_.trip();
+  emergencyStateNeedsClear_.store(true, std::memory_order_release);
   const auto stopTime = unixTimeMs();
   auto previousTime = lastEmergencyStopUnixMs_.load(std::memory_order_acquire);
   while (previousTime < stopTime && !lastEmergencyStopUnixMs_.compare_exchange_weak(
@@ -716,6 +724,13 @@ void LTDMCDriver::acknowledgeEmergencyStop() {
 void LTDMCDriver::acknowledgeEmergencyStop(std::uint64_t expectedEpoch) {
   if (stopsInProgress_.load(std::memory_order_acquire) != 0) {
     throw std::runtime_error("emergency stop is still being applied; acknowledge again after it completes");
+  }
+  if (emergencyStateNeedsClear_.load(std::memory_order_acquire)) {
+    std::unique_lock<std::mutex> stateLock(mutex_, std::try_to_lock);
+    if (!stateLock.owns_lock()) {
+      throw std::runtime_error("emergency stop state is still being reconciled; acknowledge again after it completes");
+    }
+    clearEmergencyStateLocked();
   }
   controlLease_.acknowledge(estop_, expectedEpoch);
   std::unique_lock<std::mutex> stateLock(mutex_, std::try_to_lock);

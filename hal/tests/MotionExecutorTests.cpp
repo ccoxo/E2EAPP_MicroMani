@@ -238,10 +238,11 @@ void emergencyCancelsCommandAlreadyAdmittedBeforeDriverAccess() {
   // 普通提交误判 executor 忙而提前拒绝，无法覆盖本用例要求的在途窗口。
   command.wait_for(std::chrono::milliseconds(100));
   const bool admitted = MotionExecutorTestAccess::executorBusy(f.executor);
-  // 急停硬件路径不等待主状态锁；确认后，已捕获旧代际的请求仍必须失效。
+  // 急停硬件路径不等待主状态锁；状态未清理前不能确认急停。
   f.motion.emergencyStop();
-  f.motion.acknowledgeEmergencyStop();
+  rejects([&] { f.motion.acknowledgeEmergencyStop(); });
   heldDriver.unlock();
+  f.motion.acknowledgeEmergencyStop();
   const bool rejected = command.get();
   require(admitted && rejected, "emergency did not cancel an already-admitted command across acknowledgement");
   require(f.motion.readState().axes[0].uiPosition == 0, "cancelled command changed motion position");
