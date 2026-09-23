@@ -4129,9 +4129,28 @@ def test_create_dataset_can_resume_native_lerobot_recording(tmp_path: Path, monk
         assert finish_response.status_code == 200
 
 
+def _manual_axis_test_client(tmp_path: Path, monkeypatch: MonkeyPatch) -> TestClient:
+    class FakeHal:
+        async def motion_state(self) -> dict[str, Any]:
+            return {
+                "timestamp_ms": now_ms(), "sample_cached": False,
+                "positions": [0.0] * 12, "pulses": [0.0] * 12,
+                "enabled": [True] * 12, "moving": [False] * 12,
+                "estop_active": False,
+            }
+
+        async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
+            return {"command": name, "payload": payload or {}}
+
+    monkeypatch.setattr("backend.app.make_hal_client", lambda _config, _logs: FakeHal())
+    client = TestClient(create_app(tmp_path))
+    _attach_mock_control_lease(client)
+    return client
+
+
 def test_manual_axis_move_allows_card0_yaw(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
-    client = TestClient(create_app(tmp_path))
+    client = _manual_axis_test_client(tmp_path, monkeypatch)
 
     response = client.post(
         "/api/motion/manual_axis_move",
@@ -4142,8 +4161,8 @@ def test_manual_axis_move_allows_card0_yaw(tmp_path: Path, monkeypatch: MonkeyPa
     assert response.json()["data"]["applied"] != 0
 
 
-def test_manual_axis_move_rejects_unsafe_step(tmp_path: Path) -> None:
-    client = TestClient(create_app(tmp_path))
+def test_manual_axis_move_rejects_unsafe_step(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    client = _manual_axis_test_client(tmp_path, monkeypatch)
 
     response = client.post(
         "/api/motion/manual_axis_move",
@@ -4155,8 +4174,7 @@ def test_manual_axis_move_rejects_unsafe_step(tmp_path: Path) -> None:
 
 def test_manual_axis_move_ignores_translation_soft_limit_target(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
-    client = TestClient(create_app(tmp_path))
-    _attach_mock_control_lease(client)
+    client = _manual_axis_test_client(tmp_path, monkeypatch)
     config = default_config()
     config["hal"]["mode"] = "real"
     config["motion"]["origin"] = {
@@ -4168,7 +4186,8 @@ def test_manual_axis_move_ignores_translation_soft_limit_target(tmp_path: Path, 
         "updatedAt": 1,
     }
     config["motion"]["leftSoftLimits"]["x"] = {"min": -10, "max": 10}
-    assert client.put("/api/settings", json=config).status_code == 200
+    settings_response = client.put("/api/settings", json=config)
+    assert settings_response.status_code == 200, settings_response.text
 
     class FakeHal:
         async def motion_state(self) -> dict:
@@ -4197,8 +4216,7 @@ def test_manual_axis_move_uses_hardware_zero_work_limit_for_rotation(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
-    client = TestClient(create_app(tmp_path))
-    _attach_mock_control_lease(client)
+    client = _manual_axis_test_client(tmp_path, monkeypatch)
     config = default_config()
     config["hal"]["mode"] = "real"
     config["motion"]["homeReference"] = {
@@ -4275,8 +4293,7 @@ def test_manual_axis_move_uses_hardware_zero_yaw_work_window(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
-    client = TestClient(create_app(tmp_path))
-    _attach_mock_control_lease(client)
+    client = _manual_axis_test_client(tmp_path, monkeypatch)
     config = default_config()
     config["hal"]["mode"] = "real"
     config["motion"]["homeReference"] = {
@@ -4339,8 +4356,7 @@ def test_manual_axis_move_requires_hardware_zero_not_work_origin_for_rotation_wo
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
-    client = TestClient(create_app(tmp_path))
-    _attach_mock_control_lease(client)
+    client = _manual_axis_test_client(tmp_path, monkeypatch)
     config = default_config()
     config["hal"]["mode"] = "real"
     config["motion"]["origin"]["leftValid"] = False
@@ -4404,8 +4420,7 @@ def test_manual_axis_move_allows_return_toward_limit_when_already_outside(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
-    client = TestClient(create_app(tmp_path))
-    _attach_mock_control_lease(client)
+    client = _manual_axis_test_client(tmp_path, monkeypatch)
     config = default_config()
     config["hal"]["mode"] = "real"
     config["motion"]["origin"] = {
@@ -5943,19 +5958,19 @@ def test_dataset_recorder_action_vector_prefers_teleop_delta_vector() -> None:
     recorder.teleop = FakeTeleop()
 
     assert recorder._latest_action_vector() == [
-        10.0,
-        0.0,
-        0.0,
-        500.0,
-        0.0,
-        0.0,
-        0.0,
         -20.0,
         0.0,
         0.0,
         0.0,
         0.0,
         -100.0,
+        0.0,
+        10.0,
+        0.0,
+        0.0,
+        500.0,
+        0.0,
+        0.0,
         0.0,
     ]
 
@@ -5976,7 +5991,11 @@ def test_runtime_shutdown_endpoint_schedules_stop_stack(tmp_path: Path, monkeypa
     monkeypatch.setattr("backend.app.subprocess.Popen", fake_popen)
 
     with TestClient(create_app(tmp_path)) as client:
-        response = client.post("/api/runtime/shutdown", json={"reason": "test-close"})
+        session = _attach_mock_control_lease(client)
+        response = client.post(
+            "/api/runtime/shutdown",
+            json={"reason": "test-close", "controlSessionId": session},
+        )
         assert response.status_code == 200
         assert response.json()["data"]["scheduled"] is True
         time.sleep(0.1)
@@ -6049,6 +6068,7 @@ def test_stability_monitor_samples_read_config_off_event_loop(
 def test_policy_model_auto_and_fine_tune_endpoints_are_conservative(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     client = TestClient(create_app(tmp_path))
+    _attach_mock_control_lease(client)
 
     models_response = client.get("/api/models")
     assert models_response.status_code == 200
@@ -6094,6 +6114,7 @@ def test_policy_auto_routes_read_config_off_event_loop(
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     client = TestClient(create_app(tmp_path), raise_server_exceptions=False)
+    _attach_mock_control_lease(client)
     app_state = _app_state(client)
     original_get_config = app_state.settings.get_config
     calls: list[str] = []
@@ -6126,6 +6147,7 @@ def test_policy_auto_routes_read_config_off_event_loop(
 def test_emergency_stop_clears_auto_policy_queue(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "test")
     client = TestClient(create_app(tmp_path))
+    _attach_mock_control_lease(client)
 
     start_response = client.post("/api/auto/start", json={"modelId": "act"})
     assert start_response.status_code == 200
@@ -6205,7 +6227,6 @@ def test_acknowledge_safety_clears_latch_without_restoring_servos_or_moving_orig
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
-    from backend.tests.test_control_watchdog import confirm_mock_browser_lease
 
     class FakeHal:
         def __init__(self) -> None:
@@ -6249,7 +6270,7 @@ def test_acknowledge_safety_clears_latch_without_restoring_servos_or_moving_orig
     emergency_response = client.post("/api/motion/emergency_stop")
     assert emergency_response.status_code == 200
 
-    asyncio.run(confirm_mock_browser_lease(client.app.state.control_watchdog))
+    _attach_mock_control_lease(client)
     acknowledge_response = client.post("/api/motion/safety/acknowledge")
 
     assert acknowledge_response.status_code == 200
