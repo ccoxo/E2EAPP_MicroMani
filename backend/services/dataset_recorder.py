@@ -50,6 +50,7 @@ from backend.core.motion_safety import MotionSafetyGate, motion_operation
 from backend.core.units import lerobot_to_ui_state, motion_pulse_per_unit, pulses_to_ui_state
 from backend.hal_client.client import HalClient
 from backend.services.hardware_service import HardwareService
+from backend.services.gripper_backend import native_teleop_enabled
 from backend.services.telemetry_hub import TelemetryHub
 from backend.services.teleop_mapping import TeleopMappingService
 
@@ -740,17 +741,19 @@ class DatasetRecorderService:
                 self._write_enqueue_pending = 0
                 self._write_enqueue_idle.set()
                 self._begin_episode_locked(sample_clock_now_s=sample_clock_now_s, schedule_now_s=schedule_now_s)
+                self._accepting_frame_jobs = False
                 self._start_sampler_tasks_locked()
-                self._loop_task = asyncio.create_task(self._record_loop(), name="dataset-recorder")
-                self._assembler_task = asyncio.create_task(self._frame_assembler_loop(), name="dataset-frame-assembler")
                 self.telemetry.episode_count = self._episode_index
                 self.telemetry.frame_count = 0
-                self.telemetry.recording = True
+                self.telemetry.recording = False
             if self._real_hardware_mode(config):
                 await self._refresh_gripper_cache(config)
             self.safety.check(safety_token)
             await self.teleop.start("recording", pre_home=False)
-            await self._wait_for_fresh_native_gripper_feedback(config)
+            await self._arm_episode_after_feedback(config, safety_token)
+            async with self._lock:
+                self._loop_task = asyncio.create_task(self._record_loop(), name="dataset-recorder")
+                self._assembler_task = asyncio.create_task(self._frame_assembler_loop(), name="dataset-frame-assembler")
             await self._wait_for_episode_warmup()
             self.safety.check(safety_token)
         except (asyncio.CancelledError, Exception):
@@ -912,7 +915,8 @@ class DatasetRecorderService:
                 self._reset_pending = False
                 self._reset_returned_sides = set()
                 self._begin_episode_locked(sample_clock_now_s=sample_clock_now_s, schedule_now_s=schedule_now_s)
-                self.telemetry.recording = True
+                self._accepting_frame_jobs = False
+                self.telemetry.recording = False
                 self.telemetry.frame_count = 0
             except (asyncio.CancelledError, Exception):
                 self._last_saved_episode = previous_last_saved_episode
@@ -924,7 +928,7 @@ class DatasetRecorderService:
         try:
             self.safety.check(safety_token)
             await self.teleop.start("recording", pre_home=False)
-            await self._wait_for_fresh_native_gripper_feedback(config)
+            await self._arm_episode_after_feedback(config, safety_token)
             await self._wait_for_episode_warmup()
             self.safety.check(safety_token)
         except (asyncio.CancelledError, Exception):
@@ -1809,29 +1813,52 @@ class DatasetRecorderService:
         required_sides = tuple(hardware_sides(selected, "grippers")) if selected else ()
         if not required_sides:
             return
-        async with self._lock:
-            self._accepting_frame_jobs = False
         deadline = time.monotonic() + 3.0
-        try:
+        while time.monotonic() < deadline:
+            result = await self.hal.command("teleop.native.status", {})
+            native = result.get("response") if isinstance(result, dict) else None
+            grippers = native.get("grippers", {}) if isinstance(native, dict) else {}
+            now_ms = time.time() * 1000.0
+            fresh = all(
+                isinstance(grippers.get(side), dict)
+                and grippers[side].get("positionOk") is True
+                and 0.0 <= now_ms - float(grippers[side].get("positionSampleTs", 0.0)) <= 1000.0
+                for side in required_sides
+            )
+            if fresh:
+                return
+            await asyncio.sleep(0.02)
+        raise RuntimeError("参与采集的夹爪在录制开始前没有获得新鲜位置反馈")
+
+    async def _arm_episode_after_feedback(self, config: dict[str, Any], safety_token: Any) -> None:
+        """等真实反馈进入采样缓存后，重新确定第 0 帧的未来时间。"""
+        await self._wait_for_fresh_native_gripper_feedback(config)
+        if self._real_hardware_mode(config) and self._participation:
+            sources = ("hal",) + (("gripper",) if self._participation["grippers"] else ())
+            deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline:
-                result = await self.hal.command("teleop.native.status", {})
-                native = result.get("response") if isinstance(result, dict) else None
-                grippers = native.get("grippers", {}) if isinstance(native, dict) else {}
-                now_ms = time.time() * 1000.0
-                fresh = all(
-                    isinstance(grippers.get(side), dict)
-                    and grippers[side].get("positionOk") is True
-                    and 0.0 <= now_ms - float(grippers[side].get("positionSampleTs", 0.0)) <= 1000.0
-                    for side in required_sides
-                )
-                if fresh:
-                    return
+                now_s = time.monotonic()
+                valid_at_ms = now_ms()
+                if all(
+                    (buffer := self._sample_buffers.get(source)) is not None
+                    and (sample := buffer.nearest(now_s, 0.2, valid_only=True,
+                                                  valid_at_unix_ms=valid_at_ms)) is not None
+                    and self._feedback_is_valid(sample)
+                    for source in sources
+                ):
+                    break
                 await asyncio.sleep(0.02)
-            raise RuntimeError("参与采集的夹爪在录制开始前没有获得新鲜位置反馈")
-        finally:
-            if getattr(self, "_recording", False):
-                async with self._lock:
-                    self._accepting_frame_jobs = True
+            else:
+                raise RuntimeError("参与采集设备采样预热超时，拒绝开始录制")
+        sample_clock_now_s, schedule_now_s = await self._episode_clock_pair(config)
+        async with self._lock:
+            self.safety.check(safety_token)
+            self._episode_start_monotonic_s = sample_clock_now_s + RECORDER_HARDWARE_WARMUP_S
+            self._record_loop_start_monotonic_s = schedule_now_s + RECORDER_HARDWARE_WARMUP_S
+            self._episode_started_at = self._record_loop_start_monotonic_s
+            self._episode_source_time0_s = self._episode_start_monotonic_s - self._sampler_start_monotonic_s
+            self._accepting_frame_jobs = True
+            self.telemetry.recording = True
 
     async def _native_writer_command(self, kind: str) -> Any:
         """向 native 写线程发送控制命令，并异步等待执行结果。"""
@@ -2112,8 +2139,7 @@ class DatasetRecorderService:
 
     def _record_target_timestamp_s(self, frame_index: int) -> float:
         """根据帧号、预热时间和录制 FPS 计算目标帧时间。"""
-        record_start_s = self._sampler_start_monotonic_s or self._episode_start_monotonic_s
-        return record_start_s + RECORDER_HARDWARE_WARMUP_S + max(0, int(frame_index)) / max(1, self._record_fps_hz)
+        return self._episode_start_monotonic_s + max(0, int(frame_index)) / max(1, self._record_fps_hz)
 
     def _record_schedule_timestamp_s(self, frame_index: int) -> float:
         """根据帧号和 Python 调度起点计算本机唤醒时间。"""
@@ -4921,8 +4947,7 @@ class DatasetRecorderService:
 
     def _using_real_hal_native_teleop(self, config: dict[str, Any]) -> bool:
         """判断当前录制是否由 HAL-native 直接提供实机 teleop 数据。"""
-        teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
-        return self._real_hardware_mode(config) and str(teleop.get("engine", "")).lower() == "hal_native"
+        return self._real_hardware_mode(config) and native_teleop_enabled(config)
 
     def _force_norm(self, values: object) -> float:
         """计算前三轴力值的最大绝对值作为力幅度指标。"""
