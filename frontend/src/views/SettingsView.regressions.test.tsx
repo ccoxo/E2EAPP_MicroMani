@@ -50,6 +50,36 @@ function returnButton(side: 'left' | 'right') {
 }
 
 describe('设置迁移回归', () => {
+  it('主手后台连接在物理反馈到达后解除等待，后续掉线仍可断开', async () => {
+    const connect = vi.spyOn(api, 'connectTeleopHand').mockResolvedValue({
+      data: { connected: true, backgroundSync: true, physicalConnected: false },
+    })
+    useTelemetryStore.setState((state) => ({
+      config: { ...state.config, teleop: { ...state.config.teleop, homeBeforeStart: false } },
+    }))
+    await show('teleop-left')
+    const left = within(document.getElementById('teleop-left')!)
+    await act(async () => { fireEvent.click(left.getByRole('button', { name: '连接主手' })) })
+    expect(connect).toHaveBeenCalledWith('left')
+    expect(left.getByRole('button', { name: '断开主手' })).toBeDisabled()
+
+    await act(async () => {
+      useTelemetryStore.setState((state) => ({ frame: {
+        ...state.frame,
+        teleopHands: state.frame.teleopHands.map((hand) => hand.side === 'left' ? { ...hand, connected: true } : hand),
+      } }))
+    })
+    expect(left.getByRole('button', { name: '断开主手' })).toBeEnabled()
+
+    await act(async () => {
+      useTelemetryStore.setState((state) => ({ frame: {
+        ...state.frame,
+        teleopHands: state.frame.teleopHands.map((hand) => hand.side === 'left' ? { ...hand, connected: false } : hand),
+      } }))
+    })
+    expect(left.getByRole('button', { name: '断开主手' })).toBeEnabled()
+  })
+
   it('默认显示 HKVL 主用串口，并可切换 NI-DAQ 备用后保留选择', async () => {
     await show('force-left')
     const left = () => within(document.getElementById('force-left')!)

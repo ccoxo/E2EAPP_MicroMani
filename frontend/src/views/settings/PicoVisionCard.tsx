@@ -22,7 +22,8 @@ import {
 } from '../../components/ui'
 import { useTelemetryStore } from '../../stores/telemetry'
 import type { AppConfig, LogEntry } from '../../types'
-import { HardwareConfigCard, MetricBox, commandLog } from './shared'
+import { HardwareConfigCard, MetricBox } from './shared'
+import { commandLog } from './sharedHelpers'
 
 const rotationOptions = [
   { value: 'none', label: '不旋转' },

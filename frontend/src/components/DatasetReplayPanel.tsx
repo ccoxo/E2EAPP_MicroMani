@@ -1,6 +1,6 @@
 import type { Participation } from '../types'
 import { ParticipationSelector } from './ParticipationSelector'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { AlertCircle, CheckCircle2, Play, RotateCcw, ShieldCheck, Square } from 'lucide-react'
 import { apiBase, mockMode, postCommand } from '../api'
 import { UiButton, UiTag, UiTitle } from './ui'
@@ -39,6 +39,10 @@ const phaseLabels: Record<string, string> = {
 }
 
 export function DatasetReplayPanel({ datasetId, episodeId, recordedParticipation }: { datasetId: string; episodeId: string; recordedParticipation?: Participation | null }) {
+  return <DatasetReplayPanelContent key={`${datasetId}/${episodeId}/${JSON.stringify(recordedParticipation)}`} datasetId={datasetId} episodeId={episodeId} recordedParticipation={recordedParticipation} />
+}
+
+function DatasetReplayPanelContent({ datasetId, episodeId, recordedParticipation }: { datasetId: string; episodeId: string; recordedParticipation?: Participation | null }) {
   const [selected, setSelected] = useState<Participation>(recordedParticipation ?? { version: 'appstation.participation.v1', arms: [], grippers: [] })
   const [status, setStatus] = useState<ReplayStatus | null>(null)
   const [verified, setVerified] = useState(false)
@@ -48,18 +52,7 @@ export function DatasetReplayPanel({ datasetId, episodeId, recordedParticipation
   const [error, setError] = useState('')
   const [summary, setSummary] = useState('')
   const [inspectedTiming, setInspectedTiming] = useState<ReplayTiming | null>(null)
-  const selectionKey = `${datasetId}/${episodeId}`
-  const currentSelection = useRef(selectionKey)
-  currentSelection.current = selectionKey
   const [connected, setConnected] = useState(false)
-  useEffect(() => {
-    setSelected(recordedParticipation ?? { version: 'appstation.participation.v1', arms: [], grippers: [] })
-    setVerified(false)
-    setConfirmed(false)
-    setSummary('')
-    setInspectedTiming(null)
-    setError('')
-  }, [datasetId, episodeId, recordedParticipation])
   useEffect(() => {
     if (mockMode) return
     let disposed = false
@@ -89,7 +82,6 @@ export function DatasetReplayPanel({ datasetId, episodeId, recordedParticipation
         data: ReplayStatus & { frames: number; fps: number; durationS: number }
       }
       if (operation === 'inspect') {
-        if (currentSelection.current !== selectionKey) return
         setVerified(true)
         setSummary(`${result.data.frames} 帧 · ${result.data.fps} Hz · ${result.data.durationS.toFixed(1)} 秒`)
         setInspectedTiming(result.data.timing ?? null)

@@ -99,7 +99,9 @@ export function SettingsView() {
   const canAcknowledge = useTelemetryStore(canAcknowledgeControlSafety)
   const location = useLocation()
   const focusHash = location.hash.replace('#', '')
-  const [activeTab, setActiveTab] = useState(() => tabForHardwareHash(focusHash))
+  const [tabSelection, setTabSelection] = useState(() => ({ focusHash, tab: tabForHardwareHash(focusHash) }))
+  const activeTab = tabSelection.focusHash === focusHash ? tabSelection.tab : tabForHardwareHash(focusHash)
+  if (tabSelection.focusHash !== focusHash) setTabSelection({ focusHash, tab: activeTab })
   const config = useTelemetryStore((state) => state.config)
   const dangerIndex = useTelemetryStore((state) => activeTab === 'force' ? state.frame.dangerIndex : 0)
   const forceLeft = useFrameField((frame) => activeTab === 'force' ? frame.forceLeft : emptyValues, numberArrayEqual)
@@ -144,10 +146,6 @@ export function SettingsView() {
   const [configApplyStatus, setConfigApplyStatus] = useState('')
 
   useEffect(() => {
-    setActiveTab(tabForHardwareHash(focusHash))
-  }, [focusHash])
-
-  useEffect(() => {
     if (!applyingConfigRef.current) setConfigApplyStatus('')
   }, [config])
 
@@ -178,14 +176,10 @@ export function SettingsView() {
     }
   }
 
-  const refreshMotionOriginStatus = useCallback(async () => {
-    try {
-      const response = await fetchMotionOrigin()
-      setPreviousRestoreStatus(response.data?.previousRestore ?? null)
-    } catch (error) {
-      injectLog('WARNING', `motion origin status fetch failed: ${commandErrorMessage(error)}`, '[HAL]')
-    }
-  }, [injectLog])
+  const refreshMotionOriginStatus = useCallback(() => fetchMotionOrigin()
+    .then((response) => setPreviousRestoreStatus(response.data?.previousRestore ?? null))
+    .catch((error) => injectLog('WARNING', `motion origin status fetch failed: ${commandErrorMessage(error)}`, '[HAL]')),
+  [injectLog])
 
   useEffect(() => {
     void refreshMotionOriginStatus()
@@ -233,7 +227,7 @@ export function SettingsView() {
       <div className="ui-tabs">
         <UiTabs
           activeKey={activeTab}
-          onChange={setActiveTab}
+          onChange={(tab) => setTabSelection({ focusHash, tab })}
           items={[
             { key: 'system', label: '系统连接' },
             { key: 'force', label: '安全与力觉' },

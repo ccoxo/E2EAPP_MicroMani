@@ -48,7 +48,8 @@ import type {
   ParameterSnapshotScope,
   RotationWorkLimitSideConfig,
 } from '../../types'
-import { HardwareConfigCard, MetricBox, commandLog, type PendingComparison } from './shared'
+import { HardwareConfigCard, MetricBox, type PendingComparison } from './shared'
+import { commandLog } from './sharedHelpers'
 import { formatSnapshotTime } from './motionHelpers'
 
 const REFERENCE_AXES: ManualControlAxis[] = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']

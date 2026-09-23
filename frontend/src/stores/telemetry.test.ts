@@ -115,7 +115,7 @@ describe('hardware diagnostics', () => {
           latestPath: 'backend/app.py',
         },
       },
-    } as any)
+    })
 
     expect(diagnostics.find((item) => item.key === 'hal-health')).toMatchObject({
       status: 'warn',

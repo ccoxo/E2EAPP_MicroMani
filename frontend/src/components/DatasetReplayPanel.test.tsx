@@ -68,7 +68,7 @@ it('切换片段后迟到的校验响应不能解除新片段的门控', async (
   fireEvent.click(inspect)
   rerender(<DatasetReplayPanel recordedParticipation={dualParticipation} datasetId="local" episodeId="new" />)
   resolve({ data: { frames: 60, fps: 30, durationS: 2, timing } })
-  await waitFor(() => expect(inspect).toBeEnabled())
+  await waitFor(() => expect(screen.getByRole('button', { name: '校验回放数据' })).toBeEnabled())
   expect(screen.queryByLabelText('回放时间规划')).not.toBeInTheDocument()
   expect(screen.getByRole('checkbox', { name: /确认工作区/ })).toBeDisabled()
 })
