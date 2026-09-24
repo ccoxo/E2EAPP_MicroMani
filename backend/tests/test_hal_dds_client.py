@@ -69,8 +69,11 @@ def test_recording_sources_can_read_concurrently_without_competing_for_two_slots
 
         def get_latest(topic):
             barrier.wait()
+            payload = {"topic": topic}
+            if topic == TOPIC_HAL_MOTION_STATE:
+                payload["timestamp_ms"] = 100_000
             return JsonEnvelope(stamp_unix_ms=100_000, stamp_monotonic_ms=456,
-                                source="test", payload_json=json.dumps({"topic": topic}))
+                                source="test", payload_json=json.dumps(payload))
 
         transport.get_latest = get_latest
         client = DdsHalClient(LogService(emit_startup=False), transport=transport, state_timeout_s=2)
@@ -119,19 +122,41 @@ def test_dds_hal_client_reads_motion_state_from_topic_cache() -> None:
         stamp_unix_ms=100_000,
         stamp_monotonic_ms=456,
         source="bridge",
-        payload_json='{"positions":[1,2,3]}',
+        payload_json='{"timestamp_ms":99900,"sample_cached":true,"positions":[1,2,3]}',
     )
 
     client = DdsHalClient(LogService(emit_startup=False), transport=transport)
     state = asyncio.run(client.motion_state())
 
     assert state["positions"] == [1, 2, 3]
-    assert state["timestamp_ms"] == 100_000
+    assert state["timestamp_ms"] == 99_900
+    assert state["sample_cached"] is True
     assert state["monotonicMs"] == 456
     assert state["monotonic_s"] == pytest.approx(0.456)
     assert state["dds_stamp_unix_ms"] == 100_000
     assert state["dds_stamp_monotonic_ms"] == 456
     assert "received_monotonic_ms" not in state
+
+
+@pytest.mark.parametrize("payload", [
+    {"positions": [1, 2, 3]},
+    {"timestamp_ms": 0},
+    {"timestamp_ms": True},
+    {"timestamp_ms": "100000"},
+    {"timestamp_ms": 99_000},
+])
+def test_dds_hal_client_rejects_missing_or_stale_controller_sample_time(payload: dict[str, Any]) -> None:
+    transport = FakeDdsTransport()
+    transport.latest[TOPIC_HAL_MOTION_STATE] = JsonEnvelope(
+        stamp_unix_ms=100_000,
+        stamp_monotonic_ms=456,
+        source="hal-cpp",
+        payload_json=json.dumps(payload),
+    )
+    client = DdsHalClient(LogService(emit_startup=False), transport=transport)
+
+    with pytest.raises(RuntimeError, match="controller sample timestamp"):
+        asyncio.run(client.motion_state())
 
 
 def test_dds_hal_client_reads_force_state_from_topic_cache() -> None:

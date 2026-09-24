@@ -299,10 +299,16 @@ class DdsHalClient(HalClient):
         if (type(stamp_unix_ms) is not int or stamp_unix_ms <= 0
                 or type(stamp_monotonic_ms) is not int or stamp_monotonic_ms < 0):
             raise RuntimeError(f"DDS topic has invalid source timestamp: {topic_name}")
-        age_ms = now_unix_ms() - stamp_unix_ms
+        current_ms = now_unix_ms()
+        age_ms = current_ms - stamp_unix_ms
         if age_ms > _DDS_STATE_MAX_AGE_MS or age_ms < -_DDS_STATE_MAX_FUTURE_MS:
             raise RuntimeError(f"DDS topic source timestamp is stale or in the future: {topic_name} age_ms={age_ms}")
         payload = dict(_json_object(envelope.payload_json, topic_name))
+        if topic_name == TOPIC_HAL_MOTION_STATE:
+            sample_ms = payload.get("timestamp_ms")
+            if (type(sample_ms) is not int or sample_ms <= 0
+                    or not -_DDS_STATE_MAX_FUTURE_MS <= current_ms - sample_ms <= _DDS_STATE_MAX_AGE_MS):
+                raise RuntimeError("DDS motion controller sample timestamp is stale or unavailable")
         payload.setdefault("timestamp_ms", stamp_unix_ms)
         payload.setdefault("monotonicMs", stamp_monotonic_ms)
         payload.setdefault("monotonic_s", stamp_monotonic_ms / 1000.0)

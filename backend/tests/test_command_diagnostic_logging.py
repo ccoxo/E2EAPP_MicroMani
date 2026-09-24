@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from backend.core.defaults import default_config
-from backend.core.logging import LogService
+from backend.core.logging import LogService, now_ms
 from backend.core.motion_limits import effective_limits_ui, side_home_reference_ui
 from backend.core.schemas import ManualAxisMoveRequest
 from backend.services.command_service import CommandService
@@ -74,7 +74,15 @@ class FakeHal:
         return {"mode": "test", "command": name, "payload": payload or {}, "response": {"ok": True}}
 
     async def motion_state(self) -> dict[str, Any]:
-        return {"pulses": [0.0] * 12, "enabled": [True] * 12}
+        return {
+            "timestamp_ms": now_ms(),
+            "sample_cached": False,
+            "pulses": [0.0] * 12,
+            "enabled": [True] * 12,
+            "enabled_confirmed": [True] * 12,
+            "moving": [False] * 12,
+            "estop_active": False,
+        }
 
 
 class RecordingHal(FakeHal):
@@ -89,7 +97,15 @@ class RecordingHal(FakeHal):
 
 class DisabledMotionHal(RecordingHal):
     async def motion_state(self) -> dict[str, Any]:
-        return {"pulses": [0.0] * 12, "enabled": [False] * 12}
+        return {
+            "timestamp_ms": now_ms(),
+            "sample_cached": False,
+            "pulses": [0.0] * 12,
+            "enabled": [False] * 12,
+            "enabled_confirmed": [True] * 12,
+            "moving": [False] * 12,
+            "estop_active": False,
+        }
 
 
 class FakeTeleop:
@@ -108,10 +124,34 @@ class FakeTeleop:
 
 class FakeMotionStateHal(FakeHal):
     def __init__(self, pulses: list[float]) -> None:
-        self.pulses = pulses
+        self.pulses = list(pulses)
+
+    async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        active = payload or {}
+        if name in {"motion.home_origin_side", "motion.return_home_reference"}:
+            side = str(active.get("side", "left"))
+            target = list(active.get("pulse", []))
+            enabled_axes = list(active.get("enabledAxes", [True] * 6))
+            offset = 0 if side == "left" else 6
+            for index, enabled in enumerate(enabled_axes[:6]):
+                if enabled and index < len(target):
+                    self.pulses[offset + index] = float(target[index])
+        elif name == "motion.home_all":
+            left = list(active.get("leftPulse", self.pulses[:6]))
+            right = list(active.get("rightPulse", self.pulses[6:]))
+            self.pulses = left + right
+        return await super().command(name, active)
 
     async def motion_state(self) -> dict[str, Any]:
-        return {"pulses": self.pulses, "enabled": [True] * 12}
+        return {
+            "timestamp_ms": now_ms(),
+            "sample_cached": False,
+            "pulses": self.pulses,
+            "enabled": [True] * 12,
+            "enabled_confirmed": [True] * 12,
+            "moving": [False] * 12,
+            "estop_active": False,
+        }
 
 
 def _service(config: dict[str, Any], logs: LogService) -> CommandService:
@@ -458,6 +498,20 @@ def test_capture_motion_origin_keeps_mechanical_soft_limits_stable(
     assert limits[5].min - home_reference[5] == pytest.approx(-7.0)
     assert limits[5].max - home_reference[5] == pytest.approx(7.0)
     service._validate_work_origin_target(config, "left")
+
+
+def test_stationary_motion_accepts_recent_cached_controller_sample_and_rejects_old_sample() -> None:
+    service = _service(default_config(), LogService(emit_startup=False))
+    recent = {
+        "timestamp_ms": now_ms(),
+        "sample_cached": True,
+        "moving": [False] * 12,
+    }
+    service.require_stationary_motion(recent)
+
+    stale = {**recent, "timestamp_ms": now_ms() - 1_000}
+    with pytest.raises(RuntimeError, match="stale or unavailable"):
+        service.require_stationary_motion(stale)
 
 
 def test_manual_axis_effective_direction_matches_site_direction_corrections() -> None:

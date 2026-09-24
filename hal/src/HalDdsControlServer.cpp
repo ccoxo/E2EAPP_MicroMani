@@ -637,7 +637,7 @@ struct HalDdsControlServer::Impl {
       const double uptime =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
       publishJson(healthWriter_, jsonHealth(motion_.health(uptime), omega_.ok(), omega_.lastError()));
-      publishJson(motionWriter_, jsonMotionState(motion_.readState()));
+      publishJson(motionWriter_, jsonMotionState(motion_.latestState()));
       publishJson(omegaWriter_, jsonOmegaState(omega_.readState()));
       publishJson(nativeTeleopWriter_, nativeTeleop_.statusJson());
   }

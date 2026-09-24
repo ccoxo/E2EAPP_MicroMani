@@ -593,10 +593,15 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 status_code=409,
                 detail={"code": "SAFETY_STOP_ACTIVE", "message": "acknowledge safety before teleop connect"},
             )
-        if state.get("sample_cached") is True:
+        stamp = state.get("timestamp_ms")
+        if (
+            not isinstance(stamp, (int, float))
+            or not math.isfinite(stamp)
+            or not -100 <= now_ms() - stamp <= 500
+        ):
             raise HTTPException(
                 status_code=409,
-                detail={"code": "MOTION_STATE_STALE", "message": "fresh motion state is required before teleop connect"},
+                detail={"code": "MOTION_STATE_STALE", "message": "fresh controller motion sample is required before teleop connect"},
             )
         enabled = state.get("enabled")
         offset = 0 if hardware_side == "left" else 6

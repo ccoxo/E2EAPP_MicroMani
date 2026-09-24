@@ -26,6 +26,28 @@ void cachedMotionStatePreservesHardwareSampleTime() {
       "cached state fabricated a new controller sample timestamp");
 }
 
+void syntheticStateUpdateInvalidatesHardwareSampleTime() {
+  LTDMCDriver motion;
+  MotionExecutorTestAccess::initialize(motion);
+  const auto fresh = motion.readState();
+  require(fresh.readTimestampMs > 0, "fresh sample timestamp missing");
+  motion.latchEmergencyStop();
+  try { motion.emergencyStop(); } catch (...) {}
+  const auto cached = motion.latestState();
+  require(cached.sampleCached, "command-side snapshot must be marked cached");
+  require(cached.readTimestampMs == 0,
+      "command-side state update reused an old controller timestamp for synthetic feedback");
+}
+
+void motionJsonDoesNotInventMissingControllerTimestamp() {
+  MotionState state;
+  state.readTimestampMs = 0;
+  state.sampleCached = true;
+  const auto json = jsonMotionState(state);
+  require(json.find("\"timestamp_ms\":0") != std::string::npos,
+      "motion JSON invented a controller timestamp before any hardware sample");
+}
+
 void motionJsonPreservesIntegerPulsePrecisionAndFeedbackTruth() {
   MotionState state;
   state.readTimestampMs = 123456789;
@@ -49,8 +71,10 @@ void motionJsonPreservesIntegerPulsePrecisionAndFeedbackTruth() {
 int main() {
   try {
     cachedMotionStatePreservesHardwareSampleTime();
+    syntheticStateUpdateInvalidatesHardwareSampleTime();
+    motionJsonDoesNotInventMissingControllerTimestamp();
     motionJsonPreservesIntegerPulsePrecisionAndFeedbackTruth();
-    std::cout << "StateSemanticsTests passed (2 offline cases)" << std::endl;
+    std::cout << "StateSemanticsTests passed (4 offline cases)" << std::endl;
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "StateSemanticsTests failed: " << error.what() << std::endl;

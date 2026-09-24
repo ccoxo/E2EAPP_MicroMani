@@ -78,6 +78,9 @@ void MotionControlThread::loop() {
     // 周期从本轮开始时间计算，读硬件耗时会自动从 sleep 中扣除。
     if (elapsed < period_) {
       std::this_thread::sleep_for(period_ - elapsed);
+    } else {
+      // Slow vendor reads must not immediately reacquire the driver lock forever.
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
 }

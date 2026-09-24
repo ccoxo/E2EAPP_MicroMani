@@ -563,7 +563,6 @@ MotionState LTDMCDriver::readState() {
   }
   ensureInitialized();
   MotionState state;
-  state.readTimestampMs = unixTimeMs();
   state.estopActive = estop_.active();
   state.sampleCached = false;
   for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
@@ -593,8 +592,14 @@ MotionState LTDMCDriver::readState() {
       state.axes[index].enabled = enabled_[index];
     }
   }
+  // Timestamp the completed full-controller read, not the start of a potentially slow vendor scan.
+  state.readTimestampMs = unixTimeMs();
   publishStateSnapshotLocked(state);
   return state;
+}
+
+MotionState LTDMCDriver::latestState() const {
+  return cachedStateSnapshot();
 }
 
 MotionState LTDMCDriver::cachedStateSnapshot() const {
@@ -616,11 +621,11 @@ HalHealth LTDMCDriver::cachedHealth(double uptimeS) const {
 }
 
 void LTDMCDriver::publishStateSnapshotLocked() {
-  // 调用方已持有 mutex_；这里把内部 pulse/enabled 状态转换成对外 MotionState。
+  // Command-side snapshots may update software state but must never fabricate a controller sample time.
   MotionState state;
-  state.readTimestampMs = unixTimeMs();
+  state.readTimestampMs = 0;
   state.estopActive = estop_.active();
-  state.sampleCached = false;
+  state.sampleCached = true;
   for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
     for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {

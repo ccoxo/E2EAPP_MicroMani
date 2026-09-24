@@ -78,7 +78,7 @@ std::string jsonMotionState(const appstation::hal::MotionState& state) {
   // positions/pulses/enabled/moving 都按 MotionState::axes 的 12 轴顺序返回。
   std::ostringstream out;
   out << std::setprecision(17);
-  out << "{\"timestamp_ms\":" << timestampOrNow(state.readTimestampMs)
+  out << "{\"timestamp_ms\":" << state.readTimestampMs
       << ",\"sample_cached\":" << (state.sampleCached ? "true" : "false")
       << ",\"estop_active\":" << (state.estopActive ? "true" : "false") << ",\"positions\":[";
   for (size_t i = 0; i < state.axes.size(); ++i) {

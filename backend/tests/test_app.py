@@ -3599,8 +3599,16 @@ def test_native_teleop_connect_sends_hal_native_gripper_config_without_python_pr
                 {"side": "right", "connected": True, "lastReadOk": True, "deviceId": 1, "serial": "R"},
             ]}
         async def motion_state(self) -> dict[str, Any]:
-            return {"positions": [0.0] * 12, "pulses": [0.0] * 12, "enabled": [True] * 12,
-                    "enabled_confirmed": [False] * 12, "sample_cached": False, "estop_active": False}
+            return {
+                "timestamp_ms": now_ms(),
+                "sample_cached": False,
+                "positions": [0.0] * 12,
+                "pulses": [0.0] * 12,
+                "enabled": [True] * 12,
+                "enabled_confirmed": [False] * 12,
+                "moving": [False] * 12,
+                "estop_active": False,
+            }
         async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
             self.commands.append((name, payload or {}))
             if name == "control.lease":
@@ -3793,8 +3801,16 @@ def test_teleop_logical_connect_does_not_return_to_work_origin(tmp_path: Path, m
                 {"side": "right", "connected": True, "lastReadOk": True, "deviceId": 1, "serial": "R"},
             ]}
         async def motion_state(self) -> dict[str, Any]:
-            return {"positions": [0.0] * 12, "pulses": [0.0] * 12, "enabled": [True] * 12,
-                    "enabled_confirmed": [False] * 12, "sample_cached": False, "estop_active": False}
+            return {
+                "timestamp_ms": now_ms(),
+                "sample_cached": False,
+                "positions": [0.0] * 12,
+                "pulses": [0.0] * 12,
+                "enabled": [True] * 12,
+                "enabled_confirmed": [False] * 12,
+                "moving": [False] * 12,
+                "estop_active": False,
+            }
         async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
             self.commands.append((name, payload or {}))
             if name == "control.lease":
@@ -6301,7 +6317,16 @@ def test_omega_state_poll_logs_device_summary(tmp_path: Path, monkeypatch: Monke
             return HalHealth(ltdmc_ok=True, omega7_ok=True, version="test", uptime_s=1.0)
 
         async def motion_state(self) -> dict[str, Any]:
-            return {"positions": [0.0] * 12, "pulses": [0.0] * 12, "enabled": [True] * 12}
+            return {
+                "timestamp_ms": now_ms(),
+                "sample_cached": False,
+                "positions": [0.0] * 12,
+                "pulses": [0.0] * 12,
+                "enabled": [True] * 12,
+                "enabled_confirmed": [True] * 12,
+                "moving": [False] * 12,
+                "estop_active": False,
+            }
 
         async def omega_state(self) -> dict[str, Any]:
             return {
@@ -6327,6 +6352,9 @@ def test_omega_state_poll_logs_device_summary(tmp_path: Path, monkeypatch: Monke
                 ]
             }
 
+        async def force_state(self) -> dict[str, Any]:
+            return {"sides": {}, "dangerIndex": 0.0}
+
         async def command(self, name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
             _ = (name, payload)
             return {}
@@ -6344,22 +6372,123 @@ def test_omega_state_poll_logs_device_summary(tmp_path: Path, monkeypatch: Monke
     )
 
 
-def test_teleop_connect_rejects_cached_motion_state_and_never_enables_slave(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_teleop_connect_rejects_stale_cached_motion_state_and_never_enables_slave(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
     monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
     class FakeHal:
-        def __init__(self): self.commands = []
-        async def health(self): return HalHealth(ltdmc_ok=True, omega7_ok=True, version="fake", uptime_s=1.0, connected=True, mode="real")
-        async def omega_state(self): return {"hands":[{"side":"left","connected":True,"lastReadOk":True},{"side":"right","connected":True,"lastReadOk":True}]}
-        async def motion_state(self): return {"enabled":[True]*12,"sample_cached":True,"estop_active":False}
-        async def command(self,name,payload=None):
-            self.commands.append((name,payload or {}))
-            if name == "control.lease": return {"response":{"ok":True,"leaseFresh":True,"timeoutMs":2500}}
-            return {"response":{}}
-    fake=FakeHal(); monkeypatch.setattr("backend.app.make_hal_client", lambda *_: fake)
-    client=TestClient(create_app(tmp_path)); config=client.app.state.settings.get_config(); config["motion"]["origin"].update(valid=True,leftValid=True,rightValid=True); client.app.state.settings.save_config(config,emit_log=False)
+        def __init__(self) -> None:
+            self.commands: list[tuple[str, dict[str, Any]]] = []
+
+        async def health(self) -> HalHealth:
+            return HalHealth(
+                ltdmc_ok=True,
+                omega7_ok=True,
+                version="fake",
+                uptime_s=1.0,
+                connected=True,
+                mode="real",
+            )
+
+        async def omega_state(self) -> dict[str, Any]:
+            return {"hands": [
+                {"side": "left", "connected": True, "lastReadOk": True},
+                {"side": "right", "connected": True, "lastReadOk": True},
+            ]}
+
+        async def motion_state(self) -> dict[str, Any]:
+            return {
+                "timestamp_ms": now_ms() - 1_000,
+                "sample_cached": True,
+                "enabled": [True] * 12,
+                "moving": [False] * 12,
+                "estop_active": False,
+            }
+
+        async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
+            self.commands.append((name, payload or {}))
+            if name == "control.lease":
+                return {"response": {"ok": True, "leaseFresh": True, "timeoutMs": 2500}}
+            return {"response": {}}
+
+    fake = FakeHal()
+    monkeypatch.setattr("backend.app.make_hal_client", lambda *_: fake)
+    client = TestClient(create_app(tmp_path))
+    config = client.app.state.settings.get_config()
+    config["motion"]["origin"].update(valid=True, leftValid=True, rightValid=True)
+    client.app.state.settings.save_config(config, emit_log=False)
     from backend.tests.test_control_watchdog import confirm_mock_browser_lease
-    session=asyncio.run(confirm_mock_browser_lease(client.app.state.control_watchdog)); client.headers["X-Control-Session"]=session
-    response=client.post("/api/teleop/left/connect")
-    assert response.status_code==409 and response.json()["detail"]["code"]=="MOTION_STATE_STALE"
+    session = asyncio.run(confirm_mock_browser_lease(client.app.state.control_watchdog))
+    client.headers["X-Control-Session"] = session
+
+    response = client.post("/api/teleop/left/connect")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "MOTION_STATE_STALE"
     assert client.app.state.settings.get_config()["teleop"]["leftConnected"] is False
-    assert "motion.enable_side" not in [name for name,_ in fake.commands]
+    assert "motion.enable_side" not in [name for name, _ in fake.commands]
+
+
+def test_teleop_connect_accepts_recent_cached_controller_sample(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
+
+    class FakeHal:
+        def __init__(self) -> None:
+            self.commands: list[tuple[str, dict[str, Any]]] = []
+
+        async def health(self) -> HalHealth:
+            return HalHealth(
+                ltdmc_ok=True,
+                omega7_ok=True,
+                version="fake",
+                uptime_s=1.0,
+                connected=True,
+                mode="real",
+            )
+
+        async def omega_state(self) -> dict[str, Any]:
+            return {"hands": [
+                {"side": "left", "connected": True, "lastReadOk": True},
+                {"side": "right", "connected": True, "lastReadOk": True},
+            ]}
+
+        async def motion_state(self) -> dict[str, Any]:
+            return {
+                "timestamp_ms": now_ms(),
+                "sample_cached": True,
+                "positions": [0.0] * 12,
+                "pulses": [0.0] * 12,
+                "enabled": [True] * 12,
+                "enabled_confirmed": [True] * 12,
+                "moving": [False] * 12,
+                "estop_active": False,
+            }
+
+        async def command(self, name: str, payload: dict | None = None) -> dict[str, Any]:
+            self.commands.append((name, payload or {}))
+            if name == "control.lease":
+                return {"response": {"ok": True, "leaseFresh": True, "timeoutMs": 2500}}
+            if name == "teleop.native.status":
+                return {"response": {"running": True}}
+            return {"response": {}}
+
+    fake = FakeHal()
+    monkeypatch.setattr("backend.app.make_hal_client", lambda *_: fake)
+    client = TestClient(create_app(tmp_path))
+    config = client.app.state.settings.get_config()
+    config["motion"]["origin"].update(valid=True, leftValid=True, rightValid=True)
+    client.app.state.settings.save_config(config, emit_log=False)
+    from backend.tests.test_control_watchdog import confirm_mock_browser_lease
+    session = asyncio.run(confirm_mock_browser_lease(client.app.state.control_watchdog))
+    client.headers["X-Control-Session"] = session
+
+    response = client.post("/api/teleop/left/connect")
+
+    assert response.status_code == 200, response.text
+    assert client.app.state.settings.get_config()["teleop"]["leftConnected"] is True
+    assert "motion.enable_side" not in [name for name, _ in fake.commands]

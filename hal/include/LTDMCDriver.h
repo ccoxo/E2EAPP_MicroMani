@@ -28,6 +28,8 @@ class LTDMCDriver {
   HalHealth health(double uptimeS) const;
   // 读取 12 个语义轴的运动快照。读锁竞争时返回最近缓存，避免周期线程阻塞。
   MotionState readState();
+  // Return the latest completed controller sample without issuing vendor SDK reads.
+  MotionState latestState() const;
   // 立即急停所有轴并尽力关闭伺服；只有显式安全确认可以清除锁存。
   void emergencyStop();
   void latchEmergencyStop() noexcept;

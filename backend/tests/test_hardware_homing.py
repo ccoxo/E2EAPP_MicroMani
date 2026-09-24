@@ -48,6 +48,17 @@ def setup_homing(tmp_path, monkeypatch):
     return TestClient(app, headers={"X-Control-Session": session}), hal, state
 
 
+def test_home_accepts_recent_controller_sample_forwarded_from_cache(tmp_path, monkeypatch):
+    client, _, state = setup_homing(tmp_path, monkeypatch)
+    state["sample_cached"] = True
+
+    response = client.post("/api/motion/right/home", json={"axes": ["Pitch"]})
+
+    assert response.status_code == 200, response.text
+    saved = client.app.state.settings.get_config()["motion"]["homeReference"]
+    assert saved["rightAxisConfirmed"][4] is True
+
+
 def test_selected_homing_preserves_other_references(tmp_path, monkeypatch):
     client, hal, _ = setup_homing(tmp_path, monkeypatch)
     before = deepcopy(client.app.state.settings.get_config()["motion"])

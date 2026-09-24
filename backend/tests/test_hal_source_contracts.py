@@ -478,7 +478,7 @@ def test_hal_dds_motion_state_telemetry_publishes_at_100hz() -> None:
     loop_body = source.split("void telemetryLoop()", 1)[1].split("void emergencyLoop()", 1)[0]
     telemetry_body = source.split("void publishTelemetry()", 1)[1].split("void publishJson", 1)[0]
 
-    assert "publishJson(motionWriter_, jsonMotionState(motion_.readState()))" in telemetry_body
+    assert "publishJson(motionWriter_, jsonMotionState(motion_.latestState()))" in telemetry_body
     assert "100 Hz" in loop_body
     assert "std::chrono::milliseconds(10)" in loop_body
     assert "std::chrono::milliseconds(50)" not in loop_body
@@ -2202,7 +2202,12 @@ def test_hal_native_gripper_uses_isolated_jodell_worker_processes() -> None:
     assert "sampleGripperPosition(Side::Left);" in normalized_loop
     assert "sampleGripperPosition(Side::Right);" in normalized_loop
     assert "sampleGripperPosition(sideFromIndex(sampleIndex));" not in normalized_loop
+    assert normalized_loop.index("if (shouldSample)") < normalized_loop.index("for (const auto& command : commands)")
     assert "const bool ok = gripper_.readPositionMm(side, &message);" in normalized_sample
+    assert "const auto sampleMidpoint = readStarted + (readFinished - readStarted) / 2;" in normalized_sample
+    assert "gripperPositionSampleMonotonicMs_[index] = sampleMonotonicMs;" in normalized_sample
+    assert "std::array<std::int64_t, 2> gripperPositionSampleMonotonicMs_" in controller_header
+    assert 'positionSampleMonotonicMs' in controller_source
     assert "gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);" in normalized_sample
     assert "gripperLastCommandOk_[index] = ok;" in normalized_sample
     assert "gripperLastMessage_[index] = message;" in normalized_sample
@@ -2630,3 +2635,37 @@ def test_hal_dds_logs_low_frequency_command_request_lifecycle() -> None:
     assert "event=command_replied request_id=" in source
     assert 'request.name != "motion.teleop_target_update"' in source
     assert "durationMs=" in source
+
+
+def test_motion_telemetry_uses_cached_hardware_sample_without_duplicate_vendor_read() -> None:
+    header = (REPO_ROOT / "hal" / "include" / "LTDMCDriver.h").read_text(encoding="utf-8")
+    driver = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
+    dds = (REPO_ROOT / "hal" / "src" / "HalDdsControlServer.cpp").read_text(encoding="utf-8")
+    thread = (REPO_ROOT / "hal" / "src" / "MotionControlThread.cpp").read_text(encoding="utf-8")
+    json_source = (REPO_ROOT / "hal" / "src" / "HalJson.cpp").read_text(encoding="utf-8")
+    synthetic = driver.split("void LTDMCDriver::publishStateSnapshotLocked()", 1)[1].split(
+        "void LTDMCDriver::publishStateSnapshotLocked(const MotionState& state)", 1
+    )[0]
+    assert "MotionState latestState() const;" in header
+    assert "jsonMotionState(motion_.latestState())" in dds
+    assert "jsonMotionState(motion_.readState())" not in dds
+    assert "state.readTimestampMs = 0;" in synthetic
+    assert "state.sampleCached = true;" in synthetic
+    assert '<< state.readTimestampMs' in json_source
+    assert "std::chrono::milliseconds(1)" in thread
+
+
+def test_backend_freshness_uses_controller_sample_age_not_cache_provenance() -> None:
+    service = (REPO_ROOT / "backend" / "services" / "command_service.py").read_text(encoding="utf-8")
+    app = (REPO_ROOT / "backend" / "app.py").read_text(encoding="utf-8")
+    stationary = service.split("def require_stationary_motion", 1)[1].split("async def _confirm_work_origin", 1)[0]
+    confirm = service.split("async def _confirm_work_origin", 1)[1].split(
+        "async def _stop_manual_teleop_connect_before_motion_return", 1
+    )[0]
+    assert "sample_cached" not in stationary
+    assert "sample_cached" not in confirm
+    teleop = app.split("async def require_teleop_motion_already_enabled", 1)[1].split(
+        "def schedule_teleop_background", 1
+    )[0]
+    assert "timestamp_ms" in teleop
+    assert "sample_cached" not in teleop

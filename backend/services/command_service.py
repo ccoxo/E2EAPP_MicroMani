@@ -141,8 +141,6 @@ class CommandService:
     def require_stationary_motion(self, state: dict[str, Any]) -> None:
         moving = state.get("moving")
         stamp = state.get("timestamp_ms")
-        if state.get("sample_cached") is True:
-            raise RuntimeError("stationary motion feedback is cached; fresh controller sample required")
         if not isinstance(stamp, (int, float)) or not math.isfinite(stamp) or not -100 <= now_ms() - stamp <= 500:
             raise RuntimeError("stationary motion feedback is stale or unavailable")
         if not isinstance(moving, list) or len(moving) != 12 or any(value is not False for value in moving):
@@ -159,7 +157,7 @@ class CommandService:
             pulses = self._motion_state_pulses(state)
             moving = state.get("moving")
             stamp = state.get("timestamp_ms")
-            fresh = (state.get("sample_cached") is not True and isinstance(stamp, (float, int))
+            fresh = (isinstance(stamp, (float, int))
                      and math.isfinite(stamp) and requested_at <= stamp <= now_ms() + 100
                      and now_ms() - stamp <= 500)
             confirmed = fresh and not state.get("estop_active", False) and isinstance(moving, list) and len(moving) == 12
@@ -595,8 +593,7 @@ class CommandService:
             moving = state.get("moving")
             offset = 0 if side == "left" else 6
             if not self._real_hardware_mode(config) or (
-                state.get("sample_cached") is not True
-                and isinstance(stamp, (int, float)) and completed_at <= stamp <= now_ms() + 100 and now_ms() - stamp <= 500
+                isinstance(stamp, (int, float)) and completed_at <= stamp <= now_ms() + 100 and now_ms() - stamp <= 500
                 and isinstance(moving, list) and len(moving) == 12
                 and all(moving[offset + index] is False for index, selected in enumerate(enabled_axes) if selected)
             ):
