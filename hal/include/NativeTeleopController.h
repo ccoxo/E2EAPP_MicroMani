@@ -366,6 +366,7 @@ class NativeTeleopController {
   std::array<std::string, 2> gripperLastMessage_{};
   std::array<std::int64_t, 2> gripperLastCommandTs_{{0, 0}};
   std::array<std::int64_t, 2> gripperPositionSampleTs_{{0, 0}};
+  std::array<std::int64_t, 2> gripperPositionSampleMonotonicMs_{{0, 0}};
   std::array<bool, 2> gripperPositionOk_{{false, false}};
   std::array<double, 2> gripperCommandDurationMs_{};
   std::array<double, 2> gripperReadDurationMs_{};

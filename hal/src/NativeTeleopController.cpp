@@ -388,6 +388,7 @@ void NativeTeleopController::prepareReplayGripper(const JodellGripperConfig& con
     config_.gripperParticipating = participating;
     gripperPositionOk_ = {false, false};
     gripperPositionSampleTs_ = {0, 0};
+    gripperPositionSampleMonotonicMs_ = {0, 0};
   }
   startGripperWorker();
   if (!motion_.commandEpochAllowed(epoch)) {
@@ -703,17 +704,27 @@ void NativeTeleopController::sampleGripperPosition(Side side) {
   std::string message;
   const auto readStarted = std::chrono::steady_clock::now();
   const bool ok = gripper_.readPositionMm(side, &message);
-  const double readMs = std::chrono::duration<double, std::milli>(
-      std::chrono::steady_clock::now() - readStarted).count();
+  const auto readFinished = std::chrono::steady_clock::now();
+  const double readMs = std::chrono::duration<double, std::milli>(readFinished - readStarted).count();
+  const auto sampleMidpoint = readStarted + (readFinished - readStarted) / 2;
+  const auto sampleMonotonicMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      sampleMidpoint.time_since_epoch()).count();
+  const auto readFinishedUnixMs = unixTimeMs();
   const int index = sideIndex(side);
   std::scoped_lock lock(mutex_);
   gripperReadDurationMs_[index] = readMs;
-  gripperReadAttemptTs_[index] = unixTimeMs();
+  gripperReadAttemptTs_[index] = readFinishedUnixMs;
   gripperReadMessage_[index] = message;
   gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);
   gripperLastCommandOk_[index] = ok;
   gripperPositionOk_[index] = ok;
-  if (ok) gripperPositionSampleTs_[index] = unixTimeMs();
+  if (ok) {
+    // Jodell does not expose a hardware sample timestamp. Use the midpoint of
+    // the blocking READ as the best host-side estimate of measurement time.
+    gripperPositionSampleTs_[index] = readFinishedUnixMs
+        - static_cast<std::int64_t>(std::llround(readMs * 0.5));
+    gripperPositionSampleMonotonicMs_[index] = sampleMonotonicMs;
+  }
   if (!message.empty()) {
     gripperLastMessage_[index] = message;
   }
@@ -877,6 +888,7 @@ std::string NativeTeleopController::statusJson() const {
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[0]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[0]
       << ",\"positionSampleTs\":" << gripperPositionSampleTs_[0]
+      << ",\"positionSampleMonotonicMs\":" << gripperPositionSampleMonotonicMs_[0]
       << ",\"lastCommandDurationMs\":" << gripperCommandDurationMs_[0]
       << ",\"lastReadDurationMs\":" << gripperReadDurationMs_[0]
       << ",\"lastReadAttemptTs\":" << gripperReadAttemptTs_[0]
@@ -895,6 +907,7 @@ std::string NativeTeleopController::statusJson() const {
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[1]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[1]
       << ",\"positionSampleTs\":" << gripperPositionSampleTs_[1]
+      << ",\"positionSampleMonotonicMs\":" << gripperPositionSampleMonotonicMs_[1]
       << ",\"lastCommandDurationMs\":" << gripperCommandDurationMs_[1]
       << ",\"lastReadDurationMs\":" << gripperReadDurationMs_[1]
       << ",\"lastReadAttemptTs\":" << gripperReadAttemptTs_[1]

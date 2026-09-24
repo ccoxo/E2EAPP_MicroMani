@@ -2612,13 +2612,20 @@ class DatasetRecorderService:
             measurement_times = None
             valid_until = 0.
             if selected and native_status is not None:
+                selected_grippers = hardware_sides(selected, "grippers")
                 measurement_times = {side: float(native_status["grippers"][side]["positionSampleTs"])
-                                     for side in hardware_sides(selected, "grippers")}
+                                     for side in selected_grippers}
                 source_ts = self._coerce_float(native_status.get("dds_stamp_unix_ms")) or 0.
                 valid_until = min(source_ts + 500., min(measurement_times.values()) + 1000.)
-                # 将实际读回时刻映射到同一个 HAL 单调时钟，保留双侧各自的原始时间。
-                if source_ts > 0 and sampled_at > 0:
-                    sampled_at -= (source_ts - min(measurement_times.values())) / 1000.
+                direct_monotonic = [
+                    self._coerce_float(native_status["grippers"][side].get("positionSampleMonotonicMs"))
+                    for side in selected_grippers
+                ]
+                # New HAL publishes the Jodell READ midpoint on its steady clock.
+                # Only old HAL payloads need DDS/Unix clock reconstruction.
+                if not direct_monotonic or any(value is None or value <= 0 for value in direct_monotonic):
+                    if source_ts > 0 and sampled_at > 0:
+                        sampled_at -= (source_ts - min(measurement_times.values())) / 1000.
             if sampled_at <= 0.0:
                 sampled_at = target_monotonic_s
             self._last_native_gripper_sample = (native_positions, sampled_at)
@@ -2767,8 +2774,10 @@ class DatasetRecorderService:
         selected = getattr(self, "_participation", None)
         if selected:
             values = []
+            selected_grippers = set(hardware_sides(selected, "grippers"))
+            direct_monotonic_ms: list[float] = []
             for side in ("left", "right"):
-                if side not in hardware_sides(selected, "grippers"):
+                if side not in selected_grippers:
                     values.append(0.)
                     continue
                 detail = grippers.get(side, {})
@@ -2779,6 +2788,11 @@ class DatasetRecorderService:
                                        f"ageMs={age:.3f} diagnostic="
                                        + json.dumps(detail, ensure_ascii=False, separators=(",", ":")))
                 values.append(gap)
+                direct = self._coerce_float(detail.get("positionSampleMonotonicMs"))
+                if direct is not None and direct > 0:
+                    direct_monotonic_ms.append(direct)
+            if selected_grippers and len(direct_monotonic_ms) == len(selected_grippers):
+                return tuple(values), min(direct_monotonic_ms) / 1000.0
             return tuple(values), self._source_sample_monotonic(native_status, 0.0)
         left = grippers.get("left")
         right = grippers.get("right")
@@ -2788,6 +2802,12 @@ class DatasetRecorderService:
         right_position = self._coerce_float(right.get("positionMm"))
         if left_position is None or right_position is None:
             return None
+        direct_times = [
+            self._coerce_float(left.get("positionSampleMonotonicMs")),
+            self._coerce_float(right.get("positionSampleMonotonicMs")),
+        ]
+        if all(value is not None and value > 0 for value in direct_times):
+            return (left_position, right_position), min(float(value) for value in direct_times) / 1000.0
         return (left_position, right_position), self._source_sample_monotonic(native_status, 0.0)
 
     async def _refresh_gripper_cache(self, config: dict[str, Any]) -> None:
