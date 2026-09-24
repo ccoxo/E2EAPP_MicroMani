@@ -214,6 +214,24 @@ std::string jsonOmegaState(const std::array<appstation::hal::Omega7State, 2>& st
     } else {
       out << ",\"gripperGapMm\":null";
     }
+    out << ",\"poseReadCode\":" << hand.poseReadCode
+        << ",\"poseSampleTs\":" << hand.poseSampleTs
+        << ",\"translationChangeTs\":" << hand.translationChangeTs
+        << ",\"rotationChangeTs\":" << hand.rotationChangeTs
+        << ",\"gripperInputSource\":\"" << jsonEscape(hand.gripperInputSource) << "\""
+        << ",\"gripperInputSampleTs\":" << hand.gripperInputSampleTs
+        << ",\"gripperInputChangeTs\":" << hand.gripperInputChangeTs
+        << ",\"gripperGapReadCode\":" << hand.gripperGapReadCode
+        << ",\"gripperEncoderReadCode\":" << hand.gripperEncoderReadCode
+        << ",\"gripperEncoderConvertCode\":" << hand.gripperEncoderConvertCode
+        << ",\"gripperAngleReadCode\":" << hand.gripperAngleReadCode
+        << ",\"gripperButtonReadCode\":" << hand.gripperButtonReadCode
+        << ",\"gripperDirectGapMm\":";
+    if (hand.gripperDirectGapMm >= 0.0) out << hand.gripperDirectGapMm;
+    else out << "null";
+    out << ",\"gripperEncoderGapMm\":";
+    if (hand.gripperEncoderGapMm >= 0.0) out << hand.gripperEncoderGapMm;
+    else out << "null";
     out << ",\"lastReadOk\":" << (hand.lastReadOk ? "true" : "false")
         << ",\"message\":\"" << jsonEscape(hand.lastReadError) << "\"}";
   }
@@ -281,6 +299,21 @@ std::array<Omega7State, 2> jsonOmegaStateValue(const std::string& body) {
     const auto gapMm = jsonNumberValue(handJson, "gripperGapMm", -1.0);
     hand.gripperGapAvailable = gapMm >= 0.0;
     hand.gripperGap = hand.gripperGapAvailable ? gapMm / 1000.0 : 0.0;
+    hand.poseReadCode = static_cast<int>(jsonNumberValue(handJson, "poseReadCode", -1.0));
+    hand.poseSampleTs = static_cast<std::int64_t>(jsonNumberValue(handJson, "poseSampleTs", 0.0));
+    hand.translationChangeTs = static_cast<std::int64_t>(jsonNumberValue(handJson, "translationChangeTs", 0.0));
+    hand.rotationChangeTs = static_cast<std::int64_t>(jsonNumberValue(handJson, "rotationChangeTs", 0.0));
+    hand.gripperInputSource = jsonStringValue(handJson, "gripperInputSource");
+    if (hand.gripperInputSource.empty()) hand.gripperInputSource = "unavailable";
+    hand.gripperInputSampleTs = static_cast<std::int64_t>(jsonNumberValue(handJson, "gripperInputSampleTs", 0.0));
+    hand.gripperInputChangeTs = static_cast<std::int64_t>(jsonNumberValue(handJson, "gripperInputChangeTs", 0.0));
+    hand.gripperGapReadCode = static_cast<int>(jsonNumberValue(handJson, "gripperGapReadCode", -2.0));
+    hand.gripperEncoderReadCode = static_cast<int>(jsonNumberValue(handJson, "gripperEncoderReadCode", -2.0));
+    hand.gripperEncoderConvertCode = static_cast<int>(jsonNumberValue(handJson, "gripperEncoderConvertCode", -2.0));
+    hand.gripperAngleReadCode = static_cast<int>(jsonNumberValue(handJson, "gripperAngleReadCode", -2.0));
+    hand.gripperButtonReadCode = static_cast<int>(jsonNumberValue(handJson, "gripperButtonReadCode", -2.0));
+    hand.gripperDirectGapMm = jsonNumberValue(handJson, "gripperDirectGapMm", -1.0);
+    hand.gripperEncoderGapMm = jsonNumberValue(handJson, "gripperEncoderGapMm", -1.0);
     hand.lastReadOk = jsonBoolValue(handJson, "lastReadOk", false);
     hand.lastReadError = jsonStringValue(handJson, "message");
     hand.readTimestampMs = timestamp;

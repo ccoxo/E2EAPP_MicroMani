@@ -570,6 +570,8 @@ class DatasetRecorderService:
         self._recording = False
         self._accepting_frame_jobs = False
         self._samplers_paused = False
+        # 停遥操作后只暂停夹爪读取，其它源仍可完成已排队帧的对齐。
+        self._gripper_sampler_paused = False
         self._session_id = ""
         self._dataset_id = ""
         self._dataset_name = ""
@@ -775,6 +777,7 @@ class DatasetRecorderService:
         self._safety_interrupted = True
         self._accepting_frame_jobs = False
         self._samplers_paused = True
+        self._gripper_sampler_paused = True
         self.telemetry.recording = False
         self.logs.warning("[LEROBOT]", "safety interrupted recording; unsaved episode retained for review")
 
@@ -801,6 +804,7 @@ class DatasetRecorderService:
                 raise RuntimeError("record session is not active")
             self._final_action_status = deepcopy(self.teleop.status())
             self._accepting_frame_jobs = False
+            self._gripper_sampler_paused = True
             self.telemetry.recording = False
         try:
             await self.teleop.stop("recording")
@@ -858,6 +862,7 @@ class DatasetRecorderService:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
             was_recording = self._recording
+            self._gripper_sampler_paused = True
             if was_recording:
                 self._recording = False
                 self._accepting_frame_jobs = False
@@ -910,6 +915,7 @@ class DatasetRecorderService:
             previous_reset_required_sides = self._reset_required_sides_locked()
             previous_reset_returned_sides = self._reset_returned_sides_locked()
             previous_samplers_paused = bool(getattr(self, "_samplers_paused", False))
+            previous_gripper_sampler_paused = bool(getattr(self, "_gripper_sampler_paused", False))
             try:
                 self._last_saved_episode = None
                 self._reset_pending = False
@@ -924,6 +930,7 @@ class DatasetRecorderService:
                 self._reset_required_sides = previous_reset_required_sides
                 self._reset_returned_sides = previous_reset_returned_sides
                 self._samplers_paused = previous_samplers_paused
+                self._gripper_sampler_paused = previous_gripper_sampler_paused
                 raise
         try:
             self.safety.check(safety_token)
@@ -940,6 +947,7 @@ class DatasetRecorderService:
                 self._reset_required_sides = previous_reset_required_sides
                 self._reset_returned_sides = previous_reset_returned_sides
                 self._samplers_paused = previous_samplers_paused
+                self._gripper_sampler_paused = previous_gripper_sampler_paused
                 self.telemetry.recording = False
                 self.telemetry.frame_count = 0
             with contextlib.suppress(Exception):
@@ -967,6 +975,7 @@ class DatasetRecorderService:
             if was_recording:
                 self._recording = False
                 self._accepting_frame_jobs = False
+                self._gripper_sampler_paused = True
                 self.telemetry.recording = False
         if was_recording:
             await self._drain_recording_queues()
@@ -2099,6 +2108,11 @@ class DatasetRecorderService:
         with asyncio.Runner() as runner:
             self._sample_source_loop_with_runner(source, runner)
 
+    def _source_sampler_paused(self, source: str) -> bool:
+        return bool(getattr(self, "_samplers_paused", False) or (
+            source == "gripper" and getattr(self, "_gripper_sampler_paused", False)
+        ))
+
     def _sample_source_loop_with_runner(self, source: str, runner: asyncio.Runner) -> None:
         # Source samplers run in ordinary threads so slow hardware calls cannot
         # block the asyncio event loop that drives UI commands and status.
@@ -2107,7 +2121,7 @@ class DatasetRecorderService:
         sample_index = 0
         while self._session_active and not self._sampler_stop_event.is_set():
             try:
-                if getattr(self, "_samplers_paused", False):
+                if self._source_sampler_paused(source):
                     self._sampler_stop_event.wait(0.02)
                     continue
                 config = self._recording_config()
@@ -2134,6 +2148,8 @@ class DatasetRecorderService:
                 if now < next_schedule_s:
                     if self._sampler_stop_event.wait(next_schedule_s - now):
                         return
+                if self._source_sampler_paused(source):
+                    continue
                 target_s = sample_epoch_s + self._source_sample_timestamp_s(source, sample_index, config)
                 diagnostic = getattr(self, "_recording_diagnostics", None)
                 trace_poll = source in {"hal", "gripper"}
@@ -2152,13 +2168,16 @@ class DatasetRecorderService:
                                     sample_index=sample_index, target_s=target_s, capture_s=sample.monotonic_s,
                                     started_s=read_started, read_ms=(read_finished - read_started) * 1000,
                                     wake_lateness_ms=max(0, read_started - original_schedule_s) * 1000)
-                if sample_epoch_s != self._sampler_start_monotonic_s:
+                if sample_epoch_s != self._sampler_start_monotonic_s or self._source_sampler_paused(source):
                     continue
                 self._sample_buffers.setdefault(source, TimedRingBuffer()).append(sample)
                 sample_index += 1
                 self._source_sample_indices[source] = sample_index
             except Exception as exc:  # noqa: BLE001
-                self.logs.warning("[LEROBOT]", f"{source} sampler recovered: {exc}")
+                if not self._source_sampler_paused(source) and (
+                    sample_epoch_s == 0.0 or sample_epoch_s == self._sampler_start_monotonic_s
+                ):
+                    self.logs.warning("[LEROBOT]", f"{source} sampler recovered: {exc}")
                 self._sampler_stop_event.wait(0.1)
 
     def _source_sample_timestamp_s(self, source: str, sample_index: int, config: dict[str, Any]) -> float:
@@ -3292,6 +3311,7 @@ class DatasetRecorderService:
         self._episode_force_calibration = self._force_calibration_snapshot(self._recording_config())
         self._native_dataset_from_index = self._native_total_frames_cached
         self._samplers_paused = False
+        self._gripper_sampler_paused = False
         self._recording = True
         self._safety_interrupted = False
         self._accepting_frame_jobs = True

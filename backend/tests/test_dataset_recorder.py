@@ -849,6 +849,8 @@ def test_dataset_recorder_discard_pauses_until_reset(stop_fails) -> None:
             with pytest.raises(RuntimeError, match="already in progress"):
                 await recorder.discard_episode()
             assert recorder._reset_pending is False
+            assert recorder._gripper_sampler_paused is True
+            assert recorder._samplers_paused is False
             calls.append(f"stop:{source}")
             if stop_fails:
                 raise RuntimeError("stop unconfirmed")
@@ -999,6 +1001,8 @@ def test_dataset_recorder_save_stops_recording_teleop_before_drain() -> None:
             return {"id": "episode_000000", "episodeIndex": 0}
 
         async def stop(source: str) -> None:
+            assert recorder._gripper_sampler_paused is True
+            assert recorder._samplers_paused is False
             calls.append(f"stop:{source}")
             live_status["nativeStatus"]["gripperTargets"][1] = 1.02
 
@@ -1043,6 +1047,7 @@ def test_dataset_recorder_discard_marks_saved_episode_off_event_loop(
 
         async def stop(source: str) -> None:
             assert source == "recording"
+            assert recorder._gripper_sampler_paused is True
 
         def record_status() -> dict[str, object]:
             return {"recording": recorder._recording}
@@ -1153,6 +1158,7 @@ def test_dataset_recorder_skip_reset_starts_after_discarded_episode_waiting() ->
         recorder._reset_returned_sides = {"left"}
         recorder._last_saved_episode = None
         recorder._episode_index = 0
+        recorder._gripper_sampler_paused = True
         recorder._lock = asyncio.Lock()
         recorder.telemetry = SimpleNamespace(recording=False, frame_count=8)
         recorder.logs = SimpleNamespace(info=lambda *_args: calls.append("log"))
@@ -1161,6 +1167,7 @@ def test_dataset_recorder_skip_reset_starts_after_discarded_episode_waiting() ->
         def begin_episode(**_kwargs: object) -> None:
             calls.append("begin")
             recorder._recording = True
+            recorder._gripper_sampler_paused = False
 
         async def start(source: str, *, pre_home: bool = True) -> None:
             calls.append(f"start:{source}:{pre_home}")
@@ -1182,6 +1189,7 @@ def test_dataset_recorder_skip_reset_starts_after_discarded_episode_waiting() ->
         assert result["recording"] is True
         assert recorder._reset_pending is False
         assert recorder.telemetry.recording is True
+        assert recorder._gripper_sampler_paused is False
         assert recorder.telemetry.frame_count == 0
         assert calls == ["begin", "start:recording:False", "arm", "warmup", "log"]
 
@@ -1215,6 +1223,7 @@ def test_dataset_recorder_skip_reset_rolls_back_when_teleop_start_fails() -> Non
         recorder._episode_index = 1
         recorder._lock = asyncio.Lock()
         recorder._samplers_paused = True
+        recorder._gripper_sampler_paused = True
         recorder.telemetry = SimpleNamespace(recording=False, frame_count=12)
         recorder.logs = SimpleNamespace(
             info=lambda *_args: calls.append("log"),
@@ -1225,6 +1234,7 @@ def test_dataset_recorder_skip_reset_rolls_back_when_teleop_start_fails() -> Non
             calls.append("begin")
             recorder._recording = True
             recorder._samplers_paused = False
+            recorder._gripper_sampler_paused = False
 
         async def start(source: str, *, pre_home: bool = True) -> None:
             calls.append(f"start:{source}:{pre_home}")
@@ -1251,6 +1261,7 @@ def test_dataset_recorder_skip_reset_rolls_back_when_teleop_start_fails() -> Non
         assert recorder._reset_returned_sides == {"left"}
         assert recorder._last_saved_episode is saved_episode
         assert recorder._samplers_paused is True
+        assert recorder._gripper_sampler_paused is True
         assert recorder.telemetry.recording is False
         assert recorder.telemetry.frame_count == 0
         assert calls == ["begin", "start:recording:False", "stop:recording"]
@@ -1765,6 +1776,77 @@ def test_dataset_sampler_pauses_hardware_sampling_between_episodes() -> None:
     finally:
         recorder._sampler_stop_event.set()
         recorder._session_active = False
+        thread.join(1.0)
+
+
+def test_gripper_sampler_reports_errors_before_initial_epoch() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    warnings: list[str] = []
+    recorder._session_active = True
+    recorder._samplers_paused = False
+    recorder._gripper_sampler_paused = False
+    recorder._sampler_stop_event = Event()
+    recorder._sampler_start_monotonic_s = time.monotonic()
+
+    def broken_config() -> dict[str, object]:
+        raise RuntimeError("recording config unavailable")
+
+    def warn(_tag: str, message: str) -> None:
+        warnings.append(message)
+        recorder._sampler_stop_event.set()
+
+    recorder._recording_config = broken_config
+    recorder.logs = SimpleNamespace(warning=warn)
+    thread = Thread(target=recorder._sample_source_loop, args=("gripper",), daemon=True)
+    thread.start()
+    thread.join(1.0)
+
+    assert not thread.is_alive()
+    assert warnings == ["gripper sampler recovered: recording config unavailable"]
+
+
+def test_gripper_sampler_ignores_inflight_expiry_after_episode_stop() -> None:
+    recorder = object.__new__(DatasetRecorderService)
+    entered, release, reported = Event(), Event(), Event()
+    warnings: list[str] = []
+    calls: list[str] = []
+    recorder._session_active = True
+    recorder._samplers_paused = False
+    recorder._gripper_sampler_paused = False
+    recorder._sampler_stop_event = Event()
+    recorder._sampler_start_monotonic_s = time.monotonic() - 0.1
+    recorder._recording_config_snapshot = {"hal": {"mode": "real"}}
+    recorder._source_sample_indices = {"gripper": 0}
+    recorder._sample_buffers = {"gripper": TimedRingBuffer()}
+    recorder._source_sample_rate_hz = lambda _source, _config: 100.0
+
+    def warn(_tag: str, message: str) -> None:
+        warnings.append(message)
+        reported.set()
+
+    def sample_once(_source: str, _config: dict[str, object], _target_s: float, **_kwargs) -> TimedSample:
+        calls.append("read")
+        entered.set()
+        release.wait(1.0)
+        raise RuntimeError("feedback expired")
+
+    recorder.logs = SimpleNamespace(warning=warn)
+    recorder._sample_source_once_sync = sample_once
+    thread = Thread(target=recorder._sample_source_loop, args=("gripper",), daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(1.0)
+        recorder._gripper_sampler_paused = True
+        release.set()
+        assert reported.wait(0.2) is False
+        assert calls == ["read"]
+        recorder._gripper_sampler_paused = False
+        assert reported.wait(1.0)
+        assert warnings == ["gripper sampler recovered: feedback expired"]
+    finally:
+        recorder._sampler_stop_event.set()
+        recorder._session_active = False
+        release.set()
         thread.join(1.0)
 
 
