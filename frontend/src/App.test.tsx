@@ -1756,6 +1756,37 @@ describe('AppStation M0 frontend', () => {
     expect(useTelemetryStore.getState().recordSession.latestQualityReport).toBeNull()
   })
 
+  it('keeps a confirmed right slave origin when accepting the quality report', async () => {
+    const returnOriginSpy = vi.spyOn(api, 'returnMotionOriginSide').mockResolvedValue({ ok: true })
+    useTelemetryStore.setState((state) => ({
+      recording: true,
+      recordSession: {
+        ...state.recordSession,
+        phase: 'recording',
+        recorderFrameCount: 30,
+        recorderElapsedS: 1,
+        participation: { version: 'appstation.participation.v1', arms: ['right'], grippers: ['right'] },
+      },
+      frame: {
+        ...state.frame,
+        motionEnabled: { ...state.frame.motionEnabled, left: true },
+        motionAxisEnabled: { ...state.frame.motionAxisEnabled, left: [true, true, true, true, true, true] },
+      },
+    }))
+
+    act(() => useTelemetryStore.getState().saveRecordEpisode())
+    await waitFor(() => expect(useTelemetryStore.getState().recordSession.phase).toBe('reviewing'))
+    await act(async () => useTelemetryStore.getState().returnRecordMotionOrigin('left'))
+    expect(returnOriginSpy).toHaveBeenCalledWith('left')
+    expect(useTelemetryStore.getState().recordSession.resetReady).toBe(true)
+
+    act(() => useTelemetryStore.getState().acceptRecordQualityReport())
+    expect(useTelemetryStore.getState().recordSession.phase).toBe('resetting')
+    expect(useTelemetryStore.getState().recordSession.resetReady).toBe(true)
+    render(<EpisodeControlPanel onStartSession={() => undefined} />)
+    expect(screen.getByRole('button', { name: '跳过复位，立即开始' })).not.toBeDisabled()
+  })
+
   it('does not skip reset from a repeated Space shortcut after saving', async () => {
     window.history.pushState({}, '', '/record')
     await renderApp()

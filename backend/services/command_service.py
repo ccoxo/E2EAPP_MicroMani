@@ -152,7 +152,16 @@ class CommandService:
         deadline = time.monotonic() + 2.0
         while True:
             self.safety.check(token)
-            state = await self.hal.motion_state()
+            try:
+                state = await self.hal.motion_state()
+            except RuntimeError as exc:
+                if str(exc) != "DDS motion controller sample timestamp is stale or unavailable":
+                    raise
+                self.safety.check(token)
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("work origin result unconfirmed: fresh stationary position feedback required") from exc
+                await asyncio.sleep(0.05)
+                continue
             self.safety.check(token)
             pulses = self._motion_state_pulses(state)
             moving = state.get("moving")

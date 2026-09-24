@@ -2114,9 +2114,6 @@ acceptRecordQualityReport: () => {
           recorderElapsedS: 0,
           recorderTotalS: state.recordSession.resetTimeS,
           resetPending: true,
-          resetRequiredSides: defaultRecordResetRequiredSides,
-          resetReturnedSides: [],
-          resetReady: false,
         },
         logs: appendLog(state.logs, makeLog('INFO', '质量报告已接受，进入复位等待', '[LEROBOT]')),
       }
