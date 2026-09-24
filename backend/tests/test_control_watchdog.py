@@ -159,6 +159,50 @@ def test_hal_renewal_failure_never_reports_active_or_automatically_acknowledges(
     asyncio.run(exercise())
 
 
+def test_slow_but_confirmed_hal_renewal_keeps_control_session() -> None:
+    async def exercise() -> None:
+        watchdog, _now, hal, invalidate, stop = make_watchdog()
+        watchdog.register(AsyncMock())
+
+        async def slow_renewal(_name, _payload):
+            await asyncio.sleep(0.85)
+            return {"response": {"ok": True, "leaseFresh": True, "timeoutMs": 2500}}
+
+        hal.command.side_effect = slow_renewal
+        try:
+            await watchdog.cycle()
+            watchdog.require_ready()
+            invalidate.assert_not_called()
+            stop.assert_not_awaited()
+        finally:
+            await watchdog.close()
+
+    asyncio.run(exercise())
+
+
+def test_unconfirmed_hal_renewal_still_trips_control_session() -> None:
+    async def exercise() -> None:
+        watchdog, _now, hal, invalidate, stop = make_watchdog()
+        watchdog.register(AsyncMock())
+
+        async def stalled_renewal(_name, _payload):
+            await asyncio.sleep(1.35)
+            return {"response": {"ok": True, "leaseFresh": True, "timeoutMs": 2500}}
+
+        hal.command.side_effect = stalled_renewal
+        try:
+            await watchdog.cycle()
+            with pytest.raises(ControlLeaseUnavailable):
+                watchdog.require_ready()
+            invalidate.assert_called_once()
+            await flush()
+            stop.assert_awaited_once()
+        finally:
+            await watchdog.close()
+
+    asyncio.run(exercise())
+
+
 def test_late_successful_renewal_cannot_reactivate_disconnected_session() -> None:
     async def exercise() -> None:
         watchdog, _now, hal, invalidate, stop = make_watchdog()

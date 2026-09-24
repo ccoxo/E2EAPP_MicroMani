@@ -602,9 +602,7 @@ struct HalDdsControlServer::Impl {
   }
 
   void handleEmergencyStopCommand(const HalCommandRequestSample& request) {
-    const auto receivedAt = std::chrono::steady_clock::now();
-    std::cout << "[HAL] DEBUG component=DDS event=command_received request_id="
-              << request.request_id << " name=" << request.name << std::endl;
+    // Logging can block on a stalled stdout sink; this worker must keep processing leases and stops.
     HalCommandReplySample reply;
     reply.request_id = request.request_id;
     try {
@@ -624,12 +622,6 @@ struct HalDdsControlServer::Impl {
       reply.error = exc.what();
     }
     writeReply(reply);
-    const auto durationMs = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - receivedAt).count();
-    std::cout << "[HAL] DEBUG component=DDS event=command_replied request_id="
-              << request.request_id << " name=" << request.name
-              << " ok=" << (reply.ok ? "true" : "false")
-              << " durationMs=" << durationMs << std::endl;
   }
 
   void writeReply(HalCommandReplySample& reply) {

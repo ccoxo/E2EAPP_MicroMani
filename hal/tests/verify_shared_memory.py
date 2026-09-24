@@ -32,11 +32,14 @@ class Server:
         )
         self.lines = queue.Queue()
         self.output = []
+        self.output_enabled = threading.Event()
+        self.output_enabled.set()
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
 
     def _read(self):
         for line in self.process.stdout:
+            self.output_enabled.wait()
             self.output.append(line.rstrip())
             self.lines.put(line.rstrip())
 
@@ -61,6 +64,7 @@ class Server:
             assert self.process.wait(timeout=10) == 0, self.output
 
     def cleanup(self):
+        self.output_enabled.set()
         if self.process.poll() is None:
             self.process.kill()
             self.process.wait(timeout=5)
@@ -103,6 +107,20 @@ def main():
         transport.start()
         await_telemetry(transport)
         assert request(transport, "force.state").ok
+
+        # A stalled diagnostic sink must not hold the lease/stop command worker.
+        server.output_enabled.clear()
+        try:
+            for _ in range(48):
+                sample = HalCommandRequest(uuid.uuid4().hex, now_unix_ms(), "control.lease", "{}")
+                transport.publish_emergency_stop(sample)
+                assert transport.wait_for_command_reply(sample.request_id, 0.75) is not None
+            sample = HalCommandRequest(uuid.uuid4().hex, now_unix_ms(), "motion.emergency_stop", "{}")
+            transport.publish_emergency_stop(sample)
+            reply = transport.wait_for_command_reply(sample.request_id, 0.75)
+            assert reply is not None and reply.ok
+        finally:
+            server.output_enabled.set()
 
         # 大请求及大错误应答，覆盖 SHM 分片和 ctypes 动态扩容。
         name = "unknown_" + "x" * 262144

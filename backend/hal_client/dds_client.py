@@ -160,8 +160,11 @@ class DdsHalClient(HalClient):
         lane = self._lease_lane if name == "control.lease" else (
             self._emergency_lane if name == "motion.emergency_stop" else self._command_lane
         )
-        if name in {"control.lease", "motion.emergency_stop"}:
-            timeout_s = min(timeout_s, 0.5)
+        # 给 HAL 偶发慢应答留余量，仍低于 2.5 秒硬件租约有效期。
+        if name == "control.lease":
+            timeout_s = min(timeout_s, 1.0)
+        elif name == "motion.emergency_stop":
+            timeout_s = min(timeout_s, 0.75)
         control_critical = name not in {"hal.reconnect", "teleop.native.status"}
         if not stop_or_read and name != "control.lease":
             request_payload = dict(request_payload)

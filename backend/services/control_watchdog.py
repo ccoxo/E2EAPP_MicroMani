@@ -207,7 +207,7 @@ class ControlWatchdog:
                 "sequence": self._sequence,
                 "timeoutMs": self.hal_timeout_ms,
                 "issuedAtUnixMs": int(time.time() * 1000),
-            }), 0.75)
+            }), 1.25)
             response = result.get("response", {})
             if response.get("ok") is not True or response.get("leaseFresh") is not True:
                 raise RuntimeError("HAL did not confirm a fresh control lease")

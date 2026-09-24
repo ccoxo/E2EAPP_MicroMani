@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import pytest
@@ -206,6 +207,32 @@ def test_dds_hal_client_emergency_stop_uses_dedicated_topic_and_matches_reply() 
         "command": "motion.emergency_stop",
         "response": {"ok": True},
     }
+
+
+@pytest.mark.parametrize("command,delay_s,expected_timeout_s", [
+    ("control.lease", 0.7, 1.0),
+    ("motion.emergency_stop", 0.55, 0.75),
+])
+def test_dds_critical_reply_within_hal_lease_is_not_false_timeout(
+    command: str, delay_s: float, expected_timeout_s: float
+) -> None:
+    transport = FakeDdsTransport()
+
+    def wait_for_reply(request_id: str, timeout_s: float) -> HalCommandReply:
+        transport.waits.append((request_id, timeout_s))
+        time.sleep(delay_s)
+        return HalCommandReply(request_id=request_id, ok=True, result_json='{"ok":true,"leaseFresh":true}', error="")
+
+    transport.wait_for_command_reply = wait_for_reply  # type: ignore[method-assign]
+    client = DdsHalClient(LogService(emit_startup=False), transport=transport)
+    try:
+        result = asyncio.run(client.command(command, {}))
+        assert result["response"]["ok"] is True
+        assert client._control_transport_failed is False
+        assert len(transport.emergency_requests) == 1
+        assert transport.waits == [(transport.emergency_requests[0].request_id, expected_timeout_s)]
+    finally:
+        client.close()
 
 
 def test_dds_hal_client_routes_teleop_target_update_through_command_request() -> None:
