@@ -1326,6 +1326,20 @@ class DatasetRecorderService:
             raise FileNotFoundError(episode_id)
         if episode.get("status") in {"discarded", "deleted"}:
             raise ValueError("不能回放已丢弃的片段")
+        native_episode_index = int(episode["episodeIndex"])
+        start = episode.get("datasetFromIndex")
+        stop = episode.get("datasetToIndex")
+        if start is not None or stop is not None:
+            if start is None or stop is None or int(stop) - int(start) != int(episode["frames"]):
+                raise ValueError("片段与原生数据索引不一致")
+            matches = [
+                item for item in self._native_episodes_from_meta(dataset_dir, info)
+                if item["datasetFromIndex"] == int(start) and item["datasetToIndex"] == int(stop)
+                and item["frames"] == int(episode["frames"])
+            ]
+            if len(matches) != 1:
+                raise ValueError("片段与原生数据索引不一致")
+            native_episode_index = int(matches[0]["episodeIndex"])
         import pyarrow.dataset as ds
 
         files = sorted((dataset_dir / "data").glob("chunk-*/*.parquet"))
@@ -1333,7 +1347,7 @@ class DatasetRecorderService:
             raise ValueError("没有完整的动作数据文件")
         table = ds.dataset([str(path) for path in files], format="parquet").to_table(
             columns=["episode_index", "frame_index", "timestamp", "action", "observation.state"],
-            filter=ds.field("episode_index") == int(episode["episodeIndex"]),
+            filter=ds.field("episode_index") == native_episode_index,
         ).sort_by("frame_index")
         rows = table.to_pylist()
         if not rows or len(rows) != int(episode["frames"]):
@@ -1734,12 +1748,26 @@ class DatasetRecorderService:
             raise FileNotFoundError(str(frame))
         if live_metadata is not None:
             return self._native_video_row_to_jpeg(dataset_dir, episode, camera, frame, live_metadata)
+        start = episode.get("datasetFromIndex")
+        stop = episode.get("datasetToIndex")
+        has_range = start is not None or stop is not None
+        if has_range and (
+            start is None or stop is None or int(stop) - int(start) != int(episode["frames"])
+        ):
+            raise FileNotFoundError("episode video mapping missing")
         pq = importlib.import_module("pyarrow.parquet")
+        matches: list[dict[str, Any]] = []
         for meta_path in sorted((dataset_dir / "meta" / "episodes").glob("chunk-*/file-*.parquet")):
             for row in pq.read_table(meta_path).to_pylist():
-                if row.get("episode_index") != episode.get("episodeIndex"):
-                    continue
-                return self._native_video_row_to_jpeg(dataset_dir, episode, camera, frame, row)
+                if has_range:
+                    if (int(row.get("dataset_from_index", -1)) == int(start)
+                            and int(row.get("dataset_to_index", -1)) == int(stop)
+                            and int(row.get("length", -1)) == int(episode["frames"])):
+                        matches.append(row)
+                elif row.get("episode_index") == episode.get("episodeIndex"):
+                    return self._native_video_row_to_jpeg(dataset_dir, episode, camera, frame, row)
+        if len(matches) == 1:
+            return self._native_video_row_to_jpeg(dataset_dir, episode, camera, frame, matches[0])
         raise FileNotFoundError("episode video mapping missing")
 
     # 内部说明。
@@ -4888,11 +4916,15 @@ class DatasetRecorderService:
 
     def _next_episode_index(self, dataset_dir: Path) -> int:
         """根据已有 episode 元数据计算下一条 episode 序号。"""
+        info = self._read_json(dataset_dir / "meta" / "info.json")
         episodes = self._read_episodes(dataset_dir)
-        if not episodes:
-            episodes = self._native_episodes_from_meta(dataset_dir, self._read_json(dataset_dir / "meta" / "info.json"))
-        indices = [int(item.get("episodeIndex", -1)) for item in episodes]
-        return max(indices, default=-1) + 1
+        native_episodes = self._native_episodes_from_meta(dataset_dir, info)
+        indices = [int(item.get("episodeIndex", -1)) for item in (*episodes, *native_episodes)]
+        try:
+            total_episodes = max(0, int(info.get("total_episodes") or 0))
+        except (TypeError, ValueError):
+            total_episodes = 0
+        return max(max(indices, default=-1) + 1, total_episodes)
 
     def _read_episodes(self, dataset_dir: Path) -> list[dict[str, Any]]:
         """读取 episodes.jsonl 中的 episode 元数据列表。"""

@@ -203,6 +203,70 @@ def test_reader_loads_complete_episode_without_preview_sampling(setup_replay, tm
         DatasetRecorderService.load_replay_episode(app.state.recorder, 'dataset', episode['id'])
 
 
+def test_replay_resolves_native_episode_by_frame_range_when_sidecar_index_has_gaps(tmp_path, monkeypatch):
+    import json
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from backend.services.dataset_recorder import DatasetRecorderService
+
+    root = tmp_path / 'dataset'
+    (root / 'meta' / 'episodes' / 'chunk-000').mkdir(parents=True)
+    (root / 'data' / 'chunk-000').mkdir(parents=True)
+    (root / 'meta' / 'info.json').write_text(json.dumps({
+        'format': 'lerobot-v3-native', 'fps': 30, 'total_episodes': 3,
+        'dataContract': data_contract_metadata(),
+    }))
+    episode = {
+        'id': 'episode_000000', 'episodeIndex': 0, 'frames': 4,
+        'datasetFromIndex': 5, 'datasetToIndex': 9, 'status': 'review',
+    }
+    (root / 'meta' / 'episodes.jsonl').write_text(json.dumps(episode) + '\n')
+    native_meta = []
+    offset = 0
+    for native_index, frames in enumerate((2, 3, 4)):
+        rows = [
+            {'episode_index': native_index, 'frame_index': frame, 'timestamp': frame / 30,
+             'action': [float(native_index)] * 14, 'observation.state': [0.] * 14}
+            for frame in range(frames)
+        ]
+        pq.write_table(pa.Table.from_pylist(rows), root / 'data' / 'chunk-000' / f'file-{native_index:03d}.parquet')
+        native_meta.append({
+            'episode_index': native_index, 'dataset_from_index': offset,
+            'dataset_to_index': offset + frames, 'length': frames, 'tasks': ['task'],
+        })
+        offset += frames
+    pq.write_table(pa.Table.from_pylist(native_meta), root / 'meta' / 'episodes' / 'chunk-000' / 'file-000.parquet')
+
+    recorder = object.__new__(DatasetRecorderService)
+    monkeypatch.setattr(recorder, '_dataset_path', lambda _dataset_id: root)
+    assert recorder._next_episode_index(root) == 3
+    info_path = root / 'meta' / 'info.json'
+    info = json.loads(info_path.read_text())
+    info['total_episodes'] = 5
+    info_path.write_text(json.dumps(info))
+    assert recorder._next_episode_index(root) == 5
+    loaded = recorder.load_replay_episode('dataset', episode['id'])
+    validate_episode(loaded)
+    assert len(loaded['rows']) == 4
+    assert loaded['rows'][0]['action'] == [2.] * 14
+
+    monkeypatch.setattr(recorder, '_native_video_row_to_jpeg',
+                        lambda _root, _episode, _camera, _frame, row: str(row['episode_index']).encode())
+    assert recorder._native_video_frame_to_jpeg(root, episode, 'global', 0) == b'2'
+    legacy_episode = {**episode, 'episodeIndex': 1, 'frames': 3}
+    legacy_episode.pop('datasetFromIndex')
+    legacy_episode.pop('datasetToIndex')
+    assert recorder._native_video_frame_to_jpeg(root, legacy_episode, 'global', 0) == b'1'
+
+    episode['datasetFromIndex'] = 6
+    episode['datasetToIndex'] = 10
+    (root / 'meta' / 'episodes.jsonl').write_text(json.dumps(episode) + '\n')
+    with pytest.raises(ValueError, match='原生数据'):
+        recorder.load_replay_episode('dataset', episode['id'])
+    with pytest.raises(FileNotFoundError, match='video mapping'):
+        recorder._native_video_frame_to_jpeg(root, episode, 'global', 0)
+
+
 def test_inspect_is_read_only_and_start_requires_confirmation_and_lease(setup_replay):
     from fastapi.testclient import TestClient
     from backend.services.control_watchdog import ControlLeaseUnavailable
