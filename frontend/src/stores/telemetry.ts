@@ -1300,9 +1300,9 @@ function reportFromSavedEpisode(fallback: RecordQualityReport, episode?: RecordE
 /** 构建当前流程需要的数据结构。 */
 function makeDiscardedEpisodeRecord(session: RecordSessionState): EpisodeRecord {
   return {
-    index: session.currentEpisode,
-    frameCount: Math.max(0, session.recorderFrameCount),
-    durationS: Math.max(0, session.recorderElapsedS),
+    index: session.latestQualityReport?.index ?? session.currentEpisode,
+    frameCount: session.latestQualityReport?.frameCount ?? Math.max(0, session.recorderFrameCount),
+    durationS: session.latestQualityReport?.durationS ?? Math.max(0, session.recorderElapsedS),
     status: 'discarded',
     maxForceLeft: 0,
     maxForceRight: 0,
@@ -2054,6 +2054,7 @@ saveRecordEpisode: () => {
 discardRecordEpisode: () => {
     const session = get().recordSession
     if (!['recording', 'interrupted', 'reviewing'].includes(session.phase)) return
+    const discardingSavedEpisode = session.latestQualityReport !== null
     const record = makeDiscardedEpisodeRecord(session)
     set((state) => ({ recording: false, recordSession: { ...state.recordSession,
       phase: 'discarding', phaseStartedAt: Date.now(), resetPending: false, resetReady: false } }))
@@ -2063,6 +2064,9 @@ discardRecordEpisode: () => {
         recording: false,
         recordSession: {
           ...state.recordSession,
+          savedEpisodes: discardingSavedEpisode
+            ? Math.max(0, state.recordSession.savedEpisodes - 1)
+            : state.recordSession.savedEpisodes,
           phase: 'resetting',
           phaseStartedAt: Date.now(),
           recorderFps: 0,
@@ -2075,14 +2079,14 @@ discardRecordEpisode: () => {
           resetRequiredSides: defaultRecordResetRequiredSides,
           resetReturnedSides: [],
           resetReady: false,
-          episodeHistory: [record, ...state.recordSession.episodeHistory].slice(0, 20),
+          episodeHistory: [record, ...state.recordSession.episodeHistory.filter((item) => item.index !== record.index)].slice(0, 20),
         },
         logs: appendLog(state.logs, makeLog('WARNING', `Episode #${record.index} 已丢弃，等待复位`, '[LEROBOT]')),
       }
     })).catch((error) => {
       set((state) => ({
         recordSession: state.recordSession.phase === 'discarding'
-          ? { ...state.recordSession, phase: 'interrupted', resetPending: false, resetReady: false }
+          ? { ...state.recordSession, phase: discardingSavedEpisode ? 'reviewing' : 'interrupted', resetPending: false, resetReady: false }
           : state.recordSession,
         logs: appendLog(state.logs, makeLog('ERROR', `record episode discard failed; pending review: ${String(error)}`, '[LEROBOT]')),
       }))
@@ -2123,39 +2127,9 @@ acceptRecordQualityReport: () => {
 
 /** 描述当前方法的功能边界。 */
 rejectRecordQualityReport: () => {
-    void discardRecordEpisodeApi().catch((error) => {
-      set((state) => ({
-        logs: appendLog(state.logs, makeLog('ERROR', `record episode rerecord failed: ${String(error)}`, '[LEROBOT]')),
-      }))
-    })
-    set((state) => {
-      const report = state.recordSession.latestQualityReport
-      if (!report) return state
-      finishRecordSessionAfterReview = false
-      const savedEpisodes = Math.max(0, state.recordSession.savedEpisodes - 1)
-      return {
-        recording: false,
-        recordSession: {
-          ...state.recordSession,
-          currentEpisode: report.index,
-          savedEpisodes,
-          latestQualityReport: null,
-          phase: 'resetting',
-          phaseStartedAt: Date.now(),
-          recorderFps: 0,
-          recorderFrameCount: 0,
-          recorderLateFrames: 0,
-          recorderElapsedS: 0,
-          recorderTotalS: state.recordSession.resetTimeS,
-          resetPending: true,
-          resetRequiredSides: defaultRecordResetRequiredSides,
-          resetReturnedSides: [],
-          resetReady: false,
-          episodeHistory: state.recordSession.episodeHistory.filter((item) => item.index !== report.index),
-        },
-        logs: appendLog(state.logs, makeLog('WARNING', `Episode #${report.index} 已退回，等待复位`, '[LEROBOT]')),
-      }
-    })
+    if (get().recordSession.phase !== 'reviewing' || !get().recordSession.latestQualityReport) return
+    finishRecordSessionAfterReview = false
+    get().discardRecordEpisode()
   },
 
 /** 描述当前方法的功能边界。 */

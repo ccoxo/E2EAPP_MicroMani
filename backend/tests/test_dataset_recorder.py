@@ -1060,7 +1060,8 @@ def test_dataset_recorder_discard_marks_saved_episode_off_event_loop(
         result = await recorder.discard_episode()
 
         assert result["recording"] is False
-        assert recorder._episode_index == 1
+        assert recorder._episode_index == 2
+        assert recorder.telemetry.episode_count == 2
         assert recorder._last_saved_episode is None
         assert to_thread_calls == ["mark_saved_episode_deleted", "record_status"]
 
@@ -1670,7 +1671,7 @@ def test_dataset_recorder_start_session_runs_blocking_setup_off_event_loop(
         finally:
             await recorder.finish_session()
 
-        assert to_thread_calls[:4] == ["get_config", "mkdir", "<lambda>", "<lambda>"]
+        assert to_thread_calls[:5] == ["get_config", "mkdir", "_dataset_resume_error", "<lambda>", "<lambda>"]
 
     asyncio.run(run_case())
 

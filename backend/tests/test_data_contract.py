@@ -129,24 +129,39 @@ def test_session_rejects_unknown_native_contract_before_starting_writer(tmp_path
 def test_native_writer_resumes_current_contract_without_recreating_dataset(tmp_path) -> None:
     dataset_dir = tmp_path / "dataset"
     (dataset_dir / "meta").mkdir(parents=True)
-    (dataset_dir / "meta" / "info.json").write_text(
-        json.dumps({"format": "lerobot-v3-native", "dataContract": data_contract_metadata(), "fps": 25}),
-        encoding="utf-8",
-    )
-    (dataset_dir / "meta" / "episodes.jsonl").write_text('{"id":"episode_000000"}\n', encoding="utf-8")
+    config = default_config()
+    config["storage"]["recordFps"] = 25
+    config["motion"]["origin"].update(leftValid=True, rightValid=True)
+    config["cameras"].update(globalIdentity="global", wristLeftIdentity="left", wristRightIdentity="right")
     resumed = object()
     native = SimpleNamespace(resume=Mock(return_value=resumed), create=Mock(side_effect=AssertionError("不应重建已有数据集")))
     recorder = object.__new__(DatasetRecorderService)
     recorder._dataset_dir = dataset_dir
     recorder._dataset_id = "dataset"
-    recorder._record_fps_hz = 30
-    recorder._recording_config = default_config
+    recorder._dataset_name = "dataset"
+    recorder._record_fps_hz = 25
+    recorder._force_sample_hz = 200
+    recorder._native_use_videos = False
+    recorder._recording_config = lambda: config
     recorder._native_recording_requested = lambda: True
     recorder._native_preflight = lambda: ""
     recorder._native_imports = lambda: (native, None)
     recorder._native_use_videos_requested = lambda: False
     recorder._native_writer_kwargs = lambda: {}
     recorder._configure_native_chunk_settings = lambda _dataset: None
+    recorder._write_appstation_info(dataset_dir, config)
+    recorder._write_json(dataset_dir / "meta/info.json", {
+        "format": "lerobot-v3-native", "dataContract": data_contract_metadata(), "fps": 25,
+        "features": recorder._native_features(config), "total_frames": 10, "total_episodes": 1,
+    })
+    recorder._write_episodes(dataset_dir, [{"id": "episode_000000", "episodeIndex": 0,
+                                          "frames": 10, "datasetFromIndex": 0, "datasetToIndex": 10}])
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    meta_dir = dataset_dir / "meta/episodes/chunk-000"
+    meta_dir.mkdir(parents=True)
+    pq.write_table(pa.Table.from_pylist([{"episode_index": 0, "length": 10,
+                                         "dataset_from_index": 0, "dataset_to_index": 10}]), meta_dir / "file-000.parquet")
 
     assert recorder._open_native_dataset_for_writer() is resumed
     native.resume.assert_called_once_with(repo_id="local/dataset", root=dataset_dir)

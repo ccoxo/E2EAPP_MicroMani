@@ -33,6 +33,8 @@ from typing import Any
 from backend.services.recording_diagnostics import RecordingDiagnostics
 from backend.services.process_video_encoder import isolate_dataset_encoder
 from backend.services.recording_gc import RecordingGcScope
+from backend.services.dataset_resume import resume_metadata_error
+from backend.services.dataset_episode_index import match_records, read_native_index
 
 from backend.core.participation import participation, action_mask, hardware_sides, source_sides, scoped_config
 from backend.core.config import SettingsService
@@ -678,6 +680,10 @@ class DatasetRecorderService:
             if contract_error:
                 raise RuntimeError(contract_error)
 
+            resume_error = await asyncio.to_thread(self._dataset_resume_error, dataset_dir, config)
+            if resume_error:
+                raise RuntimeError(resume_error)
+
             async with self._lock:
                 self._recording_config_snapshot = deepcopy(config)
                 self._dataset_name = next_dataset_name
@@ -874,11 +880,8 @@ class DatasetRecorderService:
                 await self._clear_native_episode_buffer()
         async with self._lock:
             if not was_recording and self._last_saved_episode is not None:
-                episode_index = int(self._last_saved_episode.get("episodeIndex", self._episode_index))
                 await asyncio.to_thread(self._mark_saved_episode_deleted_locked, self._last_saved_episode)
-                if episode_index < self._episode_index:
-                    self._episode_index = episode_index
-                    self.telemetry.episode_count = episode_index
+                # 已落盘的 native 编号不会回退；保留弃用记录，重录使用新编号。
                 self._last_saved_episode = None
             self._enter_reset_pending_locked()
             self._samplers_paused = True
@@ -3368,10 +3371,12 @@ class DatasetRecorderService:
             "motionOrigin": self._episode_motion_origin_snapshot(config_snapshot),
             "motionCalibration": self._motion_calibration_snapshot(config_snapshot),
             "forceCalibration": deepcopy(getattr(self, "_episode_force_calibration", {})),
+            "session": getattr(self, "_session_id", ""),
         }
         episode["qualityAssessment"] = self._quality_assessment(episode)
         episodes = self._read_episodes(dataset_dir)
-        episodes = [item for item in episodes if str(item.get("id")) != episode_id]
+        if any(str(item.get("id")) == episode_id for item in episodes):
+            raise DatasetSaveError(f"片段编号 {episode_id} 已存在，拒绝覆盖历史记录")
         episodes.append(episode)
         self._write_episodes(dataset_dir, episodes)
         info_path = dataset_dir / "meta" / "info.json"
@@ -3585,6 +3590,31 @@ class DatasetRecorderService:
                 "motion": self._motion_calibration_snapshot(config),
             },
         }
+        # 数据集最初的采集条件保留不变，每次会话另留快照以便追溯。
+        current_origin = deepcopy(payload["sessionOrigin"])
+        current_hardware = deepcopy(payload["hardware"])
+        current_recording = deepcopy(payload["recording"])
+        selected = deepcopy(getattr(self, "_participation", None))
+        has_recorded_data = not self._native_dataset_is_empty(dataset_dir)
+        for key in ("sessionOrigin", "hardware", "recording"):
+            if has_recorded_data and key in info:
+                payload[key] = deepcopy(info[key])
+        payload["participation"] = deepcopy(info.get("participation", selected) if has_recorded_data else selected)
+        history = deepcopy(info.get("sessionHistory", []))
+        if not isinstance(history, list) or any(not isinstance(item, dict) for item in history):
+            raise RuntimeError("采集会话历史损坏，拒绝覆盖原元数据")
+        session_id = getattr(self, "_session_id", "")
+        if session_id and not any(item.get("session") == session_id for item in history):
+            history.append({
+                "session": session_id,
+                "startedAt": now_ms(),
+                "firstEpisodeIndex": self._next_episode_index(dataset_dir),
+                "origin": current_origin,
+                "hardware": current_hardware,
+                "recording": current_recording,
+                "participation": selected,
+            })
+        payload["sessionHistory"] = history
         self._write_json(path, payload)
         info_path = dataset_dir / "meta" / "info.json"
         info = self._read_json(info_path)
@@ -3703,6 +3733,9 @@ class DatasetRecorderService:
         contract_error = self._dataset_contract_error(dataset_dir)
         if contract_error:
             raise RuntimeError(contract_error)
+        resume_error = self._dataset_resume_error(dataset_dir, config)
+        if resume_error:
+            raise RuntimeError(resume_error)
         repo_id = f"local/{self._dataset_id}"
         self._native_use_videos = self._native_use_videos_requested()
         try:
@@ -3902,6 +3935,63 @@ class DatasetRecorderService:
             return True
         app_info = self._read_json(dataset_dir / "meta" / "appstation_info.json")
         return str(app_info.get("format", "")) == "lerobot-v3-native"
+
+    def _dataset_resume_error(self, dataset_dir: Path, config: dict[str, Any]) -> str:
+        """在写线程和元数据更新前验证续录条件，不修改已有数据。"""
+        if not dataset_dir.exists() or not any(dataset_dir.iterdir()):
+            return ""
+        info = self._read_json(dataset_dir / "meta" / "info.json")
+        saved = self._read_json(dataset_dir / "meta" / "appstation_info.json")
+        if not info or not saved or not self._is_native_dataset(dataset_dir, info):
+            return "无法续录：原数据集元数据缺失、损坏或格式未知，请使用新数据集"
+        history = saved.get("sessionHistory", [])
+        if not isinstance(history, list) or any(not isinstance(item, dict) for item in history):
+            return "无法续录：采集会话历史损坏，请先检查数据集"
+        # 通用读取器会跳过坏行；续录不能将不完整的清单当成兼容证据。
+        episodes = []
+        episode_path = dataset_dir / "meta" / "episodes.jsonl"
+        if episode_path.exists():
+            try:
+                episodes = [json.loads(line) for line in episode_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            except (OSError, UnicodeError, ValueError):
+                return "无法续录：片段清单损坏或无法读取，请先检查数据集"
+            if any(not isinstance(item, dict) for item in episodes):
+                return "无法续录：片段清单格式无效，请先检查数据集"
+        empty = self._native_dataset_is_empty(dataset_dir)
+        if empty and all(type(info.get(key)) is int and info[key] == 0 for key in ("total_frames", "total_episodes")):
+            return ""
+        if empty:
+            return "无法续录：元数据与已有片段文件不一致，请先检查数据集"
+        try:
+            native = read_native_index(dataset_dir, info)
+            _matched, untracked = match_records(episodes, native)
+        except (OSError, ValueError, TypeError, ImportError) as exc:
+            return f"无法续录：片段索引无法核对：{exc}"
+        if untracked:
+            return "无法续录：部分原生片段缺少保留或弃用记录，请先核查历史记录或使用整理后的副本"
+        # 旧版本将参与侧写在 episode 中；只有每条都有记录且一致时才允许采用。
+        if "participation" not in saved:
+            if episodes and all("participation" in item for item in episodes):
+                selections = [item["participation"] for item in episodes]
+                if all(value == selections[0] for value in selections):
+                    saved["participation"] = selections[0]
+        try:
+            expected_features = self._native_features(config)
+            for name in CAMERA_FEATURE_KEYS.values():
+                expected_features[name]["dtype"] = "video" if self._native_use_videos_requested() else "image"
+            reason = resume_metadata_error(
+                info, saved,
+                fps=self._record_fps_from_config(config),
+                origin=config.get("motion", {}).get("origin", {}),
+                selected=getattr(self, "_participation", None),
+                cameras=config.get("cameras", {}),
+                resolutions=self._camera_resolution_summary_from_config(config),
+                features=expected_features,
+                motion=self._motion_calibration_snapshot(config),
+            )
+        except (TypeError, ValueError, KeyError, OverflowError):
+            reason = "采集配置或原始元数据包含无效数值或结构"
+        return f"无法续录：{reason}。请保持原采集条件或使用新数据集" if reason else ""
 
     def _dataset_contract_error(self, dataset_dir: Path) -> str:
         """Reject native datasets whose numeric side order cannot be proven."""
