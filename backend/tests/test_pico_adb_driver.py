@@ -18,11 +18,15 @@ def test_pico_status_reports_offline_device_as_not_ok(monkeypatch: Any) -> None:
 
     class FakeCompletedProcess:
         returncode = 0
-        stdout = "10.90.129.166:5555     offline transport_id:64\n"
-        stderr = "error: device offline\n"
 
     monkeypatch.setattr(PicoAdbDriver, "_script", lambda *_args: Path("check_pico4ultra_wireless_status.bat"))
-    monkeypatch.setattr("backend.drivers.pico_adb.subprocess.run", lambda *_args, **_kwargs: FakeCompletedProcess())
+
+    def fake_run(*_args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        kwargs["stdout"].write("10.90.129.166:5555     offline transport_id:64\n")
+        kwargs["stderr"].write("error: device offline\n")
+        return FakeCompletedProcess()
+
+    monkeypatch.setattr("backend.drivers.pico_adb.subprocess.run", fake_run)
 
     result = PicoAdbDriver().status(config)
 

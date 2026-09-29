@@ -18,7 +18,7 @@ import {
   Upload,
   XCircle,
 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { CameraPreview } from '../components/CameraPreview'
 import { DatasetReplayPanel } from '../components/DatasetReplayPanel'
 import {
@@ -610,13 +610,15 @@ export function DatasetView() {
 
   const previewScope = `${detailDatasetId}:${detailEpisodeId}`
   const previewScopeRef = useRef(previewScope)
-  previewScopeRef.current = previewScope
-  useEffect(() => {
+  useLayoutEffect(() => { previewScopeRef.current = previewScope }, [previewScope])
+  const [renderedPreviewScope, setRenderedPreviewScope] = useState(previewScope)
+  if (renderedPreviewScope !== previewScope) {
+    setRenderedPreviewScope(previewScope)
     setFrameIndex(0)
     setRequestedFrame(0)
     setImageStates({})
     setPlaying(false)
-  }, [previewScope])
+  }
 
   const imageUrlsAt = (frame: number) => selectedEpisode ? selectedCameras.map((camera) => {
     const path = currentSample(selectedEpisode, frame).images?.[camera.key]
@@ -631,7 +633,7 @@ export function DatasetView() {
     [...new Set([previewUrls[index], requestedUrls[index], nextUrls[index]].filter((url): url is string => Boolean(url)))])
   const activeUrls = new Set(bufferedUrls.flat())
   const activeUrlsRef = useRef(activeUrls)
-  activeUrlsRef.current = activeUrls
+  useLayoutEffect(() => { activeUrlsRef.current = activeUrls })
   const onImageState = (url: string, state: 'loaded' | 'error') => {
     if (previewScopeRef.current !== previewScope || !activeUrlsRef.current.has(url)) return
     setImageStates((current) => ({
@@ -641,9 +643,7 @@ export function DatasetView() {
   const previewReady = previewUrls.every((url) => !url || imageStates[url] === 'loaded')
   const requestedReady = requestedUrls.every((url) => !url || imageStates[url] === 'loaded')
   const previewError = requestedUrls.some((url) => url && imageStates[url] === 'error')
-  useEffect(() => {
-    if (requestedReady) setFrameIndex(requestedFrame)
-  }, [requestedReady, requestedFrame])
+  if (requestedReady && frameIndex !== requestedFrame) setFrameIndex(requestedFrame)
   useEffect(() => {
     if (!playing || !selectedEpisode || !previewReady || frameIndex !== requestedFrame) return
     const timer = window.setTimeout(() => {

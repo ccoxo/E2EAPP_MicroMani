@@ -21,15 +21,13 @@ import type {
   ManualGripperCommand,
 } from '../../types'
 import {
-  commandLog,
-  formatGripperPosition,
   HardwareConfigCard,
   MetricBox,
-  safeGripperPosition,
   type GripperPortHint,
   type InlineStatusTone,
   type PendingComparison,
 } from './shared'
+import { commandLog, formatGripperPosition, safeGripperPosition } from './sharedHelpers'
 
 function useGripperSafetyCommand(
   hardwareSide: RobotSide,

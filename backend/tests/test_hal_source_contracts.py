@@ -137,7 +137,8 @@ def test_hal_home_all_requires_work_origin_payload() -> None:
     assert "executor_.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes, commandEpoch)" in normalized
     assert "jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled)" in normalized
     assert "executor_.enableSide(side, true, jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled), commandEpoch)" in normalized
-    assert "executor_.homeSide(side, jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled), commandEpoch)" in normalized
+    assert "jsonHardwareHomeConfig(bodyText)" in normalized
+    assert "executor_.homeSide( side, jsonBoolArray6(bodyText, \"enabledAxes\", {}), homeConfig, commandEpoch)" in normalized
     assert "home_all requires leftPulse[6] work origin payload" in json_source
     assert "home_all requires rightPulse[6] work origin payload" in json_source
     assert "home_origin_side requires pulse[6] work origin payload" in json_source
@@ -145,7 +146,7 @@ def test_hal_home_all_requires_work_origin_payload() -> None:
 
 def test_hal_hardware_home_logs_per_axis_diagnostics() -> None:
     source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
-    body = source.split("void LTDMCDriver::homeSide(", 1)[
+    body = source.split("LTDMCDriver::homeSide(", 1)[
         1
     ].split("void LTDMCDriver::homeAll", 1)[0]
 
@@ -477,7 +478,7 @@ def test_hal_dds_motion_state_telemetry_publishes_at_100hz() -> None:
     loop_body = source.split("void telemetryLoop()", 1)[1].split("void emergencyLoop()", 1)[0]
     telemetry_body = source.split("void publishTelemetry()", 1)[1].split("void publishJson", 1)[0]
 
-    assert "publishJson(motionWriter_, jsonMotionState(motion_.readState()))" in telemetry_body
+    assert "publishJson(motionWriter_, jsonMotionState(motion_.latestState()))" in telemetry_body
     assert "100 Hz" in loop_body
     assert "std::chrono::milliseconds(10)" in loop_body
     assert "std::chrono::milliseconds(50)" not in loop_body
@@ -795,10 +796,10 @@ def test_hal_home_origin_does_not_auto_enable_participating_axes() -> None:
     source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
     dispatcher = (REPO_ROOT / "hal" / "src" / "HalCommandDispatcher.cpp").read_text(encoding="utf-8")
     home_all_branch = dispatcher.split('if (name == "motion.home_all")', 1)[1].split(
-        'if (name == "motion.home_origin_side")',
+        'if (name == "motion.home_origin_side" || name == "motion.return_home_reference")',
         1,
     )[0]
-    home_side_branch = dispatcher.split('if (name == "motion.home_origin_side")', 1)[1].split(
+    home_side_branch = dispatcher.split('if (name == "motion.home_origin_side" || name == "motion.return_home_reference")', 1)[1].split(
         'if (name == "motion.enable_side")',
         1,
     )[0]
@@ -831,10 +832,10 @@ def test_hal_treats_card0_dmc5c10_sevon_feedback_as_unreadable() -> None:
     assert "bool hasReadableSevonFeedback(appstation::hal::Side side, appstation::hal::SemanticAxis axis)" in normalized
     assert "if (side == appstation::hal::Side::Right) { return false; }" in normalized
     assert "std::array<bool, 12> commandedEnabled_{};" in header
-    assert "if (!hasReadableSevonFeedback(side, axis)) { enabled_[index] = commandedEnabled_[index]; }" in normalized
+    assert "if (!hasReadableSevonFeedback(side, axis)) { enabled_[index] = commandedEnabled_[index]; state.axes[index].enabledConfirmed = false; }" in normalized
     assert (
         "else if (dmcReadSevonPin) { enabled_[index] = dmcReadSevonPin(card, axisNo) > 0; "
-        "commandedEnabled_[index] = enabled_[index]; }"
+        "commandedEnabled_[index] = enabled_[index]; state.axes[index].enabledConfirmed = true; }"
     ) in normalized
     unsupported_sevon_branch = normalized.split("if (!usesSevonPin(side, axis)) {", 1)[1].split(
         "const auto ret = dmcWriteSevonPin",
@@ -886,7 +887,7 @@ def test_hal_stage_axis_and_direction_signs_match_icf_mapping() -> None:
     assert "kLeftPhysicalAxis{0, 1, 3, 5, 4, 2}" in normalized
     assert "kRightPhysicalAxis{2, 0, 5, 8, 1, 7}" in normalized
     assert "-5000.0, 5000.0, -10000.0, 1666.666667, -2500.0, -3333.333" in normalized
-    assert "-5000.0, -10000.0, -5000.0, 1666.666667, 2500.0, 333.3333" in normalized
+    assert "-5000.0, -10000.0, -5000.0, 1666.666667, 2500.0, 3333.3333" in normalized
 
 
 def test_runtime_launch_disables_pagehide_auto_shutdown_and_stop_stack_kills_all_listener_trees() -> None:
@@ -980,10 +981,10 @@ def test_hal_native_home_stops_controller_and_waits_for_motion_done() -> None:
     dispatcher = (REPO_ROOT / "hal" / "src" / "HalCommandDispatcher.cpp").read_text(encoding="utf-8")
     motion = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
     home_all_branch = dispatcher.split('if (name == "motion.home_all")', 1)[1].split(
-        'if (name == "motion.home_origin_side")',
+        'if (name == "motion.home_origin_side" || name == "motion.return_home_reference")',
         1,
     )[0]
-    home_side_branch = dispatcher.split('if (name == "motion.home_origin_side")', 1)[1].split(
+    home_side_branch = dispatcher.split('if (name == "motion.home_origin_side" || name == "motion.return_home_reference")', 1)[1].split(
         'if (name == "motion.enable_side")',
         1,
     )[0]
@@ -992,7 +993,7 @@ def test_hal_native_home_stops_controller_and_waits_for_motion_done() -> None:
     assert "nativeTeleop_.stop();" in home_side_branch
     assert "const auto enabledAxes = jsonHomeAllEnabledAxes(bodyText);" in home_all_branch
     assert "motion_.enableHomeAxes" not in home_all_branch
-    assert "const auto enabledAxes = jsonBoolArray6(bodyText, \"enabledAxes\", kAllAxesEnabled);" in home_side_branch
+    assert "referenceReturn ? std::array<bool, 6>{} : kAllAxesEnabled" in home_side_branch
     assert "motion_.enableHomeAxes" not in home_side_branch
     assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_all pre-move\", 3000, [&]() { checkMotionCommand(estopSequenceAtStart); })" in motion
     assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_all\", 60000, [&]() { checkMotionCommand(estopSequenceAtStart); })" in motion
@@ -1043,12 +1044,19 @@ def test_hal_emergency_stop_preempts_long_motion_waits() -> None:
     assert "return handleEmergencyStop();" in emergency_branch
     assert "nativeTeleop_.stop();" not in emergency_branch
     assert 'GetProcAddress(ltdmcModule, "dmc_emg_stop")' in motion
-    assert "dmcEmgStop(card);" in emergency_body
+    assert "stopAllAxesBestEffort()" in emergency_body
+    assert "dmcEmgStop(card)" in motion
     assert "std::scoped_lock lock(mutex_)" not in emergency_body
     assert "stopAllAxesBestEffort();" in emergency_body
     assert "disableAllAxesBestEffort();" in emergency_body
-    assert "dmcStop(card, static_cast<unsigned short>(axisNo), 1);" in emergency_body
-    assert "dmcWriteSevonPin(card, static_cast<unsigned short>(axisNo), 0);" in emergency_body
+    stop_helper = motion.split("LTDMCDriver::StopAttemptSummary LTDMCDriver::stopAllAxesBestEffort() noexcept", 1)[1].split(
+        "LTDMCDriver::StopAttemptSummary LTDMCDriver::disableAllAxesBestEffort() noexcept", 1
+    )[0]
+    assert "dmcStop(card, static_cast<unsigned short>(axisNo), 1)" in stop_helper
+    disable_helper = motion.split("LTDMCDriver::StopAttemptSummary LTDMCDriver::disableAllAxesBestEffort() noexcept", 1)[1].split(
+        "void LTDMCDriver::checkMotionCommand", 1
+    )[0]
+    assert "dmcWriteSevonPin(card, axisNo, 0)" in disable_helper
     assert "std::unique_lock<std::mutex> stateLock(mutex_, std::try_to_lock);" in emergency_body
     assert "EmergencyStopState estop_;" in header
     assert "estop_.trip();" in emergency_body
@@ -1056,7 +1064,7 @@ def test_hal_emergency_stop_preempts_long_motion_waits() -> None:
     assert "controlLease_.acknowledge(estop_, expectedEpoch);" in motion
     assert "stop.acknowledge(epoch)" in lease
     assert "control lease expired during acknowledgement" in lease
-    assert "void disableAllAxesBestEffort() noexcept;" in header
+    assert "StopAttemptSummary disableAllAxesBestEffort() noexcept;" in header
     assert "void checkMotionCommand(std::uint64_t epoch);" in header
     assert "clearEstopIfUnchanged" not in motion
     assert "checkCurrent();" in motion
@@ -1190,10 +1198,10 @@ def test_hal_direct_work_origin_home_rejects_estop_before_enable_or_motion() -> 
     motion = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
     dispatcher = (REPO_ROOT / "hal" / "src" / "HalCommandDispatcher.cpp").read_text(encoding="utf-8")
     home_all_branch = dispatcher.split('if (name == "motion.home_all")', 1)[1].split(
-        'if (name == "motion.home_origin_side")',
+        'if (name == "motion.home_origin_side" || name == "motion.return_home_reference")',
         1,
     )[0]
-    home_side_branch = dispatcher.split('if (name == "motion.home_origin_side")', 1)[1].split(
+    home_side_branch = dispatcher.split('if (name == "motion.home_origin_side" || name == "motion.return_home_reference")', 1)[1].split(
         'if (name == "motion.enable_side")',
         1,
     )[0]
@@ -2194,7 +2202,12 @@ def test_hal_native_gripper_uses_isolated_jodell_worker_processes() -> None:
     assert "sampleGripperPosition(Side::Left);" in normalized_loop
     assert "sampleGripperPosition(Side::Right);" in normalized_loop
     assert "sampleGripperPosition(sideFromIndex(sampleIndex));" not in normalized_loop
+    assert normalized_loop.index("if (shouldSample)") < normalized_loop.index("for (const auto& command : commands)")
     assert "const bool ok = gripper_.readPositionMm(side, &message);" in normalized_sample
+    assert "const auto sampleMidpoint = readStarted + (readFinished - readStarted) / 2;" in normalized_sample
+    assert "gripperPositionSampleMonotonicMs_[index] = sampleMonotonicMs;" in normalized_sample
+    assert "std::array<std::int64_t, 2> gripperPositionSampleMonotonicMs_" in controller_header
+    assert 'positionSampleMonotonicMs' in controller_source
     assert "gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);" in normalized_sample
     assert "gripperLastCommandOk_[index] = ok;" in normalized_sample
     assert "gripperLastMessage_[index] = message;" in normalized_sample
@@ -2582,3 +2595,77 @@ def test_no_network_transport_implementation_remains_in_project_dds_code() -> No
                            "TCPv4TransportDescriptor", "TCPv6TransportDescriptor"):
             assert descriptor not in source, str(path)
         assert "APPSTATION_DDS_LAN_DISCOVERY" not in source, str(path)
+
+
+def test_hal_motion_state_preserves_controller_sample_age_and_json_precision() -> None:
+    types = (REPO_ROOT / "hal" / "include" / "HalTypes.h").read_text(encoding="utf-8")
+    source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
+    json_source = (REPO_ROOT / "hal" / "src" / "HalJson.cpp").read_text(encoding="utf-8")
+    cached = source.split("MotionState LTDMCDriver::cachedStateSnapshot() const", 1)[1].split("HalHealth LTDMCDriver::cachedHealth", 1)[0]
+    assert "state.readTimestampMs = unixTimeMs()" not in cached
+    assert "state.sampleCached = true" in cached
+    assert "std::setprecision(17)" in json_source
+    assert "enabledConfirmed" in types
+    assert 'enabled_confirmed' in json_source
+
+
+def test_hal_hardware_home_is_sequential_bounded_and_limit_mode_is_explicit() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
+    body = source.split("std::array<bool, 6> LTDMCDriver::homeSide(", 1)[1].split("void LTDMCDriver::homeAll", 1)[0]
+    assert "True sequential seek" in body
+    assert "hardware reference search exceeded configured travel" in body
+    assert "done == 1 && homed == 0" in body
+    assert "ReferenceSeekMode::PositiveLimit" in body
+    assert "requires EL+ to be inactive before seek" in body
+    assert "edgeObserved" in body
+    assert "configureStageAxes(side);" not in body
+
+
+def test_native_dds_only_retains_pending_command_replies_and_cleans_timeouts() -> None:
+    source = (REPO_ROOT / "backend" / "native" / "appstation_fastdds_transport.cpp").read_text(encoding="utf-8")
+    assert "std::set<std::string> pendingReplies" in source
+    assert "pendingReplies.contains(samples[i].request_id)" in source
+    assert "pendingReplies.erase(key)" in source
+    assert "replies.erase(key)" in source
+
+
+def test_hal_dds_logs_low_frequency_command_request_lifecycle() -> None:
+    source = (REPO_ROOT / "hal" / "src" / "HalDdsControlServer.cpp").read_text(encoding="utf-8")
+    assert "event=command_received request_id=" in source
+    assert "event=command_replied request_id=" in source
+    assert 'request.name != "motion.teleop_target_update"' in source
+    assert "durationMs=" in source
+
+
+def test_motion_telemetry_uses_cached_hardware_sample_without_duplicate_vendor_read() -> None:
+    header = (REPO_ROOT / "hal" / "include" / "LTDMCDriver.h").read_text(encoding="utf-8")
+    driver = (REPO_ROOT / "hal" / "src" / "LTDMCDriver.cpp").read_text(encoding="utf-8")
+    dds = (REPO_ROOT / "hal" / "src" / "HalDdsControlServer.cpp").read_text(encoding="utf-8")
+    thread = (REPO_ROOT / "hal" / "src" / "MotionControlThread.cpp").read_text(encoding="utf-8")
+    json_source = (REPO_ROOT / "hal" / "src" / "HalJson.cpp").read_text(encoding="utf-8")
+    synthetic = driver.split("void LTDMCDriver::publishStateSnapshotLocked()", 1)[1].split(
+        "void LTDMCDriver::publishStateSnapshotLocked(const MotionState& state)", 1
+    )[0]
+    assert "MotionState latestState() const;" in header
+    assert "jsonMotionState(motion_.latestState())" in dds
+    assert "jsonMotionState(motion_.readState())" not in dds
+    assert "state.readTimestampMs = 0;" in synthetic
+    assert "state.sampleCached = true;" in synthetic
+    assert '<< state.readTimestampMs' in json_source
+    assert "std::chrono::milliseconds(1)" in thread
+
+
+def test_backend_freshness_uses_controller_sample_age_not_cache_provenance() -> None:
+    service = (REPO_ROOT / "backend" / "services" / "command_service.py").read_text(encoding="utf-8")
+    app = (REPO_ROOT / "backend" / "app.py").read_text(encoding="utf-8")
+    stationary = service.split("def require_stationary_motion", 1)[1].split("async def _confirm_work_origin", 1)[0]
+    confirm = service.split("async def _confirm_work_origin", 1)[1].split(
+        "async def _stop_manual_teleop_connect_before_motion_return", 1
+    )[0]
+    assert "sample_cached" not in stationary
+    assert "sample_cached" not in confirm
+    teleop = app.split("async def require_teleop_motion_already_enabled", 1)[1].split(
+        "def schedule_teleop_background", 1
+    )[0]
+    assert "timestamp_ms" in teleop
+    assert "sample_cached" not in teleop

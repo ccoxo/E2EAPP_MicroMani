@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 ConnectionState = Literal["ok", "warn", "error", "checking", "pending"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
@@ -32,6 +32,10 @@ def _default_motion_enabled() -> dict[ManualSide, bool | None]:
 
 def _default_motion_axis_enabled() -> dict[ManualSide, list[bool | None]]:
     return {"left": [None] * 6, "right": [None] * 6}
+
+
+def _default_motion_axis_enabled_confirmed() -> dict[ManualSide, list[bool]]:
+    return {"left": [False] * 6, "right": [False] * 6}
 ManualAxis = Literal["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
 ManualSpeedMode = Literal["fine", "medium", "coarse"]
 ManualGripperCommand = Literal["enable", "disable", "open", "close", "home", "target", "stop"]
@@ -106,6 +110,9 @@ class TelemetryFrame(BaseModel):
     )
     motionAxisEnabled: dict[Literal["left", "right"], list[bool | None]] = Field(
         default_factory=_default_motion_axis_enabled
+    )
+    motionAxisEnabledConfirmed: dict[Literal["left", "right"], list[bool]] = Field(
+        default_factory=_default_motion_axis_enabled_confirmed
     )
     forceLeft: list[float] = Field(min_length=6, max_length=6)
     forceRight: list[float] = Field(min_length=6, max_length=6)
@@ -188,6 +195,18 @@ class SnapshotCreateRequest(BaseModel):
     scope: SnapshotScope
     name: str
     config: dict[str, Any] | MotionCardSnapshotConfig | None = None
+
+
+class HardwareHomeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    axes: list[ManualAxis] = Field(min_length=1, max_length=6)
+
+    @field_validator("axes")
+    @classmethod
+    def unique_axes(cls, axes: list[ManualAxis]) -> list[ManualAxis]:
+        if len(set(axes)) != len(axes):
+            raise ValueError("hardware home axes must be unique")
+        return axes
 
 
 class ManualAxisMoveRequest(BaseModel):

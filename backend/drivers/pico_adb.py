@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -69,24 +70,30 @@ class PicoAdbDriver:
             }
         )
         try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-                check=False,
-                env=env,
-            )
+            # A batch file can leave a child holding stdout/stderr open after timeout.
+            # Files avoid waiting for inherited pipe handles when the parent is killed.
+            with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as stdout_file, \
+                    tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as stderr_file:
+                result = subprocess.run(
+                    args,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    timeout=timeout,
+                    check=False,
+                    env=env,
+                )
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout = stdout_file.read()
+                stderr = stderr_file.read()
         except FileNotFoundError:
             return PicoResult(False, f"executable not found: {args[0]}")
         except subprocess.TimeoutExpired:
             return PicoResult(False, f"adb command timed out: {' '.join(args)}")
         message = " ".join(args)
-        if result.returncode == 0 and self._adb_output_has_offline_device(result.stdout, result.stderr):
-            return PicoResult(False, f"{message} (device offline)", result.stdout, result.stderr)
-        return PicoResult(result.returncode == 0, message, result.stdout, result.stderr)
+        if result.returncode == 0 and self._adb_output_has_offline_device(stdout, stderr):
+            return PicoResult(False, f"{message} (device offline)", stdout, stderr)
+        return PicoResult(result.returncode == 0, message, stdout, stderr)
 
     def _endpoint(self, config: dict[str, Any]) -> str:
         pico = config["picoVision"]

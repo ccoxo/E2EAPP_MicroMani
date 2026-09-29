@@ -45,6 +45,8 @@ def test_resumed_dataset_keeps_each_episode_force_calibration(
         monkeypatch.setenv("APPSTATION_HAL_MODE", "real")
         config = default_config()
         config["storage"]["datasetRoot"] = str(tmp_path)
+        config["motion"]["origin"].update(leftValid=True, rightValid=True)
+        config["cameras"].update(globalIdentity="global", wristLeftIdentity="left", wristRightIdentity="right")
         hal = SimpleNamespace(force_state=AsyncMock(return_value=calibration_state(0.1, 1000)))
         recorder = DatasetRecorderService(
             SimpleNamespace(get_config=lambda: config),
@@ -56,8 +58,12 @@ def test_resumed_dataset_keeps_each_episode_force_calibration(
         )
         dataset_dir = tmp_path / "unit"
         (dataset_dir / "meta").mkdir(parents=True)
+        recorder._native_use_videos = True
+        recorder._write_appstation_info(dataset_dir, config)
         (dataset_dir / "meta" / "info.json").write_text(
-            json.dumps({"codebase_version": "v3.0", "dataContract": data_contract_metadata()}),
+            json.dumps({"codebase_version": "v3.0", "dataContract": data_contract_metadata(),
+                        "fps": 30, "features": recorder._native_features(config),
+                        "total_frames": 0, "total_episodes": 0}),
             encoding="utf-8",
         )
         monkeypatch.setattr(recorder, "_try_begin_native_dataset", AsyncMock(return_value=True))
@@ -73,6 +79,16 @@ def test_resumed_dataset_keeps_each_episode_force_calibration(
             recorder._episode_frames = 1
             first = (await recorder.save_episode())["episode"]
             first_snapshot = deepcopy(first["forceCalibration"])
+            # LeRobot 为替身，显式模拟它保存片段后更新的计数。
+            info = recorder._read_json(dataset_dir / "meta/info.json")
+            info.update(total_frames=1, total_episodes=1)
+            recorder._write_json(dataset_dir / "meta/info.json", info)
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+            meta_dir = dataset_dir / "meta/episodes/chunk-000"
+            meta_dir.mkdir(parents=True)
+            pq.write_table(pa.Table.from_pylist([{"episode_index": 0, "length": 1,
+                                                 "dataset_from_index": 0, "dataset_to_index": 1}]), meta_dir / "file-000.parquet")
             await recorder.finish_session()
 
             # 新会话模拟再次 Tare，仍然续录同一数据集。
@@ -96,7 +112,10 @@ def test_resumed_dataset_keeps_each_episode_force_calibration(
         assert first_snapshot["sideSemantics"] == "hardware"
         assert first_snapshot["hardwareSideForDatasetSide"] == {"left": "right", "right": "left"}
         app_info = recorder._read_json(dataset_dir / "meta" / "appstation_info.json")
-        assert app_info["hardware"]["force"]["calibration"]["completedAtUnixMs"] == 2000
+        assert app_info["hardware"]["force"]["calibration"]["completedAtUnixMs"] == 1000
+        assert app_info["sessionHistory"][-1]["hardware"]["force"]["calibration"]["completedAtUnixMs"] == 2000
+        assert episodes[0]["session"] == app_info["sessionHistory"][0]["session"]
+        assert episodes[1]["session"] == app_info["sessionHistory"][-1]["session"]
         first_detail = recorder._episode_for_api(dataset_dir, "unit", episodes[0], include_samples=False)
         assert first_detail["forceCalibration"] == first_snapshot
         first_detail["forceCalibration"]["state"]["sides"]["left"]["sensorTareBias"][0] = 99.0

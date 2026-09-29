@@ -453,6 +453,7 @@ const emptyFrame: TelemetryFrame = {
   gripperPositions: [-1, -1],
   motionEnabled: { left: null, right: null },
   motionAxisEnabled: { left: Array.from({ length: 6 }, () => null), right: Array.from({ length: 6 }, () => null) },
+  motionAxisEnabledConfirmed: { left: Array.from({ length: 6 }, () => false), right: Array.from({ length: 6 }, () => false) },
   forceLeft: [0, 0, 0, 0, 0, 0],
   forceRight: [0, 0, 0, 0, 0, 0],
   forceStatus: {
@@ -629,6 +630,10 @@ function buildFrame(state: TelemetryStore): TelemetryFrame {
     ],
     motionEnabled: { left: false, right: false },
     motionAxisEnabled: {
+      left: Array.from({ length: 6 }, () => false),
+      right: Array.from({ length: 6 }, () => false),
+    },
+    motionAxisEnabledConfirmed: {
       left: Array.from({ length: 6 }, () => false),
       right: Array.from({ length: 6 }, () => false),
     },
@@ -901,6 +906,8 @@ function backendFrameCommitIsUrgent(previous: TelemetryFrame, next: TelemetryFra
     || previous.motionEnabled.right !== next.motionEnabled.right
     || previous.motionAxisEnabled.left.some((value, index) => value !== next.motionAxisEnabled.left[index])
     || previous.motionAxisEnabled.right.some((value, index) => value !== next.motionAxisEnabled.right[index])
+    || (previous.motionAxisEnabledConfirmed?.left ?? []).some((value, index) => value !== (next.motionAxisEnabledConfirmed?.left ?? [])[index])
+    || (previous.motionAxisEnabledConfirmed?.right ?? []).some((value, index) => value !== (next.motionAxisEnabledConfirmed?.right ?? [])[index])
     || (previous.dangerIndex < 1 && next.dangerIndex >= 1)
 }
 /** 当前 UI 提交节流间隔：隐藏页降频，可见页约 15Hz。 */
@@ -1066,6 +1073,28 @@ export function normalizeConfig(config: AppConfig): AppConfig {
     delete motion.homeOnStartup
     config = { ...config, motion }
   }
+  // 只迁移已发布的旧默认路径，保留用户后来确认的稳定绑定。
+  const oldGlobalIdentities = [
+    'USB\\VID_0ABD&PID_8050&MI_00\\7&1396F44D&0&0000',
+    'USB\\VID_0ABD&PID_8050&MI_00\\7&124CCBA8&0&0000',
+  ]
+  if (oldGlobalIdentities.includes(config.cameras.globalIdentity ?? '')) {
+    const cameras = { ...config.cameras, global: defaultConfig.cameras.global, globalIdentity: defaultConfig.cameras.globalIdentity }
+    const oldWristIdentities = [
+      'USB\\VID_0ABD&PID_8050&MI_00\\7&398F0A3&0&0000',
+      'USB\\VID_0ABD&PID_8050&MI_00\\7&7861A93&0&0000',
+      'USB\\VID_0ABD&PID_8050&MI_00\\8&3724732E&0&0000',
+    ]
+    for (const role of ['wristLeft', 'wristRight'] as const) {
+      if (oldWristIdentities.includes(cameras[`${role}Identity`] ?? '')) {
+        cameras[role] = 'index -1'
+        cameras[`${role}Identity`] = ''
+      }
+    }
+    config = { ...config, cameras }
+  }
+  const hasExplicitCameraIdentity = (['globalIdentity', 'wristLeftIdentity', 'wristRightIdentity'] as const)
+    .some((key) => config.cameras[key] && config.cameras[key] !== defaultConfig.cameras[key])
   const hasPreviousImx258CameraDefaults =
     config.cameras.global === 'AR0234 / index 1'
     && config.cameras.wristLeft === 'IMX258 / index 2'
@@ -1093,12 +1122,12 @@ export function normalizeConfig(config: AppConfig): AppConfig {
     return config
   }
   const next = cloneConfig(config)
-  if (
+  if (!hasExplicitCameraIdentity && (
     hasPreviousImx258CameraDefaults
     || hasPreviousImx335CameraDefaults
     || hasLegacyReversedWristCameras
     || hasLegacyCyclicCameraRoles
-  ) {
+  )) {
     next.cameras = {
       ...next.cameras,
       global: defaultConfig.cameras.global,
@@ -1271,9 +1300,9 @@ function reportFromSavedEpisode(fallback: RecordQualityReport, episode?: RecordE
 /** 构建当前流程需要的数据结构。 */
 function makeDiscardedEpisodeRecord(session: RecordSessionState): EpisodeRecord {
   return {
-    index: session.currentEpisode,
-    frameCount: Math.max(0, session.recorderFrameCount),
-    durationS: Math.max(0, session.recorderElapsedS),
+    index: session.latestQualityReport?.index ?? session.currentEpisode,
+    frameCount: session.latestQualityReport?.frameCount ?? Math.max(0, session.recorderFrameCount),
+    durationS: session.latestQualityReport?.durationS ?? Math.max(0, session.recorderElapsedS),
     status: 'discarded',
     maxForceLeft: 0,
     maxForceRight: 0,
@@ -1340,6 +1369,15 @@ function rejectUnsafeControl(get: TelemetryStoreGet, set: TelemetryStoreSet): bo
   const reason = controlSafetyBlockReason(get(), !mockMode)
   if (!reason) return false
   set((state) => ({ logs: appendLog(state.logs, makeLog('WARNING', reason, '[SAFETY]')) }))
+  return true
+}
+
+function rejectRecordingOriginReturn(get: TelemetryStoreGet, set: TelemetryStoreSet): boolean {
+  const state = get()
+  if (!state.recording && ['idle', 'resetting', 'reviewing'].includes(state.recordSession.phase)) return false
+  set((current) => ({
+    logs: appendLog(current.logs, makeLog('WARNING', '请先保存或丢弃当前录制片段，等待处理完成后再返回工作原点', '[LEROBOT]')),
+  }))
   return true
 }
 
@@ -2016,6 +2054,7 @@ saveRecordEpisode: () => {
 discardRecordEpisode: () => {
     const session = get().recordSession
     if (!['recording', 'interrupted', 'reviewing'].includes(session.phase)) return
+    const discardingSavedEpisode = session.latestQualityReport !== null
     const record = makeDiscardedEpisodeRecord(session)
     set((state) => ({ recording: false, recordSession: { ...state.recordSession,
       phase: 'discarding', phaseStartedAt: Date.now(), resetPending: false, resetReady: false } }))
@@ -2025,6 +2064,9 @@ discardRecordEpisode: () => {
         recording: false,
         recordSession: {
           ...state.recordSession,
+          savedEpisodes: discardingSavedEpisode
+            ? Math.max(0, state.recordSession.savedEpisodes - 1)
+            : state.recordSession.savedEpisodes,
           phase: 'resetting',
           phaseStartedAt: Date.now(),
           recorderFps: 0,
@@ -2037,14 +2079,14 @@ discardRecordEpisode: () => {
           resetRequiredSides: defaultRecordResetRequiredSides,
           resetReturnedSides: [],
           resetReady: false,
-          episodeHistory: [record, ...state.recordSession.episodeHistory].slice(0, 20),
+          episodeHistory: [record, ...state.recordSession.episodeHistory.filter((item) => item.index !== record.index)].slice(0, 20),
         },
         logs: appendLog(state.logs, makeLog('WARNING', `Episode #${record.index} 已丢弃，等待复位`, '[LEROBOT]')),
       }
     })).catch((error) => {
       set((state) => ({
         recordSession: state.recordSession.phase === 'discarding'
-          ? { ...state.recordSession, phase: 'interrupted', resetPending: false, resetReady: false }
+          ? { ...state.recordSession, phase: discardingSavedEpisode ? 'reviewing' : 'interrupted', resetPending: false, resetReady: false }
           : state.recordSession,
         logs: appendLog(state.logs, makeLog('ERROR', `record episode discard failed; pending review: ${String(error)}`, '[LEROBOT]')),
       }))
@@ -2076,9 +2118,6 @@ acceptRecordQualityReport: () => {
           recorderElapsedS: 0,
           recorderTotalS: state.recordSession.resetTimeS,
           resetPending: true,
-          resetRequiredSides: defaultRecordResetRequiredSides,
-          resetReturnedSides: [],
-          resetReady: false,
         },
         logs: appendLog(state.logs, makeLog('INFO', '质量报告已接受，进入复位等待', '[LEROBOT]')),
       }
@@ -2088,39 +2127,9 @@ acceptRecordQualityReport: () => {
 
 /** 描述当前方法的功能边界。 */
 rejectRecordQualityReport: () => {
-    void discardRecordEpisodeApi().catch((error) => {
-      set((state) => ({
-        logs: appendLog(state.logs, makeLog('ERROR', `record episode rerecord failed: ${String(error)}`, '[LEROBOT]')),
-      }))
-    })
-    set((state) => {
-      const report = state.recordSession.latestQualityReport
-      if (!report) return state
-      finishRecordSessionAfterReview = false
-      const savedEpisodes = Math.max(0, state.recordSession.savedEpisodes - 1)
-      return {
-        recording: false,
-        recordSession: {
-          ...state.recordSession,
-          currentEpisode: report.index,
-          savedEpisodes,
-          latestQualityReport: null,
-          phase: 'resetting',
-          phaseStartedAt: Date.now(),
-          recorderFps: 0,
-          recorderFrameCount: 0,
-          recorderLateFrames: 0,
-          recorderElapsedS: 0,
-          recorderTotalS: state.recordSession.resetTimeS,
-          resetPending: true,
-          resetRequiredSides: defaultRecordResetRequiredSides,
-          resetReturnedSides: [],
-          resetReady: false,
-          episodeHistory: state.recordSession.episodeHistory.filter((item) => item.index !== report.index),
-        },
-        logs: appendLog(state.logs, makeLog('WARNING', `Episode #${report.index} 已退回，等待复位`, '[LEROBOT]')),
-      }
-    })
+    if (get().recordSession.phase !== 'reviewing' || !get().recordSession.latestQualityReport) return
+    finishRecordSessionAfterReview = false
+    get().discardRecordEpisode()
   },
 
 /** 描述当前方法的功能边界。 */
@@ -2246,7 +2255,7 @@ setRecordSpeedMode: (mode) => {
 
 /** 发送或封装对应的后端命令。 */
 homeRecordArms: () => {
-    if (get().recordSession.phase === 'discarding') return
+    if (rejectRecordingOriginReturn(get, set)) return
     if (rejectUnsafeControl(get, set)) return
     const generation = get().controlSafety.generation
     if (recordMotionOriginInFlight) {
@@ -2314,7 +2323,7 @@ homeRecordArms: () => {
 
 /** 描述当前方法的功能边界。 */
 returnRecordMotionOrigin: async (side) => {
-    if (get().recordSession.phase === 'discarding') return
+    if (rejectRecordingOriginReturn(get, set)) return
     if (rejectUnsafeControl(get, set)) return
     const generation = get().controlSafety.generation
     const operatorLabel = operatorSideLabel(operatorSideForHardwareSide(side))

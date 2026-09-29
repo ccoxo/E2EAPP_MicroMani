@@ -13,11 +13,18 @@ for %%S in (LTDMCDriver MotionControlThread MotionExecutor NativeTeleopControlle
 )
 set OBJECTS=LTDMCDriver.obj MotionControlThread.obj MotionExecutor.obj NativeTeleopController.obj Omega7Driver.obj JodellGripperDriver.obj ForceControlRuntime.obj ForceSafetyLatch.obj ForceComplianceController.obj HkvlForceDriver.obj HkvlForceProtocol.obj HalJson.obj HalCommandDispatcher.obj TeleopHardwareTargetExecutor.obj
 set TEST_RESULT=0
-for %%T in (MotionExecutorTests EmergencyStopTests ControlLeaseTests ThreadStabilityTests WorkerResilienceTests ForceTareRuntimeTests ForceCoreTests) do (
+for %%T in (MotionExecutorTests EmergencyStopTests ControlLeaseTests ThreadStabilityTests WorkerResilienceTests ForceTareRuntimeTests ForceCoreTests StateSemanticsTests) do (
   cl %FLAGS% "%HAL_ROOT%\tests\%%T.cpp" %OBJECTS% /Fe"%%T.exe" || goto :failed
   call :run_test %%T
   if errorlevel 1 set TEST_RESULT=1
 )
+rem 此测试注入 SDK 函数指针，不加载 vendor DLL 或连接设备。
+cl %FLAGS% "%HAL_ROOT%\tests\HardwareHomingTests.cpp" /Fe"HardwareHomingTests.exe" || goto :failed
+call :run_test HardwareHomingTests
+if errorlevel 1 set TEST_RESULT=1
+cl %FLAGS% "%HAL_ROOT%\tests\HardwareReferenceReturnTests.cpp" /Fe"HardwareReferenceReturnTests.exe" || goto :failed
+call :run_test HardwareReferenceReturnTests
+if errorlevel 1 set TEST_RESULT=1
 popd
 exit /b %TEST_RESULT%
 :failed

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -14,6 +15,90 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize("scenario,domain,recovered_ports", [
+    ("stale", 42, [17900, 17910]),
+    ("current_boot", 42, []),
+    ("mixed_age", 42, [17910]),
+    ("busy", 42, [17900]),
+    ("custom_domain", 43, [18150]),
+    ("missing", 42, []),
+])
+def test_hal_recovers_only_unused_preboot_dds_ports(scenario, domain, recovered_ports, tmp_path):
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if shell is None:
+        pytest.skip("PowerShell is required for DDS startup recovery validation")
+    program_data = tmp_path / "programdata"
+    shm_dir = program_data / "eProsima" / "fastrtps_interprocess"
+    original = {}
+    if scenario != "missing":
+        shm_dir.mkdir(parents=True)
+        for port in (17900, 17910, 18150):
+            for suffix in ("", "_mutex", "_sl"):
+                path = shm_dir / f"fastrtps_port{port}{suffix}"
+                original[path.name] = path.name.encode("ascii")
+                path.write_bytes(original[path.name])
+                os.utime(path, (1_000_000, 1_000_000))
+        # 匿名数据段和其他文件不属于本次端口锁恢复范围。
+        for name in ("fastrtps_0123456789abcdef", "unrelated.txt", "fastrtps_port17900_unknown"):
+            path = shm_dir / name
+            original[name] = b"preserve"
+            path.write_bytes(original[name])
+            os.utime(path, (1_000_000, 1_000_000))
+        if scenario == "current_boot":
+            for path in shm_dir.iterdir():
+                os.utime(path, (2_000_000_000, 2_000_000_000))
+        elif scenario == "mixed_age":
+            os.utime(shm_dir / "fastrtps_port17900", (2_000_000_000, 2_000_000_000))
+    script = REPO_ROOT / "scripts" / "start-hal.ps1"
+    command = f"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$env:ProgramData = '{program_data.as_posix()}'
+function Get-CimInstance {{ [pscustomobject]@{{ LastBootUpTime = [datetime]'2026-09-29T06:42:00Z' }} }}
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('{script.as_posix()}', [ref]$null, [ref]$parseErrors)
+if ($parseErrors.Count) {{ throw ($parseErrors | Out-String) }}
+$fn = $ast.Find({{ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Repair-StaleDdsPorts' }}, $true)
+if ($null -eq $fn) {{ throw 'missing DDS startup recovery' }}
+Invoke-Expression $fn.Extent.Text
+$busy = $null
+try {{
+  if ('{scenario}' -eq 'busy') {{
+    $busy = [IO.File]::Open('{(shm_dir / "fastrtps_port17910_sl").as_posix()}', 'Open', 'ReadWrite', 'ReadWrite, Delete')
+    $busy.Lock(0, 1)
+  }}
+  Repair-StaleDdsPorts -DomainId {domain}
+  Repair-StaleDdsPorts -DomainId {domain}
+}} finally {{ if ($busy) {{ $busy.Dispose() }} }}
+"""
+    result = subprocess.run(
+        [shell, "-NoProfile", "-Command", command], capture_output=True,
+        text=True, encoding="utf-8", timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected_moved = {
+        f"fastrtps_port{port}{suffix}"
+        for port in recovered_ports for suffix in ("", "_mutex", "_sl")
+    }
+    backups = list(shm_dir.glob("appstation-recovery-*/*"))
+    assert {path.name for path in backups} == expected_moved
+    for name, contents in original.items():
+        if name in expected_moved:
+            assert not (shm_dir / name).exists()
+            assert next(path for path in backups if path.name == name).read_bytes() == contents
+        else:
+            assert (shm_dir / name).read_bytes() == contents
+    assert len(list(shm_dir.glob("appstation-recovery-*"))) == bool(expected_moved)
+
+
+def test_hal_repairs_dds_ports_after_domain_selection_and_before_launch():
+    script = (REPO_ROOT / "scripts" / "start-hal.ps1").read_text(encoding="utf-8")
+    recovery = script.index("Repair-StaleDdsPorts -DomainId")
+    assert script.index('if (-not $env:APPSTATION_DDS_DOMAIN_ID)') < recovery
+    assert script.index("if ($existing)") < recovery < script.index("$process = Start-Process")
+    assert "-DomainId ([int]$env:APPSTATION_DDS_DOMAIN_ID)" in script
 
 
 def test_start_app_cmd_runs_without_command_errors(tmp_path):
@@ -76,6 +161,80 @@ def test_hal_startup_validates_existing_and_new_processes():
     assert existing.index("Assert-HalCapabilities -Health $health") < existing.index("exit 0")
     started = script.split("$process = Start-Process", 1)[1]
     assert "Assert-HalCapabilities -Health $health" in started
+
+
+@pytest.mark.parametrize("scenario,attempts,error", [
+    ("delayed", 3, None),
+    ("timeout", 6, "Timed out after 60 seconds"),
+    ("exited", 1, "exit code=42"),
+    ("capabilities", 1, "HAL protocol capabilities missing"),
+    ("motion", 1, "LTDMC is not initialized"),
+])
+def test_hal_startup_waits_for_readiness_and_reports_failures(scenario, attempts, error, tmp_path):
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if shell is None:
+        pytest.skip("PowerShell is required for startup validation")
+    script = REPO_ROOT / "scripts" / "start-hal.ps1"
+    diagnostic = tmp_path / "hal.err.log"
+    diagnostic.write_text("driver startup diagnostic", encoding="ascii")
+    # 只运行启动后的检查段；替代进程、HTTP 和时钟，不加载 DLL 或访问硬件。
+    command = f"""
+$ErrorActionPreference = 'Stop'
+$source = Get-Content -Raw '{script.as_posix()}'
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$null, [ref]$parseErrors)
+if ($parseErrors.Count) {{ throw ($parseErrors | Out-String) }}
+$fn = $ast.Find({{ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-HalCapabilities' }}, $true)
+Invoke-Expression $fn.Extent.Text
+$script:attempts = 0
+$script:clock = [datetime]'2026-01-01'
+$script:stopped = $false
+$fakeProcess = [pscustomobject]@{{ Id = 4242; HasExited = $false; ExitCode = 42 }}
+$fakeProcess | Add-Member ScriptMethod Refresh {{
+  if ('{scenario}' -eq 'exited' -and $script:attempts -gt 0) {{ $this.HasExited = $true }}
+}}
+function Start-Process {{ return $fakeProcess }}
+function Stop-ProcessTree {{ param($RootPid) $script:stopped = $true }}
+function Start-Sleep {{ }}
+function Get-Date {{
+  $script:clock = $script:clock.AddSeconds(10)
+  return $script:clock
+}}
+function Invoke-RestMethod {{
+  $script:attempts++
+  if ('{scenario}' -in @('timeout', 'exited') -or ('{scenario}' -eq 'delayed' -and $script:attempts -lt 3)) {{
+    throw 'connection refused'
+  }}
+  $capabilities = @('force_calibration_state_v1', 'control_lease_v1')
+  if ('{scenario}' -eq 'capabilities') {{ $capabilities = @() }}
+  return [pscustomobject]@{{ ltdmc_ok = ('{scenario}' -ne 'motion'); omega7_ok = $true; version = 'test'; capabilities = $capabilities }}
+}}
+$Port = 8091
+$halOutLog = '{(tmp_path / "hal.out.log").as_posix()}'
+$halErrLog = '{diagnostic.as_posix()}'
+$failure = $null
+$result = $null
+try {{
+  $result = Invoke-Expression $source.Substring($source.IndexOf('$process = Start-Process'))
+}} catch {{
+  $failure = $_.Exception.Message
+}}
+[pscustomobject]@{{ result = $result; failure = $failure; attempts = $script:attempts; stopped = $script:stopped }} | ConvertTo-Json -Depth 5 -Compress
+"""
+    result = subprocess.run([shell, "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+    outcome = json.loads(result.stdout.strip().splitlines()[-1])
+    assert outcome["attempts"] == attempts, outcome
+    if error is None:
+        assert outcome["failure"] is None, outcome
+        assert outcome["result"]["pid"] == 4242
+        assert outcome["result"]["ltdmc_ok"] is True
+        assert outcome["stopped"] is False
+    else:
+        assert error in outcome["failure"], outcome
+        assert "driver startup diagnostic" in outcome["failure"]
+        assert outcome["result"] is None
+        assert outcome["stopped"] is True
 
 
 def test_start_stack_cleans_backend_process_tree_even_without_listening_port() -> None:
@@ -250,6 +409,41 @@ def test_start_stack_retries_hal_on_fallback_port_and_propagates_active_url() ->
     assert 'APPSTATION_DDS_DOMAIN_ID = "42"' in script
     assert 'APPSTATION_HAL_BASE_URL = "http://127.0.0.1:$activeHalPort"' in script
     assert 'hal = "http://127.0.0.1:$activeHalPort"' in script
+
+
+@pytest.mark.parametrize("failure,ports", [
+    ("Failed to bind HalServer on 127.0.0.1:8091", ["8091", "8092"]),
+    ("Timed out after 60 seconds", ["8091"]),
+    ("HAL exited before readiness; exit code=42", ["8091"]),
+    ("HAL protocol capabilities missing", ["8091"]),
+])
+def test_start_stack_only_changes_port_for_bind_failure(failure, ports, tmp_path):
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if shell is None:
+        pytest.skip("PowerShell is required for startup validation")
+    source = (REPO_ROOT / "scripts" / "start-stack.ps1").read_text(encoding="utf-8")
+    start = source.index("$activeHalPort = $HalPort")
+    end = source.index("Start-Sleep -Seconds 1", start)
+    # 临时目录中的替身只记录端口；不执行真实服务脚本。
+    (tmp_path / "start-hal.ps1").write_text(
+        'param([switch]$Restart, [int]$Port)\n'
+        'Add-Content -LiteralPath "$PSScriptRoot/ports.txt" -Value $Port\n'
+        f"if ($Port -eq 8091) {{ throw 'HAL started pid=4242, but /health failed: {failure}' }}\n",
+        encoding="ascii",
+    )
+    harness = tmp_path / "test.ps1"
+    harness.write_text(
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
+        "$ErrorActionPreference = 'Stop'\n$HalPort = 8091\ntry {\n"
+        + source[start:end] + "\n} catch { Write-Output $_.Exception.Message }\n",
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+        capture_output=True, text=True, encoding="utf-8", timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "ports.txt").read_text().splitlines() == ports
 
 
 def test_start_stack_preserves_existing_dds_domain_for_backend_after_hal_start() -> None:

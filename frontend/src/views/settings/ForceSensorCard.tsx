@@ -33,7 +33,8 @@ import type {
   LogEntry,
   TelemetryFrame,
 } from '../../types'
-import { HardwareConfigCard, MetricBox, commandLog } from './shared'
+import { HardwareConfigCard, MetricBox } from './shared'
+import { commandLog } from './sharedHelpers'
 
 const forceAxisCalibrationAxes = semanticAxes.map((axis, index) => ({ axis, channel: forceChannels[index], index }))
 const forceAxisCalibrationGroups = [

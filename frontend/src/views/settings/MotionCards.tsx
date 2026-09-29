@@ -4,7 +4,10 @@
  */
 import {
   captureMotionOrigin,
+  fetchMotionOrigin,
   homeMotionSide,
+  referencePositiveLimitSide,
+  returnHardwareReferenceSide,
   restorePreviousMotionOrigin,
   type MotionOriginCaptureDrift,
   type MotionPreviousRestoreStatus,
@@ -40,12 +43,16 @@ import type {
   ArmMotionProfile,
   ArmSoftLimitConfig,
   LogEntry,
+  ManualControlAxis,
   MotionOriginConfig,
   ParameterSnapshotScope,
   RotationWorkLimitSideConfig,
 } from '../../types'
-import { HardwareConfigCard, MetricBox, commandLog, type PendingComparison } from './shared'
+import { HardwareConfigCard, MetricBox, type PendingComparison } from './shared'
+import { commandLog } from './sharedHelpers'
 import { formatSnapshotTime } from './motionHelpers'
+
+const REFERENCE_AXES: ManualControlAxis[] = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw']
 
 const TRANSLATION_SOFT_LIMIT_DISABLED_MIN = -1000000000
 const TRANSLATION_SOFT_LIMIT_DISABLED_MAX = 1000000000
@@ -265,7 +272,7 @@ function AxisMappingTable({
                   <span className="axis-travel">{axis.travel}</span>
                 </td>
                 <td className="numeric-cell">{formatAxisValue(positions[sideSpec.stateOffset + index] ?? 0, index)}</td>
-                <td className="numeric-cell">{pulse.toFixed(axis.axis === 'X' || axis.axis === 'Z' ? 4 : 3)}</td>
+                <td className="numeric-cell">{pulse.toFixed(axis.axis === 'X' || axis.axis === 'Z' || (side === 'right' && axis.axis === 'Yaw') ? 4 : 3)}</td>
                 <td>{renderProfileInput(group, 'startSpeed', group === 'translation' ? 0.1 : 0.01)}</td>
                 <td>{renderProfileInput(group, 'maxSpeed', group === 'translation' ? 0.1 : 0.01)}</td>
                 <td>{renderProfileInput(group, 'accTimeSec', 0.01)}</td>
@@ -478,7 +485,21 @@ export function MotionCard({
         : '仅当前侧工作原点已记录'
       : '当前侧工作原点未记录'
   const originUpdatedText = motionOrigin.updatedAt > 0 ? `最后更新 ${formatSnapshotTime(motionOrigin.updatedAt)}` : originScopeText
-  const [pendingMotionAction, setPendingMotionAction] = useState<'home' | null>(null)
+  const [pendingMotionAction, setPendingMotionAction] = useState<'return' | 'seek' | 'limit' | null>(null)
+  const [referenceAction, setReferenceAction] = useState<'return' | 'seek' | 'limit' | null>(null)
+  const [selectedAxes, setSelectedAxes] = useState<ManualControlAxis[]>([])
+  const [referenceStatus, setReferenceStatus] = useState('')
+  const reference = config.motion.homeReference
+  const confirmedAxes = reference[hardwareSide === 'left' ? 'leftAxisConfirmed' : 'rightAxisConfirmed'] ?? []
+  const referencePulses = reference[hardwareSide === 'left' ? 'leftPulse' : 'rightPulse']
+  const unconfirmedSelection = selectedAxes.filter((axis) => confirmedAxes[REFERENCE_AXES.indexOf(axis)] !== true)
+  const positiveLimitAxes: ManualControlAxis[] = hardwareSide === 'right' ? ['X', 'Z'] : ['X', 'Y']
+  const invalidPositiveLimitSelection = selectedAxes.filter((axis) => !positiveLimitAxes.includes(axis))
+  const openReferenceAction = (action: 'return' | 'seek' | 'limit') => {
+    setReferenceAction(action)
+    setSelectedAxes([])
+    setReferenceStatus('')
+  }
   const [pendingOriginAction, setPendingOriginAction] = useState<'capture' | 'restore' | null>(null)
   const motionEnable = useMotionEnable(hardwareSide)
   const controlBlockReason = useTelemetryStore((state) => controlSafetyBlockReason(state))
@@ -498,19 +519,72 @@ export function MotionCard({
         : '备份待校验'
   const previousRestoreMessage = previousRestoreAvailable ? previousRestoreStatus?.message : ''
  /** 处理对应的用户交互。 */
- const handleHome = async () => {
+ // 服务端反馈只同步页面，不能经 updateConfig 再写回配置覆盖新的寻零结果。
+ const syncMotionState = (patch: Pick<AppConfig, 'motion'>) => {
+    useTelemetryStore.setState((state) => ({ config: { ...state.config, ...patch } }))
+  }
+ const handleReferenceAction = async (action: 'return' | 'seek' | 'limit', axes: ManualControlAxis[]) => {
+    const label = action === 'seek' ? '\u673a\u68b0\u5bfb\u96f6' : action === 'limit' ? '\u6b63\u9650\u4f4d\u5efa\u53c2\u8003' : '\u8fd4\u56de\u673a\u68b0\u53c2\u8003\u70b9'
+    let completionMessage = `${label}\u5b8c\u6210\uff1a${axes.join('\u3001')}`
     const reason = controlSafetyBlockReason(useTelemetryStore.getState())
     if (reason) {
-      injectLog('WARNING', `${operatorLabel}回硬件零点受阻：${reason}`, '[HAL]')
+      injectLog('WARNING', `${operatorLabel}${label}\u53d7\u963b\uff1a${reason}`, '[HAL]')
+      setReferenceStatus(`${label}\u53d7\u963b\uff1a${reason}`)
       return
     }
-    setPendingMotionAction('home')
+    const generation = useTelemetryStore.getState().controlSafety.generation
+    setPendingMotionAction(action)
+    setReferenceStatus(`${action === 'seek' ? '\u6b63\u5728\u5bfb\u96f6' : action === 'limit' ? '\u6b63\u5728\u5bfb\u627e\u6b63\u9650\u4f4d' : '\u6b63\u5728\u8fd4\u56de'}\uff1a${axes.join('\u3001')}`)
     try {
-      await homeMotionSide(hardwareSide)
-      commandLog(injectLog, '[HAL]', `${operatorLabel}回硬件零点完成（未写入工作原点）`)
+      if (action === 'seek' || action === 'limit') {
+        const nextConfirmed = REFERENCE_AXES.map((axis, index) => !axes.includes(axis) && confirmedAxes[index] === true)
+        syncMotionState({ motion: { ...config.motion, homeReference: {
+          ...reference, [hardwareSide === 'left' ? 'leftAxisConfirmed' : 'rightAxisConfirmed']: nextConfirmed,
+        } } })
+        const response = action === 'seek'
+          ? await homeMotionSide(hardwareSide, axes)
+          : await referencePositiveLimitSide(hardwareSide, axes)
+        if (response.data?.homeReference) {
+          const limitSources = response.data.homeReference[hardwareSide === 'left' ? 'leftAxisLimitReference' : 'rightAxisLimitReference'] ?? []
+          const limitAxes = axes.filter((axis) => limitSources[REFERENCE_AXES.indexOf(axis)] === true)
+          if (action === 'limit') completionMessage = `\u6b63\u9650\u4f4d\u53c2\u8003\u8bb0\u5f55\u5b8c\u6210\uff1a${limitAxes.join('\u3001')}`
+          syncMotionState({ motion: {
+            ...useTelemetryStore.getState().config.motion,
+            homeReference: response.data.homeReference,
+            ...(response.data.origin ? { origin: response.data.origin } : {}),
+            ...(response.data.workOriginOffset ? { workOriginOffset: response.data.workOriginOffset } : {}),
+          } })
+        }
+      } else {
+        await returnHardwareReferenceSide(hardwareSide, axes)
+      }
+      const current = useTelemetryStore.getState()
+      if (current.controlSafety.generation !== generation || controlSafetyBlockReason(current)) {
+        throw new Error('\u64cd\u4f5c\u671f\u95f4\u53d1\u751f\u6025\u505c\u6216\u8fde\u63a5\u72b6\u6001\u53d8\u5316\uff0c\u8bf7\u6838\u9a8c\u6267\u884c\u7ed3\u679c')
+      }
+      setReferenceStatus(completionMessage)
+      commandLog(injectLog, '[HAL]', `${operatorLabel}${completionMessage}`)
     } catch (error) {
-      injectLog('ERROR', `${operatorLabel}回硬件零点失败：${commandErrorMessage(error)}`, '[HAL]')
+      const message = `${label}\u5931\u8d25\uff1a${commandErrorMessage(error)}`
+      setReferenceStatus(message)
+      injectLog('ERROR', `${operatorLabel}${message}`, '[HAL]')
     } finally {
+      if (action === 'seek' || action === 'limit') {
+        try {
+          const response = await fetchMotionOrigin()
+          if (response.data?.homeReference) {
+            syncMotionState({ motion: {
+              ...useTelemetryStore.getState().config.motion,
+              homeReference: response.data.homeReference,
+              ...(response.data.origin ? { origin: response.data.origin } : {}),
+              ...(response.data.workOriginOffset ? { workOriginOffset: response.data.workOriginOffset } : {}),
+            } })
+          }
+          await refreshMotionOriginStatus()
+        } catch (error) {
+          injectLog('WARNING', `\u673a\u68b0\u53c2\u8003\u72b6\u6001\u5237\u65b0\u5931\u8d25\uff1a${commandErrorMessage(error)}`, '[HAL]')
+        }
+      }
       setPendingMotionAction(null)
     }
   }
@@ -591,27 +665,38 @@ export function MotionCard({
     }
   }
  /** 处理对应的用户交互。 */
- const requestHome = () => {
-    const reason = controlSafetyBlockReason(useTelemetryStore.getState())
-    if (reason) {
-      injectLog('WARNING', `${operatorLabel}回硬件零点受阻：${reason}`, '[HAL]')
-      return
-    }
+ const requestReferenceAction = () => {
+    if (!referenceAction || selectedAxes.length === 0 || pendingMotionAction) return
+    if (referenceAction === 'return' && unconfirmedSelection.length > 0) return
+    if (referenceAction === 'limit' && invalidPositiveLimitSelection.length > 0) return
+    const action = referenceAction
+    const axes = [...selectedAxes]
+    const seeking = action === 'seek'
+    const limitSeeking = action === 'limit'
+    const label = seeking ? '\u673a\u68b0\u5bfb\u96f6' : limitSeeking ? '\u6b63\u9650\u4f4d\u5efa\u53c2\u8003' : '\u8fd4\u56de\u673a\u68b0\u53c2\u8003\u70b9'
     requestComparison({
-      title: `${operatorLabel}回硬件零点`,
+      title: `${operatorLabel}${label}`,
       tone: 'danger',
-      impact: `将通过 HAL 调用 ${operatorLabel} LTDMC HOME 回零流程；本动作不会写入工作原点记录。`,
-      expected: '确认前请确认工作区安全；确认后只移动硬件轴，不更改 homeReference、工作原点或软限位。',
+      impact: seeking
+        ? `\u4ec5\u5bf9 ${axes.join('\u3001')} \u9010\u8f74\u6267\u884c\u4e25\u683c ORG \u5bfb\u96f6\uff1b\u524d\u4e00\u8f74\u6210\u529f\u7ed3\u675f\u540e\u624d\u542f\u52a8\u4e0b\u4e00\u8f74\u3002\u5931\u8d25\u4e0d\u4f1a\u81ea\u52a8\u6539\u7528\u9650\u4f4d\u53c2\u8003\u3002`
+        : limitSeeking
+          ? `\u4ec5\u5bf9 ${axes.join('\u3001')} \u9010\u8f74\u5bfb\u627e\u5df2\u914d\u7f6e\u7684\u6b63\u9650\u4f4d\uff0c\u5fc5\u987b\u89c2\u5bdf\u5230 EL+ OFF->ON \u8fb9\u6cbf\u624d\u8bb0\u5f55\u53c2\u8003\uff0c\u4e0d\u4f1a\u5ba3\u79f0\u627e\u5230 ORG\u3002`
+          : `\u4ec5\u5c06 ${axes.join('\u3001')} \u8fd4\u56de\u5df2\u786e\u8ba4\u7684\u673a\u68b0\u53c2\u8003\u70b9\uff0c\u4e0d\u5bfb\u96f6\u3001\u4e0d\u66f4\u65b0\u53c2\u8003\u8bb0\u5f55\u3002`,
+      expected: seeking
+        ? '\u786e\u8ba4\u6240\u9009\u8f74\u5bfb\u96f6\u8def\u5f84\u5b89\u5168\uff1b\u641c\u7d22\u53d7\u6bcf\u8f74\u6700\u5927\u884c\u7a0b\u548c\u8d85\u65f6\u9650\u5236\u3002'
+        : limitSeeking
+          ? '\u786e\u8ba4\u6240\u9009\u5e73\u79fb\u8f74\u5f53\u524d\u4e0d\u5728\u6b63\u9650\u4f4d\u4e0a\u3001\u6b63\u5411\u8def\u5f84\u65e0\u969c\u788d\uff1b\u5df2\u5728 EL+ \u4e0a\u7684\u8f74\u4f1a\u88ab\u62d2\u7edd\u3002'
+          : '\u786e\u8ba4\u6240\u9009\u8f74\u8fd4\u56de\u8def\u5f84\u5b89\u5168\uff1b\u4efb\u4e00\u6240\u9009\u53c2\u8003\u672a\u786e\u8ba4\u3001\u5c5e\u4e8e\u65e7 HAL \u5b9e\u4f8b\u6216\u65cb\u8f6c\u9700\u8d85\u8fc7 180\u00b0 \u65f6\u6574\u6b21\u62d2\u7edd\u3002',
       current: [
-        { label: '使能状态', value: motionStateText },
-        { label: '当前位置', value: sidePositionsText || '--' },
+        { label: '\u4f7f\u80fd\u72b6\u6001', value: motionStateText },
+        { label: '\u5f53\u524d\u4f4d\u7f6e', value: sidePositionsText || '--' },
       ],
       proposed: [
-        { label: '目标动作', value: '硬件HOME（不写入）' },
-        { label: '命令接口', value: 'motion.home_side' },
+        { label: '\u64cd\u4f5c\u8f74', value: axes.join('\u3001') },
+        { label: seeking || limitSeeking ? '\u53c2\u8003\u66f4\u65b0\u8303\u56f4' : '\u76ee\u6807\u8109\u51b2', value: seeking || limitSeeking ? '\u4ec5\u6240\u9009\u8f74' : axes.map((axis) => `${axis}: ${referencePulses[REFERENCE_AXES.indexOf(axis)]}`).join('\u3001') },
       ],
-      confirmText: '确认回硬件零点',
-      onConfirm: handleHome,
+      confirmText: `\u786e\u8ba4${label}`,
+      onConfirm: () => handleReferenceAction(action, axes),
     })
   }
  /** 处理对应的用户交互。 */
@@ -742,15 +827,6 @@ export function MotionCard({
           </UiSpace>
         )}
         <UiSpace wrap className="motion-origin-actions">
-          <UiButton
-            icon={<RotateCcw size={15} />}
-            loading={pendingMotionAction === 'home'}
-            disabled={Boolean(controlBlockReason)}
-            title={controlBlockReason ?? undefined}
-            onClick={requestHome}
-          >
-            回硬件零点
-          </UiButton>
           {hardwareSide === 'left' && (
             <UiButton
               icon={<RefreshCw size={15} />}
@@ -762,6 +838,65 @@ export function MotionCard({
             </UiButton>
           )}
         </UiSpace>
+      </div>
+      <div className="motion-origin-panel">
+        <div className="hardware-subtitle-row"><b>机械参考点</b><span>逐轴确认，仅作用于所选轴</span></div>
+        <UiSpace wrap>
+          {REFERENCE_AXES.map((axis, index) => (
+            <UiTag key={axis} tone={confirmedAxes[index] === true ? 'success' : 'warning'}>
+              {axis}：{confirmedAxes[index] === true ? '已确认' : '待确认'}
+            </UiTag>
+          ))}
+        </UiSpace>
+        <UiSpace wrap className="motion-origin-actions">
+          <UiButton icon={<RotateCcw size={15} />} disabled={Boolean(controlBlockReason) || pendingMotionAction !== null}
+            title={controlBlockReason ?? undefined} onClick={() => openReferenceAction('return')}>
+            返回机械参考点
+          </UiButton>
+          <UiButton icon={<RefreshCw size={15} />} disabled={Boolean(controlBlockReason) || pendingMotionAction !== null}
+            title={controlBlockReason ?? undefined} onClick={() => openReferenceAction('seek')}>
+            机械寻零
+          </UiButton>
+          <UiButton icon={<Crosshair size={15} />} disabled={Boolean(controlBlockReason) || pendingMotionAction !== null}
+            title={controlBlockReason ?? undefined} onClick={() => openReferenceAction('limit')}>
+            {'\u6b63\u9650\u4f4d\u5efa\u53c2\u8003'}
+          </UiButton>
+        </UiSpace>
+        {referenceAction && (
+          <fieldset disabled={pendingMotionAction !== null}>
+            <legend>{referenceAction === 'seek' ? '\u7ef4\u62a4\uff1a\u673a\u68b0\u5bfb\u96f6\u9009\u8f74' : referenceAction === 'limit' ? '\u7ef4\u62a4\uff1a\u6b63\u9650\u4f4d\u53c2\u8003\u9009\u8f74' : '\u8fd4\u56de\u673a\u68b0\u53c2\u8003\u70b9\u9009\u8f74'}</legend>
+            <UiSpace wrap>
+              {REFERENCE_AXES.map((axis) => (
+                <label key={axis}>
+                  <input type="checkbox" aria-label={axis} checked={selectedAxes.includes(axis)}
+                    disabled={referenceAction === 'limit' && !positiveLimitAxes.includes(axis)}
+                    onChange={(event) => setSelectedAxes(REFERENCE_AXES.filter((item) => item === axis ? event.target.checked : selectedAxes.includes(item)))} /> {axis}
+                </label>
+              ))}
+              <UiButton onClick={() => setSelectedAxes(referenceAction === 'limit' ? [...positiveLimitAxes] : [...REFERENCE_AXES])}>
+                {referenceAction === 'limit' ? '\u5168\u9009\u53ef\u7528\u8f74' : '\u5168\u9009\u516d\u8f74'}
+              </UiButton>
+              <UiButton onClick={() => setSelectedAxes([])}>{'\u6e05\u7a7a\u9009\u62e9'}</UiButton>
+            </UiSpace>
+            <p>{referenceAction === 'seek'
+              ? '\u7ef4\u62a4\u64cd\u4f5c\uff1a\u6240\u9009\u8f74\u6309\u987a\u5e8f\u6267\u884c\u4e25\u683c ORG \u5bfb\u96f6\uff0c\u4e0d\u4f1a\u628a\u9650\u4f4d\u505c\u6b62\u5f53\u6210 HOME \u6210\u529f\u3002'
+              : referenceAction === 'limit'
+                ? `\u7ef4\u62a4\u64cd\u4f5c\uff1a\u53ea\u652f\u6301 ${positiveLimitAxes.join('\u3001')}\uff0c\u8981\u6c42 EL+ OFF->ON \u540e\u8bb0\u5f55\u6b63\u9650\u4f4d\u53c2\u8003\u3002`
+                : '\u65e5\u5e38\u8fd4\u56de\uff1a\u4f7f\u7528\u5df2\u786e\u8ba4\u4e14\u5c5e\u4e8e\u5f53\u524d HAL \u5b9e\u4f8b\u7684\u53c2\u8003\u8bb0\u5f55\u3002'}</p>
+            {referenceAction === 'return' && unconfirmedSelection.length > 0 && (
+              <p role="alert">{'\u672a\u786e\u8ba4\u7684\u5df2\u9009\u8f74\uff1a'}{unconfirmedSelection.join('\u3001')}</p>
+            )}
+            {referenceAction === 'limit' && invalidPositiveLimitSelection.length > 0 && (
+              <p role="alert">{'\u8fd9\u4e9b\u8f74\u672a\u914d\u7f6e\u6b63\u9650\u4f4d\u53c2\u8003\uff1a'}{invalidPositiveLimitSelection.join('\u3001')}</p>
+            )}
+            <UiButton disabled={Boolean(controlBlockReason) || selectedAxes.length === 0 || (referenceAction === 'return' && unconfirmedSelection.length > 0) || (referenceAction === 'limit' && invalidPositiveLimitSelection.length > 0)}
+              onClick={requestReferenceAction}>
+              {referenceAction === 'seek' ? '\u5ba1\u9605\u5bfb\u96f6\u52a8\u4f5c' : referenceAction === 'limit' ? '\u5ba1\u9605\u9650\u4f4d\u53c2\u8003\u52a8\u4f5c' : '\u5ba1\u9605\u8fd4\u56de\u52a8\u4f5c'}
+            </UiButton>
+            <UiButton onClick={() => { setReferenceAction(null); setSelectedAxes([]) }}>{'\u53d6\u6d88'}</UiButton>
+          </fieldset>
+        )}
+        <p role="status" aria-label={`${operatorLabel}原点操作状态`}>{referenceStatus || '尚未执行原点操作'}</p>
       </div>
       <AxisMappingTable
         side={hardwareSide}

@@ -51,6 +51,7 @@ function emit(axes: Array<boolean | null>, extra: Partial<TelemetryFrame> = {}) 
     ...frame, timestamp: ++timestamp, halOk: true, wsOk: true,
     motionEnabled: { left: axes.every((value) => value === true), right: null },
     motionAxisEnabled: { left: axes, right: Array(6).fill(null) },
+    motionAxisEnabledConfirmed: { left: axes.map((value) => value !== null), right: Array(6).fill(false) },
     ...extra,
   })
 }
@@ -100,6 +101,20 @@ afterEach(() => {
 })
 
 describe('运动使能共享入口', () => {
+  it('硬件反馈未确认时两处展示提示，状态未知时不显示伪确认', async () => {
+    const { card, manual } = await renderMotionPage()
+    await act(async () => {
+      emit(Array(6).fill(true), {
+        motionAxisEnabledConfirmed: { left: Array(6).fill(false), right: Array(6).fill(false) },
+      })
+    })
+    expect(card.getByText('已使能（硬件反馈未确认）')).toBeInTheDocument()
+    expect(manual.getByText('已使能（硬件反馈未确认）')).toBeInTheDocument()
+    await act(async () => { emit(Array(6).fill(null)) })
+    expect(card.getByText('使能状态未知')).toBeInTheDocument()
+    expect(manual.getByText('使能状态未知')).toBeInTheDocument()
+  })
+
   it('WS 挑战已经应答但执行侧未确认租约时两处仍拒绝使能', async () => {
     MockWebSocket.confirmLeases = false
     const enable = vi.spyOn(api, 'enableMotionSide').mockResolvedValue({ ok: true })
@@ -175,8 +190,8 @@ describe('运动使能共享入口', () => {
     await act(async () => {
       emit([true, null, null, null, null, null], { motionEnabled: { left: true, right: null } })
     })
-    expect(card.getAllByText('部分使能').length).toBeGreaterThan(0)
-    expect(manual.getByText('部分使能')).toBeInTheDocument()
+    expect(card.getAllByText('部分使能（硬件反馈未确认）').length).toBeGreaterThan(0)
+    expect(manual.getByText('部分使能（硬件反馈未确认）')).toBeInTheDocument()
     expect(useTelemetryStore.getState().motionCommand.left.phase).toBe('waitingConfirm')
     await act(async () => { emit(Array(6).fill(true)) })
     expectSharedProgress('使能请求已获反馈确认')

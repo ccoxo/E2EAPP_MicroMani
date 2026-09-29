@@ -48,6 +48,7 @@ std::array<bool, 6> jsonBoolArray6(
     const std::string& body,
     const std::string& key,
     const std::array<bool, 6>& fallback);
+HardwareHomeConfig jsonHardwareHomeConfig(const std::string& body);
 std::array<std::array<bool, 6>, 2> jsonHomeAllEnabledAxes(const std::string& body);
 std::array<AxisLimit, 6> jsonAxisLimits(
     const std::string& body,

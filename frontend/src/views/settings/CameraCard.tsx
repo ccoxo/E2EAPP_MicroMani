@@ -30,12 +30,10 @@ import type {
 import {
   HardwareConfigCard,
   MetricBox,
-  commandLog,
-  stateTone,
-  stateText,
   type InlineStatusTone,
   type PendingComparison,
 } from './shared'
+import { commandLog, stateTone, stateText } from './sharedHelpers'
 import type { ActionCompareItem } from '../../components/ActionCompareModal'
 
 function commandErrorMessage(error: unknown) {

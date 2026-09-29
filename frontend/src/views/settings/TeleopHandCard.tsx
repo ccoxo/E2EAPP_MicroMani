@@ -16,7 +16,7 @@ import {
   ShieldAlert,
   Usb,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import {
   UiButton,
   UiField,
@@ -42,7 +42,8 @@ import type {
   ConnectionState,
   LogEntry,
 } from '../../types'
-import { HardwareConfigCard, MetricBox, commandLog, type InlineStatusTone } from './shared'
+import { HardwareConfigCard, MetricBox, type InlineStatusTone } from './shared'
+import { commandLog } from './sharedHelpers'
 
 function commandErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
@@ -130,13 +131,10 @@ export function TeleopHandCard({
   const [connectSyncPending, setConnectSyncPending] = useState(false)
   const [connectionHint, setConnectionHint] = useState('')
   const teleopConnectPending = connectionPending || connectSyncPending
-  useEffect(() => {
-    if (!connectSyncPending) return
-    if (!logicalConnected || physicalConnected) {
-      setConnectSyncPending(false)
-      setConnectionPending(false)
-    }
-  }, [connectSyncPending, logicalConnected, physicalConnected])
+  if (connectSyncPending && (!logicalConnected || physicalConnected)) {
+    setConnectSyncPending(false)
+    setConnectionPending(false)
+  }
   const liveOpenId = handState?.openId ?? openId
   const omegaSummary = `OpenID ${liveOpenId} / device ${handState?.deviceId ?? '-'}`
   const handedText = handState?.leftHanded == null ? 'handedness -' : handState.leftHanded ? 'left-handed' : 'right-handed'

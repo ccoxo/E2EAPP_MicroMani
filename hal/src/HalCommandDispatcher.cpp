@@ -226,13 +226,15 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
     executor_.homeAll(jsonWorkOriginPulse(bodyText), enabledAxes, commandEpoch);
     return "{\"ok\":true}";
   }
-  if (name == "motion.home_origin_side") {
+  if (name == "motion.home_origin_side" || name == "motion.return_home_reference") {
     motion_.ensureMotionReturnAllowed();
     const auto side = parseSide(jsonStringValue(bodyText, "side"));
-    const auto enabledAxes = jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled);
+    const bool referenceReturn = name == "motion.return_home_reference";
+    const auto enabledAxes = jsonBoolArray6(bodyText, "enabledAxes", referenceReturn ? std::array<bool, 6>{} : kAllAxesEnabled);
     nativeTeleop_.stop();
     ensureCurrentMotionCommand();
-    executor_.homeOriginSide(side, jsonSideWorkOriginPulse(bodyText), enabledAxes, commandEpoch);
+    executor_.homeOriginSide(side, jsonSideWorkOriginPulse(bodyText), enabledAxes, commandEpoch, referenceReturn);
+    if (referenceReturn) return "{\"ok\":true,\"referenceReturnCompleted\":true}";
     return "{\"ok\":true}";
   }
   if (name == "motion.enable_side") {
@@ -247,8 +249,17 @@ std::string HalCommandDispatcher::handle(const std::string& name, const std::str
   }
   if (name == "motion.home_side") {
     const auto side = parseSide(jsonStringValue(bodyText, "side"));
-    executor_.homeSide(side, jsonBoolArray6(bodyText, "enabledAxes", kAllAxesEnabled), commandEpoch);
-    return "{\"ok\":true}";
+    nativeTeleop_.stop();
+    ensureCurrentMotionCommand();
+    const auto homeConfig = jsonHardwareHomeConfig(bodyText);
+    const auto limitReferenceAxes = executor_.homeSide(
+        side, jsonBoolArray6(bodyText, "enabledAxes", {}), homeConfig, commandEpoch);
+    std::string response = "{\"ok\":true,\"homeCompleted\":true,\"limitReferenceAxes\":[";
+    for (std::size_t index = 0; index < limitReferenceAxes.size(); ++index) {
+      if (index) response += ',';
+      response += limitReferenceAxes[index] ? "true" : "false";
+    }
+    return response + "]}";
   }
   if (name == "motion.manual_axis_move") {
     const auto side = parseSide(jsonStringValue(bodyText, "side"));

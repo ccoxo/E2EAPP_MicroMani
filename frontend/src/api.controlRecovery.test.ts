@@ -60,3 +60,17 @@ it('真机回放开始经过控制门闩，停止始终允许发送', async () =
   await api.postCommand('/api/replay/stop', {})
   expect(fetcher).toHaveBeenCalledOnce()
 })
+
+it('策略 Dry-Run 可读取计划，真实发送必须经过控制门闩', async () => {
+  vi.resetModules()
+  vi.stubEnv('MODE', 'development')
+  const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })))
+  vi.stubGlobal('fetch', fetcher)
+  const api = await import('./api')
+  api.installControlCommandGuard(() => '未确认控制租约')
+  await api.postCommand('/api/policy/action', { action: Array(14).fill(0), dryRun: true })
+  expect(fetcher).toHaveBeenCalledOnce()
+  await expect(api.postCommand('/api/policy/action', { action: Array(14).fill(0), dryRun: false }))
+    .rejects.toThrow('未确认控制租约')
+  expect(fetcher).toHaveBeenCalledOnce()
+})

@@ -1,5 +1,6 @@
 #include "OfflineMotion.h"
 #include "HalCommandDispatcher.h"
+#include "HalJson.h"
 
 #include <chrono>
 #include <cmath>
@@ -45,13 +46,20 @@ struct Fixture {
   }
 };
 
+void cardZeroYawUsesUpdatedPulseEquivalent() {
+  require(std::abs(uiToPulse(1.0, Side::Right, SemanticAxis::Yaw) - 3333.3333) < 1e-6,
+      "Card 0 Yaw pulse equivalent is incorrect");
+  require(std::abs(pulseToUi(3333.3333, Side::Right, SemanticAxis::Yaw) - 1.0) < 1e-9,
+      "Card 0 Yaw pulse feedback is incorrect");
+}
+
 void nativeExcludesOtherSources() {
   Fixture f;
   f.executor.beginNative(0, f.epoch());
   rejects([&] { f.manual(); });
   rejects([&] { f.manual(Side::Right); });
   rejects([&] { f.executor.applyExternal(f.target(1), f.epoch()); });
-  rejects([&] { f.executor.homeSide(Side::Left, allAxes, f.epoch()); });
+  rejects([&] { f.executor.homeSide(Side::Left, allAxes, HardwareHomeConfig{}, f.epoch()); });
   rejects([&] { f.executor.homeAll({}, {allAxes, allAxes}, f.epoch()); });
   auto target = f.target(1);
   require(f.executor.applyNative(target, target.deltas).has_value(), "active native target rejected");
@@ -138,11 +146,33 @@ void dispatcherUsesSharedArbitration() {
   dispatcher.handle("motion.manual_axis_move", R"({"side":"left","axis":"X","step":1,"maxVelocityUiPerSec":100})");
 }
 
+void dispatcherReferenceReturnStopsNativeAndRejectsWholeTurn() {
+  Fixture f;
+  Omega7Driver omega;
+  JodellGripperDriver gripper;
+  NativeTeleopController native(f.motion, f.executor, omega, gripper);
+  ForceControlRuntime force([] {}, [] {});
+  const auto started = std::chrono::steady_clock::now();
+  HalCommandDispatcher dispatcher(f.motion, f.executor, omega, native, force, started);
+  native.start(false, false);
+  const auto result = dispatcher.handle("motion.return_home_reference",
+      R"({"side":"right","pulse":[100,200,300,400,500,600],"enabledAxes":[true,true,true,true,true,true]})");
+  require(result.find("referenceReturnCompleted") != std::string::npos, "return not confirmed");
+  require(!native.running(), "native teleop still running after reference return");
+  const auto before = f.motion.readState();
+  rejects([&] { dispatcher.handle("motion.return_home_reference", R"({"side":"right","pulse":[1,2,3,4,5,6]})"); });
+  rejects([&] { dispatcher.handle("motion.home_side", R"({"side":"right"})"); });
+  rejects([&] { dispatcher.handle("motion.return_home_reference",
+      R"({"side":"right","pulse":[900,800,700,600400,500,600],"enabledAxes":[true,true,true,true,true,true]})"); });
+  const auto after = f.motion.readState();
+  for (int i = 0; i < 12; ++i) require(before.axes[i].pulse == after.axes[i].pulse, "rejection moved another axis");
+}
+
 void busyExecutorRejectsInsteadOfQueueingAndCannotBlockEmergencyLatch() {
   Fixture f;
   auto held = MotionExecutorTestAccess::holdExecutor(f.executor);
   rejects([&] { f.manual(); });
-  rejects([&] { f.executor.homeSide(Side::Left, allAxes, f.epoch()); });
+  rejects([&] { f.executor.homeSide(Side::Left, allAxes, HardwareHomeConfig{}, f.epoch()); });
   rejects([&] { f.executor.applyExternal(f.target(1), f.epoch()); });
   // 不等待执行器锁，模拟阻塞驱动调用期间撤销运动许可。
   f.motion.latchEmergencyStop();
@@ -208,10 +238,11 @@ void emergencyCancelsCommandAlreadyAdmittedBeforeDriverAccess() {
   // 普通提交误判 executor 忙而提前拒绝，无法覆盖本用例要求的在途窗口。
   command.wait_for(std::chrono::milliseconds(100));
   const bool admitted = MotionExecutorTestAccess::executorBusy(f.executor);
-  // 急停硬件路径不等待主状态锁；确认后，已捕获旧代际的请求仍必须失效。
+  // 急停硬件路径不等待主状态锁；状态未清理前不能确认急停。
   f.motion.emergencyStop();
-  f.motion.acknowledgeEmergencyStop();
+  rejects([&] { f.motion.acknowledgeEmergencyStop(); });
   heldDriver.unlock();
+  f.motion.acknowledgeEmergencyStop();
   const bool rejected = command.get();
   require(admitted && rejected, "emergency did not cancel an already-admitted command across acknowledgement");
   require(f.motion.readState().axes[0].uiPosition == 0, "cancelled command changed motion position");
@@ -235,8 +266,34 @@ void replayAbsoluteTargetsDoNotAccumulate() {
   rejects([&] { f.executor.applyExternal(target, f.epoch(), true); });
 }
 
+void failedGripperReadKeepsSuccessTimestampAndReportsTiming() {
+  Fixture f;
+  Omega7Driver omega;
+  JodellGripperDriver gripper;
+  NativeTeleopController native(f.motion, f.executor, omega, gripper);
+  JodellGripperConfig config;
+  config.enabled = false; // 离线失败读回，不加载 SDK，不连接设备。
+  native.prepareReplayGripper(config, f.epoch(), {true, false});
+  std::string status;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  do {
+    status = native.statusJson();
+    if (jsonNumberValue(status, "lastReadAttemptTs", 0) > 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  } while (std::chrono::steady_clock::now() < deadline);
+  native.stop();
+  require(jsonNumberValue(status, "lastReadAttemptTs", 0) > 0, "read attempt diagnostic missing");
+  require(jsonNumberValue(status, "lastReadDurationMs", -1) >= 0, "read duration missing");
+  require(jsonNumberValue(status, "lastCommandDurationMs", -1) == 0, "read changed command duration");
+  require(jsonNumberValue(status, "positionSampleTs", -1) == 0, "failed read fabricated fresh feedback");
+  require(!jsonBoolValue(status, "positionOk", true), "failed read reported valid feedback");
+  require(jsonStringValue(status, "lastReadMessage") == "native gripper teleop disabled", "read failure reason lost");
+}
+
 int main() {
   try {
+    cardZeroYawUsesUpdatedPulseEquivalent();
+    failedGripperReadKeepsSuccessTimestampAndReportsTiming();
     replayAbsoluteTargetsDoNotAccumulate();
     nativeExcludesOtherSources();
     externalOwnershipIsPerSide();
@@ -245,11 +302,12 @@ int main() {
     emergencyDoesNotRestoreOldOwnership();
     stoppingInactiveNativeDoesNotStopExternal();
     dispatcherUsesSharedArbitration();
+    dispatcherReferenceReturnStopsNativeAndRejectsWholeTurn();
     busyExecutorRejectsInsteadOfQueueingAndCannotBlockEmergencyLatch();
     revokeRejectsAlreadyWaitingFollower();
     dispatcherEmergencyBypassesBothExecutionAndDriverLocks();
     emergencyCancelsCommandAlreadyAdmittedBeforeDriverAccess();
-    std::cout << "MotionExecutorTests passed (12 cases, offline)\n";
+    std::cout << "MotionExecutorTests passed (15 cases, offline)\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "MotionExecutorTests failed: " << error.what() << '\n';

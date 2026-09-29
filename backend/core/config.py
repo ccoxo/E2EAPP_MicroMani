@@ -9,6 +9,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -55,6 +56,13 @@ from backend.core.schemas import (
 
 SNAPSHOT_ID_SAFE = re.compile(r"[^a-zA-Z0-9_.-]+")
 AXIS_KEYS = ("x", "y", "z", "roll", "pitch", "yaw")
+# config.json 可能被上一个实例或杀毒软件短暂占用；瞬时读不到不能当成配置损坏。
+CONFIG_READ_ATTEMPTS = 5
+CONFIG_READ_RETRY_DELAY_S = 0.2
+
+
+class ConfigUnavailableError(RuntimeError):
+    """config.json 存在但持续不可读；此时保留原文件，不用默认配置覆盖。"""
 
 
 def _compact_config_value(value: Any) -> Any:
@@ -173,6 +181,25 @@ def _ensure_home_reference_model(config: dict[str, Any], has_current_home_refere
             side_reference_valid = _side_valid(origin, side)
             side_offset_valid = side_reference_valid
         next_reference[pulse_key] = side_reference
+        # 历史整侧 valid 不能证明每轴确实完成寻零；只迁移显式逐轴确认。
+        raw_confirmed = reference.get(f"{side}AxisConfirmed")
+        confirmed = ([value is True for value in raw_confirmed]
+                     if isinstance(raw_confirmed, list) and len(raw_confirmed) == 6 else [False] * 6)
+        next_reference[f"{side}AxisConfirmed"] = confirmed
+        raw_instance_ids = reference.get(f"{side}AxisInstanceId")
+        next_reference[f"{side}AxisInstanceId"] = [
+            str(raw_instance_ids[index]) if confirmed[index] and isinstance(raw_instance_ids, list)
+            and len(raw_instance_ids) == 6 and raw_instance_ids[index] else ""
+            for index in range(6)
+        ]
+        limit_key = f"{side}AxisLimitReference"
+        if limit_key in reference:
+            raw_limits = reference[limit_key]
+            next_reference[limit_key] = [
+                index in ((0, 2) if side == "right" else (0, 1)) and confirmed[index] and value is True
+                for index, value in enumerate(raw_limits)
+            ] if isinstance(raw_limits, list) and len(raw_limits) == 6 else [False] * 6
+        # 旧 valid 仅保留给既有偏移/限位计算；返回权限单独检查 AxisConfirmed。
         next_reference[valid_key] = side_reference_valid
         next_offset[delta_key] = side_offset
         next_offset[valid_key] = side_offset_valid
@@ -430,9 +457,26 @@ class SettingsService:
         if not self.config_path.exists():
             self.save_config(default_config(), emit_log=False)
 
+    def _read_config_json(self) -> Any:
+        """读取 config.json；只对瞬时占用重试，持续不可读时报错而不改写文件。"""
+        last_error: OSError | None = None
+        for attempt in range(CONFIG_READ_ATTEMPTS):
+            try:
+                return json.loads(self.config_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                # 内容损坏交由调用方按默认配置恢复，重试没有意义。
+                raise
+            except OSError as exc:
+                last_error = exc
+                if attempt + 1 < CONFIG_READ_ATTEMPTS:
+                    time.sleep(CONFIG_READ_RETRY_DELAY_S)
+        raise ConfigUnavailableError(
+            f"config.json 持续不可读，保留原文件不改写：{type(last_error).__name__}: {last_error}"
+        )
+
     def get_config(self) -> dict[str, Any]:
         try:
-            data = json.loads(self.config_path.read_text(encoding="utf-8"))
+            data = self._read_config_json()
             raw_teleop = data.get("teleop", {}) if isinstance(data, dict) else {}
             raw_motion = data.get("motion", {}) if isinstance(data, dict) else {}
             raw_cameras = data.get("cameras", {}) if isinstance(data, dict) else {}
@@ -478,7 +522,7 @@ class SettingsService:
             if merged != data:
                 self.save_config(validated, emit_log=False, source="startup")
             return validated
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, ValueError) as exc:
             config = default_config()
             self.save_config(config, source="startup")
             self.logs.warning(
@@ -495,6 +539,7 @@ class SettingsService:
         source: str = "ui",
         op_id: str | None = None,
         before_commit: Callable[[], None] | None = None,
+        home_reference_update: bool = False,
     ) -> dict[str, Any]:
         old_config: dict[str, Any] = {}
         if self.config_path.exists():
@@ -513,6 +558,33 @@ class SettingsService:
                 isinstance(raw_motion, dict)
                 and raw_motion.get("homeReferenceVersion") == ICF_HOME_REFERENCE_VERSION,
             )
+            if not home_reference_update:
+                # 普通设置保存/旧快照不能伪造或恢复寻零完成标记；改目标脉冲则撤销确认。
+                previous = old_config.get("motion", {}).get("homeReference", {})
+                reference = config["motion"]["homeReference"]
+                for side in ("left", "right"):
+                    old_flags = previous.get(f"{side}AxisConfirmed", [])
+                    old_pulses = previous.get(f"{side}Pulse", [])
+                    reference[f"{side}AxisConfirmed"] = [
+                        index < len(old_flags) and old_flags[index] is True
+                        and index < len(old_pulses) and old_pulses[index] == reference[f"{side}Pulse"][index]
+                        for index in range(6)
+                    ]
+                    old_instance_ids = previous.get(f"{side}AxisInstanceId", [])
+                    reference[f"{side}AxisInstanceId"] = [
+                        str(old_instance_ids[index]) if reference[f"{side}AxisConfirmed"][index]
+                        and isinstance(old_instance_ids, list) and index < len(old_instance_ids)
+                        and old_instance_ids[index] else ""
+                        for index in range(6)
+                    ]
+                    limit_key = f"{side}AxisLimitReference"
+                    old_limits = previous.get(limit_key, [])
+                    if limit_key in previous or limit_key in reference:
+                        reference[limit_key] = [
+                            reference[f"{side}AxisConfirmed"][index]
+                            and index < len(old_limits) and old_limits[index] is True
+                            for index in range(6)
+                        ]
         validate_force_config(config)
         validated = AppConfig.model_validate(config).model_dump(mode="json")
         old_hash = stable_config_hash(old_config) if old_config else "-"
@@ -946,6 +1018,22 @@ class SettingsService:
                 teleop["syncImpulseCoeffFromKinematics"] = False
         cameras = config.get("cameras", {})
         if isinstance(cameras, dict):
+            # 只迁移已发布的旧默认路径，保留用户后来确认的稳定绑定。
+            if cameras.get("globalIdentity") in {
+                r"USB\VID_0ABD&PID_8050&MI_00\7&1396F44D&0&0000",
+                r"USB\VID_0ABD&PID_8050&MI_00\7&124CCBA8&0&0000",
+            }:
+                cameras["global"] = ICF_CAMERA_DEFAULTS["global"]
+                cameras["globalIdentity"] = ICF_CAMERA_DEFAULTS["globalIdentity"]
+                old_wrist_identities = {
+                    r"USB\VID_0ABD&PID_8050&MI_00\7&398F0A3&0&0000",
+                    r"USB\VID_0ABD&PID_8050&MI_00\7&7861A93&0&0000",
+                    r"USB\VID_0ABD&PID_8050&MI_00\8&3724732E&0&0000",
+                }
+                for role in ("wristLeft", "wristRight"):
+                    if cameras.get(f"{role}Identity") in old_wrist_identities:
+                        cameras[role] = "index -1"
+                        cameras[f"{role}Identity"] = ""
             # 新绑定的稳定身份优先于历史 index 标签，重载时不能被默认迁移覆盖。
             has_explicit_camera_identity = any(
                 cameras.get(key) and cameras[key] != ICF_CAMERA_DEFAULTS[key]
@@ -984,6 +1072,13 @@ class SettingsService:
             _normalize_camera_tuning_defaults(config, has_current_camera_tuning_defaults)
         motion = config.get("motion", {})
         if isinstance(motion, dict):
+            # 仅迁移 Card 0 Yaw 的旧默认当量，保留用户自定义标定。
+            kinematics = motion.get("kinematics")
+            if isinstance(kinematics, dict):
+                for key in ("rightPulsePerUnit", "rightSignedPulsePerUnit"):
+                    values = kinematics.get(key)
+                    if isinstance(values, list) and len(values) == 6 and values[5] == 333.3333:
+                        kinematics[key] = [*values[:5], 3333.3333]
             if self._uses_legacy_motion_profile(motion.get("leftProfile")):
                 motion["leftProfile"] = json.loads(json.dumps(default_config()["motion"]["leftProfile"]))
             if self._uses_legacy_motion_profile(motion.get("rightProfile")):

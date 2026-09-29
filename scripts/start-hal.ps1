@@ -150,6 +150,62 @@ function Assert-HalCapabilities {
   }
 }
 
+function Repair-StaleDdsPorts {
+  param([ValidateRange(0, 232)][int]$DomainId)
+
+  $shmDir = Join-Path $env:ProgramData "eProsima\fastrtps_interprocess"
+  if (!(Test-Path -LiteralPath $shmDir -PathType Container)) { return }
+  $shmDir = (Resolve-Path -LiteralPath $shmDir).Path
+  $bootTimeUtc = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime()
+  # Fast-DDS 默认端口公式：7400 + 250 * domain；不处理其他域或匿名数据段。
+  $firstPort = 7400 + 250 * $DomainId
+  $groups = @(Get-ChildItem -LiteralPath $shmDir -File -Filter "fastrtps_port*" | Where-Object {
+      $_.Name -match '^fastrtps_port(\d+)(?:_(?:el|sl|mutex))?$' -and
+      [int]$Matches[1] -ge $firstPort -and [int]$Matches[1] -lt ($firstPort + 250)
+    } | Group-Object { $_.Name -replace '_(el|sl|mutex)$', '' })
+  $backupDir = $null
+  $recovered = 0
+  foreach ($group in $groups) {
+    $files = @($group.Group)
+    if (@($files | Where-Object { $_.LastWriteTimeUtc -ge $bootTimeUtc }).Count -gt 0) { continue }
+    $handles = New-Object 'System.Collections.Generic.List[System.IO.FileStream]'
+    try {
+      try {
+        foreach ($file in $files) {
+          # 保持句柄到移动结束，拒绝其他读写打开；Delete 共享允许同卷重命名。
+          $handle = [IO.File]::Open($file.FullName, 'Open', 'ReadWrite', 'Delete')
+          $handles.Add($handle)
+          $handle.Lock(0, 1)
+        }
+      } catch {
+        Write-Warning "DDS port recovery skipped (in use or inaccessible): $($group.Name)"
+        continue
+      }
+      # 获取句柄后再检查时间，避免处理枚举之后刚被重新打开的端口。
+      foreach ($file in $files) { $file.Refresh() }
+      if (@($files | Where-Object { $_.LastWriteTimeUtc -ge $bootTimeUtc }).Count -gt 0) { continue }
+      if (!$backupDir) {
+        $backupName = "appstation-recovery-$(Get-Date -Format 'yyyyMMdd-HHmmss')-$([guid]::NewGuid().ToString('N'))"
+        $backupDir = [IO.Path]::GetFullPath((Join-Path $shmDir $backupName))
+        if (!$backupDir.StartsWith($shmDir + '\', [StringComparison]::OrdinalIgnoreCase)) {
+          throw "DDS recovery backup is outside the shared memory directory"
+        }
+        New-Item -ItemType Directory -Path $backupDir -ErrorAction Stop | Out-Null
+      }
+      foreach ($file in $files) {
+        if ($file.DirectoryName -ne $shmDir) { throw "Unexpected DDS recovery source: $($file.FullName)" }
+        Move-Item -LiteralPath $file.FullName -Destination (Join-Path $backupDir $file.Name) -ErrorAction Stop
+        $recovered++
+      }
+    } finally {
+      foreach ($handle in $handles) { $handle.Dispose() }
+    }
+  }
+  if ($recovered -gt 0) {
+    Write-Host "Recovered $recovered stale DDS port files for domain $DomainId. Backup: $backupDir"
+  }
+}
+
 function Resolve-HkvlBoundPort {
   param(
     [string]$Side,
@@ -369,6 +425,7 @@ $env:APPSTATION_FORCE_CONFIG_JSON = $forceRuntimeConfig | ConvertTo-Json -Compre
 $env:APPSTATION_HAL_PORT = "$Port"
 $env:APPSTATION_HAL_DDS_ENABLED = "1"
 if (-not $env:APPSTATION_DDS_DOMAIN_ID) { $env:APPSTATION_DDS_DOMAIN_ID = "42" }
+Repair-StaleDdsPorts -DomainId ([int]$env:APPSTATION_DDS_DOMAIN_ID)
 $env:APPSTATION_JODELL_WORKER_EXE = "$workerRuntimeExe"
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 $process = Start-Process `
@@ -378,18 +435,42 @@ $process = Start-Process `
   -RedirectStandardOutput $halOutLog `
   -RedirectStandardError $halErrLog `
   -PassThru
-Start-Sleep -Seconds 2
 
 try {
-  $health = Invoke-RestMethod "http://127.0.0.1:$Port/health" -TimeoutSec 3
+  # 设备和 DDS 初始化结束后才监听 HTTP，冷启动不能只检查一次。
+  Write-Host "Waiting for HAL readiness on port $Port (up to 60 seconds)..."
+  $deadline = (Get-Date).AddSeconds(60)
+  while ($true) {
+    $process.Refresh()
+    if ($process.HasExited) {
+      throw "HAL exited before /health became ready; exit code=$($process.ExitCode)"
+    }
+    try {
+      $health = Invoke-RestMethod "http://127.0.0.1:$Port/health" -TimeoutSec 2
+      break
+    } catch {
+      if ((Get-Date) -ge $deadline) {
+        throw "Timed out after 60 seconds waiting for HAL /health: $($_.Exception.Message)"
+      }
+      Start-Sleep -Milliseconds 500
+    }
+  }
   Assert-HalCapabilities -Health $health
+  if (!$health.ltdmc_ok) {
+    throw "LTDMC is not initialized: $($health.version)"
+  }
 } catch {
+  $startupError = $_.Exception.Message
   Stop-ProcessTree -RootPid $process.Id
-  throw "HAL started pid=$($process.Id), but /health failed: $($_.Exception.Message)"
-}
-
-if (!$health.ltdmc_ok) {
-  throw "HAL started pid=$($process.Id), but LTDMC is not initialized: $($health.version)"
+  $logDetails = foreach ($logPath in @($halErrLog, $halOutLog)) {
+    $tail = @(Get-Content -LiteralPath $logPath -Tail 20 -ErrorAction SilentlyContinue)
+    if ($tail.Count -gt 0) {
+      "${logPath}:`n$($tail -join "`n")"
+    } else {
+      "${logPath}: <empty>"
+    }
+  }
+  throw "HAL startup failed pid=$($process.Id): $startupError`n$($logDetails -join "`n")"
 }
 
 [pscustomobject]@{

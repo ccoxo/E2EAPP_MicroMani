@@ -39,6 +39,7 @@ from backend.core.schemas import (
     AppConfig,
     GripperCommandRequest,
     ManualAxisMoveRequest,
+    HardwareHomeRequest,
     SettingsCommandRequest,
     SnapshotCreateRequest,
     SnapshotScope,
@@ -51,7 +52,7 @@ from backend.services.command_service import (
     MotionOriginDriftConfirmationRequired,
     normalize_motion_axis_enabled,
 )
-from backend.services.dataset_recorder import DatasetSaveError
+from backend.services.dataset_recorder import DatasetSaveError, RecordingBlocksOriginReturn
 from backend.services.dataset_replay import DatasetReplayService
 from backend.services.control_watchdog import ControlLeaseUnavailable, ControlWatchdog
 from backend.services.gripper_backend import native_teleop_enabled
@@ -467,7 +468,10 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         policy.invalidate_pending_actions()
         commands.safety.interrupt(emergency=True)
 
-    control_watchdog = ControlWatchdog(hal, logs, invalidate_control_session, commands.emergency_stop)
+    control_watchdog = ControlWatchdog(
+        hal, logs, invalidate_control_session, commands.emergency_stop,
+        disconnect_grace_s=float(os.environ.get("APPSTATION_CONTROL_DISCONNECT_GRACE_SEC", "0")),
+    )
     app.state.control_watchdog = control_watchdog
     commands.safety.readiness_check = control_watchdog.require_ready
     from backend.services.control_watchdog import request_control_session
@@ -533,6 +537,83 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             },
         )
 
+    async def require_teleop_hand_live(side: SideName) -> dict[str, Any]:
+        try:
+            health = await hal.health()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "OMEGA_HAND_NOT_READY", "message": f"HAL health unavailable: {exc}",
+            }) from exc
+        if health.mode != "real":
+            return {"side": side, "connected": True, "lastReadOk": True}
+        if not health.connected or not health.omega7_ok:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "OMEGA_HAND_NOT_READY", "message": health.message or "Omega.7 HAL is not ready"},
+            )
+        try:
+            state = await hal.omega_state()
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "OMEGA_HAND_NOT_READY", "message": f"Omega.7 state unavailable: {exc}"},
+            ) from exc
+        hands = state.get("hands")
+        hand = (
+            next((item for item in hands if isinstance(item, dict) and item.get("side") == side), None)
+            if isinstance(hands, list)
+            else None
+        )
+        if not isinstance(hand, dict) or not bool(hand.get("connected")) or not bool(hand.get("lastReadOk")):
+            message = str(hand.get("message", "")) if isinstance(hand, dict) else "hand not reported by HAL"
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "OMEGA_HAND_NOT_READY", "message": f"{side} Omega.7 is not live/readable: {message}"},
+            )
+        return hand
+
+    async def require_teleop_motion_already_enabled(side: SideName, config: dict[str, Any]) -> None:
+        try:
+            health = await hal.health()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "MOTION_STATE_UNAVAILABLE", "message": f"HAL health unavailable: {exc}",
+            }) from exc
+        if health.mode != "real":
+            return
+        try:
+            state = await hal.motion_state()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "MOTION_STATE_UNAVAILABLE", "message": f"motion state unavailable: {exc}",
+            }) from exc
+        hardware_side = teleop_hardware_side_for_operator_source(side, config)
+        if bool(state.get("estop_active")):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "SAFETY_STOP_ACTIVE", "message": "acknowledge safety before teleop connect"},
+            )
+        stamp = state.get("timestamp_ms")
+        if (
+            not isinstance(stamp, (int, float))
+            or not math.isfinite(stamp)
+            or not -100 <= now_ms() - stamp <= 500
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "MOTION_STATE_STALE", "message": "fresh controller motion sample is required before teleop connect"},
+            )
+        enabled = state.get("enabled")
+        offset = 0 if hardware_side == "left" else 6
+        if not isinstance(enabled, list) or len(enabled) != 12 or not all(value is True for value in enabled[offset:offset + 6]):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "MOTION_SIDE_NOT_ENABLED",
+                    "message": f"{hardware_side} motion side must be explicitly servo-enabled before teleop connect",
+                },
+            )
+
     def schedule_teleop_background(coro: Any, label: str) -> None:
         task = asyncio.create_task(coro, name=label)
         app.state.teleop_background_tasks.add(task)
@@ -573,27 +654,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     )
                 except RuntimeError as exc:
                     logs.warning("[HAL]", f"Omega.7 force output apply failed: {exc}")
-            try:
-                commands.safety.check(safety_token)
-                await commands.enable_motion_side(hardware_side)
-            except RuntimeError as exc:
-                logs.error("[HAL]", f"teleop connect enable mapped {hardware_side} failed: {exc}")
-            native_started = False
-            try:
-                commands.safety.check(safety_token)
-                await teleop_mapper.start("teleop-connect", pre_home=False, home_side=hardware_side)
-                native_started = True
-            except Exception:
-                if native_started:
-                    try:
-                        await teleop_mapper.stop("teleop-connect")
-                    except RuntimeError as cleanup_exc:
-                        logs.error("[HAL]", f"teleop connect rollback native stop failed: {cleanup_exc}")
-                try:
-                    await commands.stop_motion_side(hardware_side)
-                except RuntimeError as cleanup_exc:
-                    logs.error("[HAL]", f"teleop connect rollback stop mapped {hardware_side} failed: {cleanup_exc}")
-                raise
+            commands.safety.check(safety_token)
+            await teleop_mapper.start("teleop-connect", pre_home=False, home_side=hardware_side)
             logs.info("[HAL]", f"{side} Omega.7 logical connect background sync completed")
             return
 
@@ -1200,10 +1262,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.post("/api/motion/home_all")
     async def home_all() -> ApiEnvelope:
         try:
-            recorder.require_discard_complete()
+            recorder.require_work_origin_return_allowed()
             result = await commands.home_all()
             recorder.mark_reset_origin_all_returned()
             return envelope(result)
+        except RecordingBlocksOriginReturn as exc:
+            raise HTTPException(status_code=409, detail={"code": "RECORDING_ACTIVE", "message": str(exc)}) from exc
         except ControlLeaseUnavailable as exc:
             raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
@@ -1338,13 +1402,26 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             logs.error("[HAL]", f"stop_motion_side failed: {exc}")
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
 
-    # 指定侧运动轴执行回零。
-    @app.post("/api/motion/{side}/home")
-    async def home_motion_side(side: str) -> ApiEnvelope:
+    # 日常返回已标定硬件零点；不启动机械寻零或改写标定。
+    @app.post("/api/motion/{side}/return_home_reference")
+    async def return_hardware_reference_side(side: str, request: HardwareHomeRequest) -> ApiEnvelope:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         try:
-            return envelope(await commands.home_motion_side(side))
+            return envelope(await commands.return_hardware_reference_side(side, request.axes))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
+        except RuntimeError as exc:
+            logs.error("[HAL]", f"return_hardware_reference_side failed: {exc}")
+            raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
+
+    # 维护用机械寻零：可能沿固定方向绕圈；日常按钮不能调用此入口。
+    @app.post("/api/motion/{side}/home")
+    async def home_motion_side(side: str, request: HardwareHomeRequest) -> ApiEnvelope:
+        if side not in {"left", "right"}:
+            raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
+        try:
+            return envelope(await commands.home_motion_side(side, request.axes, reference_mode="origin"))
         except ControlLeaseUnavailable as exc:
             raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
@@ -1352,15 +1429,31 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
 
     # 指定侧返回已记录工作原点。
+    @app.post("/api/motion/{side}/positive_limit_reference")
+    async def positive_limit_reference_side(side: str, request: HardwareHomeRequest) -> ApiEnvelope:
+        if side not in {"left", "right"}:
+            raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
+        try:
+            return envelope(await commands.home_motion_side(
+                side, request.axes, reference_mode="positive_limit"
+            ))
+        except ControlLeaseUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
+        except RuntimeError as exc:
+            logs.error("[HAL]", f"positive_limit_reference_side failed: {exc}")
+            raise HTTPException(status_code=503, detail={"code": "MOTION_UNAVAILABLE", "message": str(exc)}) from exc
+
     @app.post("/api/motion/{side}/return_origin")
     async def return_motion_origin_side(side: str) -> ApiEnvelope:
         if side not in {"left", "right"}:
             raise HTTPException(status_code=400, detail={"code": "BAD_SIDE", "message": "side must be left or right"})
         try:
-            recorder.require_discard_complete()
+            recorder.require_work_origin_return_allowed()
             result = await commands.return_motion_origin_side(side)
             recorder.mark_reset_origin_returned(side)
             return envelope(result)
+        except RecordingBlocksOriginReturn as exc:
+            raise HTTPException(status_code=409, detail={"code": "RECORDING_ACTIVE", "message": str(exc)}) from exc
         except ControlLeaseUnavailable as exc:
             raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
@@ -1642,28 +1735,52 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         pending_config = await get_config_async()
         commands.safety.check(safety_token)
         validate_teleop_connect_ready(side_name, pending_config)
-        config = await asyncio.to_thread(set_teleop_logical_connection, side_name, True)
+        hand = await require_teleop_hand_live(side_name)
+        await require_teleop_motion_already_enabled(side_name, pending_config)
         commands.safety.check(safety_token)
-        mapped_side = teleop_target_side_for_source(side_name, config)
-        schedule_teleop_background(
-            sync_teleop_logical_connection(side_name, True, config, safety_token),
-            f"teleop-{side}-connect-sync",
-        )
-        logs.info(
-            "[HAL]",
-            f"{side} Omega.7 logical connect accepted; background sync scheduled",
-        )
-        return envelope(
-            {
-                "side": side,
-                "connected": True,
-                "mappedSide": mapped_side,
-                "backgroundSync": True,
-                "message": "logical connection accepted; hardware sync continues in background",
-            }
-        )
 
-    # 断开指定侧 Omega.7 遥操作逻辑连接。
+        # The logical flag is visible to the native payload, but the operation is transactional:
+        # any start failure rolls it back before the API returns an error.
+        config = await asyncio.to_thread(set_teleop_logical_connection, side_name, True)
+        mapped_side = teleop_target_side_for_source(side_name, config)
+        try:
+            await sync_teleop_logical_connection(side_name, True, config, safety_token)
+            commands.safety.check(safety_token)
+        except Exception:
+            rollback_saved = False
+            try:
+                await asyncio.to_thread(set_teleop_logical_connection, side_name, False)
+                rollback_saved = True
+            except Exception as cleanup_exc:
+                logs.error("[HAL]", f"teleop connect rollback config failed: {cleanup_exc}")
+            sources: list[str] = []
+            if rollback_saved:
+                try:
+                    await teleop_mapper.stop("teleop-connect")
+                    sources = teleop_mapper.status().get("sources", [])
+                except Exception as cleanup_exc:
+                    logs.error("[HAL]", f"teleop connect rollback mapper stop failed: {cleanup_exc}")
+            if not rollback_saved or not sources:
+                try:
+                    await hal.command("teleop.native.stop", {})
+                except Exception as cleanup_exc:
+                    logs.error("[HAL]", f"teleop connect rollback native stop failed: {cleanup_exc}")
+            try:
+                await commands.stop_motion_side(teleop_hardware_side_for_operator_source(side_name, config))
+            except Exception as cleanup_exc:
+                logs.error("[HAL]", f"teleop connect rollback motion stop failed: {cleanup_exc}")
+            raise
+        logs.info("[HAL]", f"{side} Omega.7 logical connect completed")
+        return envelope({
+            "side": side,
+            "connected": True,
+            "mappedSide": mapped_side,
+            "backgroundSync": False,
+            "physicalConnected": bool(hand.get("connected", False)),
+            "lastReadOk": bool(hand.get("lastReadOk", False)),
+            "message": "teleop master validated; slave enable state was not changed",
+        })
+
     @app.post("/api/teleop/{side}/disconnect")
     async def teleop_disconnect(side: str) -> ApiEnvelope:
         if side not in {"left", "right"}:
@@ -1671,14 +1788,15 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         side_name = cast(SideName, side)
         config = await asyncio.to_thread(set_teleop_logical_connection, side_name, False)
         mapped_side = teleop_target_side_for_source(side_name, config)
-        schedule_teleop_background(
-            sync_teleop_logical_connection(side_name, False, config),
-            f"teleop-{side}-disconnect-sync",
-        )
-        logs.info("[HAL]", f"{side} Omega.7 logical disconnect accepted; background sync scheduled")
-        return envelope({"side": side, "connected": False, "stoppedSide": mapped_side, "backgroundSync": True})
+        await sync_teleop_logical_connection(side_name, False, config)
+        logs.info("[HAL]", f"{side} Omega.7 logical disconnect completed")
+        return envelope({
+            "side": side,
+            "connected": False,
+            "stoppedSide": mapped_side,
+            "backgroundSync": False,
+        })
 
-    # 查询遥操作设备状态。
     @app.get("/api/teleop/state")
     async def teleop_state() -> ApiEnvelope:
         try:
@@ -2328,6 +2446,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     motion_estop_active = None
                     motion_enabled = None
                     motion_axis_enabled = None
+                    motion_axis_enabled_confirmed = None
                     if motion_state is not None:
                         raw_positions = motion_state.get("positions")
                         if isinstance(raw_positions, list) and len(raw_positions) == 12:
@@ -2364,6 +2483,13 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                                     if right_known_enabled
                                     else None
                                 ),
+                            }
+                        raw_enabled_confirmed = motion_state.get("enabled_confirmed")
+                        if (isinstance(raw_enabled_confirmed, list) and len(raw_enabled_confirmed) == 12
+                                and all(type(value) is bool for value in raw_enabled_confirmed)):
+                            motion_axis_enabled_confirmed = {
+                                "left": list(raw_enabled_confirmed[:6]),
+                                "right": list(raw_enabled_confirmed[6:12]),
                             }
                         elif isinstance(raw_enabled, dict):
                             raw_left_enabled = raw_enabled.get("left")
@@ -2430,6 +2556,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         motion_estop_active=motion_estop_active,
                         motion_enabled=motion_enabled,
                         motion_axis_enabled=motion_axis_enabled,
+                        motion_axis_enabled_confirmed=motion_axis_enabled_confirmed,
                         omega_hands=omega_hands,
                         force_state=force_state,
                         native_gripper_status=active_native_gripper_status,

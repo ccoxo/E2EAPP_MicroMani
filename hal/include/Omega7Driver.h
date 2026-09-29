@@ -42,6 +42,22 @@ struct Omega7State {
   bool lastReadOk{};
   std::int64_t readTimestampMs{};
   std::string lastReadError;
+  // 成功读取与读数变化分别计时；静止读数本身不代表设备故障。
+  int poseReadCode{-1};
+  std::int64_t poseSampleTs{};
+  std::int64_t translationChangeTs{};
+  std::int64_t rotationChangeTs{};
+  // 记录夹持输入的实际来源和各 SDK 调用结果；-2 表示未调用。
+  std::string gripperInputSource{"unavailable"};
+  std::int64_t gripperInputSampleTs{};
+  std::int64_t gripperInputChangeTs{};
+  int gripperGapReadCode{-2};
+  int gripperEncoderReadCode{-2};
+  int gripperEncoderConvertCode{-2};
+  int gripperAngleReadCode{-2};
+  int gripperButtonReadCode{-2};
+  double gripperDirectGapMm{-1.0};
+  double gripperEncoderGapMm{-1.0};
 };
 
 // Force Dimension Omega.7 主手驱动。该类只负责设备枚举、状态读取和力输出开关，

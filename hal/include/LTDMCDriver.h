@@ -28,6 +28,8 @@ class LTDMCDriver {
   HalHealth health(double uptimeS) const;
   // 读取 12 个语义轴的运动快照。读锁竞争时返回最近缓存，避免周期线程阻塞。
   MotionState readState();
+  // Return the latest completed controller sample without issuing vendor SDK reads.
+  MotionState latestState() const;
   // 立即急停所有轴并尽力关闭伺服；只有显式安全确认可以清除锁存。
   void emergencyStop();
   void latchEmergencyStop() noexcept;
@@ -52,8 +54,11 @@ class LTDMCDriver {
   std::string enableSide(Side side, bool enabled = true);
   std::string enableSide(Side side, bool enabled, const std::array<bool, 6>& enabledAxes,
       std::optional<std::uint64_t> expectedEpoch = std::nullopt);
-  // 使用控制卡原点回零模式回单侧机械原点。
-  void homeSide(Side side, const std::array<bool, 6>& enabledAxes,
+  // 返回逐轴限位参考标记；原点信号完成的轴为 false，限位参考保留原始脉冲计数。
+  std::array<bool, 6> homeSide(
+      Side side,
+      const std::array<bool, 6>& enabledAxes,
+      const HardwareHomeConfig& homeConfig = {},
       std::optional<std::uint64_t> expectedEpoch = std::nullopt);
   // 两侧回工作原点。workOriginPulse 是 12 轴目标脉冲，顺序与 MotionState::axes 一致。
   void homeAll(
@@ -65,7 +70,8 @@ class LTDMCDriver {
       Side side,
       const std::array<double, 6>& workOriginPulse,
       const std::array<bool, 6>& enabledAxes,
-      std::optional<std::uint64_t> expectedEpoch = std::nullopt);
+      std::optional<std::uint64_t> expectedEpoch = std::nullopt,
+      bool hardwareReferenceReturn = false);
   // maxVelocityUiPerSec/startVelocityUiPerSec 使用语义 UI 单位：
   // 平移轴是 um/s，旋转轴是 deg/s；传入 <=0 时使用内置保守默认值。
   void moveRelativeUi(
@@ -116,8 +122,19 @@ class LTDMCDriver {
   void publishStateSnapshotLocked();
   void publishStateSnapshotLocked(const MotionState& state);
   // best-effort 方法用于急停路径，不能抛异常，也不能依赖完整初始化状态。
-  void stopAllAxesBestEffort() noexcept;
-  void disableAllAxesBestEffort() noexcept;
+  struct StopAttemptSummary {
+    int attempted{};
+    int failed{};
+    short firstRet{};
+    unsigned short firstCard{};
+    int firstAxis{-1};
+    const char* firstOperation{"none"};
+  };
+  StopAttemptSummary stopAllAxesBestEffort() noexcept;
+  StopAttemptSummary disableAllAxesBestEffort() noexcept;
+  void clearEmergencyStateLocked();
+  static std::string stopAttemptFailureMessage(
+      const StopAttemptSummary& stop, const StopAttemptSummary& disable);
   void checkMotionCommand(std::uint64_t epoch);
 
   // mutex_ 保护 vendor SDK 调用和内部状态；snapshotMutex_ 只保护对外快照缓存。
@@ -128,8 +145,10 @@ class LTDMCDriver {
   EmergencyStopState estop_;
   ControlLeaseState controlLease_;
   std::atomic_uint32_t stopsInProgress_{0};
+  std::atomic_bool emergencyStateNeedsClear_{false};
   std::atomic_int64_t lastEmergencyStopUnixMs_{0};
   std::string lastError_;
+  std::string instanceId_;
   // pulse_/enabled_ 是 12 轴内部状态，索引由 stateIndex(side, axis) 计算。
   std::array<double, 12> pulse_{};
   std::array<bool, 12> enabled_{};

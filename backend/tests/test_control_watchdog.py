@@ -80,6 +80,7 @@ def test_ack_readiness_requires_confirmed_current_session_and_rejects_trip_befor
 def test_second_controller_is_rejected_and_owner_disconnect_trips_control() -> None:
     async def exercise() -> None:
         watchdog, _now, hal, invalidate, stop = make_watchdog()
+        watchdog.disconnect_grace_s = 0.0
         messages = [[], []]
 
         async def send_first(message):
@@ -110,6 +111,31 @@ def test_second_controller_is_rejected_and_owner_disconnect_trips_control() -> N
     asyncio.run(exercise())
 
 
+def test_owner_disconnect_allows_quick_reconnect_before_fail_safe_stop() -> None:
+    async def exercise() -> None:
+        watchdog, _now, _hal, invalidate, stop = make_watchdog()
+        watchdog.disconnect_grace_s = 0.05
+
+        async def send(_message):
+            return None
+
+        first = await confirm_mock_browser_lease(watchdog)
+        watchdog.remove(first)
+        await asyncio.sleep(0.01)
+        second = watchdog.register(send)
+        try:
+            await watchdog.cycle()
+            await flush()
+            watchdog.require_ready()
+            invalidate.assert_not_called()
+            stop.assert_not_awaited()
+            assert second in watchdog.clients
+        finally:
+            await watchdog.close()
+
+    asyncio.run(exercise())
+
+
 def test_hal_renewal_failure_never_reports_active_or_automatically_acknowledges() -> None:
     async def exercise() -> None:
         watchdog, _now, hal, invalidate, stop = make_watchdog()
@@ -133,9 +159,54 @@ def test_hal_renewal_failure_never_reports_active_or_automatically_acknowledges(
     asyncio.run(exercise())
 
 
+def test_slow_but_confirmed_hal_renewal_keeps_control_session() -> None:
+    async def exercise() -> None:
+        watchdog, _now, hal, invalidate, stop = make_watchdog()
+        watchdog.register(AsyncMock())
+
+        async def slow_renewal(_name, _payload):
+            await asyncio.sleep(0.85)
+            return {"response": {"ok": True, "leaseFresh": True, "timeoutMs": 2500}}
+
+        hal.command.side_effect = slow_renewal
+        try:
+            await watchdog.cycle()
+            watchdog.require_ready()
+            invalidate.assert_not_called()
+            stop.assert_not_awaited()
+        finally:
+            await watchdog.close()
+
+    asyncio.run(exercise())
+
+
+def test_unconfirmed_hal_renewal_still_trips_control_session() -> None:
+    async def exercise() -> None:
+        watchdog, _now, hal, invalidate, stop = make_watchdog()
+        watchdog.register(AsyncMock())
+
+        async def stalled_renewal(_name, _payload):
+            await asyncio.sleep(1.35)
+            return {"response": {"ok": True, "leaseFresh": True, "timeoutMs": 2500}}
+
+        hal.command.side_effect = stalled_renewal
+        try:
+            await watchdog.cycle()
+            with pytest.raises(ControlLeaseUnavailable):
+                watchdog.require_ready()
+            invalidate.assert_called_once()
+            await flush()
+            stop.assert_awaited_once()
+        finally:
+            await watchdog.close()
+
+    asyncio.run(exercise())
+
+
 def test_late_successful_renewal_cannot_reactivate_disconnected_session() -> None:
     async def exercise() -> None:
         watchdog, _now, hal, invalidate, stop = make_watchdog()
+        watchdog.disconnect_grace_s = 0.0
         messages = []
         entered, release = asyncio.Event(), asyncio.Event()
 
@@ -276,6 +347,7 @@ def test_app_websocket_lease_confirmation_allows_ack_and_disconnect_blocks_it(tm
     app = create_app(tmp_path)
     app.state.telemetry.hardware = None
     watchdog = app.state.control_watchdog
+    watchdog.disconnect_grace_s = 0.0
 
     async def exercise() -> None:
         inbox = asyncio.Queue()

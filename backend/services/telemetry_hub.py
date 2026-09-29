@@ -34,6 +34,10 @@ class TelemetryHub:
             "left": [None] * 6,
             "right": [None] * 6,
         }
+        self.motion_axis_enabled_confirmed: dict[Literal["left", "right"], list[bool]] = {
+            "left": [False] * 6,
+            "right": [False] * 6,
+        }
         self.gripper_positions = [-1.0, -1.0]
         self.estop_active = False
         self.force_tare_active = False
@@ -76,6 +80,7 @@ class TelemetryHub:
         motion_estop_active: bool | None = None,
         motion_enabled: dict[str, bool | None] | None = None,
         motion_axis_enabled: dict[str, list[bool | None]] | None = None,
+        motion_axis_enabled_confirmed: dict[str, list[bool]] | None = None,
         omega_hands: list[dict[str, Any]] | None = None,
         force_state: dict[str, Any] | None = None,
         native_gripper_status: dict[str, Any] | None = None,
@@ -107,6 +112,11 @@ class TelemetryHub:
                 self.motion_axis_enabled = {
                     "left": list(motion_axis_enabled.get("left", [None] * 6))[:6],
                     "right": list(motion_axis_enabled.get("right", [None] * 6))[:6],
+                }
+            if motion_axis_enabled_confirmed is not None:
+                self.motion_axis_enabled_confirmed = {
+                    "left": [value is True for value in list(motion_axis_enabled_confirmed.get("left", [False] * 6))[:6]],
+                    "right": [value is True for value in list(motion_axis_enabled_confirmed.get("right", [False] * 6))[:6]],
                 }
             joint_positions = list(self.motion_positions)
         else:
@@ -189,6 +199,10 @@ class TelemetryHub:
                 "left": list(self.motion_axis_enabled["left"]),
                 "right": list(self.motion_axis_enabled["right"]),
             },
+            motionAxisEnabledConfirmed={
+                "left": list(self.motion_axis_enabled_confirmed["left"]),
+                "right": list(self.motion_axis_enabled_confirmed["right"]),
+            },
             forceLeft=force_left,
             forceRight=force_right,
             forceStatus=force_status,
@@ -255,10 +269,11 @@ class TelemetryHub:
         self.axis_offsets = [0.0] * 12
         self.estop_active = False
 
-    def home_side(self, side: str) -> None:
+    def home_side(self, side: str, enabled_axes: list[bool] | None = None) -> None:
         start = 0 if side == "left" else 6
         for idx in range(start, start + 6):
-            self.axis_offsets[idx] = 0.0
+            if enabled_axes is None or enabled_axes[idx - start]:
+                self.axis_offsets[idx] = 0.0
         self.estop_active = False
 
     def set_motion_enabled(self, side: str, enabled: bool | None) -> None:

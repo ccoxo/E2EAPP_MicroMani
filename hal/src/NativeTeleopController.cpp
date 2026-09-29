@@ -388,6 +388,7 @@ void NativeTeleopController::prepareReplayGripper(const JodellGripperConfig& con
     config_.gripperParticipating = participating;
     gripperPositionOk_ = {false, false};
     gripperPositionSampleTs_ = {0, 0};
+    gripperPositionSampleMonotonicMs_ = {0, 0};
   }
   startGripperWorker();
   if (!motion_.commandEpochAllowed(epoch)) {
@@ -658,30 +659,6 @@ void NativeTeleopController::gripperLoop() {
         nextSampleAt = now + kGripperPositionSampleInterval;
       }
     }
-    for (const auto& command : commands) {
-      if (!command.pending || !gripperWorkerRunning_.load()
-          || !motion_.commandEpochAllowed(command.motionEpoch)) {
-        continue;
-      }
-      std::string message;
-      const bool ok = gripper_.commandTarget(
-          command.side,
-          command.targetMm,
-          command.speed,
-          command.torque,
-          &message,
-          false,
-          [&]() { return gripperWorkerRunning_.load() && motion_.commandEpochAllowed(command.motionEpoch); });
-      {
-        std::scoped_lock lock(mutex_);
-        // 命令不强制读位置，使用非阻塞快照刷新 UI 状态。
-        const auto gripperPositions = gripper_.positionMmSnapshot(gripperPositionsMm_);
-        gripperPositionsMm_ = gripperPositions;
-        gripperLastCommandOk_[command.targetIndex] = ok;
-        gripperLastMessage_[command.targetIndex] = message;
-        gripperLastCommandTs_[command.targetIndex] = unixTimeMs();
-      }
-    }
     if (shouldSample) {
       std::array<bool, 2> participating;
       {
@@ -691,19 +668,63 @@ void NativeTeleopController::gripperLoop() {
       if (participating[0]) sampleGripperPosition(Side::Left);
       if (participating[1]) sampleGripperPosition(Side::Right);
     }
+    for (const auto& command : commands) {
+      if (!command.pending || !gripperWorkerRunning_.load()
+          || !motion_.commandEpochAllowed(command.motionEpoch)) {
+        continue;
+      }
+      std::string message;
+      const auto commandStarted = std::chrono::steady_clock::now();
+      const bool ok = gripper_.commandTarget(
+          command.side,
+          command.targetMm,
+          command.speed,
+          command.torque,
+          &message,
+          false,
+          [&]() { return gripperWorkerRunning_.load() && motion_.commandEpochAllowed(command.motionEpoch); });
+      const double commandMs = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - commandStarted).count();
+      {
+        std::scoped_lock lock(mutex_);
+        // 命令不强制读位置，使用非阻塞快照刷新 UI 状态。
+        gripperCommandDurationMs_[command.targetIndex] = commandMs;
+        const auto gripperPositions = gripper_.positionMmSnapshot(gripperPositionsMm_);
+        gripperPositionsMm_ = gripperPositions;
+        gripperLastCommandOk_[command.targetIndex] = ok;
+        gripperLastMessage_[command.targetIndex] = message;
+        gripperLastCommandTs_[command.targetIndex] = unixTimeMs();
+      }
+    }
   }
 }
 
 void NativeTeleopController::sampleGripperPosition(Side side) {
   // 周期性采样供状态显示及回放到位判断；失败不能刷新成功采样时间。
   std::string message;
+  const auto readStarted = std::chrono::steady_clock::now();
   const bool ok = gripper_.readPositionMm(side, &message);
+  const auto readFinished = std::chrono::steady_clock::now();
+  const double readMs = std::chrono::duration<double, std::milli>(readFinished - readStarted).count();
+  const auto sampleMidpoint = readStarted + (readFinished - readStarted) / 2;
+  const auto sampleMonotonicMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      sampleMidpoint.time_since_epoch()).count();
+  const auto readFinishedUnixMs = unixTimeMs();
   const int index = sideIndex(side);
   std::scoped_lock lock(mutex_);
+  gripperReadDurationMs_[index] = readMs;
+  gripperReadAttemptTs_[index] = readFinishedUnixMs;
+  gripperReadMessage_[index] = message;
   gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);
   gripperLastCommandOk_[index] = ok;
   gripperPositionOk_[index] = ok;
-  if (ok) gripperPositionSampleTs_[index] = unixTimeMs();
+  if (ok) {
+    // Jodell does not expose a hardware sample timestamp. Use the midpoint of
+    // the blocking READ as the best host-side estimate of measurement time.
+    gripperPositionSampleTs_[index] = readFinishedUnixMs
+        - static_cast<std::int64_t>(std::llround(readMs * 0.5));
+    gripperPositionSampleMonotonicMs_[index] = sampleMonotonicMs;
+  }
   if (!message.empty()) {
     gripperLastMessage_[index] = message;
   }
@@ -867,6 +888,11 @@ std::string NativeTeleopController::statusJson() const {
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[0]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[0]
       << ",\"positionSampleTs\":" << gripperPositionSampleTs_[0]
+      << ",\"positionSampleMonotonicMs\":" << gripperPositionSampleMonotonicMs_[0]
+      << ",\"lastCommandDurationMs\":" << gripperCommandDurationMs_[0]
+      << ",\"lastReadDurationMs\":" << gripperReadDurationMs_[0]
+      << ",\"lastReadAttemptTs\":" << gripperReadAttemptTs_[0]
+      << ",\"lastReadMessage\":\"" << jsonEscape(gripperReadMessage_[0]) << "\""
       << ",\"positionOk\":" << (gripperPositionOk_[0] ? "true" : "false")
       << "},\"right\":{\"ok\":" << (gripperLastCommandOk_[1] ? "true" : "false")
       << ",\"targetMm\":" << gripperTargetsMm_[1];
@@ -881,6 +907,11 @@ std::string NativeTeleopController::statusJson() const {
       << ",\"message\":\"" << jsonEscape(gripperLastMessage_[1]) << "\""
       << ",\"lastCommandTs\":" << gripperLastCommandTs_[1]
       << ",\"positionSampleTs\":" << gripperPositionSampleTs_[1]
+      << ",\"positionSampleMonotonicMs\":" << gripperPositionSampleMonotonicMs_[1]
+      << ",\"lastCommandDurationMs\":" << gripperCommandDurationMs_[1]
+      << ",\"lastReadDurationMs\":" << gripperReadDurationMs_[1]
+      << ",\"lastReadAttemptTs\":" << gripperReadAttemptTs_[1]
+      << ",\"lastReadMessage\":\"" << jsonEscape(gripperReadMessage_[1]) << "\""
       << ",\"positionOk\":" << (gripperPositionOk_[1] ? "true" : "false")
       << "}}";
   out << ",\"gravityCompensation\":["

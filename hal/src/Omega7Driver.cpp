@@ -322,8 +322,18 @@ std::array<Omega7State, 2> Omega7Driver::readState() {
     }
     double x = 0, y = 0, z = 0, roll = 0, pitch = 0, yaw = 0;
     // pose 前三维是位置，后三维是姿态角，姿态单位由 SDK 函数名确定为 degree。
-    if (dhdGetPositionAndOrientationDeg(&x, &y, &z, &roll, &pitch, &yaw, static_cast<char>(item.deviceId)) >= 0) {
-      item.pose = {x, y, z, roll, pitch, yaw};
+    item.poseReadCode = dhdGetPositionAndOrientationDeg(
+        &x, &y, &z, &roll, &pitch, &yaw, static_cast<char>(item.deviceId));
+    if (item.poseReadCode >= 0) {
+      const std::array<double, 6> nextPose{x, y, z, roll, pitch, yaw};
+      if (nextPose[0] != item.pose[0] || nextPose[1] != item.pose[1] || nextPose[2] != item.pose[2]) {
+        item.translationChangeTs = readTimestampMs;
+      }
+      if (nextPose[3] != item.pose[3] || nextPose[4] != item.pose[4] || nextPose[5] != item.pose[5]) {
+        item.rotationChangeTs = readTimestampMs;
+      }
+      item.pose = nextPose;
+      item.poseSampleTs = readTimestampMs;
       item.lastReadOk = true;
       item.lastReadError.clear();
     } else {
@@ -334,18 +344,31 @@ std::array<Omega7State, 2> Omega7Driver::readState() {
     // 会根据 clutch 配置决定是否允许把主手位姿变化映射到从臂动作。
     if (dhdGetButton) {
       item.clutchPressed = dhdGetButton(0, static_cast<char>(item.deviceId)) > 0;
-      item.gripperPressed = dhdGetButton(1, static_cast<char>(item.deviceId)) > 0;
+      item.gripperButtonReadCode = dhdGetButton(1, static_cast<char>(item.deviceId));
+      item.gripperPressed = item.gripperButtonReadCode > 0;
     }
     // gripperGap 是 Omega.7 主手自身夹持开口；下游可用它映射从端夹爪命令。
+    const double previousGap = item.gripperGap;
+    const bool previousGapAvailable = item.gripperGapAvailable;
+    const auto previousSource = item.gripperInputSource;
+    item.gripperInputSource = "unavailable";
+    item.gripperGapReadCode = -2;
+    item.gripperEncoderReadCode = -2;
+    item.gripperEncoderConvertCode = -2;
+    item.gripperAngleReadCode = -2;
+    item.gripperDirectGapMm = -1.0;
+    item.gripperEncoderGapMm = -1.0;
     double selectedGapMm = 0.0;
     bool haveGap = false;
     if (dhdGetGripperGap) {
       // 首选 SDK 直接给出的开口距离，单位米。
       double gapM = 0.0;
-      if (dhdGetGripperGap(&gapM, static_cast<char>(item.deviceId)) >= 0 && std::isfinite(gapM)) {
-        const double directGapMm = (std::max)(0.0, gapM * 1000.0);
-        if (directGapMm > kOmega7GripperGapMinReliableMm) {
-          selectedGapMm = directGapMm;
+      item.gripperGapReadCode = dhdGetGripperGap(&gapM, static_cast<char>(item.deviceId));
+      if (item.gripperGapReadCode >= 0 && std::isfinite(gapM)) {
+        item.gripperDirectGapMm = (std::max)(0.0, gapM * 1000.0);
+        if (item.gripperDirectGapMm > kOmega7GripperGapMinReliableMm) {
+          selectedGapMm = item.gripperDirectGapMm;
+          item.gripperInputSource = "gap";
           haveGap = true;
         }
       }
@@ -354,27 +377,40 @@ std::array<Omega7State, 2> Omega7Driver::readState() {
       // 直接开口不可用时，用编码器读数经 SDK 换算成开口距离。
       int encoder = 0;
       double encoderGapM = 0.0;
-      if (dhdGetGripperEncoder(&encoder, static_cast<char>(item.deviceId)) >= 0
-          && dhdGripperEncoderToGap(encoder, &encoderGapM, static_cast<char>(item.deviceId)) >= 0
-          && std::isfinite(encoderGapM)) {
-        const double encoderGapMm = (std::max)(0.0, encoderGapM * 1000.0);
-        if (encoderGapMm > kOmega7GripperGapMinReliableMm) {
-          selectedGapMm = encoderGapMm;
-          haveGap = true;
+      item.gripperEncoderReadCode = dhdGetGripperEncoder(&encoder, static_cast<char>(item.deviceId));
+      if (item.gripperEncoderReadCode >= 0) {
+        item.gripperEncoderConvertCode = dhdGripperEncoderToGap(
+            encoder, &encoderGapM, static_cast<char>(item.deviceId));
+        if (item.gripperEncoderConvertCode >= 0 && std::isfinite(encoderGapM)) {
+          item.gripperEncoderGapMm = (std::max)(0.0, encoderGapM * 1000.0);
+          if (item.gripperEncoderGapMm > kOmega7GripperGapMinReliableMm) {
+            selectedGapMm = item.gripperEncoderGapMm;
+            item.gripperInputSource = "encoder";
+            haveGap = true;
+          }
         }
       }
     }
     if (!haveGap && dhdGetGripperAngleDeg) {
       // 最后才用夹爪角度线性估算开口，精度较低但可作为 teleop 兜底输入。
       double angleDeg = 0.0;
-      if (dhdGetGripperAngleDeg(&angleDeg, static_cast<char>(item.deviceId)) >= 0 && std::isfinite(angleDeg)) {
+      item.gripperAngleReadCode = dhdGetGripperAngleDeg(&angleDeg, static_cast<char>(item.deviceId));
+      if (item.gripperAngleReadCode >= 0 && std::isfinite(angleDeg)) {
         selectedGapMm = std::clamp(std::abs(angleDeg) / kOmega7GripperOpenDeg, 0.0, 1.0)
             * kOmega7GripperOpenMm;
+        item.gripperInputSource = "angle";
         haveGap = true;
       }
     }
     item.gripperGap = selectedGapMm / 1000.0;
     item.gripperGapAvailable = haveGap;
+    if (haveGap) {
+      item.gripperInputSampleTs = readTimestampMs;
+    }
+    if (previousGapAvailable != haveGap || previousGap != item.gripperGap
+        || previousSource != item.gripperInputSource) {
+      item.gripperInputChangeTs = readTimestampMs;
+    }
     if (forceStopRequested_.load()) {
       applyForceOutputUnlocked(index, false);
     } else if (forceOutputEnabled_[index]) {

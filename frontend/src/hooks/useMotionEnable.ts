@@ -11,14 +11,20 @@ export function useMotionEnable(side: ManualControlSide) {
   const live = useTelemetryStore((state) => motionTelemetryIsLive(state.frame, state.telemetryLink))
   const blockedReason = useTelemetryStore((state) => controlSafetyBlockReason(state, false))
   const axes = useTelemetryStore(useShallow((state) => state.frame.motionAxisEnabled?.[side]))
+  const confirmedAxes = useTelemetryStore(useShallow((state) => state.frame.motionAxisEnabledConfirmed?.[side]))
   const setMotionEnabled = useTelemetryStore((state) => state.setMotionEnabled)
   const busy = command.transportPending || command.phase === 'waitingConfirm'
   const desired = command.queuedEnabled ?? (busy ? command.targetEnabled : null)
   const canEnable = live && !blockedReason
+  const feedbackConfirmed = Array.isArray(confirmedAxes) && confirmedAxes.length === 6 && confirmedAxes.every(Boolean)
+  const deviceLabel = deviceState === 'unknown' || feedbackConfirmed
+    ? motionDeviceLabels[deviceState]
+    : `${motionDeviceLabels[deviceState]}（硬件反馈未确认）`
   return {
     command,
     deviceState,
-    deviceLabel: motionDeviceLabels[deviceState],
+    deviceLabel,
+    feedbackConfirmed,
     commandLabel: motionCommandLabel(command),
     live,
     canEnable,
