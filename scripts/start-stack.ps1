@@ -98,7 +98,8 @@ try {
   & (Join-Path $PSScriptRoot "start-hal.ps1") -Restart -Port $activeHalPort | Out-Host
 } catch {
   $halStartError = $_.Exception.Message
-  if ($HalPort -ne 8091 -or $halStartError -notmatch "/health failed") {
+  # 仅监听端口失败时换端口，初始化超时或崩溃应保留首次诊断。
+  if ($HalPort -ne 8091 -or $halStartError -notmatch "Failed to bind HalServer on 127\.0\.0\.1:8091") {
     throw
   }
   Write-Warning "HAL start on port 8091 failed; retrying on 8092. $halStartError"
