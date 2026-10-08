@@ -322,6 +322,8 @@ export async function postCommand(path: string, body?: unknown) {
   const controller = new AbortController()
   const timeoutMs = /\/motion\/(home_all|(left|right)\/(home|return_origin|return_home_reference))$/.test(apiPath)
     ? 80_000
+    // 首次录制需加载 LeRobot/编码器；等待期间仍由独立租约与遥测保护设备。
+    : apiPath === '/api/record/session/create' ? 60_000
     : /\/cameras\/wrists\/(identify|bind)$/.test(apiPath) ? 60_000 : 10_000
   let timer: ReturnType<typeof setTimeout> | undefined
   const exchange = async () => {
