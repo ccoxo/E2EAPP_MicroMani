@@ -539,7 +539,7 @@ bool JodellGripperDriver::ensureProcessWorkerUnlocked(int index, std::string* me
     if (GetExitCodeProcess(static_cast<HANDLE>(worker.process), &exitCode) && exitCode == STILL_ACTIVE) {
       return true;
     }
-    closeProcessWorkersUnlocked();
+    closeProcessWorkerUnlocked(index);
   }
 
   SECURITY_ATTRIBUTES security{};
@@ -629,6 +629,7 @@ bool JodellGripperDriver::commandProcessWorkerUnlocked(
     if (message) {
       *message = "failed to write Jodell worker command";
     }
+    closeProcessWorkerUnlocked(index, true);
     return false;
   }
   std::string line;
@@ -636,6 +637,7 @@ bool JodellGripperDriver::commandProcessWorkerUnlocked(
     if (message) {
       *message = "Jodell worker response timeout";
     }
+    closeProcessWorkerUnlocked(index, true);
     return false;
   }
   const auto parts = splitTabs(line);
@@ -643,6 +645,7 @@ bool JodellGripperDriver::commandProcessWorkerUnlocked(
     if (message) {
       *message = "invalid Jodell worker response: " + sanitizeProtocolField(line);
     }
+    closeProcessWorkerUnlocked(index, true);
     return false;
   }
   // parts[0] 是 OK/ERR，parts[1] 是位置毫米值，parts[2] 是可读诊断消息。
@@ -657,31 +660,29 @@ bool JodellGripperDriver::commandProcessWorkerUnlocked(
   return parts[0] == "OK";
 }
 
-void JodellGripperDriver::closeProcessWorkersUnlocked() {
-  for (auto& worker : workerProcesses_) {
-    if (worker.stdinWrite) {
-      // 正常路径先请求 worker 自行退出，避免直接终止时 DLL/串口状态未释放。
-      (void)writeAll(static_cast<HANDLE>(worker.stdinWrite), "EXIT\n");
-    }
-    if (worker.process) {
-      const DWORD waitResult = WaitForSingleObject(static_cast<HANDLE>(worker.process), 500);
-      if (waitResult == WAIT_TIMEOUT) {
-        // 进程不响应时才强制终止，防止 HalServer 关闭流程无限等待。
-        TerminateProcess(static_cast<HANDLE>(worker.process), 1);
-        WaitForSingleObject(static_cast<HANDLE>(worker.process), 500);
-      }
-    }
-    if (worker.stdinWrite) {
-      CloseHandle(static_cast<HANDLE>(worker.stdinWrite));
-    }
-    if (worker.stdoutRead) {
-      CloseHandle(static_cast<HANDLE>(worker.stdoutRead));
-    }
-    if (worker.process) {
-      CloseHandle(static_cast<HANDLE>(worker.process));
-    }
-    worker = ProcessWorkerHandle{};
+void JodellGripperDriver::closeProcessWorkerUnlocked(int index, bool abortPending) {
+  auto& worker = workerProcesses_[index];
+  if (worker.stdinWrite && !abortPending) {
+    (void)writeAll(static_cast<HANDLE>(worker.stdinWrite), "EXIT\n");
   }
+  if (worker.process) {
+    // 故障通道不能执行积压命令或把迟到回复留给下一次请求。
+    const DWORD waitResult = abortPending ? WAIT_TIMEOUT
+        : WaitForSingleObject(static_cast<HANDLE>(worker.process), 500);
+    if (waitResult == WAIT_TIMEOUT) {
+      TerminateProcess(static_cast<HANDLE>(worker.process), 1);
+      WaitForSingleObject(static_cast<HANDLE>(worker.process), 500);
+    }
+  }
+  if (worker.stdinWrite) CloseHandle(static_cast<HANDLE>(worker.stdinWrite));
+  if (worker.stdoutRead) CloseHandle(static_cast<HANDLE>(worker.stdoutRead));
+  if (worker.process) CloseHandle(static_cast<HANDLE>(worker.process));
+  worker = ProcessWorkerHandle{};
+  positionMm_[index] = -1.0;
+}
+
+void JodellGripperDriver::closeProcessWorkersUnlocked() {
+  for (int index = 0; index < 2; ++index) closeProcessWorkerUnlocked(index);
 }
 
 void JodellGripperDriver::closeUnlocked() {

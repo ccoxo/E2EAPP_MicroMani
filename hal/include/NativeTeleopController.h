@@ -257,7 +257,9 @@ class NativeTeleopController {
   void loop();
   void startGripperWorker();
   void stopGripperWorker();
-  void gripperLoop();
+  void gripperLoop(int targetIndex);
+  JodellGripperDriver& gripperDriver(Side side);
+  std::array<double, 2> gripperPositionSnapshotUnlocked() const;
   void sampleGripperPosition(Side side);
   void tick(double dtSec);
   void tickSideBestEffort(int sourceIndex, const Omega7State& hand, double dtSec);
@@ -312,6 +314,8 @@ class NativeTeleopController {
   MotionExecutor& executor_;
   Omega7Driver& omega_;
   JodellGripperDriver& gripper_;
+  // 隔离模式下右侧拥有独立驱动锁和管道；直连 DLL 模式仍共用原驱动串行访问。
+  JodellGripperDriver rightGripper_;
   // mutex_ 保护 teleop 配置、引用位姿、诊断状态和动作历史；夹爪队列使用单独 mutex。
   mutable std::mutex mutex_;
   NativeTeleopConfig config_{};
@@ -374,7 +378,7 @@ class NativeTeleopController {
   std::array<std::string, 2> gripperReadMessage_{};
   std::mutex gripperMutex_;
   std::condition_variable gripperCv_;
-  std::thread gripperWorker_;
+  std::array<std::thread, 2> gripperWorkers_;
   std::atomic<bool> gripperWorkerRunning_{false};
   std::array<PendingGripperCommand, 2> pendingGripperCommands_{};
 };

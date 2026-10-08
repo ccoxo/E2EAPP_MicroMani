@@ -366,6 +366,7 @@ void NativeTeleopController::configure(const NativeTeleopConfig& config,
   }
   // 夹爪和主手力输出配置下推到底层驱动，避免等待下一次 start。
   gripper_.configure(normalized.gripper);
+  rightGripper_.configure(normalized.gripper);
   if (!normalized.gripperTeleopEnabled) {
     stopGripperWorker();
   }
@@ -408,6 +409,7 @@ void NativeTeleopController::configureGripper(const JodellGripperConfig& config)
         std::max(0.001, config_.gripper.strokeMm));
   }
   gripper_.configure(config);
+  rightGripper_.configure(config);
 }
 
 void NativeTeleopController::configureGripperProtection(bool enabled, double minGapMm) {
@@ -602,99 +604,103 @@ void NativeTeleopController::reportControlFailure(const char* message) noexcept 
   }
 }
 
+JodellGripperDriver& NativeTeleopController::gripperDriver(Side side) {
+  std::scoped_lock lock(mutex_);
+  return side == Side::Right && config_.gripper.processWorkersEnabled ? rightGripper_ : gripper_;
+}
+
+std::array<double, 2> NativeTeleopController::gripperPositionSnapshotUnlocked() const {
+  auto positions = gripper_.positionMmSnapshot(gripperPositionsMm_);
+  if (config_.gripper.processWorkersEnabled) {
+    positions[1] = rightGripper_.positionMmSnapshot(gripperPositionsMm_)[1];
+  }
+  return positions;
+}
+
 void NativeTeleopController::startGripperWorker() {
-  if (gripperWorker_.joinable()) {
-    if (gripperWorkerRunning_.load()) return;
-    gripperWorker_.join();
+  if (gripperWorkerRunning_.load()) return;
+  for (auto& worker : gripperWorkers_) {
+    if (worker.joinable()) worker.join();
   }
   if (motion_.estopActive()) return;
   gripperWorkerRunning_.store(true);
   try {
-    gripperWorker_ = std::thread([this]() {
-      try { gripperLoop(); }
-      catch (const std::exception& error) { reportControlFailure(error.what()); }
-      catch (...) { reportControlFailure("unknown C++ exception in native gripper worker"); }
-    });
+    for (int index = 0; index < 2; ++index) {
+      gripperWorkers_[index] = std::thread([this, index]() {
+        try { gripperLoop(index); }
+        catch (const std::exception& error) { reportControlFailure(error.what()); }
+        catch (...) { reportControlFailure("unknown C++ exception in native gripper worker"); }
+      });
+    }
   } catch (...) {
     reportControlFailure("native gripper worker could not be created");
+    stopGripperWorker();
     throw;
   }
 }
 
 void NativeTeleopController::stopGripperWorker() {
-  if (gripperWorkerRunning_.exchange(false)) {
-    // 唤醒正在等待命令或采样时间的 worker，让它尽快退出。
-    gripperCv_.notify_all();
-  }
-  if (gripperWorker_.joinable()) {
-    gripperWorker_.join();
+  gripperWorkerRunning_.store(false);
+  gripperCv_.notify_all();
+  for (auto& worker : gripperWorkers_) {
+    if (worker.joinable()) worker.join();
   }
   std::scoped_lock lock(gripperMutex_);
-  // 停止 worker 后丢弃未执行命令，避免下次启动时执行过期目标。
   pendingGripperCommands_ = {};
 }
 
-void NativeTeleopController::gripperLoop() {
-  // 单独线程串行处理夹爪命令和低频位置采样。
+void NativeTeleopController::gripperLoop(int targetIndex) {
+  // 每侧独立等待串口，命令优先；绝不把旧目标带过阻塞的位置读取。
+  const Side side = sideFromIndex(targetIndex);
   auto nextSampleAt = std::chrono::steady_clock::now();
   while (gripperWorkerRunning_.load()) {
-    std::array<PendingGripperCommand, 2> commands{};
+    PendingGripperCommand command{};
     bool shouldSample = false;
     {
       std::unique_lock lock(gripperMutex_);
       gripperCv_.wait_until(lock, nextSampleAt, [&] {
-        return !gripperWorkerRunning_.load()
-            || pendingGripperCommands_[0].pending
-            || pendingGripperCommands_[1].pending;
+        return !gripperWorkerRunning_.load() || pendingGripperCommands_[targetIndex].pending;
       });
-      if (!gripperWorkerRunning_.load()) {
-        break;
-      }
-      // 取出并清空 pending，后续命令会覆盖为最新目标，避免排队积压。
-      commands = pendingGripperCommands_;
-      pendingGripperCommands_ = {};
-      const auto now = std::chrono::steady_clock::now();
-      if (now >= nextSampleAt) {
-        shouldSample = true;
-        nextSampleAt = now + kGripperPositionSampleInterval;
-      }
+      if (!gripperWorkerRunning_.load()) break;
+      command = pendingGripperCommands_[targetIndex];
+      pendingGripperCommands_[targetIndex] = {};
+      shouldSample = !command.pending && std::chrono::steady_clock::now() >= nextSampleAt;
     }
     if (shouldSample) {
-      std::array<bool, 2> participating;
+      bool participating;
       {
         std::scoped_lock lock(mutex_);
-        participating = config_.gripperParticipating;
+        participating = config_.gripperParticipating[targetIndex];
       }
-      if (participating[0]) sampleGripperPosition(Side::Left);
-      if (participating[1]) sampleGripperPosition(Side::Right);
+      if (participating) sampleGripperPosition(side);
+      nextSampleAt = std::chrono::steady_clock::now() + kGripperPositionSampleInterval;
+      // READ 期间可能收到多个目标，只取此刻最新的一个。
+      std::scoped_lock lock(gripperMutex_);
+      command = pendingGripperCommands_[targetIndex];
+      pendingGripperCommands_[targetIndex] = {};
     }
-    for (const auto& command : commands) {
-      if (!command.pending || !gripperWorkerRunning_.load()
-          || !motion_.commandEpochAllowed(command.motionEpoch)) {
-        continue;
-      }
-      std::string message;
-      const auto commandStarted = std::chrono::steady_clock::now();
-      const bool ok = gripper_.commandTarget(
-          command.side,
-          command.targetMm,
-          command.speed,
-          command.torque,
-          &message,
-          false,
-          [&]() { return gripperWorkerRunning_.load() && motion_.commandEpochAllowed(command.motionEpoch); });
-      const double commandMs = std::chrono::duration<double, std::milli>(
-          std::chrono::steady_clock::now() - commandStarted).count();
-      {
-        std::scoped_lock lock(mutex_);
-        // 命令不强制读位置，使用非阻塞快照刷新 UI 状态。
-        gripperCommandDurationMs_[command.targetIndex] = commandMs;
-        const auto gripperPositions = gripper_.positionMmSnapshot(gripperPositionsMm_);
-        gripperPositionsMm_ = gripperPositions;
-        gripperLastCommandOk_[command.targetIndex] = ok;
-        gripperLastMessage_[command.targetIndex] = message;
-        gripperLastCommandTs_[command.targetIndex] = unixTimeMs();
-      }
+    if (!command.pending || !gripperWorkerRunning_.load()
+        || !motion_.commandEpochAllowed(command.motionEpoch)) continue;
+    std::string message;
+    const auto commandStarted = std::chrono::steady_clock::now();
+    const bool ok = gripperDriver(command.side).commandTarget(
+        command.side, command.targetMm, command.speed, command.torque, &message, false,
+        [&]() { return gripperWorkerRunning_.load() && motion_.commandEpochAllowed(command.motionEpoch); });
+    const double commandMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - commandStarted).count();
+    {
+      std::scoped_lock lock(mutex_);
+      gripperCommandDurationMs_[command.targetIndex] = commandMs;
+      const auto gripperPositions = gripperPositionSnapshotUnlocked();
+      gripperPositionsMm_ = gripperPositions;
+      gripperLastCommandOk_[command.targetIndex] = ok;
+      gripperLastMessage_[command.targetIndex] = message;
+      gripperLastCommandTs_[command.targetIndex] = unixTimeMs();
+    }
+    // 发送后采样本侧反馈；下一次发送仍在采样结束后取得最新目标。
+    if (std::chrono::steady_clock::now() >= nextSampleAt && gripperWorkerRunning_.load()) {
+      sampleGripperPosition(side);
+      nextSampleAt = std::chrono::steady_clock::now() + kGripperPositionSampleInterval;
     }
   }
 }
@@ -703,7 +709,7 @@ void NativeTeleopController::sampleGripperPosition(Side side) {
   // 周期性采样供状态显示及回放到位判断；失败不能刷新成功采样时间。
   std::string message;
   const auto readStarted = std::chrono::steady_clock::now();
-  const bool ok = gripper_.readPositionMm(side, &message);
+  const bool ok = gripperDriver(side).readPositionMm(side, &message);
   const auto readFinished = std::chrono::steady_clock::now();
   const double readMs = std::chrono::duration<double, std::milli>(readFinished - readStarted).count();
   const auto sampleMidpoint = readStarted + (readFinished - readStarted) / 2;
@@ -715,7 +721,7 @@ void NativeTeleopController::sampleGripperPosition(Side side) {
   gripperReadDurationMs_[index] = readMs;
   gripperReadAttemptTs_[index] = readFinishedUnixMs;
   gripperReadMessage_[index] = message;
-  gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);
+  gripperPositionsMm_ = gripperPositionSnapshotUnlocked();
   gripperLastCommandOk_[index] = ok;
   gripperPositionOk_[index] = ok;
   if (ok) {
@@ -785,12 +791,12 @@ bool NativeTeleopController::commandGripperTarget(
 
   std::string driverMessage;
   // worker 未运行时退回同步调用，主要用于禁用 worker 的调试场景。
-  const bool ok = gripper_.commandTarget(side, bounded, speed, torque, &driverMessage, true,
+  const bool ok = gripperDriver(side).commandTarget(side, bounded, speed, torque, &driverMessage, true,
       [&]() { return motion_.commandEpochAllowed(motionEpoch); });
   {
     std::scoped_lock lock(mutex_);
     gripperTargetsMm_[index] = bounded;
-    gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);
+    gripperPositionsMm_ = gripperPositionSnapshotUnlocked();
     gripperLastCommandOk_[index] = ok;
     gripperLastMessage_[index] = driverMessage;
     gripperLastCommandTs_[index] = unixTimeMs();
@@ -805,7 +811,7 @@ std::string NativeTeleopController::statusJson() const {
   // 先读 Omega force 状态，再持有 mutex_ 拼接控制器快照，避免锁顺序反转。
   const auto forceOutput = omega_.forceOutputEnabled();
   std::scoped_lock lock(mutex_);
-  const auto gripperPositions = gripper_.positionMmSnapshot(gripperPositionsMm_);
+  const auto gripperPositions = gripperPositionSnapshotUnlocked();
   std::ostringstream out;
   auto appendGripperSourceDiagnostics = [&](int index) {
     out << ",\"sourceHand\":\"" << jsonEscape(config_.gripperSourceHand[index]) << "\""
@@ -1729,7 +1735,7 @@ void NativeTeleopController::enqueueGripperCommand(
     if (!motion_.commandEpochAllowed(motionEpoch)) return;
     pendingGripperCommands_[targetIndex] = PendingGripperCommand{true, targetIndex, side, targetMm, speed, torque, motionEpoch};
   }
-  gripperCv_.notify_one();
+  gripperCv_.notify_all();
 }
 
 double NativeTeleopController::mappedDirection(int sourceIndex, Side targetSide, int axisIndex) const {
