@@ -2071,8 +2071,8 @@ def test_hal_native_gripper_surfaces_command_status_and_retries_port_open() -> N
         "enqueueGripperCommand(targetIndex, targetSide, targetMm, config_.gripper.speed, config_.gripper.torque, motionEpoch)"
         in normalized_controller
     )
-    assert "void NativeTeleopController::gripperLoop()" in controller_source
-    assert "const bool ok = gripper_.commandTarget" in normalized_controller
+    assert "void NativeTeleopController::gripperLoop(int targetIndex)" in controller_source
+    assert "const bool ok = gripperDriver(command.side).commandTarget" in normalized_controller
     assert "command.torque, &message, false," in normalized_controller
     assert "motion_.commandEpochAllowed(command.motionEpoch)" in normalized_controller
     assert "gripperLastCommandOk_[command.targetIndex] = ok;" in normalized_controller
@@ -2080,7 +2080,7 @@ def test_hal_native_gripper_surfaces_command_status_and_retries_port_open() -> N
     assert "gripperPositionsMm_ = gripperPositions;" in normalized_controller
     assert '",\\"positionMm\\":' in controller_source
     assert "positionMmSnapshot" in gripper_header
-    assert "const auto gripperPositions = gripper_.positionMmSnapshot(gripperPositionsMm_);" in controller_source
+    assert "const auto gripperPositions = gripperPositionSnapshotUnlocked();" in controller_source
     assert "const auto gripperPositions = gripper_.positionMm();" not in controller_source
     assert "std::array<double, 2> positionMm_" in gripper_header
     assert "getClawCurrentLocation_(slave)" in gripper_source
@@ -2098,19 +2098,19 @@ def test_hal_native_gripper_io_is_decoupled_from_motion_loop() -> None:
         "void NativeTeleopController::enqueueGripperCommand",
         1,
     )[0]
-    assert "void NativeTeleopController::gripperLoop()" in source
-    loop_body = source.split("void NativeTeleopController::gripperLoop()", 1)[1].split(
+    assert "void NativeTeleopController::gripperLoop(int targetIndex)" in source
+    loop_body = source.split("void NativeTeleopController::gripperLoop(int targetIndex)", 1)[1].split(
         "double NativeTeleopController::mappedDirection",
         1,
     )[0]
 
     assert "#include <condition_variable>" in header
     assert "std::condition_variable gripperCv_" in header
-    assert "std::thread gripperWorker_" in header
+    assert "std::array<std::thread, 2> gripperWorkers_" in header
     assert "std::array<PendingGripperCommand, 2> pendingGripperCommands_" in header
     assert "enqueueGripperCommand(" in tick_body
     assert "gripper_.commandTarget" not in tick_body
-    assert "gripper_.commandTarget" in loop_body
+    assert "gripperDriver(command.side).commandTarget" in loop_body
 
 
 def test_hal_native_gripper_worker_samples_positions_without_commands() -> None:
@@ -2157,7 +2157,7 @@ def test_hal_native_gripper_uses_isolated_jodell_worker_processes() -> None:
         "std::array<double, 2> JodellGripperDriver::targetMm",
         1,
     )[0]
-    loop_body = controller_source.split("void NativeTeleopController::gripperLoop()", 1)[1].split(
+    loop_body = controller_source.split("void NativeTeleopController::gripperLoop(int targetIndex)", 1)[1].split(
         "void NativeTeleopController::sampleGripperPosition",
         1,
     )[0]
@@ -2199,16 +2199,17 @@ def test_hal_native_gripper_uses_isolated_jodell_worker_processes() -> None:
     assert "nextGripperSampleIndex_" not in controller_header
     assert "constexpr auto kGripperPositionSampleInterval = std::chrono::microseconds(33333);" in controller_source
     assert "gripperCv_.wait_until(lock, nextSampleAt, [&]" in normalized_loop
-    assert "sampleGripperPosition(Side::Left);" in normalized_loop
-    assert "sampleGripperPosition(Side::Right);" in normalized_loop
+    assert "sampleGripperPosition(side);" in normalized_loop
+    assert "const Side side = sideFromIndex(targetIndex);" in normalized_loop
     assert "sampleGripperPosition(sideFromIndex(sampleIndex));" not in normalized_loop
-    assert normalized_loop.index("if (shouldSample)") < normalized_loop.index("for (const auto& command : commands)")
-    assert "const bool ok = gripper_.readPositionMm(side, &message);" in normalized_sample
+    assert normalized_loop.index("if (shouldSample)") < normalized_loop.index("gripperDriver(command.side).commandTarget")
+    assert "command = pendingGripperCommands_[targetIndex];" in normalized_loop
+    assert "const bool ok = gripperDriver(side).readPositionMm(side, &message);" in normalized_sample
     assert "const auto sampleMidpoint = readStarted + (readFinished - readStarted) / 2;" in normalized_sample
     assert "gripperPositionSampleMonotonicMs_[index] = sampleMonotonicMs;" in normalized_sample
     assert "std::array<std::int64_t, 2> gripperPositionSampleMonotonicMs_" in controller_header
     assert 'positionSampleMonotonicMs' in controller_source
-    assert "gripperPositionsMm_ = gripper_.positionMmSnapshot(gripperPositionsMm_);" in normalized_sample
+    assert "gripperPositionsMm_ = gripperPositionSnapshotUnlocked();" in normalized_sample
     assert "gripperLastCommandOk_[index] = ok;" in normalized_sample
     assert "gripperLastMessage_[index] = message;" in normalized_sample
 
@@ -2216,7 +2217,7 @@ def test_hal_native_gripper_uses_isolated_jodell_worker_processes() -> None:
 def test_hal_native_gripper_errors_do_not_pollute_arm_teleop_last_error() -> None:
     controller_source = (REPO_ROOT / "hal" / "src" / "NativeTeleopController.cpp").read_text(encoding="utf-8")
     normalized = " ".join(controller_source.split())
-    command_loop_body = controller_source.split("void NativeTeleopController::gripperLoop()", 1)[1].split(
+    command_loop_body = controller_source.split("void NativeTeleopController::gripperLoop(int targetIndex)", 1)[1].split(
         "void NativeTeleopController::sampleGripperPosition",
         1,
     )[0]
@@ -2410,7 +2411,7 @@ def test_hal_native_workers_and_dds_mapping_share_a_noexcept_failure_exit() -> N
     leader = (REPO_ROOT / "hal" / "src" / "TeleopLeaderPublisher.cpp").read_text(encoding="utf-8")
     assert "void NativeTeleopController::reportControlFailure(const char* message) noexcept" in native
     assert "try { loop(); }" in native
-    assert "try { gripperLoop(); }" in native
+    assert "try { gripperLoop(index); }" in native
     assert "unknown C++ exception in native control worker" in native
     assert "unknown C++ exception in native gripper worker" in native
     listener = mapping.split("void TeleopMappingNode::Impl::LeaderListener::on_data_available", 1)[1].split(

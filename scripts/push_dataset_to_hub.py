@@ -40,6 +40,11 @@ def push_dataset(repo_id: str, local_path: Path, *, private: bool) -> dict[str, 
         accepts_kwargs = True
     if "private" in parameters or accepts_kwargs:
         kwargs["private"] = private
+    # Never publish the local origin_move/ sidecar with LeRobot dataset assets.
+    if "allow_patterns" in parameters:
+        kwargs["allow_patterns"] = ["data/**", "meta/**", "videos/**", "README.md"]
+    elif (local_path / "origin_move").exists():
+        raise RuntimeError("LeRobot push_to_hub cannot exclude origin_move; refusing upload")
     dataset.push_to_hub(**kwargs)
     return {"repoId": repo_id, "localPath": str(local_path), "private": private}
 

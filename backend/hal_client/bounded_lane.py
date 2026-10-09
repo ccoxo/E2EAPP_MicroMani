@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from concurrent.futures import Future
 from threading import BoundedSemaphore, Lock, Thread
@@ -40,8 +41,11 @@ class BoundedLane:
                 raise RuntimeError(f"{self.name} channel is busy; request was not queued")
             self._active += 1
         result: Future[T] = Future()
+        deadline = time.monotonic() + timeout_s
+        completed_at: float | None = None
 
         def execute() -> None:
+            nonlocal completed_at
             running = False
             error: BaseException | None = None
             value: T | None = None
@@ -53,6 +57,7 @@ class BoundedLane:
                     except BaseException as exc:
                         error = exc
             finally:
+                completed_at = time.monotonic()
                 with self._lock:
                     self._active -= 1
                     self._slots.release()
@@ -74,10 +79,17 @@ class BoundedLane:
         wrapped = asyncio.wrap_future(result)
         wrapped.add_done_callback(lambda future: future.exception() if not future.cancelled() else None)
         try:
-            return await asyncio.wait_for(asyncio.shield(wrapped), timeout_s)
+            value = await asyncio.wait_for(asyncio.shield(wrapped), timeout_s)
         except TimeoutError as exc:
+            # 事件循环恢复晚不等于原生调用阻塞；只接纳截止前已完成的应答。
+            if result.done() and not result.cancelled() and completed_at is not None and completed_at <= deadline:
+                return result.result()
             result.cancel()
             raise BlockingCallTimeout(f"{self.name} channel timed out; blocked capacity remains reserved") from exc
         except asyncio.CancelledError:
             result.cancel()
             raise
+        # 即使完成回调先于超时回调被调度，真正迟到的结果仍不能成功。
+        if completed_at is None or completed_at > deadline:
+            raise BlockingCallTimeout(f"{self.name} channel completed after deadline")
+        return value

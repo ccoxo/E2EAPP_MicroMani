@@ -78,6 +78,7 @@ class JodellGripperDriver {
       const std::string& command,
       double* positionMm,
       std::string* message);
+  void closeProcessWorkerUnlocked(int index, bool abortPending = false);
   void closeProcessWorkersUnlocked();
 #endif
 
