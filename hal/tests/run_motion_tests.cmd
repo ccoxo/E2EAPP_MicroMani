@@ -25,6 +25,9 @@ if errorlevel 1 set TEST_RESULT=1
 cl %FLAGS% "%HAL_ROOT%\tests\HardwareReferenceReturnTests.cpp" /Fe"HardwareReferenceReturnTests.exe" || goto :failed
 call :run_test HardwareReferenceReturnTests
 if errorlevel 1 set TEST_RESULT=1
+cl %FLAGS% "%HAL_ROOT%\tests\OriginTelemetryTests.cpp" /Fe"OriginTelemetryTests.exe" || goto :failed
+call :run_test OriginTelemetryTests
+if errorlevel 1 set TEST_RESULT=1
 popd
 exit /b %TEST_RESULT%
 :failed

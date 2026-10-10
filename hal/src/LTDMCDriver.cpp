@@ -561,6 +561,10 @@ MotionState LTDMCDriver::readState() {
   if (!lock.owns_lock()) {
     return cachedStateSnapshot();
   }
+  return readStateLocked();
+}
+
+MotionState LTDMCDriver::readStateLocked() {
   ensureInitialized();
   if (emergencyStateNeedsClear_.load(std::memory_order_acquire)) clearEmergencyStateLocked();
   MotionState state;
@@ -597,6 +601,13 @@ MotionState LTDMCDriver::readState() {
   state.readTimestampMs = unixTimeMs();
   publishStateSnapshotLocked(state);
   return state;
+}
+
+void LTDMCDriver::refreshOriginStateLocked(std::uint64_t epoch) {
+  checkMotionCommand(epoch);
+  // 回原点持有独占锁，后台采样只能取缓存；由等待线程完成同一套真实采样。
+  readStateLocked();
+  checkMotionCommand(epoch);
 }
 
 MotionState LTDMCDriver::latestState() const {
@@ -1172,7 +1183,7 @@ void LTDMCDriver::homeAll(
       homeAxes[homeAxisCount++] = {card, axisNo};
     }
   }
-  waitForAxesDone(homeAxes, homeAxisCount, "home_all pre-move", 3000, [&]() { checkMotionCommand(estopSequenceAtStart); });
+  waitForAxesDone(homeAxes, homeAxisCount, "home_all pre-move", 3000, [&]() { refreshOriginStateLocked(estopSequenceAtStart); });
   // 每轴使用相同保守 profile，按目标脉冲绝对移动到工作原点。
   for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
     const auto side = sideIndex == 0 ? Side::Left : Side::Right;
@@ -1210,8 +1221,7 @@ void LTDMCDriver::homeAll(
       teleopTargetActive_[index] = false;
     }
   }
-  publishStateSnapshotLocked();
-  waitForAxesDone(homeAxes, homeAxisCount, "home_all", 60000, [&]() { checkMotionCommand(estopSequenceAtStart); });
+  waitForAxesDone(homeAxes, homeAxisCount, "home_all", 60000, [&]() { refreshOriginStateLocked(estopSequenceAtStart); });
   // 运动完成后重新读取真实位置，避免缓存只停留在理论目标值。
   if (dmcGetPosition) {
     for (int sideIndex = 0; sideIndex < 2; ++sideIndex) {
@@ -1246,7 +1256,7 @@ void LTDMCDriver::homeAll(
   }
 #endif
   checkMotionCommand(estopSequenceAtStart);
-  publishStateSnapshotLocked();
+  refreshOriginStateLocked(estopSequenceAtStart);
 }
 
 void LTDMCDriver::homeOriginSide(
@@ -1290,7 +1300,7 @@ void LTDMCDriver::homeOriginSide(
     const auto axisNo = static_cast<unsigned short>(physicalAxis(side, axis));
     homeAxes[homeAxisCount++] = {card, axisNo};
   }
-  waitForAxesDone(homeAxes, homeAxisCount, "home_origin_side pre-move", 3000, [&]() { checkMotionCommand(estopSequenceAtStart); });
+  waitForAxesDone(homeAxes, homeAxisCount, "home_origin_side pre-move", 3000, [&]() { refreshOriginStateLocked(estopSequenceAtStart); });
   if (hardwareReferenceReturn) {
     // 在启动任何轴前校验全部旋转轴，防止其他五轴先动而旋转轴跨圈返回。
     for (int axisIndex = 3; axisIndex < 6; ++axisIndex) {
@@ -1334,8 +1344,7 @@ void LTDMCDriver::homeOriginSide(
       pulse_[index] = static_cast<double>(targetPulse);
       teleopTargetActive_[index] = false;
     }
-    publishStateSnapshotLocked();
-    waitForAxesDone(homeAxes, homeAxisCount, "home_origin_side", 60000, [&]() { checkMotionCommand(estopSequenceAtStart); });
+    waitForAxesDone(homeAxes, homeAxisCount, "home_origin_side", 60000, [&]() { refreshOriginStateLocked(estopSequenceAtStart); });
     if (dmcGetPosition) {
       for (int axisIndex = 0; axisIndex < 6; ++axisIndex) {
         checkMotionCommand(estopSequenceAtStart);
@@ -1378,7 +1387,7 @@ void LTDMCDriver::homeOriginSide(
   }
 #endif
   checkMotionCommand(estopSequenceAtStart);
-  publishStateSnapshotLocked();
+  refreshOriginStateLocked(estopSequenceAtStart);
 }
 
 void LTDMCDriver::moveRelativeUi(

@@ -995,9 +995,13 @@ def test_hal_native_home_stops_controller_and_waits_for_motion_done() -> None:
     assert "motion_.enableHomeAxes" not in home_all_branch
     assert "referenceReturn ? std::array<bool, 6>{} : kAllAxesEnabled" in home_side_branch
     assert "motion_.enableHomeAxes" not in home_side_branch
-    assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_all pre-move\", 3000, [&]() { checkMotionCommand(estopSequenceAtStart); })" in motion
-    assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_all\", 60000, [&]() { checkMotionCommand(estopSequenceAtStart); })" in motion
-    assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_origin_side\", 60000, [&]() { checkMotionCommand(estopSequenceAtStart); })" in motion
+    assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_all pre-move\", 3000, [&]() { refreshOriginStateLocked(estopSequenceAtStart); })" in motion
+    assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_all\", 60000, [&]() { refreshOriginStateLocked(estopSequenceAtStart); })" in motion
+    assert "waitForAxesDone(homeAxes, homeAxisCount, \"home_origin_side\", 60000, [&]() { refreshOriginStateLocked(estopSequenceAtStart); })" in motion
+    refresh = motion.split("void LTDMCDriver::refreshOriginStateLocked", 1)[1].split("MotionState LTDMCDriver::latestState", 1)[0]
+    assert refresh.count("checkMotionCommand(epoch);") == 2
+    assert "readStateLocked();" in refresh
+    assert refresh.index("checkMotionCommand(epoch);") < refresh.index("readStateLocked();")
     assert "teleopTargetActive_[index] = false;" in motion
 
 
