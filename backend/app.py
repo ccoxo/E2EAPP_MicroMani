@@ -867,6 +867,11 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         )
 
     @app.on_event("startup")
+    async def prepare_recording_runtime() -> None:
+        # Uvicorn 在全部 startup 完成后才接受控制 WS，避免操作中首次加载 Torch/LeRobot。
+        await recorder.prepare_native_runtime(await get_config_async())
+
+    @app.on_event("startup")
     async def reconcile_startup_hal_state() -> None:
         config = await get_config_async()
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}

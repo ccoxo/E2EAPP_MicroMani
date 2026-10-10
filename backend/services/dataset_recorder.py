@@ -33,6 +33,7 @@ from typing import Any
 from backend.services.recording_diagnostics import RecordingDiagnostics
 from backend.services.process_video_encoder import isolate_dataset_encoder
 from backend.services.recording_gc import RecordingGcScope
+from backend.services.recording_timer import RecordingTimerScope
 from backend.services.dataset_resume import resume_metadata_error
 from backend.services.dataset_episode_index import match_records, read_native_index
 
@@ -659,6 +660,7 @@ class DatasetRecorderService:
         self._max_force_right = 0.0
         self._native_dataset: Any | None = None
         self._native_error = ""
+        self._startup_native_preflight_error: str | None = None
         self._native_use_videos = False
         self._native_dataset_from_index = 0
         self._native_total_frames_cached = 0
@@ -688,6 +690,43 @@ class DatasetRecorderService:
         self._reset_returned_sides: set[str] = set()
         self._hub_push_jobs: dict[str, dict[str, Any]] = {}
         self._hub_push_jobs_lock = Lock()
+
+    async def prepare_native_runtime(self, config: dict[str, Any]) -> None:
+        """在 ASGI startup 完成前预热；不得把首次原生库加载留到已持有控制租约时。"""
+        if not self._real_hardware_mode(config) or not self._native_recording_requested():
+            return
+        if getattr(self, "_startup_native_preflight_error", None) is not None:
+            return
+        started = time.monotonic()
+        self.logs.info("[LEROBOT]", "event=record_runtime_prepare phase=begin")
+        try:
+            error = await asyncio.to_thread(self._native_preflight)
+        except Exception as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"
+        # 连失败也缓存：依赖缺失时仅拒绝录制，不在操作员重试时重复冷加载。
+        # 修复依赖后需重启后端；不改变 HAL 锁定、租约或连接状态。
+        self._startup_native_preflight_error = error
+        elapsed_ms = (time.monotonic() - started) * 1000
+        if error:
+            self.logs.warning("[LEROBOT]", f"event=record_runtime_prepare phase=failed elapsed_ms={elapsed_ms:.1f} error={error}")
+        else:
+            self.logs.info("[LEROBOT]", f"event=record_runtime_prepare phase=ready elapsed_ms={elapsed_ms:.1f}")
+
+    @contextlib.contextmanager
+    def _record_start_stage(self, stage: str):
+        """保留冷启动故障前最后阶段；失败或取消也记录阶段耗时。"""
+        started = time.monotonic()
+        logs = getattr(self, "logs", None)
+        prefix = f"event=record_start_stage stage={stage} session={getattr(self, '_session_id', '')}"
+        if logs is not None:
+            logs.info("[LEROBOT]", f"{prefix} phase=begin")
+        outcome = "failed"
+        try:
+            yield
+            outcome = "done"
+        finally:
+            if logs is not None:
+                logs.info("[LEROBOT]", f"{prefix} phase={outcome} elapsed_ms={(time.monotonic() - started) * 1000:.1f}")
 
     # 会话入口：从这里沿准备数据集、启动采样/遥操作及异常清理阅读，再看 save_episode 和 finish_session。
     @motion_operation()
@@ -789,7 +828,11 @@ class DatasetRecorderService:
             episode_index = await asyncio.to_thread(self._next_episode_index, dataset_dir)
             self._recording_gc_scope = RecordingGcScope()
             # 建立录制时间轴前完成；此处不跨 await，避免取消启动后遗留冻结状态。
-            self._recording_gc_scope.start()
+            with self._record_start_stage("gc_prepare"):
+                self._recording_gc_scope.start()
+            # Windows 默认定时粒度会把 2ms 轮询拉长到约 15.6ms，导致组帧超期。
+            self._recording_timer_scope = RecordingTimerScope()
+            self._recording_timer_scope.start()
             sample_clock_now_s, schedule_now_s = await self._episode_clock_pair(config)
             async with self._lock:
                 self.safety.check(safety_token)
@@ -1015,10 +1058,16 @@ class DatasetRecorderService:
         try:
             return await self._finish_session()
         finally:
-            gc_scope = getattr(self, "_recording_gc_scope", None)
-            if gc_scope is not None:
-                gc_scope.close()
-                self._recording_gc_scope = None
+            try:
+                gc_scope = getattr(self, "_recording_gc_scope", None)
+                if gc_scope is not None:
+                    gc_scope.close()
+                    self._recording_gc_scope = None
+            finally:
+                timer_scope = getattr(self, "_recording_timer_scope", None)
+                if timer_scope is not None:
+                    timer_scope.close()
+                    self._recording_timer_scope = None
 
     async def _finish_session(self) -> dict[str, Any]:
         """结束当前录制会话，停止采样、组帧、写入和 teleop 任务。"""
@@ -1976,13 +2025,15 @@ class DatasetRecorderService:
         if not self._native_recording_requested():
             self._native_error = "native LeRobot disabled by APPSTATION_LEROBOT_NATIVE"
             return False
-        # 首次导入 LeRobot/编码器可能较慢，不能阻塞同一事件循环中的安全心跳。
-        preflight = await asyncio.to_thread(self._native_preflight)
+        # 实机启动已预热；独立使用服务时仍在线程中进行预检。
+        with self._record_start_stage("native_preflight"):
+            preflight = await asyncio.to_thread(self._native_preflight)
         if preflight:
             self._native_error = preflight
             return False
         try:
-            total_frames = await self._native_writer_command("open")
+            with self._record_start_stage("native_open"):
+                total_frames = await self._native_writer_command("open")
             self._native_dataset = self._writer_thread
             self._native_total_frames_cached = int(total_frames or 0)
             return True
@@ -2761,8 +2812,17 @@ class DatasetRecorderService:
         target_monotonic_s = (
             target_monotonic_s if target_monotonic_s is not None else self._record_target_timestamp_s(frame_index)
         )
-        await self._wait_for_critical_sources(config, target_monotonic_s)
-        return self._frame_assembler.assemble(config, target_monotonic_s, frame_index)
+        diagnostic = getattr(self, "_recording_diagnostics", None)
+        started = time.monotonic() if diagnostic is not None else 0.0
+        missing = await self._wait_for_critical_sources(config, target_monotonic_s)
+        settled = time.monotonic() if diagnostic is not None else 0.0
+        frame = self._frame_assembler.assemble(config, target_monotonic_s, frame_index)
+        if diagnostic is not None:
+            diagnostic.emit("assembly_phases", episode=self._episode_index, frame=frame_index,
+                            wait_ms=(settled - started) * 1000,
+                            assemble_ms=(time.monotonic() - settled) * 1000,
+                            missing_sources=sorted(missing))
+        return frame
 
     def _gripper_source_sync(
         self,
@@ -3945,6 +4005,9 @@ class DatasetRecorderService:
 
     def _native_preflight(self) -> str:
         """检查 native 录制依赖及视频编码器是否可用。"""
+        prepared_error = getattr(self, "_startup_native_preflight_error", None)
+        if prepared_error is not None:
+            return prepared_error
         imports = self._native_imports()
         if imports is None:
             return "lerobot[dataset] is not installed in backend runtime"
