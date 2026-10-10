@@ -4,6 +4,7 @@ import asyncio
 import time
 from collections.abc import Callable
 from concurrent.futures import Future
+from queue import SimpleQueue
 from threading import BoundedSemaphore, Lock, Thread
 from typing import TypeVar, cast
 
@@ -17,12 +18,16 @@ class BlockingCallTimeout(RuntimeError):
 class BoundedLane:
     """独立、无等待队列的阻塞调用通道；超时任务返回前始终占用容量。"""
 
-    def __init__(self, name: str, capacity: int) -> None:
+    def __init__(self, name: str, capacity: int, *, reuse_workers: bool = False) -> None:
         self.name = name
         self._slots = BoundedSemaphore(capacity)
         self._lock = Lock()
         self._active = 0
         self._closed = False
+        self._reuse_workers = reuse_workers
+        self._workers: list[Thread] = []
+        # 仅交接已取得容量的调用；不会积压额外请求或替换仍阻塞的线程。
+        self._work: SimpleQueue[Callable[[], None] | None] = SimpleQueue()
 
     @property
     def active(self) -> int:
@@ -31,7 +36,29 @@ class BoundedLane:
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
             self._closed = True
+            for _ in self._workers:
+                self._work.put(None)
+
+    def _worker_loop(self) -> None:
+        while (execute := self._work.get()) is not None:
+            execute()
+            del execute
+
+    def _submit(self, execute: Callable[[], None]) -> None:
+        if not self._reuse_workers:
+            Thread(target=execute, name=self.name, daemon=True).start()
+            return
+        with self._lock:
+            if self._closed:
+                raise RuntimeError(f"{self.name} channel is closed")
+            if len(self._workers) < self._active:
+                worker = Thread(target=self._worker_loop, name=self.name, daemon=True)
+                worker.start()
+                self._workers.append(worker)
+            self._work.put(execute)
 
     async def run(self, function: Callable[[], T], timeout_s: float) -> T:
         with self._lock:
@@ -68,9 +95,8 @@ class BoundedLane:
                     result.set_result(cast(T, value))
 
         # 原生代码无法被安全强杀；daemon 保证永久阻塞不挂住 Python 的退出钩子。
-        thread = Thread(target=execute, name=self.name, daemon=True)
         try:
-            thread.start()
+            self._submit(execute)
         except BaseException:
             with self._lock:
                 self._active -= 1
