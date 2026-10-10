@@ -91,7 +91,7 @@ int runHalServer() {
       forceRuntime,
       started);
   ControlLeaseGuardian leaseGuardian(motion, [&commandDispatcher]() {
-    commandDispatcher.handleEmergencyStop();
+    commandDispatcher.handleEmergencyStop("control_lease_lost");
   });
   leaseGuardian.start();
   HalDdsControlServer ddsControl(

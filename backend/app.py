@@ -2391,6 +2391,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         control_session_id: str | None = None
         receive_task: asyncio.Task[None] | None = None
         interruption_reported = False
+        last_force_safety: tuple[Any, ...] | None = None
 
         async def receive_control_connection() -> None:
             try:
@@ -2399,9 +2400,14 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     await ws.receive_json()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 if control_session_id is not None:
                     control_watchdog.remove(control_session_id)
+                logs.event(
+                    "[BACKEND]", "WARNING", "ws_receive_ended", component="WS",
+                    errorType=type(exc).__name__, closeCode=getattr(exc, "code", None),
+                    reason=str(exc),
+                )
 
         app.state.ws_clients.add(client_token)
         try:
@@ -2533,6 +2539,18 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                                 cached_force_state = None
                                 polling_errors.failed("HAL force state", "[FORCE]", f"HAL force state failed: {exc}")
                         force_state = cached_force_state
+                    safety = force_state.get("safety") if isinstance(force_state, dict) else None
+                    if isinstance(safety, dict):
+                        safety_signature = tuple(safety.get(key) for key in ("latched", "reason", "side", "channel"))
+                        if safety_signature != last_force_safety:
+                            logs.event(
+                                "[SAFETY]", "WARNING" if safety.get("latched") else "INFO",
+                                "hal_safety_state", component="SAFETY",
+                                latched=safety.get("latched"), reason=safety.get("reason"),
+                                side=safety.get("side"), channel=safety.get("channel"),
+                                value=safety.get("value"), canAcknowledge=safety.get("canAcknowledge"),
+                            )
+                            last_force_safety = safety_signature
                     hal_ok = hal_health.connected and (
                         hal_health.mode != "real" or (hal_health.ltdmc_ok and motion_state is not None)
                     )

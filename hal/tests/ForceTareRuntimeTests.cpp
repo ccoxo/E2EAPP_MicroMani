@@ -307,6 +307,21 @@ struct DispatcherFixture {
 
 const std::string kConfirmedTare = R"({"side":"all","samples":200,"unloadedConfirmed":true})";
 
+void testLeaseStopRetainsDistinctReason() {
+  DispatcherFixture fixture;
+  fixture.dispatcher.handle("force.tare", kConfirmedTare);
+  await([&]() { return state(fixture.force).find("\"canAcknowledge\":true") != std::string::npos; },
+      "force state did not become acknowledgeable");
+  fixture.dispatcher.handle("motion.acknowledge_estop", "{}");
+  fixture.dispatcher.handleEmergencyStop("control_lease_lost");
+  require(fixture.motion.estopActive() && fixture.force.safetyLatched(), "lease stop did not latch");
+  require(state(fixture.force).find("\"reason\":\"control_lease_lost\"") != std::string::npos,
+      "lease stop lost its diagnostic reason");
+  fixture.dispatcher.handleEmergencyStop();
+  require(state(fixture.force).find("\"reason\":\"control_lease_lost\"") != std::string::npos,
+      "later stop overwrote the first safety cause");
+}
+
 void testDispatcherGuardsAndOwnStopEpoch() {
   DispatcherFixture fixture;
   rejects([&]() { fixture.dispatcher.handle("force.tare", "{}"); }, "confirmation");
@@ -377,10 +392,11 @@ int main() {
       testCancellationPreservesBothOldBiases(cancellation);
     }
     testStopAndConfigurationInvalidateCompletedSelfCheck();
+    testLeaseStopRetainsDistinctReason();
     testDispatcherGuardsAndOwnStopEpoch();
     testDispatcherNewStopCancelsCollection();
     testDispatcherDeadlineCancelsCollectionBeforeCommit();
-    std::cout << "ForceTareRuntimeTests passed (15 cases, injected sensors, no hardware or DDS runtime)\n";
+    std::cout << "ForceTareRuntimeTests passed (16 cases, injected sensors, no hardware or DDS runtime)\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "ForceTareRuntimeTests failed: " << error.what() << "\n";
