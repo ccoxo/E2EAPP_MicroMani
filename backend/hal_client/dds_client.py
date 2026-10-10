@@ -96,12 +96,12 @@ class DdsHalClient(HalClient):
         self._command_lane = BoundedLane("dds-command", 4)
         self._emergency_lane = BoundedLane("dds-emergency", 1)
         self._lease_lane = BoundedLane("dds-lease", 1)
-        self._state_lane = BoundedLane("dds-state", 2)
+        self._state_lane = BoundedLane("dds-state", 2, reuse_workers=True)
         # 录制各源与健康查询并发读取，不能争抢同一对名额；每类仍有界且超时不释放阻塞调用。
-        self._motion_state_lane = BoundedLane("dds-motion-state", 2)
-        self._omega_state_lane = BoundedLane("dds-omega-state", 2)
-        self._force_state_lane = BoundedLane("dds-force-state", 2)
-        self._teleop_state_lane = BoundedLane("dds-teleop-state", 2)
+        self._motion_state_lane = BoundedLane("dds-motion-state", 2, reuse_workers=True)
+        self._omega_state_lane = BoundedLane("dds-omega-state", 2, reuse_workers=True)
+        self._force_state_lane = BoundedLane("dds-force-state", 2, reuse_workers=True)
+        self._teleop_state_lane = BoundedLane("dds-teleop-state", 2, reuse_workers=True)
         self._close_lane = BoundedLane("dds-close", 1)
         self._closed = False
         self._control_transport_failed = False
@@ -185,8 +185,15 @@ class DdsHalClient(HalClient):
 
             def exchange() -> HalCommandReply | None:
                 # 无队列；线程尚未开始执行就已取消/超时的请求不能迟到发布。
-                if self._closed or time.monotonic() >= deadline:
-                    raise RuntimeError("DDS request expired before publication")
+                dispatched_at = time.monotonic()
+                if self._closed or dispatched_at >= deadline:
+                    # 未触碰原生 transport；保留既有拒绝语义并暴露线程派发等待时间。
+                    raise RuntimeError(
+                        f"DDS request expired before publication: command={name} stage=dispatch "
+                        f"request_id={request.request_id} "
+                        f"elapsed_ms={(dispatched_at - (deadline - timeout_s)) * 1000:.1f} "
+                        f"deadline_ms={timeout_s * 1000:.1f} closed={self._closed}"
+                    )
                 try:
                     exchange_timing["started"] = time.monotonic()
                     if name in {"motion.emergency_stop", "control.lease"}:

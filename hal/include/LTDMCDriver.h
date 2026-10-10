@@ -118,6 +118,9 @@ class LTDMCDriver {
   bool axisMotionEnabled(Side side, SemanticAxis axis) const;
   // snapshotMutex_ 保护的缓存读写，用于高频读取失败时退回上一帧。
   MotionState cachedStateSnapshot() const;
+  // 调用方持有 mutex_；读取真实反馈后才更新时间戳。
+  MotionState readStateLocked();
+  void refreshOriginStateLocked(std::uint64_t epoch);
   HalHealth cachedHealth(double uptimeS) const;
   void publishStateSnapshotLocked();
   void publishStateSnapshotLocked(const MotionState& state);

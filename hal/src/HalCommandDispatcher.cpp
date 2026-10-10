@@ -31,6 +31,10 @@ HalCommandDispatcher::HalCommandDispatcher(
       started_(started) {}
 
 std::string HalCommandDispatcher::handleEmergencyStop() {
+  return handleEmergencyStop("manual_emergency_stop");
+}
+
+std::string HalCommandDispatcher::handleEmergencyStop(const char* reason) {
   emergencyStopsInProgress_.fetch_add(1);
   struct StopCompletion {
     std::atomic_uint32_t& count;
@@ -49,7 +53,7 @@ std::string HalCommandDispatcher::handleEmergencyStop() {
   attempt([&]() { nativeTeleop_.requestEmergencyStop(); });
   attempt([&]() { omega_.requestEmergencyStop(); });
   attempt([&]() { forceRuntime_.recordExternalEmergencyStop(
-      "manual_emergency_stop", forceMonotonicMilliseconds()); });
+      reason, forceMonotonicMilliseconds()); });
   if (failure) std::rethrow_exception(failure);
   return "{\"ok\":true}";
 }

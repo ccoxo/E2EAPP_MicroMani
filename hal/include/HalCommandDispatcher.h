@@ -34,6 +34,7 @@ class HalCommandDispatcher {
   std::string handle(const std::string& name, const std::string& bodyText,
       std::optional<std::uint64_t> expectedEpoch = std::nullopt);
   std::string handleEmergencyStop();
+  std::string handleEmergencyStop(const char* reason);
 
  private:
   void requireForceMutationSafe(const char* operation);
