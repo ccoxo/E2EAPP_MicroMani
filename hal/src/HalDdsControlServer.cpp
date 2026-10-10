@@ -639,7 +639,7 @@ struct HalDdsControlServer::Impl {
       publishJson(healthWriter_, jsonHealth(motion_.health(uptime), omega_.ok(), omega_.lastError()));
       publishJson(motionWriter_, jsonMotionState(motion_.latestState()));
       publishJson(omegaWriter_, jsonOmegaState(omega_.readState()));
-      publishJson(nativeTeleopWriter_, nativeTeleop_.statusJson());
+      publishJson(nativeTeleopWriter_, nativeTeleop_.telemetryJson());
   }
 
   void publishForceState() {

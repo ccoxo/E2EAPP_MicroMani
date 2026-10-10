@@ -145,6 +145,18 @@ void appendAction(std::ostringstream& out, const NativeTeleopAction& action) {
   out << "}";
 }
 
+// 录制只需要动作的来源、真实时间和 12 轴增量；不重复发送每条历史的控制卡诊断。
+void appendRecordingAction(std::ostringstream& out, const NativeTeleopAction& action) {
+  out << "{\"ts\":" << action.ts
+      << ",\"monotonicMs\":" << static_cast<std::int64_t>(std::llround(action.monotonicS * 1000.0))
+      << ",\"monotonic_s\":" << action.monotonicS
+      << ",\"side\":\"" << sideName(action.side) << "\""
+      << ",\"sourceSide\":\"" << sideName(action.sourceSide) << "\""
+      << ",\"deltaVector\":";
+  appendArray(out, action.deltaVector);
+  out << "}";
+}
+
 void appendInputDiagnostic(
     std::ostringstream& out,
     const char* sourceName,
@@ -808,9 +820,18 @@ bool NativeTeleopController::commandGripperTarget(
 }
 
 std::string NativeTeleopController::statusJson() const {
+  return statusJsonImpl(false);
+}
+
+std::string NativeTeleopController::telemetryJson() const {
+  return statusJsonImpl(true);
+}
+
+std::string NativeTeleopController::statusJsonImpl(bool compactHistory) const {
   // 先读 Omega force 状态，再持有 mutex_ 拼接控制器快照，避免锁顺序反转。
   const auto forceOutput = omega_.forceOutputEnabled();
-  std::scoped_lock lock(mutex_);
+  std::unique_lock lock(mutex_);
+  const auto actionHistory = actionHistory_;
   const auto gripperPositions = gripperPositionSnapshotUnlocked();
   std::ostringstream out;
   auto appendGripperSourceDiagnostics = [&](int index) {
@@ -844,14 +865,7 @@ std::string NativeTeleopController::statusJson() const {
   } else {
     out << "null";
   }
-  out << ",\"actionHistory\":[";
-  for (size_t i = 0; i < actionHistory_.size(); ++i) {
-    if (i > 0) {
-      out << ",";
-    }
-    appendAction(out, actionHistory_[i]);
-  }
-  out << "],\"inputs\":{";
+  out << ",\"inputs\":{";
   appendInputDiagnostic(
       out,
       "left",
@@ -936,7 +950,18 @@ std::string NativeTeleopController::statusJson() const {
       << ",\"minCommandIntervalMs\":" << config_.gripperMinCommandIntervalMs
       << ",\"icfTargetProtectionEnabled\":"
       << (config_.gripperIcfTargetProtectionEnabled ? "true" : "false")
-      << ",\"icfTargetMinGapMm\":" << config_.gripperIcfTargetMinGapMm << "}}";
+      << ",\"icfTargetMinGapMm\":" << config_.gripperIcfTargetMinGapMm << "}";
+  // 历史序列化可远大于实时快照，必须在释放夹爪反馈/主手控制共用锁之后进行。
+  lock.unlock();
+  out << ",\"actionHistoryFormat\":\""
+      << (compactHistory ? "recording_v1" : "diagnostic_v1") << "\""
+      << ",\"actionHistory\":[";
+  for (size_t i = 0; i < actionHistory.size(); ++i) {
+    if (i > 0) out << ",";
+    if (compactHistory) appendRecordingAction(out, actionHistory[i]);
+    else appendAction(out, actionHistory[i]);
+  }
+  out << "]}";
   return out.str();
 }
 

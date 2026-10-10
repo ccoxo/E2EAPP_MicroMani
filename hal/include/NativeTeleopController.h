@@ -205,6 +205,8 @@ class NativeTeleopController {
   void reportControlFailure(const char* message) noexcept;
   // statusJson 直接面向 HalServer 响应，包含 blocker、最后动作、夹爪和滤波诊断。
   std::string statusJson() const;
+  // 高频 DDS 使用精简历史；完整硬件诊断仍通过 statusJson 按需读取。
+  std::string telemetryJson() const;
   bool running() const;
   void setLeaderStatePublisher(LeaderStatePublisher publisher);
   void setHardwareTargetPublisher(HardwareTargetPublisher publisher);
@@ -214,6 +216,8 @@ class NativeTeleopController {
       std::optional<std::uint64_t> expectedEpoch = std::nullopt);
 
  private:
+  friend struct NativeTeleopTelemetryTestAccess;
+  std::string statusJsonImpl(bool compactHistory) const;
   // 每个目标侧只保留最新一条夹爪命令，teleop 高频输入会被合并为最新目标。
   struct PendingGripperCommand {
     bool pending{};
