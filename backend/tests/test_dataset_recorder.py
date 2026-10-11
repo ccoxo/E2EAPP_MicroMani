@@ -994,6 +994,7 @@ def test_dataset_recorder_save_stops_recording_teleop_before_drain() -> None:
 
         async def drain() -> None:
             calls.append("drain")
+            assert recorder._source_sampler_paused("gripper") is False
             assert recorder._latest_native_gripper_targets({}) == (7.0, 2.22857)
 
         def finalize_episode(*, status: str, deleted: bool) -> dict[str, object]:
@@ -1001,7 +1002,7 @@ def test_dataset_recorder_save_stops_recording_teleop_before_drain() -> None:
             return {"id": "episode_000000", "episodeIndex": 0}
 
         async def stop(source: str) -> None:
-            assert recorder._gripper_sampler_paused is True
+            assert recorder._source_sampler_paused("gripper") is False
             assert recorder._samplers_paused is False
             calls.append(f"stop:{source}")
             live_status["nativeStatus"]["gripperTargets"][1] = 1.02
@@ -1017,6 +1018,7 @@ def test_dataset_recorder_save_stops_recording_teleop_before_drain() -> None:
         await recorder.save_episode()
 
         assert calls[:2] == ["stop:recording", "drain"]
+        assert recorder._gripper_sampler_paused is True
 
     asyncio.run(run_case())
 

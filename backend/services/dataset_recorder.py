@@ -645,7 +645,7 @@ class DatasetRecorderService:
         self._recording = False
         self._accepting_frame_jobs = False
         self._samplers_paused = False
-        # 停遥操作后只暂停夹爪读取，其它源仍可完成已排队帧的对齐。
+        # 保存尾帧排空后暂停夹爪读取；中断/丢弃路径仍立即暂停。
         self._gripper_sampler_paused = False
         self._session_id = ""
         self._dataset_id = ""
@@ -928,11 +928,12 @@ class DatasetRecorderService:
                 raise RuntimeError("record session is not active")
             self._final_action_status = deepcopy(self.teleop.status())
             self._accepting_frame_jobs = False
-            self._gripper_sampler_paused = True
+            # 立即停止动作，但保留只读采样和在途反馈，直到尾帧排空。
             self.telemetry.recording = False
         try:
             await self.teleop.stop("recording")
             await self._drain_recording_queues()
+            self._gripper_sampler_paused = True
             if self._native_writer_active():
                 await self._save_native_episode()
             async with self._lock:
@@ -950,6 +951,7 @@ class DatasetRecorderService:
                 self._enter_reset_pending_locked()
                 self._samplers_paused = True
                 self.telemetry.recording = False
+                self._gripper_sampler_paused = True
             if self._native_writer_active():
                 with contextlib.suppress(Exception):
                     await self._clear_native_episode_buffer()
