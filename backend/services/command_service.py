@@ -595,7 +595,18 @@ class CommandService:
         deadline = time.monotonic() + 2.0
         while True:
             self.safety.check(safety_token)
-            state = await self.hal.motion_state()
+            try:
+                state = await self.hal.motion_state()
+            except RuntimeError as exc:
+                # 命令快照没有控制卡采样时间；在原期限内等待新的实测反馈。
+                if str(exc) != "DDS motion controller sample timestamp is stale or unavailable":
+                    raise
+                self.safety.check(safety_token)
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("fresh stationary feedback missing after hardware home completion") from exc
+                await asyncio.sleep(0.02)
+                continue
+            self.safety.check(safety_token)
             if state.get("estop_active"):
                 raise RuntimeError("emergency stop interrupted hardware home")
             stamp = state.get("timestamp_ms", 0)

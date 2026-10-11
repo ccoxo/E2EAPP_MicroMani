@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from backend.app import create_app
 from backend.core.logging import now_ms
 from backend.hal_client.client import HalHealth
+from backend.services import command_service
 
 
 def setup_homing(tmp_path, monkeypatch):
@@ -57,6 +58,70 @@ def test_home_accepts_recent_controller_sample_forwarded_from_cache(tmp_path, mo
     assert response.status_code == 200, response.text
     saved = client.app.state.settings.get_config()["motion"]["homeReference"]
     assert saved["rightAxisConfirmed"][4] is True
+
+
+def test_home_waits_for_fresh_controller_sample_after_command(tmp_path, monkeypatch):
+    client, hal, _ = setup_homing(tmp_path, monkeypatch)
+    fresh_state = hal.motion_state
+    calls = 0
+
+    async def motion_state():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("DDS motion controller sample timestamp is stale or unavailable")
+        return await fresh_state()
+
+    hal.motion_state = motion_state
+    response = client.post("/api/motion/right/home", json={"axes": ["Roll", "Pitch", "Yaw"]})
+
+    assert response.status_code == 200, response.text
+    assert calls == 2
+    reference = client.app.state.settings.get_config()["motion"]["homeReference"]
+    assert reference["rightPulse"] == [10., 20., 30., 109., 110., 111.]
+    assert reference["rightAxisConfirmed"] == [True] * 6
+
+
+@pytest.mark.parametrize("error,expected", [
+    ("DDS motion controller sample timestamp is stale or unavailable",
+     "fresh stationary feedback missing after hardware home completion"),
+    ("DDS control channel isolated", "DDS control channel isolated"),
+])
+def test_home_does_not_confirm_after_feedback_failure(tmp_path, monkeypatch, error, expected):
+    client, hal, _ = setup_homing(tmp_path, monkeypatch)
+    before = client.app.state.settings.get_config()["motion"]["homeReference"]["rightPulse"]
+    hal.motion_state = AsyncMock(side_effect=RuntimeError(error))
+    clock = iter([0.0, 3.0])
+    monkeypatch.setattr(command_service, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+
+    response = client.post("/api/motion/right/home", json={"axes": ["Pitch"]})
+
+    assert response.status_code == 503
+    assert expected in response.json()["detail"]["message"]
+    assert hal.motion_state.await_count == 1
+    reference = client.app.state.settings.get_config()["motion"]["homeReference"]
+    assert reference["rightPulse"] == before
+    assert reference["rightAxisConfirmed"][4] is False
+    assert reference["rightAxisInstanceId"][4] == ""
+
+
+def test_home_stops_waiting_for_controller_sample_after_emergency_stop(tmp_path, monkeypatch):
+    client, hal, _ = setup_homing(tmp_path, monkeypatch)
+    hal.motion_state = AsyncMock(side_effect=RuntimeError(
+        "DDS motion controller sample timestamp is stale or unavailable"))
+
+    async def stop_during_wait(_delay):
+        client.app.state.commands.safety.interrupt(emergency=True)
+
+    monkeypatch.setattr(command_service.asyncio, "sleep", stop_during_wait)
+    response = client.post("/api/motion/right/home", json={"axes": ["Pitch"]})
+
+    assert response.status_code == 503
+    assert "emergency stop active" in response.json()["detail"]["message"]
+    assert hal.motion_state.await_count == 1
+    reference = client.app.state.settings.get_config()["motion"]["homeReference"]
+    assert reference["rightAxisConfirmed"][4] is False
+    assert reference["rightAxisInstanceId"][4] == ""
 
 
 def test_selected_homing_preserves_other_references(tmp_path, monkeypatch):
