@@ -2237,6 +2237,17 @@ class DatasetRecorderService:
         with asyncio.Runner() as runner:
             self._sample_source_loop_with_runner(source, runner)
 
+    def _native_teleop_stopped(self) -> bool:
+        """HAL 只在 native 遥操作运行时读夹爪位置；复位间隙读数必然过期，不应当作采样故障告警。"""
+        teleop = getattr(self, "teleop", None)
+        if teleop is None:
+            return False
+        try:
+            status = teleop.status()
+        except Exception:  # noqa: BLE001
+            return False
+        return isinstance(status, dict) and status.get("running") is False
+
     def _source_sampler_paused(self, source: str) -> bool:
         return bool(getattr(self, "_samplers_paused", False) or (
             source == "gripper" and getattr(self, "_gripper_sampler_paused", False)
@@ -2307,7 +2318,7 @@ class DatasetRecorderService:
             except Exception as exc:  # noqa: BLE001
                 if not self._source_sampler_paused(source) and (
                     sample_epoch_s == 0.0 or sample_epoch_s == self._sampler_start_monotonic_s
-                ):
+                ) and not (source == "gripper" and self._native_teleop_stopped()):
                     self.logs.warning("[LEROBOT]", f"{source} sampler recovered: {exc}")
                 self._sampler_stop_event.wait(0.1)
 
