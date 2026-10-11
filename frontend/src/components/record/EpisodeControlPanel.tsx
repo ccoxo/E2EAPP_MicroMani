@@ -50,6 +50,9 @@ const HINTS = [
 const formatTime = (s: number) =>
   `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(Math.floor(s % 60)).padStart(2, '0')}.${Math.floor((s % 1) * 10)}`
 
+// 录制起点检查要求夹爪目标与实际开口接近 26 mm；低于此值时开始前弹窗提示张开。
+const GRIPPER_START_OPEN_MM = 25
+
 interface EpisodeControlPanelProps {
   onStartSession: () => void
 }
@@ -82,6 +85,24 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
   const resetReady = useTelemetryStore((s) => s.recordSession.resetReady)
   const returnOriginInFlight = useTelemetryStore((s) => s.recordSession.returnOriginInFlight)
   const [pendingOriginSide, setPendingOriginSide] = React.useState<'left' | 'right' | null>(null)
+
+  const gripperPositions = useTelemetryStore((s) => s.frame.gripperPositions)
+  const issueManualGripperMove = useTelemetryStore((s) => s.issueManualGripperMove)
+  const [gripperPrompt, setGripperPrompt] = React.useState<'start' | 'skip' | null>(null)
+  // 后端要求参与夹爪起点接近 26 mm；开始前先提示张开，免得到遥操作页手动张开再回来。
+  const gripperMm = (side: 'left' | 'right') => gripperPositions[hardwareSideForOperatorSide(side) === 'left' ? 0 : 1]
+  const closedGrippers = participation.grippers.filter((side) => {
+    const mm = gripperMm(side)
+    return typeof mm === 'number' && mm >= 0 && mm < GRIPPER_START_OPEN_MM
+  })
+  const runStartAction = (action: 'start' | 'skip') => (action === 'start' ? onStartSession() : skipRecordReset())
+  const guardGripperOpen = (action: 'start' | 'skip') => {
+    if (closedGrippers.length) {
+      setGripperPrompt(action)
+      return
+    }
+    runStartAction(action)
+  }
 
   const cfg = phaseConfig[phase]
   const busy = phase === 'starting' || phase === 'saving' || phase === 'discarding' || phase === 'finishing'
@@ -184,7 +205,7 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
               <div>{startError}</div>
             </div>
           )}
-          <UiButton variant="primary" block disabled={!participation.arms.length} onClick={onStartSession}>
+          <UiButton variant="primary" block disabled={!participation.arms.length} onClick={() => guardGripperOpen('start')}>
             开始采集会话
           </UiButton>
         </div>
@@ -208,7 +229,7 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
 
       {phase === 'resetting' && (
         <div className="record-action-stack">
-          <UiButton variant="primary" block onClick={skipRecordReset} disabled={busy || returnOriginInFlight || !resetReady}>
+          <UiButton variant="primary" block onClick={() => guardGripperOpen('skip')} disabled={busy || returnOriginInFlight || !resetReady}>
             跳过复位，立即开始
           </UiButton>
           <UiButton danger block onClick={finishRecordSession} disabled={busy}>
@@ -258,6 +279,47 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
           右从臂回工作原点
         </UiButton>
       </div>
+
+      {gripperPrompt && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div role="dialog" aria-modal="true" aria-label="夹爪未张开" style={{ background: '#fff', borderRadius: 8, padding: 16, width: 320, boxShadow: '0 6px 24px rgba(0,0,0,0.2)' }}>
+            <strong style={{ display: 'block', marginBottom: 8 }}>夹爪未张开</strong>
+            <div style={{ fontSize: 12, marginBottom: 12 }}>
+              录制起点要求夹爪张开到 26 mm：
+              {participation.grippers.map((side) => {
+                const mm = gripperMm(side)
+                return (
+                  <div key={side}>
+                    {side === 'left' ? '左夹爪' : '右夹爪'}：{typeof mm === 'number' && mm >= 0 ? `${mm.toFixed(1)} mm` : '无读数'}
+                  </div>
+                )
+              })}
+            </div>
+            <div className="record-action-stack">
+              <UiButton
+                variant="primary"
+                block
+                disabled={!closedGrippers.length}
+                onClick={() => closedGrippers.forEach((side) => issueManualGripperMove(hardwareSideForOperatorSide(side), 'open'))}
+              >
+                张开夹爪
+              </UiButton>
+              <UiButton
+                block
+                disabled={closedGrippers.length > 0}
+                onClick={() => {
+                  const action = gripperPrompt
+                  setGripperPrompt(null)
+                  runStartAction(action)
+                }}
+              >
+                {gripperPrompt === 'start' ? '已张开，开始采集会话' : '已张开，立即开始'}
+              </UiButton>
+              <UiButton block onClick={() => setGripperPrompt(null)}>取消</UiButton>
+            </div>
+          </div>
+        </div>
+      )}
     </UiCard>
   )
 }
