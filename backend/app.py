@@ -1568,7 +1568,8 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     commands.safety.check(safety_token)
                     motion_plan = plan["motion"][side]
                     hardware_side = dataset_side_to_hardware_side(side)
-                    await commands.enable_motion_side(hardware_side)
+                    if not await _policy_side_already_enabled(hardware_side, motion_plan):
+                        await commands.enable_motion_side(hardware_side)
                     commands.safety.check(safety_token)
                     results["motion"][side] = await hal.command(
                         "motion.teleop_target_update",
@@ -1614,6 +1615,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         left = cached[0] if len(cached) > 0 and cached[0] >= 0 else float(gripper.get("targetLeftMm", 0.0))
         right = cached[1] if len(cached) > 1 and cached[1] >= 0 else float(gripper.get("targetRightMm", 0.0))
         return [float(left), float(right)]
+
+    async def _policy_side_already_enabled(hardware_side: str, motion_plan: dict[str, Any]) -> bool:
+        """连续策略流保持 HAL 外部控制；重复使能会被当成切换控制来源而冲突。"""
+        state = await hal.motion_state()
+        raw = state.get("enabled")
+        if not (isinstance(raw, list) and len(raw) == 12):
+            return False  # 读不到使能反馈时按原逻辑使能
+        values = raw[:6] if hardware_side == "left" else raw[6:12]
+        wanted = list(motion_plan.get("enabledAxes") or [True] * 6)
+        return all(bool(value) for value, want in zip(values, wanted) if want)
 
     def _policy_motion_payload(side: str, motion_plan: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
