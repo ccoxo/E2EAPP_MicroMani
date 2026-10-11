@@ -73,37 +73,6 @@ def test_inflight_sampler_does_not_write_targets_into_next_episode(monkeypatch):
     assert len(r._gripper_target_buffer) == 0
 
 
-@pytest.mark.parametrize("side,index", [("left", 6), ("right", 13)])
-def test_target_history_preserves_operator_side_contract(monkeypatch, side, index):
-    r = recorder_stub(monkeypatch)
-    r._participation = {**SELECTED, "arms": [side], "grippers": [side]}
-    r._gripper_target_buffer.append(TimedSample("gripper_target", 10., (12., 24.)))
-    action = r._latest_action_vector([0.] * 14, CONFIG, 10.)
-    assert action[index] == (24. if side == "left" else 12.)
-
-
-def test_delayed_target_is_recorded_with_alignment_warning(monkeypatch):
-    r = recorder_stub(monkeypatch)
-    r._gripper_target_buffer.append(TimedSample("gripper_target", 9.94, (26., 0.)))
-    r.telemetry = SimpleNamespace(motion_positions=[0.] * 12, gripper_positions=[26., 0.])
-    r._last_motion_pulses = [0.] * 12
-    r._record_fps_hz = 30
-    r._episode_index = 0
-    r._recording_motion_positions = lambda _c, p, _pulse: p
-    r._camera_placeholder_value = lambda _key: b"offline"
-
-    def aligned(source, stamp):
-        value = {"positions": [0.] * 12, "pulses": [0.] * 12} if source == "hal" else [26., 0.]
-        return TimedSample(source, stamp, value, valid_until_unix_ms=time.time()*1000 + 1000)
-
-    r._aligned_sample = aligned
-    frame = module.FrameAssembler(r).assemble(CONFIG, 10., 0)
-    assert frame["action"][13] == 26.
-    assert frame["alignmentExceptions"][0]["source"] == "gripper_target"
-    assert frame["alignmentExceptions"][0]["skewMs"] == -60.
-    assert r._quality_assessment({"frames": 1, "alignmentExceptions": frame["alignmentExceptions"]})["recommendation"] == "review"
-
-
 @pytest.mark.parametrize("target,actual,valid", [(26., 26., True), (8.1, 8.1, False),
                                                 (26., 8.1, False), (8.1, 26., False)])
 def test_start_checks_both_target_and_measurement(monkeypatch, target, actual, valid):
@@ -185,6 +154,58 @@ def test_arm_does_not_admit_frames_until_warmup_and_gate_complete(monkeypatch):
     assert r._accepting_frame_jobs and r.telemetry.recording
 
 
+@pytest.mark.parametrize("grippers", [[], ["right"]])
+def test_quality_uses_participation_for_stationary_and_rotation_only_episodes(monkeypatch, grippers):
+    r = recorder_stub(monkeypatch)
+    r._participation = {**SELECTED, "grippers": grippers}
+    r._episode_frames = 0
+    r._reset_training_quality_tracking()
+    for roll in [0., 100.]:
+        state = [0.] * 14
+        action = [0.] * 14
+        state[13] = action[13] = 8.1
+        action[10] = roll
+        r._track_training_quality_frame({"observation.state": state, "action": action})
+        r._episode_frames += 1
+    summary = r._training_quality_summary()
+    assert summary["activeDatasetSides"] == ["right"]
+    report = r._quality_assessment({"frames": 2, "trainingQuality": summary})
+    codes = {x["code"] for x in report["reasons"]}
+    assert "active_side_unknown" not in codes
+    assert ("start_gripper_action" in codes) is bool(grippers)
+
+
+@pytest.mark.parametrize("side,index", [("left", 6), ("right", 13)])
+def test_target_history_preserves_operator_side_contract(monkeypatch, side, index):
+    r = recorder_stub(monkeypatch)
+    r._participation = {**SELECTED, "arms": [side], "grippers": [side]}
+    r._gripper_target_buffer.append(TimedSample("gripper_target", 10., (12., 24.)))
+    action = r._latest_action_vector([0.] * 14, CONFIG, 10.)
+    assert action[index] == (24. if side == "left" else 12.)
+
+
+def test_delayed_target_is_recorded_with_alignment_warning(monkeypatch):
+    r = recorder_stub(monkeypatch)
+    r._gripper_target_buffer.append(TimedSample("gripper_target", 9.94, (26., 0.)))
+    r.telemetry = SimpleNamespace(motion_positions=[0.] * 12, gripper_positions=[26., 0.])
+    r._last_motion_pulses = [0.] * 12
+    r._record_fps_hz = 30
+    r._episode_index = 0
+    r._recording_motion_positions = lambda _c, p, _pulse: p
+    r._camera_placeholder_value = lambda _key: b"offline"
+
+    def aligned(source, stamp):
+        value = {"positions": [0.] * 12, "pulses": [0.] * 12} if source == "hal" else [26., 0.]
+        return TimedSample(source, stamp, value, valid_until_unix_ms=time.time()*1000 + 1000)
+
+    r._aligned_sample = aligned
+    frame = module.FrameAssembler(r).assemble(CONFIG, 10., 0)
+    assert frame["action"][13] == 26.
+    assert frame["alignmentExceptions"][0]["source"] == "gripper_target"
+    assert frame["alignmentExceptions"][0]["skewMs"] == -60.
+    assert r._quality_assessment({"frames": 1, "alignmentExceptions": frame["alignmentExceptions"]})["recommendation"] == "review"
+
+
 def test_start_checks_fresh_motion_even_without_gripper(monkeypatch):
     r = recorder_stub(monkeypatch)
     r._participation = {**SELECTED, "grippers": []}
@@ -206,5 +227,3 @@ def test_stop_during_start_gate_never_admits_frames(monkeypatch):
     with pytest.raises(RuntimeError, match="emergency stop"):
         asyncio.run(r._wait_for_record_start_ready(CONFIG, r.safety.capture()))
     assert not r._accepting_frame_jobs and not r.telemetry.recording
-
-

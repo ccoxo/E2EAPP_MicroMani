@@ -162,9 +162,6 @@ QUALITY_CAMERA_REVIEW_RATE = 0.02
 QUALITY_CAMERA_RERECORD_RATE = 0.05
 QUALITY_ORIGIN_REVIEW_UM = 500.0
 QUALITY_ORIGIN_RERECORD_UM = 1000.0
-QUALITY_GRIPPER_ACTION_MIN_MM = 25.0
-QUALITY_GRIPPER_STATE_REVIEW_MM = 25.0
-QUALITY_GRIPPER_STATE_RERECORD_MM = 24.0
 QUALITY_ACTIVE_TRANSLATION_RANGE_UM = 500.0
 ACTION_STALE_S = 1.0
 HAL_NATIVE_SAMPLE_HZ = 1000.0
@@ -3460,13 +3457,16 @@ class DatasetRecorderService:
         )):
             return {}
 
+        config = self._recording_config()
+        selected = getattr(self, "_participation", None)
         sides: dict[str, Any] = {}
         active_sides: list[str] = []
         first_second = getattr(self, "_quality_first_second_gripper_min", [math.inf, math.inf])
         for slot, (side, base, hardware_side) in enumerate((("left", 0, "right"), ("right", 7, "left"))):
             translation_ranges = [action_max[base + axis] - action_min[base + axis] for axis in range(3)]
             max_translation_range = max(translation_ranges)
-            if max_translation_range >= QUALITY_ACTIVE_TRANSLATION_RANGE_UM:
+            if (side in selected["arms"] if selected is not None
+                    else max_translation_range >= QUALITY_ACTIVE_TRANSLATION_RANGE_UM):
                 active_sides.append(side)
             gripper_index = base + 6
             start_translation_norm = math.sqrt(sum(first_state[base + axis] ** 2 for axis in range(3)))
@@ -3474,6 +3474,7 @@ class DatasetRecorderService:
             first_second_min = first_second[slot] if slot < len(first_second) else math.inf
             sides[side] = {
                 "hardwareSide": hardware_side,
+                "gripperParticipating": side in selected["grippers"] if selected is not None else True,
                 "startTranslationNormUm": round(start_translation_norm, 3),
                 "startRotationMaxMdeg": round(start_rotation_max, 3),
                 "startStateGripperMm": round(first_state[gripper_index], 3),
@@ -3489,6 +3490,9 @@ class DatasetRecorderService:
         return {
             "version": "appstation.record_training_quality.v1",
             "activeDatasetSides": active_sides,
+            "startGripperExpectedMm": config.get("storage", {}).get(
+                "recordStartGripperMm", config.get("gripper", {}).get("strokeMm", 26.0)),
+            "gripperActionAlignment": "native_status_previous_v1",
             "sides": sides,
         }
 
@@ -4973,6 +4977,8 @@ class DatasetRecorderService:
 
         training = episode.get("trainingQuality", {})
         if isinstance(training, dict) and training:
+            expected_gripper = self._coerce_float(training.get("startGripperExpectedMm", 26.0))
+            expected_gripper = 26.0 if expected_gripper is None else expected_gripper
             active_sides = training.get("activeDatasetSides", [])
             sides = training.get("sides", {})
             if not isinstance(active_sides, list):
@@ -4992,22 +4998,24 @@ class DatasetRecorderService:
                     elif origin_error > QUALITY_ORIGIN_REVIEW_UM:
                         add("review", "start_origin", f"{label} 起点偏离工作原点 {origin_error / 1000.0:.2f} mm")
 
+                    if metrics.get("gripperParticipating") is False:
+                        continue
                     start_action = self._float_or_zero(metrics.get("startActionGripperMm"))
                     start_state = self._float_or_zero(metrics.get("startStateGripperMm"))
                     first_second = metrics.get("firstSecondMinActionGripperMm")
                     end_action = self._float_or_zero(metrics.get("endActionGripperMm"))
                     end_state = self._float_or_zero(metrics.get("endStateGripperMm"))
-                    if start_action < QUALITY_GRIPPER_ACTION_MIN_MM:
-                        add("rerecord", "start_gripper_action", f"{label} 起始夹爪目标仅 {start_action:.2f} mm，当前协议要求接近 26 mm")
-                    if start_state < QUALITY_GRIPPER_STATE_RERECORD_MM:
+                    if abs(start_action - expected_gripper) > RECORD_START_GRIPPER_TOLERANCE_MM:
+                        add("rerecord", "start_gripper_action", f"{label} 起始夹爪目标 {start_action:.2f} mm，当前协议要求接近 {expected_gripper:g} mm")
+                    if abs(start_state - expected_gripper) > 2 * RECORD_START_GRIPPER_TOLERANCE_MM:
                         add("rerecord", "start_gripper_state", f"{label} 起始夹爪反馈仅 {start_state:.2f} mm")
-                    elif start_state < QUALITY_GRIPPER_STATE_REVIEW_MM:
+                    elif abs(start_state - expected_gripper) > RECORD_START_GRIPPER_TOLERANCE_MM:
                         add("review", "start_gripper_state", f"{label} 起始夹爪反馈 {start_state:.2f} mm，尚未完全张开")
-                    if isinstance(first_second, (int, float)) and math.isfinite(float(first_second)) and float(first_second) < QUALITY_GRIPPER_STATE_RERECORD_MM:
+                    if isinstance(first_second, (int, float)) and math.isfinite(float(first_second)) and float(first_second) < expected_gripper - 2 * RECORD_START_GRIPPER_TOLERANCE_MM:
                         add("review", "early_gripper_change", f"{label} 前 1 秒夹爪目标最低 {float(first_second):.2f} mm")
-                    if end_action < QUALITY_GRIPPER_ACTION_MIN_MM:
+                    if end_action < expected_gripper - RECORD_START_GRIPPER_TOLERANCE_MM:
                         add("review", "end_gripper_action", f"{label} 保存时夹爪目标仅 {end_action:.2f} mm")
-                    if end_state < QUALITY_GRIPPER_STATE_RERECORD_MM:
+                    if end_state < expected_gripper - 2 * RECORD_START_GRIPPER_TOLERANCE_MM:
                         add("review", "end_gripper_state", f"{label} 保存时夹爪反馈仅 {end_state:.2f} mm")
 
         return {
