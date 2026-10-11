@@ -483,6 +483,18 @@ class FrameAssembler:
                 if camera_sample.value is not None
                 else recorder._camera_placeholder_value(feature_key)
             )
+        action = recorder._latest_action_vector(observation_state, config, target_monotonic_s)
+        if selected and selected["grippers"] and recorder._using_real_hal_native_teleop(config):
+            target_buffer = getattr(recorder, "_gripper_target_buffer", None)
+            target_sample = target_buffer.at_or_before(target_monotonic_s, ACTION_STALE_S) if target_buffer else None
+            if target_sample is not None and target_monotonic_s - target_sample.monotonic_s > SOURCE_MAX_SKEW_S["gripper"]:
+                alignment_exceptions.append({
+                    "frameIndex": frame_index, "source": "gripper_target",
+                    "targetMonotonicS": target_monotonic_s,
+                    "sampleMonotonicS": target_sample.monotonic_s,
+                    "skewMs": round((target_sample.monotonic_s - target_monotonic_s) * 1000., 3),
+                    "maxSkewMs": SOURCE_MAX_SKEW_S["gripper"] * 1000.,
+                })
         return {
             "timestamp": frame_index / max(1, recorder._record_fps_hz),
             "alignmentExceptions": alignment_exceptions,
@@ -493,7 +505,7 @@ class FrameAssembler:
             "observation.force_left": force_right,
             "observation.force_right": force_left,
             "action": [v if active else 0. for v, active in zip(
-                recorder._latest_action_vector(observation_state, config, target_monotonic_s),
+                action,
                 action_mask(selected) if selected else [True] * 14)],
             "images": image_payload,
         }
@@ -553,6 +565,14 @@ class TimedRingBuffer:
         """判断缓存是否已有达到或晚于目标时间的样本。"""
         with self._lock:
             return bool(self._samples and self._samples[-1].monotonic_s >= target_s)
+
+    def at_or_before(self, target_s: float, max_age_s: float) -> TimedSample | None:
+        """动作保持上一目标，禁止借用目标帧之后的样本。"""
+        with self._lock:
+            for sample in reversed(self._samples):
+                if sample.monotonic_s <= target_s:
+                    return sample if target_s - sample.monotonic_s <= max_age_s else None
+        return None
 
     def failure_timeline(self, target_s: float) -> dict[str, Any]:
         """只在失败时提取前后三个样本及最新样本，不复制观测数据。"""
@@ -2436,10 +2456,17 @@ class DatasetRecorderService:
             selected = getattr(self, "_participation", None)
             if selected and selected["grippers"] and self._using_real_hal_native_teleop(config):
                 # 采集直接读取 native DDS 状态，避免依赖界面状态循环的二次缓存。
+                target_buffer = getattr(self, "_gripper_target_buffer", None)
                 result = run(self.hal.command("teleop.native.status", {}))
                 native_status = result.get("response") if isinstance(result, dict) else None
                 if not isinstance(native_status, dict):
                     raise RuntimeError("参与采集的夹爪 native 状态缺失")
+                if target_buffer is not None:
+                    targets = self._native_gripper_target_values(native_status)
+                    stamp = self._source_sample_monotonic(native_status, 0.0)
+                    if targets is not None and math.isfinite(stamp) and stamp > 0:
+                        # 目标用 DDS 状态时标，不能套用更早的夹爪位置 READ 时标。
+                        target_buffer.append(TimedSample("gripper_target", stamp, targets))
                 return self._gripper_source_sync(
                     config, target_s, record_quality=False, native_status=native_status)
             return self._gripper_source_sync(config, target_s, record_quality=False)
@@ -3471,6 +3498,8 @@ class DatasetRecorderService:
         self._source_elapsed_ms = {key: [] for key in SOURCE_KEYS}
         self._source_fail_streaks = {key: 0 for key in SOURCE_KEYS}
         self._sample_buffers = self._new_sample_buffers(self._recording_config())
+        retention_s = self._sample_buffer_retention_s(self._recording_config())
+        self._gripper_target_buffer = TimedRingBuffer(retention_s=retention_s, maxlen=max(300, int(retention_s * 200)))
         if hasattr(self, "_origin_move_lock"):
             with self._origin_move_lock:
                 self._origin_move_buffer.clear()
@@ -5009,13 +5038,13 @@ class DatasetRecorderService:
         config: dict[str, Any] | None = None,
         target_monotonic_s: float | None = None,
     ) -> list[float]:
-        # action 记录绝对目标：当前 observation.state 加主手增量，夹爪目标取实时目标或配置值。
+        # action 记录绝对目标：观测加主手增量，参与夹爪按帧时刻查询目标历史。
         """根据 observation、teleop 增量和夹爪目标生成 14 维 action。"""
         base = (list(observation_state) + [0.0] * 14)[:14] if observation_state is not None else [0.0] * 14
         config = config or {}
         vector = hardware_to_dataset_state(self._latest_action_delta_vector(target_monotonic_s))
         action = [base[index] + vector[index] for index in range(14)]
-        native_gripper_targets = self._latest_native_gripper_targets(config)
+        native_gripper_targets = self._latest_native_gripper_targets(config, target_monotonic_s)
         if native_gripper_targets is not None:
             action[6], action[13] = hardware_to_dataset_grippers(list(native_gripper_targets))
             return action
@@ -5030,10 +5059,26 @@ class DatasetRecorderService:
                 )
         return action
 
-    def _latest_native_gripper_targets(self, config: dict[str, Any]) -> tuple[float, float] | None:
+    def _latest_native_gripper_targets(
+        self, config: dict[str, Any], target_monotonic_s: float | None = None,
+    ) -> tuple[float, float] | None:
         """从 native teleop 状态中提取左右夹爪目标值。"""
+        selected = getattr(self, "_participation", None)
+        if target_monotonic_s is not None and self._using_real_hal_native_teleop(config) and selected:
+            if not selected["grippers"]:
+                return (0.0, 0.0)
+            buffer = getattr(self, "_gripper_target_buffer", None)
+            # 与运动 action 一样使用过期上限；超过 50 ms 的偏差另入质量报告。
+            sample = buffer.at_or_before(target_monotonic_s, ACTION_STALE_S) if buffer else None
+            if sample is None:
+                raise RuntimeError("参与夹爪目标历史缺失或过期，拒绝用最新目标替代历史动作")
+            return sample.value
         status = self._recording_action_status()
         native_status = status.get("nativeStatus") if isinstance(status, dict) else None
+        return self._native_gripper_target_values(native_status)
+
+    def _native_gripper_target_values(self, native_status: Any) -> tuple[float, float] | None:
+        """解析硬件侧目标；非参与夹爪不要求有效反馈，也不生成动作。"""
         if not isinstance(native_status, dict):
             return None
         raw_targets = native_status.get("gripperTargets")
@@ -5045,7 +5090,12 @@ class DatasetRecorderService:
             right = self._coerce_float(raw_targets.get("rightMm", raw_targets.get("right")))
         else:
             return None
-        if left is None or right is None:
+        selected = getattr(self, "_participation", None)
+        if selected is not None:
+            sides = hardware_sides(selected, "grippers")
+            left = left if "left" in sides else 0.0
+            right = right if "right" in sides else 0.0
+        if left is None or right is None or not all(math.isfinite(v) and v >= 0 for v in (left, right)):
             return None
         return left, right
 
