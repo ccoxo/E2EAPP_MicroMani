@@ -148,6 +148,9 @@ NATIVE_SAVE_EPISODE_TIMEOUT_S = 60.0
 RECORDING_QUEUE_DRAIN_TIMEOUT_S = 30.0
 SAMPLER_START_LEAD_S = 0.05
 RECORDER_HARDWARE_WARMUP_S = 0.5
+RECORD_START_STABLE_S = 0.3
+RECORD_START_TIMEOUT_S = 3.0
+RECORD_START_GRIPPER_TOLERANCE_MM = 1.0
 MAX_SAMPLE_JITTER_S = 0.10
 SAMPLE_LOOKBACK_WINDOW_S = 0.10
 ALIGNMENT_DELAY_S = 0.100
@@ -2011,15 +2014,84 @@ class DatasetRecorderService:
                 await asyncio.sleep(0.02)
             else:
                 raise RuntimeError("参与采集设备采样预热超时，拒绝开始录制")
+        # 首条与续录共用门槛；预热时不接收帧，避免检查通过后又空等半秒。
+        await self._wait_for_episode_warmup()
+        await self._wait_for_record_start_ready(config, safety_token)
         sample_clock_now_s, schedule_now_s = await self._episode_clock_pair(config)
         async with self._lock:
             self.safety.check(safety_token)
-            self._episode_start_monotonic_s = sample_clock_now_s + RECORDER_HARDWARE_WARMUP_S
-            self._record_loop_start_monotonic_s = schedule_now_s + RECORDER_HARDWARE_WARMUP_S
+            self._episode_start_monotonic_s = sample_clock_now_s
+            self._record_loop_start_monotonic_s = schedule_now_s
             self._episode_started_at = self._record_loop_start_monotonic_s
             self._episode_source_time0_s = self._episode_start_monotonic_s - self._sampler_start_monotonic_s
             self._accepting_frame_jobs = True
             self.telemetry.recording = True
+
+    async def _wait_for_record_start_ready(self, config: dict[str, Any], safety_token: Any) -> None:
+        """只读检查 W 与参与夹爪起点连续稳定；不自动归位或驱动夹爪。"""
+        selected = getattr(self, "_participation", None)
+        if not self._real_hardware_mode(config) or not selected:
+            return
+        validator = getattr(self, "validate_start_origin", None)
+        if validator is None:
+            raise RuntimeError("录制起点检查未装配，拒绝开始录制")
+        deadline = time.monotonic() + RECORD_START_TIMEOUT_S
+        stable_since = None
+        reason = "参与设备反馈尚未就绪"
+        while time.monotonic() < deadline:
+            self.safety.check(safety_token)
+            check_started = time.monotonic()
+            await validator()
+            self.safety.check(safety_token)
+            schedule_now = time.monotonic()
+            # W 检查曾等待重新到位时，不能把等待时间计作连续稳定。
+            if schedule_now - check_started >= 0.05:
+                stable_since = None
+            target_s = self._sampler_start_monotonic_s + schedule_now - self._sampler_schedule_start_s
+            reason = self._record_start_feedback_blocker(config, target_s)
+            if reason:
+                stable_since = None
+            else:
+                stable_since = schedule_now if stable_since is None else stable_since
+                if schedule_now - stable_since >= RECORD_START_STABLE_S:
+                    return
+            await asyncio.sleep(0.02)
+        raise RuntimeError(f"录制起点未连续稳定 {RECORD_START_STABLE_S * 1000:.0f} ms：{reason or '请保持 W 和夹爪起始开口'}")
+
+    def _record_start_feedback_blocker(self, config: dict[str, Any], target_s: float) -> str:
+        selected = self._participation
+        buffer = self._sample_buffers.get("hal")
+        sample = buffer.nearest(target_s, 0.1, valid_only=True, valid_at_unix_ms=now_ms()) if buffer else None
+        if sample is None or not self._feedback_is_valid(sample):
+            return "参与机械臂反馈缺失或过期"
+        if not selected["grippers"]:
+            return ""
+        # 当前任务默认从全开开始；数据集冻结配置可显式指定其它起始开口。
+        expected = self._coerce_float(config.get("storage", {}).get(
+            "recordStartGripperMm", config.get("gripper", {}).get("strokeMm", 26.0)))
+        stroke = self._coerce_float(config.get("gripper", {}).get("strokeMm", 26.0))
+        if expected is None or stroke is None or not 0 <= expected <= stroke:
+            raise RuntimeError("录制起始开口配置无效")
+        buffer = self._sample_buffers.get("gripper")
+        sample = buffer.nearest(target_s, 0.1, valid_only=True, valid_at_unix_ms=now_ms()) if buffer else None
+        if sample is None or not self._feedback_is_valid(sample):
+            return "参与夹爪反馈缺失或过期"
+        target_buffer = getattr(self, "_gripper_target_buffer", None)
+        if target_buffer is None or target_buffer.at_or_before(target_s, 0.1) is None:
+            return "参与夹爪目标缺失或过期"
+        try:
+            targets = self._latest_native_gripper_targets(config, target_s)
+        except RuntimeError as exc:
+            return str(exc)
+        if targets is None:
+            return "参与夹爪目标缺失"
+        for side in hardware_sides(selected, "grippers"):
+            index = 0 if side == "left" else 1
+            if (abs(targets[index] - expected) > RECORD_START_GRIPPER_TOLERANCE_MM
+                    or abs(sample.value[index] - expected) > RECORD_START_GRIPPER_TOLERANCE_MM):
+                operator_side = "右" if side == "left" else "左"
+                return f"操作者{operator_side}夹爪目标与实际开口需接近 {expected:g} mm"
+        return ""
 
     async def _native_writer_command(self, kind: str, payload: OriginMoveWrite | None = None) -> Any:
         """向 native 写线程发送控制命令，并异步等待执行结果。"""
@@ -3778,9 +3850,16 @@ class DatasetRecorderService:
                 "forceSampleHz": self._force_sample_hz,
                 "alignment": (
                     "source samplers record host monotonic sample times; "
-                    "record frames align at sampler_start_s + warmup_s + frame_index / record_fps; "
+                    "record frames align at episode_start_s + frame_index / record_fps after warmup and start checks; "
                     "assembly waits alignment_delay_ms before settling critical source buffers"
                 ),
+                "gripperActionAlignment": "native_status_previous_v1",
+                "startConditions": {
+                    "gripperMm": config.get("storage", {}).get(
+                        "recordStartGripperMm", config.get("gripper", {}).get("strokeMm", 26.0)),
+                    "gripperToleranceMm": RECORD_START_GRIPPER_TOLERANCE_MM,
+                    "stableMs": RECORD_START_STABLE_S * 1000.0,
+                },
                 "alignmentDelayMs": round(self._alignment_delay_s(config) * 1000.0, 3),
                 "settleTimeoutMs": round(self._settle_timeout_s(config) * 1000.0, 3),
             },

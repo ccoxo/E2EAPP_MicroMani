@@ -1463,6 +1463,8 @@ def test_dataset_recorder_waits_for_both_real_feedback_sources_before_first_fram
         recorder._sampler_start_monotonic_s = time.monotonic() - 0.1
         recorder.telemetry = SimpleNamespace(recording=False)
         recorder._wait_for_fresh_native_gripper_feedback = lambda _config: asyncio.sleep(0)
+        recorder._wait_for_episode_warmup = lambda: asyncio.sleep(0)
+        recorder._wait_for_record_start_ready = lambda *_args: asyncio.sleep(0)
 
         async def clock_pair(_config: dict[str, object]) -> tuple[float, float]:
             now = time.monotonic()

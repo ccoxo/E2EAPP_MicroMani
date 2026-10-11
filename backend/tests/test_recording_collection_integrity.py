@@ -104,3 +104,107 @@ def test_delayed_target_is_recorded_with_alignment_warning(monkeypatch):
     assert r._quality_assessment({"frames": 1, "alignmentExceptions": frame["alignmentExceptions"]})["recommendation"] == "review"
 
 
+@pytest.mark.parametrize("target,actual,valid", [(26., 26., True), (8.1, 8.1, False),
+                                                (26., 8.1, False), (8.1, 26., False)])
+def test_start_checks_both_target_and_measurement(monkeypatch, target, actual, valid):
+    r = recorder_stub(monkeypatch)
+    r._gripper_target_buffer.append(TimedSample("gripper_target", 10., (target, 0.)))
+    r._sample_buffers["gripper"].append(TimedSample(
+        "gripper", 10., [actual, 0.], valid_until_unix_ms=time.time()*1000 + 1000))
+    assert (r._record_start_feedback_blocker(CONFIG, 10.) == "") is valid
+
+
+def test_start_rejects_old_feedback_and_supports_frozen_task_target(monkeypatch):
+    r = recorder_stub(monkeypatch)
+    r._gripper_target_buffer.append(TimedSample("gripper_target", 10., (12., 0.)))
+    sample = TimedSample("gripper", 10., [12., 0.], valid_until_unix_ms=time.time()*1000 - 1)
+    r._sample_buffers["gripper"].append(sample)
+    config = {**CONFIG, "storage": {"recordStartGripperMm": 12.}}
+    assert r._record_start_feedback_blocker(config, 10.)
+    r._sample_buffers["gripper"].clear()
+    r._sample_buffers["gripper"].append(module.replace(sample, valid_until_unix_ms=time.time()*1000 + 1000))
+    assert r._record_start_feedback_blocker(config, 10.) == ""
+
+
+def test_stability_window_restarts_after_bad_sample(monkeypatch):
+    r = recorder_stub(monkeypatch)
+    r.safety = MotionSafetyGate()
+    r._sampler_start_monotonic_s = r._sampler_schedule_start_s = time.monotonic()
+    r.validate_start_origin = AsyncMock()
+    calls = []
+
+    def blocker(*args):
+        calls.append(time.monotonic())
+        return "开口未到位" if len(calls) == 3 else ""
+
+    r._record_start_feedback_blocker = blocker
+    monkeypatch.setattr(module, "RECORD_START_STABLE_S", .05)
+    r.hal = SimpleNamespace(command=AsyncMock(side_effect=AssertionError("不得驱动设备")))
+    asyncio.run(r._wait_for_record_start_ready(CONFIG, r.safety.capture()))
+    assert calls[-1] - calls[3] >= .05
+    assert r.validate_start_origin.await_count == len(calls)
+    r.hal.command.assert_not_awaited()
+
+
+def test_start_gate_timeout_and_missing_origin_validator_fail_closed(monkeypatch):
+    r = recorder_stub(monkeypatch)
+    r.safety = MotionSafetyGate()
+    with pytest.raises(RuntimeError, match="未装配"):
+        asyncio.run(r._wait_for_record_start_ready(CONFIG, r.safety.capture()))
+    r._sampler_start_monotonic_s = r._sampler_schedule_start_s = time.monotonic()
+    r.validate_start_origin = AsyncMock()
+    r._record_start_feedback_blocker = lambda *args: "开口未到位"
+    monkeypatch.setattr(module, "RECORD_START_TIMEOUT_S", .05)
+    with pytest.raises(RuntimeError, match="开口未到位"):
+        asyncio.run(r._wait_for_record_start_ready(CONFIG, r.safety.capture()))
+
+
+def test_arm_does_not_admit_frames_until_warmup_and_gate_complete(monkeypatch):
+    r = recorder_stub(monkeypatch)
+    r.safety = MotionSafetyGate()
+    r._lock = asyncio.Lock()
+    r._participation = None  # 本测试只隔离启用顺序，真实门槛由上面用例验证。
+    r._accepting_frame_jobs = False
+    r._sampler_start_monotonic_s = 9.
+    r.telemetry = SimpleNamespace(recording=False)
+    r._wait_for_fresh_native_gripper_feedback = AsyncMock()
+    calls = []
+
+    async def stage(name):
+        assert not r._accepting_frame_jobs
+        assert not r.telemetry.recording
+        calls.append(name)
+
+    r._wait_for_episode_warmup = lambda: stage("warmup")
+    r._wait_for_record_start_ready = lambda *args: stage("gate")
+    r._episode_clock_pair = AsyncMock(return_value=(10., 20.))
+    asyncio.run(r._arm_episode_after_feedback(CONFIG, r.safety.capture()))
+    assert calls == ["warmup", "gate"]
+    assert r._episode_start_monotonic_s == 10.
+    assert r._record_loop_start_monotonic_s == 20.
+    assert r._accepting_frame_jobs and r.telemetry.recording
+
+
+def test_start_checks_fresh_motion_even_without_gripper(monkeypatch):
+    r = recorder_stub(monkeypatch)
+    r._participation = {**SELECTED, "grippers": []}
+    assert r._record_start_feedback_blocker(CONFIG, 10.) == ""
+    assert "机械臂" in r._record_start_feedback_blocker(CONFIG, 10.2)
+
+
+def test_stop_during_start_gate_never_admits_frames(monkeypatch):
+    r = recorder_stub(monkeypatch)
+    r.safety = MotionSafetyGate()
+    r._accepting_frame_jobs = False
+    r.telemetry = SimpleNamespace(recording=False)
+    r._sampler_start_monotonic_s = r._sampler_schedule_start_s = time.monotonic()
+
+    async def stop_while_checking():
+        r.safety.interrupt(emergency=True)
+
+    r.validate_start_origin = stop_while_checking
+    with pytest.raises(RuntimeError, match="emergency stop"):
+        asyncio.run(r._wait_for_record_start_ready(CONFIG, r.safety.capture()))
+    assert not r._accepting_frame_jobs and not r.telemetry.recording
+
+
