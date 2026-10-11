@@ -130,7 +130,7 @@ SOURCE_TIMEOUT_S: dict[str, float] = {
 SOURCE_MAX_SKEW_S: dict[str, float] = {
     "hal": 0.020,
     "force": 0.010,
-    "gripper": 0.050,
+    "gripper": 0.070,
     "omega": 0.020,
     **{source: 0.035 for source in CAMERA_SOURCE_KEYS.values()},
 }

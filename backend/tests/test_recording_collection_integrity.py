@@ -186,7 +186,7 @@ def test_target_history_preserves_operator_side_contract(monkeypatch, side, inde
 
 def test_delayed_target_is_recorded_with_alignment_warning(monkeypatch):
     r = recorder_stub(monkeypatch)
-    r._gripper_target_buffer.append(TimedSample("gripper_target", 9.94, (26., 0.)))
+    r._gripper_target_buffer.append(TimedSample("gripper_target", 9.92, (26., 0.)))
     r.telemetry = SimpleNamespace(motion_positions=[0.] * 12, gripper_positions=[26., 0.])
     r._last_motion_pulses = [0.] * 12
     r._record_fps_hz = 30
@@ -202,7 +202,7 @@ def test_delayed_target_is_recorded_with_alignment_warning(monkeypatch):
     frame = module.FrameAssembler(r).assemble(CONFIG, 10., 0)
     assert frame["action"][13] == 26.
     assert frame["alignmentExceptions"][0]["source"] == "gripper_target"
-    assert frame["alignmentExceptions"][0]["skewMs"] == -60.
+    assert frame["alignmentExceptions"][0]["skewMs"] == -80.
     assert r._quality_assessment({"frames": 1, "alignmentExceptions": frame["alignmentExceptions"]})["recommendation"] == "review"
 
 
