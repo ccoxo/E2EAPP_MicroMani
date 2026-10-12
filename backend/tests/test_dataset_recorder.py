@@ -783,18 +783,23 @@ def test_dataset_recorder_skip_reset_requires_required_work_origin_side() -> Non
             calls.append("begin")
             recorder._recording = True
 
-        async def start(source: str, *, pre_home: bool = True) -> None:
+        async def start(source: str, *, pre_home: bool = True, prepare_only: bool = False) -> None:
+            assert prepare_only is True
             calls.append(f"start:{source}:{pre_home}")
+
+        async def release() -> None:
+            assert recorder.telemetry.recording is False
+            calls.append("release")
 
         async def warmup() -> None:
             calls.append("warmup")
 
         async def arm(_config: dict[str, object], _safety_token: object) -> None:
             calls.append("arm")
-            recorder.telemetry.recording = True
+            recorder.telemetry.recording = False
 
         recorder._begin_episode_locked = begin_episode
-        recorder.teleop = SimpleNamespace(start=start)
+        recorder.teleop = SimpleNamespace(start=start, release_recording=release)
         recorder._arm_episode_after_feedback = arm
         recorder._wait_for_episode_warmup = warmup
 
@@ -813,7 +818,7 @@ def test_dataset_recorder_skip_reset_requires_required_work_origin_side() -> Non
         assert recorder._reset_returned_sides == set()
         assert recorder.telemetry.recording is True
         assert recorder.telemetry.frame_count == 0
-        assert calls == ["begin", "start:recording:False", "arm", "warmup", "log"]
+        assert calls == ["begin", "start:recording:False", "arm", "warmup", "release", "log"]
 
     asyncio.run(run_case())
 
@@ -1172,18 +1177,23 @@ def test_dataset_recorder_skip_reset_starts_after_discarded_episode_waiting() ->
             recorder._recording = True
             recorder._gripper_sampler_paused = False
 
-        async def start(source: str, *, pre_home: bool = True) -> None:
+        async def start(source: str, *, pre_home: bool = True, prepare_only: bool = False) -> None:
+            assert prepare_only is True
             calls.append(f"start:{source}:{pre_home}")
+
+        async def release() -> None:
+            assert recorder.telemetry.recording is False
+            calls.append("release")
 
         async def warmup() -> None:
             calls.append("warmup")
 
         async def arm(_config: dict[str, object], _safety_token: object) -> None:
             calls.append("arm")
-            recorder.telemetry.recording = True
+            recorder.telemetry.recording = False
 
         recorder._begin_episode_locked = begin_episode
-        recorder.teleop = SimpleNamespace(start=start)
+        recorder.teleop = SimpleNamespace(start=start, release_recording=release)
         recorder._arm_episode_after_feedback = arm
         recorder._wait_for_episode_warmup = warmup
 
@@ -1194,7 +1204,7 @@ def test_dataset_recorder_skip_reset_starts_after_discarded_episode_waiting() ->
         assert recorder.telemetry.recording is True
         assert recorder._gripper_sampler_paused is False
         assert recorder.telemetry.frame_count == 0
-        assert calls == ["begin", "start:recording:False", "arm", "warmup", "log"]
+        assert calls == ["begin", "start:recording:False", "arm", "warmup", "release", "log"]
 
     asyncio.run(run_case())
 
@@ -1239,7 +1249,8 @@ def test_dataset_recorder_skip_reset_rolls_back_when_teleop_start_fails() -> Non
             recorder._samplers_paused = False
             recorder._gripper_sampler_paused = False
 
-        async def start(source: str, *, pre_home: bool = True) -> None:
+        async def start(source: str, *, pre_home: bool = True, prepare_only: bool = False) -> None:
+            assert prepare_only is True
             calls.append(f"start:{source}:{pre_home}")
             raise RuntimeError("teleop start failed")
 
@@ -1492,7 +1503,7 @@ def test_dataset_recorder_waits_for_both_real_feedback_sources_before_first_fram
         await asyncio.wait_for(task, 0.5)
         assert recorder._episode_start_monotonic_s >= feedback_ready_at
         assert recorder._accepting_frame_jobs is True
-        assert recorder.telemetry.recording is True
+        assert recorder.telemetry.recording is False
 
     asyncio.run(run_case())
 

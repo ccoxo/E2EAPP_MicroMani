@@ -151,7 +151,7 @@ def test_arm_does_not_admit_frames_until_warmup_and_gate_complete(monkeypatch):
     assert calls == ["warmup", "gate"]
     assert r._episode_start_monotonic_s == 10.
     assert r._record_loop_start_monotonic_s == 20.
-    assert r._accepting_frame_jobs and r.telemetry.recording
+    assert r._accepting_frame_jobs and not r.telemetry.recording
 
 
 @pytest.mark.parametrize("grippers", [[], ["right"]])

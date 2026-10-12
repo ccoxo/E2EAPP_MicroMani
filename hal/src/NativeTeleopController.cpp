@@ -1069,9 +1069,10 @@ void NativeTeleopController::tickSide(int sourceIndex, const Omega7State& hand, 
     }
     return;
   }
-  if (config_.requireClutch && !hand.clutchPressed) {
+  if (config_.recordingPreparing || (config_.requireClutch && !hand.clutchPressed)) {
     // clutch 是安全门控：未按下时停止输出并清除参考，按下后需要重新捕获。
-    setBlockerUnlocked(sourceIndex, "blocked", "clutch is required but not pressed");
+    setBlockerUnlocked(sourceIndex, "blocked", config_.recordingPreparing
+        ? "recording is preparing; motion input held" : "clutch is required but not pressed");
     resetKalmanSideUnlocked(sourceIndex);
     referenceValid_[sourceIndex] = false;
     incrementalCarry_[sourceIndex] = {};
@@ -1723,6 +1724,12 @@ void NativeTeleopController::tickGrippers(const std::array<Omega7State, 2>& hand
       continue;
     }
     targetMm = effectiveGripperTargetMm(targetMm);
+    if (config_.recordingPreparing) {
+      // 预览主手开口供起点检查使用；采样 worker 继续运行，但不排入运动命令。
+      gripperTargetsMm_[targetIndex] = targetMm;
+      gripperLastRaw_[targetIndex] = -1;
+      continue;
+    }
     const int raw = static_cast<int>(std::lround(
         (std::max(0.001, config_.gripper.strokeMm) - std::clamp(targetMm, 0.0, config_.gripper.strokeMm))
         / std::max(0.001, config_.gripper.strokeMm) * 255.0));

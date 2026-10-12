@@ -878,13 +878,20 @@ class DatasetRecorderService:
             if self._real_hardware_mode(config):
                 await self._refresh_gripper_cache(config)
             self.safety.check(safety_token)
-            await self.teleop.start("recording", pre_home=False)
+            if self._real_hardware_mode(config):
+                await self.teleop.start("recording", pre_home=False, prepare_only=True)
+            else:
+                await self.teleop.start("recording", pre_home=False)
             await self._arm_episode_after_feedback(config, safety_token)
             async with self._lock:
                 self._loop_task = asyncio.create_task(self._record_loop(), name="dataset-recorder")
                 self._assembler_task = asyncio.create_task(self._frame_assembler_loop(), name="dataset-frame-assembler")
             await self._wait_for_episode_warmup()
             self.safety.check(safety_token)
+            if self._real_hardware_mode(config):
+                await self.teleop.release_recording()
+            self.safety.check(safety_token)
+            self.telemetry.recording = True
         except (asyncio.CancelledError, Exception):
             async with self._lock:
                 self._session_starting = False
@@ -1060,10 +1067,17 @@ class DatasetRecorderService:
                 raise
         try:
             self.safety.check(safety_token)
-            await self.teleop.start("recording", pre_home=False)
+            if self._real_hardware_mode(config):
+                await self.teleop.start("recording", pre_home=False, prepare_only=True)
+            else:
+                await self.teleop.start("recording", pre_home=False)
             await self._arm_episode_after_feedback(config, safety_token)
             await self._wait_for_episode_warmup()
             self.safety.check(safety_token)
+            if self._real_hardware_mode(config):
+                await self.teleop.release_recording()
+            self.safety.check(safety_token)
+            self.telemetry.recording = True
         except (asyncio.CancelledError, Exception):
             async with self._lock:
                 self._recording = False
@@ -1214,7 +1228,7 @@ class DatasetRecorderService:
             "datasetName": self._dataset_name,
             "task": self._task,
             "active": self._session_active,
-            "recording": self._recording and not getattr(self, "_safety_interrupted", False),
+            "recording": self._recording and bool(self.telemetry.recording) and not getattr(self, "_safety_interrupted", False),
             "safetyInterrupted": getattr(self, "_safety_interrupted", False),
             "episodeIndex": self._episode_index,
             "frameCount": max(self._queued_episode_frames, self._episode_frames),
@@ -2037,7 +2051,8 @@ class DatasetRecorderService:
             self._episode_started_at = self._record_loop_start_monotonic_s
             self._episode_source_time0_s = self._episode_start_monotonic_s - self._sampler_start_monotonic_s
             self._accepting_frame_jobs = True
-            self.telemetry.recording = True
+            # 数据通路先就绪，遥操作放行应答前界面仍保持准备中。
+            self.telemetry.recording = False
 
     async def _wait_for_record_start_ready(self, config: dict[str, Any], safety_token: Any) -> None:
         """只读检查 W 与参与夹爪起点连续稳定；不自动归位或驱动夹爪。"""
