@@ -1564,6 +1564,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 detail={"code": "BAD_POLICY_SIDES", "message": "controlledSides must include left or right"},
             )
         results: dict[str, Any] = {"motion": {}, "grippers": {}}
+        dispatch_started = False
         t_mark = time.perf_counter()
         timing_ms: dict[str, float] = {"plan": (t_mark - t_entry) * 1e3}  # 诊断：策略请求各阶段耗时
         # gripperAsync=True：夹爪目标交给后台串行下发（只保留最新目标），机械臂命令不再等串口往返。
@@ -1580,6 +1581,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     commands.safety.check(safety_token)
                     motion_plan = plan["motion"][side]
                     hardware_side = dataset_side_to_hardware_side(side)
+                    dispatch_started = True
                     if not await _policy_side_already_enabled(hardware_side, motion_plan):
                         await commands.enable_motion_side(hardware_side)
                     timing_ms["enableCheck"] = (time.perf_counter() - t_mark) * 1e3
@@ -1612,6 +1614,23 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     t_mark = time.perf_counter()
         except ControlLeaseUnavailable as exc:
             raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
+        except OSError as exc:
+            logs.error("[POLICY]", f"policy action I/O failed: {traceback.format_exc()}")
+            stop_accepted = False
+            if dispatch_started:
+                try:
+                    await commands.emergency_stop()
+                    stop_accepted = True
+                except Exception:
+                    logs.error("[POLICY]", f"policy failure stop failed: {traceback.format_exc()}")
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "POLICY_ACTION_UNAVAILABLE", "message": str(exc),
+                    "executionMayHaveStarted": dispatch_started,
+                    "retrySafe": False, "stopRequestAccepted": stop_accepted,
+                },
+            ) from exc
         except RuntimeError as exc:
             logs.error("[POLICY]", f"policy action send failed: {exc}")
             raise HTTPException(

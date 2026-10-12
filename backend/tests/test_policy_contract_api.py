@@ -131,6 +131,36 @@ def test_hal_version_does_not_imply_unimplemented_calibration_capability():
     assert supported["missing"] == []
 
 
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_policy_persistence_failure_stops_without_replaying_action(app, stop_fails):
+    async def exercise():
+        await confirm_mock_browser_lease(app.state.control_watchdog)
+        config = app.state.settings.get_config()
+        config["gripper"]["leftEnabled"] = True
+        app.state.settings.save_config(config)
+        commands = app.state.commands
+        commands.enable_motion_side = AsyncMock()
+        commands.gripper_command = AsyncMock(side_effect=PermissionError("config.json busy"))
+        commands.emergency_stop = AsyncMock(side_effect=RuntimeError("stop failed") if stop_fails else None)
+        app.state.hal.command = AsyncMock(return_value={"ok": True})
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", "") == "/api/policy/action")
+        with pytest.raises(HTTPException) as failed:
+            await endpoint({
+                "action": [0.0] * 14, "dataContract": data_contract_metadata(),
+                "dryRun": False, "controlledSides": ["right"],
+            })
+        assert failed.value.status_code == 503
+        assert failed.value.detail["executionMayHaveStarted"] is True
+        assert failed.value.detail["retrySafe"] is False
+        assert failed.value.detail["stopRequestAccepted"] is (not stop_fails)
+        assert "config.json busy" in failed.value.detail["message"]
+        commands.gripper_command.assert_awaited_once()
+        commands.emergency_stop.assert_awaited_once()
+        app.state.hal.command.assert_awaited_once()
+
+    asyncio.run(exercise())
+
+
 def _async_gripper_action(target_mm: float) -> dict:
     action = lerobot_state_from_ui([0.0] * 12, [4.5, 5.5])
     action[6] = target_mm
