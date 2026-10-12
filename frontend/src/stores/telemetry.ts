@@ -377,6 +377,8 @@ interface TelemetryStore {
   dangerOverride: number | null
   controlSafety: ControlSafetyState
   controlLease: ControlLeaseState
+  observerMode: boolean
+  setObserverMode: (observe: boolean) => void
   revokeControlLease: (reason: string) => void
   qualityReport: QualityReport | null
   recordSession: RecordSessionState
@@ -808,7 +810,7 @@ let lastBackendFrameCommitAt = 0
 let lastBackendHistoryCommitAt = 0
 let backendVisibilityHandler: (() => void) | null = null
 let backendConnectionGeneration = 0
-let backendObserverMode = false
+let backendObserverMode: boolean | null = null
 /** 页面重新可见时立即提交积压 frame，避免切回后仍按隐藏节流。 */
 function installBackendVisibilityFlush(set: TelemetryStoreSet, get: TelemetryStoreGet) {
   if (backendVisibilityHandler || typeof document === 'undefined') return
@@ -1409,6 +1411,14 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   frameCount: 0,
   logPanelOpen: false,
   controlSafety: initialSessionControlSafety(),
+  observerMode: false,
+  setObserverMode: (observe) => {
+    // 沿用关闭控制连接的执行侧保护；只切换租约，不自动解除急停或使能。
+    get().stopBackend()
+    backendObserverMode = observe
+    set({ observerMode: observe })
+    get().startBackend()
+  },
   controlLease: initialControlLease(!mockMode),
   revokeControlLease: (reason) => {
     const required = get().controlLease.required
@@ -1495,8 +1505,9 @@ stopMock: () => {
 /** 启动对应流程。 */
 startBackend: () => {
     if (get().backendWs) return
-    backendObserverMode ||= new URL(wsUrl).searchParams.get('mode') === 'observe'
+    backendObserverMode ??= new URL(wsUrl).searchParams.get('mode') === 'observe'
       || new URLSearchParams(window.location.search).get('mode') === 'observe'
+    set({ observerMode: backendObserverMode })
     const connectionGeneration = ++backendConnectionGeneration
     const connectionIsCurrent = () => backendConnectionGeneration === connectionGeneration
     motionCommands.invalidate('遥测连接中，未获得执行确认')
@@ -1557,6 +1568,7 @@ startBackend: () => {
     try {
       const target = new URL(wsUrl)
       if (backendObserverMode) target.searchParams.set('mode', 'observe')
+      else target.searchParams.delete('mode')
       ws = new WebSocket(target.toString())
     } catch (error) {
       backendConnectionGeneration += 1
@@ -1694,7 +1706,7 @@ startBackend: () => {
           backendWs: null,
           backendReconnectTimer: null,
           controlSafety: interruptedControlSafety(state.controlSafety),
-          controlLease: { ...initialControlLease(), status: 'expired', reason: transportRestartReason ?? '另一页面持有控制权；可用 ?mode=observe 打开观察页，或稍后显式重连' },
+          controlLease: { ...initialControlLease(), status: 'expired', reason: transportRestartReason ?? '另一页面持有控制权；可切换到观察模式，或稍后显式重连' },
           frame: { ...state.frame, wsOk: false },
           telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
         }))

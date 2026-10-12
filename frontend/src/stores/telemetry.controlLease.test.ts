@@ -169,3 +169,46 @@ describe('真实前端控制租约（HTTP 与 WS 均为离线替身）', () => {
     expect(store.getState().backendWs).toBeNull()
   })
 })
+
+it('手动进入观察模式撤销旧租约，旧消息无效，路由重连保持观察', async () => {
+  store.getState().startBackend()
+  const owner = Socket.instances.at(-1)!
+  expect(owner.url).not.toContain('mode=observe')
+  await live(owner); confirm(owner)
+  const staleMessage = owner.onmessage
+  store.getState().setObserverMode(true)
+  const observer = Socket.instances.at(-1)!
+  expect(owner.close).toHaveBeenCalledOnce()
+  expect(observer.url).toContain('mode=observe')
+  expect(store.getState().observerMode).toBe(true)
+  expect(store.getState().controlLease.sessionId).toBeNull()
+  staleMessage?.({ data: JSON.stringify({ type: 'control_lease', data: { sessionId: 's1', status: 'active', renewalOwner: 'backend' } }) })
+  await live(observer); confirm(observer)
+  store.getState().issueManualAxisMove('left', 'X', 1)
+  expect(commands()).toEqual([])
+  expect(store.getState().controlLease.status).toBe('pending')
+  window.history.replaceState({}, '', '/settings')
+  store.getState().stopBackend(); store.getState().startBackend()
+  expect(Socket.instances.at(-1)!.url).toContain('mode=observe')
+})
+
+it('观察页可显式申请控制，冲突不抢占，确认前不自动发运动或 ACK', async () => {
+  window.history.replaceState({}, '', '/?mode=observe')
+  store.getState().startBackend()
+  const observer = Socket.instances.at(-1)!
+  store.getState().setObserverMode(false)
+  const candidate = Socket.instances.at(-1)!
+  expect(observer.close).toHaveBeenCalledOnce()
+  expect(candidate.url).not.toContain('mode=observe')
+  expect(store.getState().observerMode).toBe(false)
+  await live(candidate)
+  store.getState().issueManualAxisMove('left', 'X', 1)
+  expect(commands()).toEqual([])
+  candidate.onclose?.({ code: 1008 })
+  const count = Socket.instances.length
+  await vi.advanceTimersByTimeAsync(16_000)
+  expect(Socket.instances).toHaveLength(count)
+  store.getState().setObserverMode(true)
+  expect(Socket.instances.at(-1)!.url).toContain('mode=observe')
+  expect(commands()).toEqual([])
+})

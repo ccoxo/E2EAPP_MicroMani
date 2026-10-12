@@ -40,3 +40,19 @@ it('失效租约保留可见恢复入口', () => {
   expect(startBackend).toHaveBeenCalledOnce()
   expect(acknowledgeSafety).not.toHaveBeenCalled()
 })
+
+it('控制租约正常时仍显示观察入口，观察模式提供申请控制', () => {
+  const setObserverMode = vi.fn()
+  useTelemetryStore.setState({ observerMode: false, setObserverMode,
+    controlLease: { ...initialControlLease(), status: 'active', sessionId: 'owner' },
+    frame: { ...initial.frame, forceStatus: { safety: { latched: false } } },
+  })
+  const view = render(<ControlLeaseStatus />)
+  expect(screen.getByRole('status')).toHaveTextContent('控制模式')
+  fireEvent.click(screen.getByRole('button', { name: '切换到观察模式' }))
+  expect(setObserverMode).toHaveBeenLastCalledWith(true)
+  useTelemetryStore.setState({ observerMode: true, controlLease: initialControlLease() })
+  view.rerender(<ControlLeaseStatus />)
+  fireEvent.click(screen.getByRole('button', { name: '申请控制' }))
+  expect(setObserverMode).toHaveBeenLastCalledWith(false)
+})
