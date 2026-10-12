@@ -2573,6 +2573,11 @@ def test_teleop_plain_dds_contract_and_loan_failure_cleanup() -> None:
     assert "leaderPublisher.publishJson" not in server
 
 
+def test_health_reader_buffers_reliable_history_without_weakening_qos() -> None:
+    source = (REPO_ROOT / "backend/native/appstation_fastdds_transport.cpp").read_text(encoding="utf-8")
+    assert "healthTopic, telemetryReaderQos(true, true, 32)" in source
+
+
 def test_all_dds_participants_use_shared_memory_only() -> None:
     config = (REPO_ROOT / "hal/include/LocalDdsTransport.h").read_text(encoding="utf-8")
     assert "SharedMemTransportDescriptor" in config
