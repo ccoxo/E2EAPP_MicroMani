@@ -55,6 +55,10 @@ link /nologo /OUT:"ForceCoreTests.next.exe" ForceCoreTests.next.obj HkvlForcePro
 "ForceCoreTests.next.exe" || goto :err
 
 rem Compile into *.next.obj first so failed builds do not overwrite the last usable objects.
+echo Compiling and running JodellGripperLifecycleTests ...
+cl %TEST_CXX_FLAGS% "%REPO%tests\JodellGripperLifecycleTests.cpp" "%SRC%\JodellGripperDriver.cpp" /Fe"JodellGripperLifecycleTests.next.exe" || goto :err
+"JodellGripperLifecycleTests.next.exe" || goto :err
+
 echo Compiling HkvlForceProtocol.cpp for HAL ...
 cl %CXX_FLAGS% /c "%SRC%\HkvlForceProtocol.cpp" /Fo"HkvlForceProtocol.next.obj" || goto :err
 

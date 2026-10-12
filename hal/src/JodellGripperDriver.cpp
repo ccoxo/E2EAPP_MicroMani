@@ -173,6 +173,7 @@ JodellGripperDriver::~JodellGripperDriver() {
 
 void JodellGripperDriver::configure(const JodellGripperConfig& config) {
   std::scoped_lock lock(mutex_);
+  if (config_ == config) return;
 #ifdef _WIN32
   // 配置可能改变端口、DLL 或 worker 路径；旧资源必须全部关闭后按新配置懒加载。
   closeProcessWorkersUnlocked();
