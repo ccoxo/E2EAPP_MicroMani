@@ -118,12 +118,12 @@ $env:APPSTATION_HAL_TRANSPORT = "dds"
 if (-not $env:APPSTATION_DDS_DOMAIN_ID) { $env:APPSTATION_DDS_DOMAIN_ID = "42" }
 $backend = Start-Process `
   -FilePath (Join-Path $repo "backend\.venv\Scripts\python.exe") `
-  -ArgumentList @("-m", "uvicorn", "backend.app:create_app", "--factory", "--host", "127.0.0.1", "--port", "$BackendPort") `
+  -ArgumentList @("-m", "uvicorn", "backend.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "$BackendPort") `
   -WorkingDirectory $repo `
   -WindowStyle Hidden `
   -PassThru
 
-$frontendCommand = "`$env:VITE_MOCK_MODE='false'; `$env:VITE_API_BASE='http://127.0.0.1:$BackendPort'; `$env:VITE_WS_URL='ws://127.0.0.1:$BackendPort/ws'; npm run build; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; node scripts/serve-dist.mjs --host 127.0.0.1 --port $FrontendPort"
+$frontendCommand = "`$env:VITE_MOCK_MODE='false'; `$env:VITE_API_BASE=''; `$env:VITE_WS_URL=''; `$env:VITE_BACKEND_PORT='$BackendPort'; npm run build; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; node scripts/serve-dist.mjs --host 0.0.0.0 --port $FrontendPort"
 $frontend = Start-Process `
   -FilePath "powershell.exe" `
   -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $frontendCommand) `

@@ -543,9 +543,12 @@ def test_start_stack_launches_frontend_on_requested_port_without_duplicate_port_
     script = (REPO_ROOT / "scripts" / "start-stack.ps1").read_text(encoding="utf-8")
 
     assert "node scripts/serve-dist.mjs" in script
-    assert "--host 127.0.0.1 --port $FrontendPort" in script
-    assert "npm run dev -- --host 127.0.0.1 --port $FrontendPort" not in script
-    assert "--port 5173 --host 127.0.0.1 --port $FrontendPort" not in script
+    assert "--host 0.0.0.0 --port $FrontendPort" in script
+    assert "npm run dev -- --host 0.0.0.0 --port $FrontendPort" not in script
+    assert "--port 5173 --host 0.0.0.0 --port $FrontendPort" not in script
+    assert "`$env:VITE_BACKEND_PORT='$BackendPort'" in script
+    assert "`$env:VITE_API_BASE=''" in script
+    assert "`$env:VITE_WS_URL=''" in script
 
 
 def test_start_dds_stack_enables_hal_direct_dds_without_python_sidecar() -> None:

@@ -77,7 +77,7 @@ function Ensure-Backend {
   $env:APPSTATION_HAL_MODE = "test"
   $null = Start-Process `
     -FilePath $backendPython `
-    -ArgumentList @("-m", "uvicorn", "backend.app:create_app", "--factory", "--host", "127.0.0.1", "--port", "$BackendPort") `
+    -ArgumentList @("-m", "uvicorn", "backend.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "$BackendPort") `
     -WorkingDirectory $repo `
     -WindowStyle Hidden `
     -RedirectStandardOutput $backendOutLog `
@@ -114,7 +114,7 @@ function Ensure-Frontend {
   Write-Host "Starting frontend server on port $FrontendPort..."
   $null = Start-Process `
     -FilePath "node" `
-    -ArgumentList @("scripts/serve-dist.mjs", "--host", "127.0.0.1", "--port", "$FrontendPort") `
+    -ArgumentList @("scripts/serve-dist.mjs", "--host", "0.0.0.0", "--port", "$FrontendPort") `
     -WorkingDirectory (Join-Path $repo "frontend") `
     -WindowStyle Hidden `
     -RedirectStandardOutput $frontendOutLog `

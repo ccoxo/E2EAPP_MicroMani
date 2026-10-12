@@ -26,8 +26,9 @@ import type {
   RecordTrainingQuality,
 } from '../types'
 
-export const apiBase = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:18082'
-export const wsUrl = import.meta.env.VITE_WS_URL || 'ws://127.0.0.1:18082/ws'
+export const apiBase = import.meta.env.VITE_API_BASE
+  || `${window.location.protocol}//${window.location.hostname}:${import.meta.env.VITE_BACKEND_PORT || '18082'}`
+export const wsUrl = import.meta.env.VITE_WS_URL || `${apiBase.replace(/^http/, 'ws')}/ws`
 export const mockMode = import.meta.env.MODE === 'test'
 
 let controlCommandBlockedReason: () => string | null = () => null

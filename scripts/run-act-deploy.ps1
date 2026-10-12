@@ -86,7 +86,7 @@ if ($WithFrontend) {
   $env:APPSTATION_DISABLE_CAMERA_PROBE = "true"
   $backend = Start-Process `
     -FilePath (Join-Path $repo "backend\.venv\Scripts\python.exe") `
-    -ArgumentList @("-m", "uvicorn", "backend.app:create_app", "--factory", "--host", "127.0.0.1", "--port", "$BackendPort") `
+    -ArgumentList @("-m", "uvicorn", "backend.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "$BackendPort") `
     -WorkingDirectory $repo `
     -WindowStyle Hidden `
     -PassThru

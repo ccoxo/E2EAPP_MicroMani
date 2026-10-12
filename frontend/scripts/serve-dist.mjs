@@ -24,7 +24,7 @@ for (let index = 2; index < process.argv.length; index += 1) {
   }
 }
 
-const host = args.get('--host') || '127.0.0.1'
+const host = args.get('--host') || '0.0.0.0'
 const port = Number(args.get('--port') || 4173)
 const root = resolve('dist')
 
