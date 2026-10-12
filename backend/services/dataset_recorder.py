@@ -299,6 +299,12 @@ class LeRobotWriterThread:
                 if self._error:
                     raise RuntimeError(self._error)
                 if self._dataset is not None:
+                    buffer = getattr(getattr(self._dataset, "writer", self._dataset), "episode_buffer", None)
+                    if isinstance(buffer, dict) and buffer.get("size") != self._recorder._episode_frames:
+                        raise RuntimeError(
+                            f"native episode frame count mismatch: buffer={buffer.get('size')}, "
+                            f"recorded={self._recorder._episode_frames}; discard before retrying"
+                        )
                     self._dataset.save_episode(parallel_encoding=True)
                 command.future.set_result(self._native_total_frames())
             elif command.kind == "latest_episode_metadata":
@@ -984,19 +990,19 @@ class DatasetRecorderService:
         async with self._lock:
             if not self._session_active:
                 raise RuntimeError("record session is not active")
-            was_recording = self._recording
+            discard_saved = not self._recording and self._last_saved_episode is not None
             self._gripper_sampler_paused = True
-            if was_recording:
-                self._recording = False
-                self._accepting_frame_jobs = False
-                self.telemetry.recording = False
+            self._recording = False
+            self._accepting_frame_jobs = False
+            self.telemetry.recording = False
         await self.teleop.stop("recording")
-        if was_recording:
+        # 异常或安全中断会先关闭 recording，但原生缓冲仍需要丢弃。
+        if not discard_saved:
             await self._drain_recording_queues()
             if self._native_writer_active():
                 await self._clear_native_episode_buffer()
         async with self._lock:
-            if not was_recording and self._last_saved_episode is not None:
+            if discard_saved:
                 await asyncio.to_thread(self._mark_saved_episode_deleted_locked, self._last_saved_episode)
                 # 已落盘的 native 编号不会回退；保留弃用记录，重录使用新编号。
                 self._last_saved_episode = None
@@ -1097,13 +1103,20 @@ class DatasetRecorderService:
         if pending is not None:
             await asyncio.shield(pending)
         async with self._lock:
-            was_recording = self._session_active and self._recording
-            if was_recording:
+            has_unsaved_episode = self._session_active and (
+                self._recording or (
+                    getattr(self, "_last_saved_episode", None) is None
+                    and (getattr(self, "_episode_frames", 0) > 0
+                         or getattr(self, "_queued_episode_frames", 0) > 0
+                         or getattr(self, "_safety_interrupted", False))
+                )
+            )
+            if has_unsaved_episode:
                 self._recording = False
                 self._accepting_frame_jobs = False
                 self._gripper_sampler_paused = True
                 self.telemetry.recording = False
-        if was_recording:
+        if has_unsaved_episode:
             await self._drain_recording_queues()
             if self._native_writer_active():
                 await self._clear_native_episode_buffer()
@@ -2174,6 +2187,7 @@ class DatasetRecorderService:
             await self._native_writer_command("clear_episode")
         except Exception as exc:  # noqa: BLE001
             self._native_error = str(exc)
+            raise DatasetSaveError(f"native LeRobot clear_episode failed: {exc}") from exc
 
     async def _finalize_native_dataset(self) -> None:
         """Finalize native metadata; after success, on-disk parquet is safe for review reads."""
