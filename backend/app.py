@@ -12,6 +12,7 @@ import math
 import os
 import subprocess
 import time
+import traceback
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -1518,6 +1519,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/policy/action")
     async def policy_action(payload: Annotated[dict[str, Any], Body()]) -> ApiEnvelope:
+        t_entry = time.perf_counter()
         safety_token = commands.safety.capture()
         action = payload.get("action")
         if not isinstance(action, list) or len(action) != 14:
@@ -1562,6 +1564,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 detail={"code": "BAD_POLICY_SIDES", "message": "controlledSides must include left or right"},
             )
         results: dict[str, Any] = {"motion": {}, "grippers": {}}
+        t_mark = time.perf_counter()
+        timing_ms: dict[str, float] = {"plan": (t_mark - t_entry) * 1e3}  # 诊断：策略请求各阶段耗时
+        # gripperAsync=True：夹爪目标交给后台串行下发（只保留最新目标），机械臂命令不再等串口往返。
+        gripper_async = payload.get("gripperAsync") is True
+        failed = _take_policy_gripper_failures(request_control_session.get()) if gripper_async else {}
+        if failed:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "POLICY_GRIPPER_FAILED", "message": f"background gripper target failed: {failed}"},
+            )
         try:
             with commands.safety.operation():
                 for side in controlled_sides:
@@ -1570,11 +1582,15 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                     hardware_side = dataset_side_to_hardware_side(side)
                     if not await _policy_side_already_enabled(hardware_side, motion_plan):
                         await commands.enable_motion_side(hardware_side)
+                    timing_ms["enableCheck"] = (time.perf_counter() - t_mark) * 1e3
+                    t_mark = time.perf_counter()
                     commands.safety.check(safety_token)
                     results["motion"][side] = await hal.command(
                         "motion.teleop_target_update",
                         _policy_motion_payload(hardware_side, motion_plan, config),
                     )
+                    timing_ms["motion"] = (time.perf_counter() - t_mark) * 1e3
+                    t_mark = time.perf_counter()
                 for side, target_key in (("left", "leftMm"), ("right", "rightMm")):
                     if side not in controlled_sides:
                         continue
@@ -1588,7 +1604,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         targetMm=plan["grippers"][target_key],
                     )
                     commands.safety.check(safety_token)
-                    results["grippers"][side] = await commands.gripper_command(request)
+                    if gripper_async:
+                        results["grippers"][side] = _queue_policy_gripper_target(hardware_side, request)
+                    else:
+                        results["grippers"][side] = await commands.gripper_command(request)
+                    timing_ms["gripper"] = (time.perf_counter() - t_mark) * 1e3
+                    t_mark = time.perf_counter()
         except ControlLeaseUnavailable as exc:
             raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
         except RuntimeError as exc:
@@ -1602,12 +1623,57 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             "sent": True,
             "plan": plan,
             "results": results,
+            "timingMs": timing_ms,
             "dataContract": data_contract_metadata(),
         })
 
     def _real_hardware_mode(config: dict[str, Any]) -> bool:
         mode = os.environ.get("APPSTATION_HAL_MODE") or config.get("hal", {}).get("mode", "real")
         return str(mode).lower() == "real"
+
+    # 按 (硬件侧, 控制会话) 分开：后台任务继承创建时的会话，上一轮会话的残留目标/失败不影响新一轮。
+    policy_gripper_latest: dict[tuple[str, str | None], GripperCommandRequest] = {}
+    policy_gripper_senders: dict[tuple[str, str | None], asyncio.Task[None]] = {}
+    policy_gripper_failures: dict[tuple[str, str | None], str] = {}
+
+    def _take_policy_gripper_failures(session: str | None) -> dict[str, str]:
+        mine = {key[0]: msg for key, msg in policy_gripper_failures.items() if key[1] == session}
+        policy_gripper_failures.clear()  # 其他会话的失败已随该会话结束，不再阻断新会话
+        return mine
+
+    def _queue_policy_gripper_target(side: str, request: GripperCommandRequest) -> dict[str, Any]:
+        """策略流夹爪目标后台串行下发：每侧只保留最新目标，不排队、不阻塞机械臂命令。"""
+        key = (side, request_control_session.get())
+        replaced = key in policy_gripper_latest
+        policy_gripper_latest[key] = request
+        sender = policy_gripper_senders.get(key)
+        if sender is None or sender.done():
+            policy_gripper_senders[key] = asyncio.create_task(_drain_policy_gripper(key))
+        return {"queued": True, "targetMm": request.targetMm, "replacedPending": replaced}
+
+    async def _drain_policy_gripper(key: tuple[str, str | None]) -> None:
+        try:
+            while (request := policy_gripper_latest.pop(key, None)) is not None:
+                try:
+                    await commands.gripper_command(request)
+                except OSError as exc:
+                    # 与同步路径一致：串口/配置 I/O 失败视为执行状态不明，急停。
+                    policy_gripper_latest.pop(key, None)
+                    policy_gripper_failures[key] = f"{type(exc).__name__}: {exc}"
+                    logs.error("[POLICY]", f"background gripper target I/O failed: {traceback.format_exc()}")
+                    try:
+                        await commands.emergency_stop()
+                    except Exception:
+                        logs.error("[POLICY]", f"background gripper failure stop failed: {traceback.format_exc()}")
+                    return
+                except Exception as exc:
+                    policy_gripper_latest.pop(key, None)
+                    policy_gripper_failures[key] = str(exc)
+                    logs.error("[POLICY]", f"background gripper target failed: {exc}")
+                    return
+        finally:
+            if policy_gripper_senders.get(key) is asyncio.current_task():
+                policy_gripper_senders.pop(key, None)
 
     def _policy_gripper_positions(config: dict[str, Any]) -> list[float]:
         gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
