@@ -97,6 +97,8 @@ def test_mode_gate(monkeypatch):
     driver = OpenCVCameraDriver()
     dshow = [(getattr(cv2, "CAP_DSHOW", 700), "CAP_DSHOW")]
     monkeypatch.delenv("APPSTATION_CAMERA_CAPTURE_MODE", raising=False)
+    assert driver._shm_capture_enabled(cv2, dshow) is True
+    monkeypatch.setenv("APPSTATION_CAMERA_CAPTURE_MODE", "thread")
     assert driver._shm_capture_enabled(cv2, dshow) is False
     monkeypatch.setenv("APPSTATION_CAMERA_CAPTURE_MODE", "process")
     assert driver._shm_capture_enabled(cv2, dshow) is False

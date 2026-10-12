@@ -1442,7 +1442,8 @@ class OpenCVCameraDriver:
 
     def _shm_capture_enabled(self, cv2: Any, backend_candidates: list[tuple[int, str]]) -> bool:
         mode = os.environ.get("APPSTATION_CAMERA_CAPTURE_MODE", "").strip().lower()
-        if mode not in {"shm", "shared-memory", "sharedmemory"}:
+        # 默认启用共享内存模式；显式设为 thread/process 等其他值时退回对应模式。
+        if mode not in {"", "shm", "shared-memory", "sharedmemory"}:
             return False
         if getattr(cv2, "__name__", "cv2") != "cv2":
             return False
