@@ -2436,6 +2436,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket) -> None:
         await ws.accept()
+        send_lock = asyncio.Lock()
+
+        async def send_json(message: dict[str, Any]) -> None:
+            # 租约通知和遥测共用连接，避免并发发送触发底层 drain 断言。
+            async with send_lock:
+                await ws.send_json(message)
         shutdown_task = app.state.shutdown_task
         if shutdown_task is not None:
             if not shutdown_task.done():
@@ -2493,7 +2499,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 if control_watchdog.clients:
                     await ws.close(code=1008, reason="another browser owns control; use ?mode=observe")
                     return
-                control_session_id = control_watchdog.register(ws.send_json)
+                control_session_id = control_watchdog.register(send_json)
                 receive_task = asyncio.create_task(receive_control_connection(), name="browser-control-connection")
             while True:
                 try:
@@ -2668,16 +2674,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         recorder.interrupt_for_safety()
                     frame.processStatus[0].label = "HalServer.exe" if hal_health.mode == "real" else "Test HAL boundary"
                     frame.processStatus[0].status = "running" if hal_health.connected else "error"
-                    await ws.send_json({"type": "telemetry", "data": frame.model_dump(mode="json")})
+                    await send_json({"type": "telemetry", "data": frame.model_dump(mode="json")})
                     if recorder.safety_interrupted:
                         if not interruption_reported:
-                            await ws.send_json({"type": "record_status", "data": await asyncio.to_thread(recorder.status)})
+                            await send_json({"type": "record_status", "data": await asyncio.to_thread(recorder.status)})
                             interruption_reported = True
                     else:
                         interruption_reported = False
                     # 日志和遥测走同一条 WebSocket，前端不需要再轮询日志接口。
                     for entry in logs.entries_after(last_log_id):
-                        await ws.send_json({"type": "log", "data": entry.model_dump(mode="json")})
+                        await send_json({"type": "log", "data": entry.model_dump(mode="json")})
                         last_log_id = max(last_log_id, entry.id)
                     await asyncio.sleep(ws_period)
                 except WebSocketDisconnect:
