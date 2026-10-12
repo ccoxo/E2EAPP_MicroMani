@@ -155,11 +155,14 @@ class CommandService:
             try:
                 state = await self.hal.motion_state()
             except RuntimeError as exc:
-                if str(exc) != "DDS motion controller sample timestamp is stale or unavailable":
+                # 遥测并发读取可能短暂占满通道；仅重试读取，保留原期限与到位检查。
+                busy = str(exc) == "dds-motion-state channel is busy; request was not queued"
+                if not busy and str(exc) != "DDS motion controller sample timestamp is stale or unavailable":
                     raise
                 self.safety.check(token)
                 if time.monotonic() >= deadline:
-                    raise RuntimeError("work origin result unconfirmed: fresh stationary position feedback required") from exc
+                    reason = str(exc) if busy else "fresh stationary position feedback required"
+                    raise RuntimeError(f"work origin result unconfirmed: {reason}") from exc
                 await asyncio.sleep(0.05)
                 continue
             self.safety.check(token)
