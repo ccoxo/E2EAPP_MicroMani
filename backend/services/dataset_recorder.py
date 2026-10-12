@@ -656,6 +656,7 @@ class DatasetRecorderService:
         self._task = ""
         self._dataset_dir: Path | None = None
         self._episode_index = 0
+        self._record_progress = (0, 0)
         self._episode_generation = 0
         self._episode_started_at = 0.0
         self._episode_start_monotonic_s = 0.0
@@ -807,6 +808,7 @@ class DatasetRecorderService:
                 self._dataset_id = next_dataset_id
                 self._task = next_task
                 self._session_id = f"session-{now_ms()}"
+                self._record_progress = (0, 0)
                 self._last_saved_episode = None
                 self._reset_pending = False
                 self._reset_required_sides = set(hardware_sides(self._participation)) if getattr(self, "_participation", None) else {"left"}
@@ -852,6 +854,8 @@ class DatasetRecorderService:
         try:
             await asyncio.to_thread(self._write_appstation_info, dataset_dir, config)
             episode_index = await asyncio.to_thread(self._next_episode_index, dataset_dir)
+            episodes = await asyncio.to_thread(self._read_episodes, dataset_dir)
+            self._update_record_progress(dataset_dir, episodes)
             self._recording_gc_scope = RecordingGcScope()
             # 建立录制时间轴前完成；此处不跨 await，避免取消启动后遗留冻结状态。
             with self._record_start_stage("gc_prepare"):
@@ -1221,6 +1225,7 @@ class DatasetRecorderService:
         reset_pending = bool(getattr(self, "_reset_pending", False))
         reset_required_sides = self._reset_required_sides_locked()
         reset_returned_sides = self._reset_returned_sides_locked()
+        saved_episodes, session_saved_episodes = getattr(self, "_record_progress", (0, 0))
         return {
             "session": self._session_id,
             "datasetId": self._dataset_id,
@@ -1231,6 +1236,8 @@ class DatasetRecorderService:
             "recording": self._recording and bool(self.telemetry.recording) and not getattr(self, "_safety_interrupted", False),
             "safetyInterrupted": getattr(self, "_safety_interrupted", False),
             "episodeIndex": self._episode_index,
+            "savedEpisodes": saved_episodes,
+            "sessionSavedEpisodes": session_saved_episodes,
             "frameCount": max(self._queued_episode_frames, self._episode_frames),
             "lateFrames": self._episode_late_frames,
             "elapsedS": round(elapsed, 3),
@@ -5403,6 +5410,18 @@ class DatasetRecorderService:
         path.parent.mkdir(parents=True, exist_ok=True)
         content = "".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n" for item in episodes)
         path.write_text(content, encoding="utf-8")
+        self._update_record_progress(dataset_dir, episodes)
+
+    def _update_record_progress(self, dataset_dir: Path, episodes: list[dict[str, Any]]) -> None:
+        """按持久化保留记录计数；状态查询不读取磁盘，不把流水编号当作数量。"""
+        if dataset_dir != getattr(self, "_dataset_dir", None):
+            return
+        retained = [item for item in episodes if not item.get("deleted", False)]
+        session_id = getattr(self, "_session_id", "")
+        self._record_progress = (
+            len(retained),
+            sum(bool(session_id) and item.get("session") == session_id for item in retained),
+        )
 
     def _episode_dataset_stub(self, dataset_dir: Path) -> dict[str, Any]:
         """从元数据生成前端需要的最小数据集标识和名称。"""

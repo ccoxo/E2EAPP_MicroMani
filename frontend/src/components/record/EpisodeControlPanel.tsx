@@ -22,7 +22,7 @@ const PRESET_TASKS = [
 const phaseConfig = {
   interrupted: { label: '采集中断，待核验；未保存片段可保存或丢弃', color: '#fa8c16', barColor: '#fa8c16' },
   idle: { label: '就绪', color: '#8c8c8c', barColor: '#d9d9d9' },
-  starting: { label: '启动中', color: '#1677ff', barColor: '#1677ff' },
+  starting: { label: '准备中，请等待“录制中”后再操作', color: '#1677ff', barColor: '#1677ff' },
   recording: { label: '录制中', color: '#cf1322', barColor: '#cf1322' },
   reviewing: { label: '质检中', color: '#fa8c16', barColor: '#fa8c16' },
   resetting: { label: '复位中', color: '#722ed1', barColor: '#722ed1' },
@@ -72,6 +72,7 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
   const setDatasetName = useTelemetryStore((s) => s.setRecordDatasetName)
   const currentEpisode = useTelemetryStore((s) => s.recordSession.currentEpisode)
   const savedEpisodes = useTelemetryStore((s) => s.recordSession.savedEpisodes)
+  const sessionSavedEpisodes = useTelemetryStore((s) => s.recordSession.sessionSavedEpisodes)
   const targetEpisodes = useTelemetryStore((s) => s.recordSession.targetEpisodes)
   const saveRecordEpisode = useTelemetryStore((s) => s.saveRecordEpisode)
   const discardRecordEpisode = useTelemetryStore((s) => s.discardRecordEpisode)
@@ -85,7 +86,6 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
   const resetReady = useTelemetryStore((s) => s.recordSession.resetReady)
   const returnOriginInFlight = useTelemetryStore((s) => s.recordSession.returnOriginInFlight)
   const [pendingOriginSide, setPendingOriginSide] = React.useState<'left' | 'right' | null>(null)
-
   const gripperPositions = useTelemetryStore((s) => s.frame.gripperPositions)
   const issueManualGripperMove = useTelemetryStore((s) => s.issueManualGripperMove)
   const [gripperPrompt, setGripperPrompt] = React.useState<'start' | 'skip' | null>(null)
@@ -155,13 +155,13 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
       <ParticipationSelector value={participation} onChange={setParticipation} disabled={phase !== 'idle'} />
       <hr className="ui-divider" />
 
-      <div className="record-episode-progress-head">
-        <span>#{String(currentEpisode).padStart(3, '0')}</span>
+      <div className="record-episode-progress-head" style={{ flexWrap: 'wrap' }}>
+        <span title="流水编号从 000 开始，丢弃已保存片段不会回退">片段 #{String(currentEpisode).padStart(3, '0')}</span>
         <small>
-          目标 {targetEpisodes} 条 / 已完成 {savedEpisodes}
+          目标 {targetEpisodes} 条 / 累计保留 {savedEpisodes} 条 / 本次保留 {sessionSavedEpisodes} 条
         </small>
       </div>
-      <UiProgress percent={targetEpisodes > 0 ? Math.round((savedEpisodes / targetEpisodes) * 100) : 0} />
+      <UiProgress percent={targetEpisodes > 0 ? Math.min(100, Math.round((savedEpisodes / targetEpisodes) * 100)) : 0} />
 
       <hr className="ui-divider" />
 

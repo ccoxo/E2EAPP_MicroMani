@@ -616,6 +616,8 @@ export interface RecordStatusApi {
   datasetName?: string
   task?: string
   episodeIndex?: number
+  savedEpisodes?: number
+  sessionSavedEpisodes?: number
   frameCount?: number
   elapsedS?: number
   fps?: number
@@ -660,7 +662,7 @@ export interface SaveEpisodeResponse {
   ok?: boolean
   data?: {
     episode?: RecordEpisodeSaveApi
-    status?: unknown
+    status?: RecordStatusApi
   }
   ts?: number
 }
@@ -668,7 +670,7 @@ export interface SaveEpisodeResponse {
 export const saveEpisode = () =>
   postCommand('/record/episode/save') as Promise<SaveEpisodeResponse>
 /** 删除对应数据并同步界面状态。 */
-export const discardEpisode = () => postCommand('/record/episode/discard')
+export const discardEpisode = () => postCommand('/record/episode/discard') as Promise<RecordSessionCommandResponse>
 
 /** 描述当前方法的功能边界。 */
 export const finishSession = () => postCommand('/record/session/finish')

@@ -238,6 +238,7 @@ const initialRecordSession: RecordSessionState = {
   resetTimeS: 10,
   currentEpisode: 0,
   savedEpisodes: 0,
+  sessionSavedEpisodes: 0,
   episodeHistory: [],
   latestQualityReport: null,
   phase: 'idle',
@@ -865,6 +866,15 @@ function finishRecordSessionNow(set: TelemetryStoreSet) {
   }))
 }
 /** 描述当前方法的功能边界。 */
+function recordProgressFromStatus(session: RecordSessionState, status: RecordStatusApi) {
+  const count = (value: number | undefined, fallback: number) =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : fallback
+  return {
+    currentEpisode: count(status.episodeIndex, session.currentEpisode),
+    savedEpisodes: count(status.savedEpisodes, session.savedEpisodes),
+    sessionSavedEpisodes: count(status.sessionSavedEpisodes, session.sessionSavedEpisodes),
+  }
+}
 function recordSessionFromStatus(
   state: TelemetryStore,
   status: RecordStatusApi,
@@ -880,6 +890,7 @@ function recordSessionFromStatus(
   const resetPending = Boolean(status.resetPending)
   return {
     ...state.recordSession,
+    ...recordProgressFromStatus(state.recordSession, status),
     datasetName: typeof status.datasetName === 'string' ? status.datasetName : datasetName,
     task: typeof status.task === 'string' ? status.task : task,
     latestQualityReport: null,
@@ -1815,6 +1826,7 @@ setRecordDatasetName: (name) =>
       recordSession: {
         ...state.recordSession,
         datasetName: name,
+        ...(name !== state.recordSession.datasetName ? { currentEpisode: 0, savedEpisodes: 0, sessionSavedEpisodes: 0 } : {}),
       },
     })),
 
@@ -1991,14 +2003,17 @@ saveRecordEpisode: () => {
         set((state) => {
           if (state.recordSession.phase !== 'saving') return state
           const report = reportFromSavedEpisode(reportSnapshot, payload.data?.episode)
-          const nextSavedEpisodes = state.recordSession.savedEpisodes + 1
-          const nextCurrentEpisode = report.index + 1
+          const progress = recordProgressFromStatus({
+            ...state.recordSession,
+            savedEpisodes: state.recordSession.savedEpisodes + 1,
+            sessionSavedEpisodes: state.recordSession.sessionSavedEpisodes + 1,
+            currentEpisode: report.index + 1,
+          }, payload.data?.status ?? {})
           return {
             recording: false,
             recordSession: {
               ...state.recordSession,
-              savedEpisodes: nextSavedEpisodes,
-              currentEpisode: nextCurrentEpisode,
+              ...progress,
               latestQualityReport: report,
               phase: 'reviewing',
               phaseStartedAt: Date.now(),
@@ -2070,15 +2085,17 @@ discardRecordEpisode: () => {
     const record = makeDiscardedEpisodeRecord(session)
     set((state) => ({ recording: false, recordSession: { ...state.recordSession,
       phase: 'discarding', phaseStartedAt: Date.now(), resetPending: false, resetReady: false } }))
-    void discardRecordEpisodeApi().then(() => set((state) => {
+    void discardRecordEpisodeApi().then((payload) => set((state) => {
       if (state.recordSession.phase !== 'discarding') return state
       return {
         recording: false,
         recordSession: {
           ...state.recordSession,
-          savedEpisodes: discardingSavedEpisode
-            ? Math.max(0, state.recordSession.savedEpisodes - 1)
-            : state.recordSession.savedEpisodes,
+          ...recordProgressFromStatus({
+            ...state.recordSession,
+            savedEpisodes: Math.max(0, state.recordSession.savedEpisodes - (discardingSavedEpisode ? 1 : 0)),
+            sessionSavedEpisodes: Math.max(0, state.recordSession.sessionSavedEpisodes - (discardingSavedEpisode ? 1 : 0)),
+          }, payload.data ?? {}),
           phase: 'resetting',
           phaseStartedAt: Date.now(),
           recorderFps: 0,
@@ -2195,6 +2212,7 @@ skipRecordReset: () => {
           recording: true,
           recordSession: {
             ...state.recordSession,
+            ...recordProgressFromStatus(state.recordSession, status),
             phase: 'recording',
             phaseStartedAt: Date.now(),
             recorderFps: typeof status.fps === 'number' ? status.fps : 30,
