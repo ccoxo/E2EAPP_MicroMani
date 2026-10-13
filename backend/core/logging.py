@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
+import queue
+import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping, Sequence
@@ -77,10 +80,16 @@ class LogService:
         self._monotonic_ms = monotonic_ms
         self.session_id = session_id or default_session_id()
         self._log_file_path = Path(log_file_path) if log_file_path is not None else None
+        # 写盘交给后台线程：事件循环和采集线程只入队，避免一次慢 I/O 卡住录制组帧。
+        self._file_queue: queue.Queue[str] = queue.Queue()
+        self._file_thread: threading.Thread | None = None
         if self._log_file_path is not None:
             self._log_file_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file_path.touch(exist_ok=True)
             self._prune_log_files(max_log_files, max_log_total_bytes)
+            self._file_thread = threading.Thread(target=self._file_writer, name="log-file-writer", daemon=True)
+            self._file_thread.start()
+            atexit.register(self.flush)
         self._op_counters: defaultdict[str, int] = defaultdict(int)
         self._last_rate_log_ms: dict[str, int] = {}
         if emit_startup:
@@ -125,10 +134,44 @@ class LogService:
         entry = LogEntry(id=self._cursor, ts=self._clock_ms(), channel=channel, level=level, msg=msg)
         self._entries.append(entry)
         if self._log_file_path is not None:
-            line = f"{entry.ts} {entry.channel} {entry.level} {entry.msg}\n"
-            with self._log_file_path.open("a", encoding="utf-8") as handle:
-                handle.write(line)
+            self._file_queue.put(f"{entry.ts} {entry.channel} {entry.level} {entry.msg}\n")
         return entry
+
+    def _file_writer(self) -> None:
+        """后台线程：文件保持打开，按批写入并刷新；写失败时下一批重新打开。"""
+        assert self._log_file_path is not None
+        handle = None
+        while True:
+            batch = [self._file_queue.get()]
+            while True:
+                try:
+                    batch.append(self._file_queue.get_nowait())
+                except queue.Empty:
+                    break
+            try:
+                if handle is None:
+                    handle = self._log_file_path.open("a", encoding="utf-8")
+                handle.write("".join(batch))
+                handle.flush()
+            except OSError:
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+                handle = None
+            finally:
+                for _ in batch:
+                    self._file_queue.task_done()
+
+    def flush(self, timeout_s: float = 2.0) -> bool:
+        """等待已入队的日志写入文件；返回是否在时限内写完。"""
+        deadline = time.monotonic() + timeout_s
+        while self._file_queue.unfinished_tasks:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.002)
+        return True
 
     def event(
         self,

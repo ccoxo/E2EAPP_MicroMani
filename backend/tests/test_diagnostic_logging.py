@@ -106,6 +106,7 @@ def test_log_service_persists_each_entry_to_session_file(tmp_path: Path) -> None
 
     logs.info("[BACKEND]", "first line")
     logs.event("[HAL]", "INFO", "startup_check", component="MOTION", ok=True)
+    assert logs.flush()
 
     lines = log_file.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2

@@ -34,6 +34,7 @@ from backend.core.data_contract import (
 from backend.core.force_config import hal_force_config_payload
 from backend.core.logging import LOG_SCHEMA_VERSION, LogService, PollingErrorLog, now_ms, stable_config_hash
 from backend.core.loop_watchdog import LoopStallWatchdog
+from backend.core.queued_log_handlers import install_queued_handlers, stop_queued_handlers
 from backend.core.motion_safety import MotionSafetyToken
 from backend.core.operator_view import hardware_side_for_operator_side
 from backend.core.schemas import (
@@ -871,6 +872,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             cwd=repo,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+
+    @app.on_event("startup")
+    async def move_server_logging_off_loop() -> None:
+        # uvicorn 已在创建应用前配置好处理器；启动时接管，关闭步骤排在最后并还原。
+        installed = install_queued_handlers()
+
+        async def restore() -> None:
+            stop_queued_handlers(installed)
+
+        app.router.on_shutdown.append(restore)
 
     @app.on_event("startup")
     async def start_loop_stall_watchdog() -> None:
