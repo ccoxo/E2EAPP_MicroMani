@@ -37,3 +37,20 @@ it('跳过复位被后端拒绝时在复位面板显示原因和张开夹爪入�
   fireEvent.click(screen.getByRole('button', { name: '张开夹爪' }))
   expect(open).toHaveBeenCalledOnce()
 })
+
+it('开始采集会话被起点检查拒绝时同样提供张开夹爪入口', () => {
+  const open = vi.fn()
+  useTelemetryStore.setState({
+    issueManualGripperMove: open,
+    recordSession: {
+      ...initial.recordSession,
+      phase: 'idle',
+      participation: { version: 'appstation.participation.v1', arms: ['right'], grippers: ['right'] },
+      startError: '录制起点未连续稳定 300 ms：操作者右夹爪目标与实际开口需接近 26 mm（主手目标 26.0 mm，实际 1.7 mm）',
+    },
+  })
+  render(<EpisodeControlPanel onStartSession={vi.fn()} />)
+  expect(screen.getByRole('alert').textContent).toContain('录制启动失败')
+  fireEvent.click(screen.getByRole('button', { name: '张开夹爪' }))
+  expect(open).toHaveBeenCalledOnce()
+})

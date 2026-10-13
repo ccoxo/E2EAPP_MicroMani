@@ -104,6 +104,25 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
     runStartAction(action)
   }
 
+  // 开始会话和跳过复位共用：后端起点检查拒绝时显示原因；遥操作此时未接管夹爪，界面上直接张开。
+  const startErrorAlert = (title: string) => (
+    <div role="alert" style={{ color: '#cf1322', background: '#fff1f0', border: '1px solid #ffa39e', borderRadius: 4, padding: 8, overflowWrap: 'anywhere' }}>
+      <strong>{title}</strong>
+      <div>{startError}</div>
+      {participation.grippers.length > 0 && (
+        <div style={{ marginTop: 6 }}>
+          <div style={{ fontSize: 11, marginBottom: 4 }}>夹爪要张开到 26 mm；主手夹爪也要完全张开，再点开始。</div>
+          <UiButton
+            block
+            onClick={() => participation.grippers.forEach((side) => issueManualGripperMove(hardwareSideForOperatorSide(side), 'open'))}
+          >
+            张开夹爪
+          </UiButton>
+        </div>
+      )}
+    </div>
+  )
+
   const cfg = phaseConfig[phase]
   const busy = phase === 'starting' || phase === 'saving' || phase === 'discarding' || phase === 'finishing'
   const progressTotalS =
@@ -199,12 +218,7 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
 
       {phase === 'idle' && (
         <div className="record-action-stack">
-          {startError && (
-            <div role="alert" style={{ color: '#cf1322', background: '#fff1f0', border: '1px solid #ffa39e', borderRadius: 4, padding: 8, overflowWrap: 'anywhere' }}>
-              <strong>录制启动失败</strong>
-              <div>{startError}</div>
-            </div>
-          )}
+          {startError && startErrorAlert('录制启动失败')}
           <UiButton variant="primary" block disabled={!participation.arms.length} onClick={() => guardGripperOpen('start')}>
             开始采集会话
           </UiButton>
@@ -229,23 +243,7 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
 
       {phase === 'resetting' && (
         <div className="record-action-stack">
-          {startError && (
-            <div role="alert" style={{ color: '#cf1322', background: '#fff1f0', border: '1px solid #ffa39e', borderRadius: 4, padding: 8, overflowWrap: 'anywhere' }}>
-              <strong>未能开始下一条</strong>
-              <div>{startError}</div>
-              {participation.grippers.length > 0 && (
-                <div style={{ marginTop: 6 }}>
-                  <div style={{ fontSize: 11, marginBottom: 4 }}>失败后遥操作已停止；主手夹爪也要完全张开，再点开始。</div>
-                  <UiButton
-                    block
-                    onClick={() => participation.grippers.forEach((side) => issueManualGripperMove(hardwareSideForOperatorSide(side), 'open'))}
-                  >
-                    张开夹爪
-                  </UiButton>
-                </div>
-              )}
-            </div>
-          )}
+          {startError && startErrorAlert('未能开始下一条')}
           <UiButton variant="primary" block onClick={() => guardGripperOpen('skip')} disabled={busy || returnOriginInFlight || !resetReady}>
             跳过复位，立即开始
           </UiButton>
