@@ -1308,6 +1308,12 @@ function reportFromSavedEpisode(fallback: RecordQualityReport, episode?: RecordE
     },
     warnings,
     passed: warnings.length === 0,
+    // 后端评估和时序统计原先没带进报告，弹窗只能按前端旧规则推断，后端判"接受"也会显示"建议复核"。
+    ...(episode.qualityAssessment ? { qualityAssessment: episode.qualityAssessment } : {}),
+    ...(typeof episode.maxSkewMs === 'number' ? { maxSkewMs: episode.maxSkewMs } : {}),
+    ...(episode.cameraMinFps ? { cameraMinFps: episode.cameraMinFps } : {}),
+    ...(episode.cameraWorkerFallbacks ? { cameraWorkerFallbacks: episode.cameraWorkerFallbacks } : {}),
+    ...(episode.trainingQuality ? { trainingQuality: episode.trainingQuality } : {}),
   }
 }
 /** 构建当前流程需要的数据结构。 */
