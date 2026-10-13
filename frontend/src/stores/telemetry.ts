@@ -2204,6 +2204,7 @@ skipRecordReset: () => {
       return
     }
     recordResetSkipInFlight = true
+    set((state) => ({ recordSession: { ...state.recordSession, startError: null } }))
     void skipRecordResetApi()
       .then((payload) => {
         assertControlGeneration(get, generation)
@@ -2228,8 +2229,10 @@ skipRecordReset: () => {
         }))
       })
       .catch((error) => {
+        // 只写日志时按钮看起来"没反应"；把后端拒绝原因留在复位面板上。
         set((state) => ({
           recording: false,
+          recordSession: { ...state.recordSession, startError: error instanceof Error ? error.message : String(error) },
           logs: appendLog(state.logs, makeLog('ERROR', `record reset skip failed: ${String(error)}`, '[LEROBOT]')),
         }))
       })

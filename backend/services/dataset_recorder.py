@@ -2124,7 +2124,8 @@ class DatasetRecorderService:
             if (abs(targets[index] - expected) > RECORD_START_GRIPPER_TOLERANCE_MM
                     or abs(sample.value[index] - expected) > RECORD_START_GRIPPER_TOLERANCE_MM):
                 operator_side = "右" if side == "left" else "左"
-                return f"操作者{operator_side}夹爪目标与实际开口需接近 {expected:g} mm"
+                return (f"操作者{operator_side}夹爪目标与实际开口需接近 {expected:g} mm"
+                        f"（主手目标 {targets[index]:.1f} mm，实际 {sample.value[index]:.1f} mm）")
         return ""
 
     async def _native_writer_command(self, kind: str, payload: OriginMoveWrite | None = None) -> Any:

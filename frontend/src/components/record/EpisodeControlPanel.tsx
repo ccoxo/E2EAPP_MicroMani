@@ -229,6 +229,23 @@ export default function EpisodeControlPanel({ onStartSession }: EpisodeControlPa
 
       {phase === 'resetting' && (
         <div className="record-action-stack">
+          {startError && (
+            <div role="alert" style={{ color: '#cf1322', background: '#fff1f0', border: '1px solid #ffa39e', borderRadius: 4, padding: 8, overflowWrap: 'anywhere' }}>
+              <strong>未能开始下一条</strong>
+              <div>{startError}</div>
+              {participation.grippers.length > 0 && (
+                <div style={{ marginTop: 6 }}>
+                  <div style={{ fontSize: 11, marginBottom: 4 }}>失败后遥操作已停止；主手夹爪也要完全张开，再点开始。</div>
+                  <UiButton
+                    block
+                    onClick={() => participation.grippers.forEach((side) => issueManualGripperMove(hardwareSideForOperatorSide(side), 'open'))}
+                  >
+                    张开夹爪
+                  </UiButton>
+                </div>
+              )}
+            </div>
+          )}
           <UiButton variant="primary" block onClick={() => guardGripperOpen('skip')} disabled={busy || returnOriginInFlight || !resetReady}>
             跳过复位，立即开始
           </UiButton>
