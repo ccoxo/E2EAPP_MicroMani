@@ -124,3 +124,24 @@ def test_hal_validity_uses_original_dds_timestamp(monkeypatch):
     assert recorder._feedback_is_valid(observed)
     monkeypatch.setattr(recording, "now_ms", lambda: 1_000_301)
     assert not recorder._feedback_is_valid(observed)
+
+
+def _alignment_episode(frames, skews):
+    return {"id": "episode_000000", "frames": frames, "alignmentExceptions": [
+        {"frameIndex": i, "source": "hal", "skewMs": skew, "maxSkewMs": 20.} for i, skew in enumerate(skews)]}
+
+
+def test_sparse_mild_alignment_exceptions_do_not_require_review(monkeypatch):
+    recorder = make_recorder(monkeypatch)
+    assessment = recorder._quality_assessment(_alignment_episode(500, [-27., 33., 22.]))
+    assert assessment["recommendation"] == "accept"
+    assert not any(r["code"] == "alignment_exceeded" for r in assessment["reasons"])
+
+
+def test_frequent_or_severe_alignment_exceptions_still_require_review(monkeypatch):
+    recorder = make_recorder(monkeypatch)
+    frequent = recorder._quality_assessment(_alignment_episode(500, [25.] * 5))
+    severe = recorder._quality_assessment(_alignment_episode(500, [-27., 150.]))
+    for assessment in (frequent, severe):
+        assert assessment["recommendation"] == "review"
+        assert any(r["code"] == "alignment_exceeded" for r in assessment["reasons"])

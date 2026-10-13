@@ -160,6 +160,9 @@ QUALITY_LATE_REVIEW_RATE = 0.05
 QUALITY_LATE_RERECORD_RATE = 0.10
 QUALITY_CAMERA_REVIEW_RATE = 0.02
 QUALITY_CAMERA_RERECORD_RATE = 0.05
+# 对齐超限：HAL 约 15 ms 一帧，偶发晚到一两次只差几十 ms；按比例或单帧严重程度才要求复核，原始记录照常保存。
+QUALITY_ALIGNMENT_REVIEW_RATE = 0.01
+QUALITY_ALIGNMENT_REVIEW_SKEW_MS = 100.0
 QUALITY_ORIGIN_REVIEW_UM = 500.0
 QUALITY_ORIGIN_RERECORD_UM = 1000.0
 QUALITY_ACTIVE_TRANSLATION_RANGE_UM = 500.0
@@ -4961,8 +4964,14 @@ class DatasetRecorderService:
             reasons.append({"severity": level, "code": code, "message": message})
 
         frames = max(1, int(episode.get("frames", 0) or 0))
-        if episode.get("alignmentExceptions"):
-            add("review", "alignment_exceeded", "存在真实测量时间对齐超限的帧，请复核时序后用于训练")
+        alignment = episode.get("alignmentExceptions") or []
+        if alignment:
+            alignment_rate = len(alignment) / frames
+            worst_skew_ms = max(abs(float(item.get("skewMs", 0) or 0)) for item in alignment)
+            if alignment_rate >= QUALITY_ALIGNMENT_REVIEW_RATE or worst_skew_ms >= QUALITY_ALIGNMENT_REVIEW_SKEW_MS:
+                add("review", "alignment_exceeded",
+                    f"对齐超限 {len(alignment)} 帧（{alignment_rate:.1%}），最大 {worst_skew_ms:.0f} ms，"
+                    "请复核时序后用于训练")
         late_frames = max(0, int(episode.get("lateFrames", 0) or 0))
         late_rate = late_frames / frames
         if late_rate >= QUALITY_LATE_RERECORD_RATE:

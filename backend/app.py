@@ -33,6 +33,7 @@ from backend.core.data_contract import (
 )
 from backend.core.force_config import hal_force_config_payload
 from backend.core.logging import LOG_SCHEMA_VERSION, LogService, PollingErrorLog, now_ms, stable_config_hash
+from backend.core.loop_watchdog import LoopStallWatchdog
 from backend.core.motion_safety import MotionSafetyToken
 from backend.core.operator_view import hardware_side_for_operator_side
 from backend.core.schemas import (
@@ -161,16 +162,20 @@ def backend_deployment_status(
     latest_mtime = 0.0
     excluded_parts = {".venv", "__pycache__", "runtime", "tests"}
     if backend_dir.exists():
-        for source_path in backend_dir.rglob("*.py"):
-            if any(part in excluded_parts for part in source_path.relative_to(backend_dir).parts):
-                continue
-            try:
-                mtime = source_path.stat().st_mtime
-            except OSError:
-                continue
-            if mtime > latest_mtime:
-                latest_mtime = mtime
-                latest_path = source_path
+        # 遍历时剪掉排除目录；先 rglob 再过滤会扫完 .venv/runtime 上万个文件（约 1 s 纯 Python，抢 GIL）。
+        for dirpath, dirnames, filenames in os.walk(backend_dir):
+            dirnames[:] = [name for name in dirnames if name not in excluded_parts]
+            for filename in filenames:
+                if not filename.endswith(".py"):
+                    continue
+                source_path = Path(dirpath) / filename
+                try:
+                    mtime = source_path.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime > latest_mtime:
+                    latest_mtime = mtime
+                    latest_path = source_path
     native_status = _backend_native_deployment_status(backend_dir)
     source_restart_required = latest_mtime > process_started_at + 1.0
     fastdds_status = native_status.get("fastddsBinding", {})
@@ -866,6 +871,17 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             cwd=repo,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+
+    @app.on_event("startup")
+    async def start_loop_stall_watchdog() -> None:
+        # 只读诊断：事件循环卡顿超过 0.25 s 时把各线程调用栈写入 logs/loop_stalls.log；设为 0 关闭。
+        if os.environ.get("APPSTATION_LOOP_WATCHDOG", "1") == "0":
+            return
+        watchdog = LoopStallWatchdog(active_runtime_dir / "logs" / "loop_stalls.log")
+        watchdog.start(asyncio.get_running_loop())
+        app.state.loop_stall_watchdog = watchdog
+        # 启动时才登记，排在全部关闭步骤之后，不改变原有关闭顺序。
+        app.router.on_shutdown.append(watchdog.stop)
 
     @app.on_event("startup")
     async def prepare_recording_runtime() -> None:
