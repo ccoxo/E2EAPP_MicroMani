@@ -5,7 +5,7 @@
  * 全局阅读顺序与关联文件：docs/CODE_READING_GUIDE.md；逐文件目录：docs/SOURCE_INDEX.md。
  */
 import type { CSSProperties } from 'react'
-import type { RecordQualityReport } from '../../types'
+import type { RecordQualityAssessment, RecordQualityReport } from '../../types'
 import { UiButton, UiText } from '../ui'
 
 type Recommendation = 'accept' | 'review' | 'rerecord'
@@ -23,8 +23,10 @@ function metricTone(value: number, reviewAt: number, rerecordAt: number): Metric
   return 'good'
 }
 
-function feedbackLevel(warnings: string[]): MetricTone {
+function feedbackLevel(warnings: string[], assessment?: RecordQualityAssessment): MetricTone {
   if (warnings.some((warning) => /frame assembler|参与采集设备反馈无效|native gripper status unavailable|control lease|WebSocket|hal timeout|hal failed/i.test(warning))) return 'bad'
+  // 有后端评估时以它为准：只有对齐超限被判复核才提示；延迟统计、到位超时等每条都有的常规告警只在下方原文列出。
+  if (assessment) return assessment.reasons?.some((reason) => reason.code === 'alignment_exceeded') ? 'warn' : 'good'
   if (warnings.some((warning) => /gripper stale|gripper settle|alignment exceeded|latency summary|hal stale|omega stale/i.test(warning))) return 'warn'
   return 'good'
 }
@@ -37,7 +39,7 @@ function recommendationFor(report: RecordQualityReport): Recommendation {
     report.cameraDrops.wristLeft,
     report.cameraDrops.wristRight,
   ) / Math.max(1, report.frameCount)
-  const feedback = feedbackLevel(report.warnings)
+  const feedback = feedbackLevel(report.warnings, report.qualityAssessment)
   if (report.status === 'emergency' || feedback === 'bad' || lateRate >= 0.1 || cameraRate >= 0.05) return 'rerecord'
   if (feedback === 'warn' || lateRate >= 0.05 || cameraRate >= 0.02 || (report.maxSkewMs ?? 0) >= 300 || Math.max(report.maxForceLeft, report.maxForceRight) > 4) return 'review'
   return 'accept'
@@ -82,7 +84,7 @@ export default function QualityReportModal({
     wrist_right: report.cameraDrops.wristRight / Math.max(1, report.frameCount),
   }
   const maxCameraRate = Math.max(cameraRates.global ?? 0, cameraRates.wrist_left ?? 0, cameraRates.wrist_right ?? 0)
-  const feedbackTone = feedbackLevel(report.warnings)
+  const feedbackTone = feedbackLevel(report.warnings, report.qualityAssessment)
   const maxSkew = report.maxSkewMs ?? 0
   const maxFps = report.cameraMinFps ? Math.min(...Object.values(report.cameraMinFps).filter((value): value is number => typeof value === 'number')) : null
   const reasons = report.qualityAssessment?.reasons?.map((reason) => reason.message) ?? []
