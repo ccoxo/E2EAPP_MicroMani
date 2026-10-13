@@ -163,6 +163,7 @@ QUALITY_CAMERA_RERECORD_RATE = 0.05
 # 对齐超限：HAL 约 15 ms 一帧，偶发晚到一两次只差几十 ms；按比例或单帧严重程度才要求复核，原始记录照常保存。
 QUALITY_ALIGNMENT_REVIEW_RATE = 0.01
 QUALITY_ALIGNMENT_REVIEW_SKEW_MS = 100.0
+LIST_EPISODE_WARNINGS_LIMIT = 20
 QUALITY_ORIGIN_REVIEW_UM = 500.0
 QUALITY_ORIGIN_RERECORD_UM = 1000.0
 QUALITY_ACTIVE_TRANSLATION_RANGE_UM = 500.0
@@ -1285,6 +1286,9 @@ class DatasetRecorderService:
                 for episode in episodes
                 if not bool(episode.get("deleted", False)) and str(episode.get("status", "review")) != "invalid"
             ]
+            # 列表只放摘要：旧数据集单条告警可达两千条（整表曾达 168 MB）；完整告警走单条详情接口。
+            features = self._feature_summary(dataset_dir)
+            camera_resolutions = self._camera_resolution_summary(dataset_dir)
             datasets.append(
                 {
                     "id": dataset_dir.name,
@@ -1305,7 +1309,11 @@ class DatasetRecorderService:
                         or {"status": "unknown", "message": contract_error}
                     ),
                     "episodes": [
-                        self._episode_for_api(dataset_dir, dataset_dir.name, episode, include_samples=False)
+                        self._episode_for_api(
+                            dataset_dir, dataset_dir.name, episode, include_samples=False,
+                            warnings_limit=LIST_EPISODE_WARNINGS_LIMIT,
+                            features=features, camera_resolutions=camera_resolutions,
+                        )
                         for episode in visible_episodes
                     ],
                 }
@@ -4470,12 +4478,18 @@ class DatasetRecorderService:
         episode: dict[str, Any],
         *,
         include_samples: bool = True,
+        warnings_limit: int | None = None,
+        features: dict[str, Any] | None = None,
+        camera_resolutions: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """将内部 episode 元数据转换为前端 API 使用的摘要结构。"""
         samples = self._episode_samples(dataset_dir, dataset_id, episode) if include_samples else []
         quality = self._episode_quality(episode)
-        features = self._feature_summary(dataset_dir)
-        camera_resolutions = self._camera_resolution_summary(dataset_dir)
+        if features is None:
+            features = self._feature_summary(dataset_dir)
+        if camera_resolutions is None:
+            camera_resolutions = self._camera_resolution_summary(dataset_dir)
+        warnings = list(episode.get("warnings", [])) if isinstance(episode.get("warnings"), list) else []
         return {
             "id": str(episode.get("id", "")),
             "name": str(episode.get("name") or episode.get("id") or "episode"),
@@ -4486,7 +4500,8 @@ class DatasetRecorderService:
             "fps": int(episode.get("fps", 30)),
             "durationS": float(episode.get("durationS", 0.0)),
             "createdAt": int(episode.get("createdAt", 0)),
-            "warnings": list(episode.get("warnings", [])) if isinstance(episode.get("warnings"), list) else [],
+            "warnings": warnings if warnings_limit is None else warnings[:warnings_limit],
+            "warningCount": len(warnings),
             "samples": samples,
             "lateFrames": int(episode.get("lateFrames", 0)),
             "cameraDrops": episode.get("cameraDrops", {}),
