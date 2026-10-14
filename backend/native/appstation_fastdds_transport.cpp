@@ -386,7 +386,9 @@ struct AppStationFastDdsTransport {
     commandReplyTopic = createTopic(kTopicCommandReply, kCommandReplyType);
     emergencyStopTopic = createTopic(kTopicEmergencyStop, kCommandRequestType);
 
-    healthReader = subscriber->create_datareader(healthTopic, telemetryReaderQos(true, true, 1));
+    // Health 以 100 Hz 可靠发布；深度 1 在晚加入接收端上可能持续收不到样本。
+    // 保留可靠性和历史发现，容纳接收线程调度期间的突发样本。
+    healthReader = subscriber->create_datareader(healthTopic, telemetryReaderQos(true, true, 32));
     motionReader = subscriber->create_datareader(motionTopic, telemetryReaderQos(false, false, 1));
     omegaReader = subscriber->create_datareader(omegaTopic, telemetryReaderQos(false, false, 1));
     nativeTeleopReader = subscriber->create_datareader(nativeTeleopTopic, telemetryReaderQos(false, false, 1));

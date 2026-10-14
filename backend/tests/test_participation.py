@@ -96,7 +96,7 @@ def test_direct_gripper_sampling_keeps_missing_and_stale_guards(monkeypatch, fau
     elif fault == "expired":
         fresh["grippers"]["right"]["positionSampleTs"] -= 2000
     elif fault == "alignment":
-        fresh["monotonic_s"] -= .067667
+        fresh["monotonic_s"] -= .087667
     recorder.hal = SimpleNamespace(command=AsyncMock(return_value={"response": fresh}))
     if fault == "timeout":
         recorder.hal.command.side_effect = RuntimeError("DDS timeout")

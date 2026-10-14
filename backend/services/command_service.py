@@ -155,11 +155,14 @@ class CommandService:
             try:
                 state = await self.hal.motion_state()
             except RuntimeError as exc:
-                if str(exc) != "DDS motion controller sample timestamp is stale or unavailable":
+                # 遥测并发读取可能短暂占满通道；仅重试读取，保留原期限与到位检查。
+                busy = str(exc) == "dds-motion-state channel is busy; request was not queued"
+                if not busy and str(exc) != "DDS motion controller sample timestamp is stale or unavailable":
                     raise
                 self.safety.check(token)
                 if time.monotonic() >= deadline:
-                    raise RuntimeError("work origin result unconfirmed: fresh stationary position feedback required") from exc
+                    reason = str(exc) if busy else "fresh stationary position feedback required"
+                    raise RuntimeError(f"work origin result unconfirmed: {reason}") from exc
                 await asyncio.sleep(0.05)
                 continue
             self.safety.check(token)
@@ -595,7 +598,18 @@ class CommandService:
         deadline = time.monotonic() + 2.0
         while True:
             self.safety.check(safety_token)
-            state = await self.hal.motion_state()
+            try:
+                state = await self.hal.motion_state()
+            except RuntimeError as exc:
+                # 命令快照没有控制卡采样时间；在原期限内等待新的实测反馈。
+                if str(exc) != "DDS motion controller sample timestamp is stale or unavailable":
+                    raise
+                self.safety.check(safety_token)
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("fresh stationary feedback missing after hardware home completion") from exc
+                await asyncio.sleep(0.02)
+                continue
+            self.safety.check(safety_token)
             if state.get("estop_active"):
                 raise RuntimeError("emergency stop interrupted hardware home")
             stamp = state.get("timestamp_ms", 0)

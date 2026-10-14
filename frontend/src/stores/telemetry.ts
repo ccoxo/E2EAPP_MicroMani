@@ -238,6 +238,7 @@ const initialRecordSession: RecordSessionState = {
   resetTimeS: 10,
   currentEpisode: 0,
   savedEpisodes: 0,
+  sessionSavedEpisodes: 0,
   episodeHistory: [],
   latestQualityReport: null,
   phase: 'idle',
@@ -377,6 +378,8 @@ interface TelemetryStore {
   dangerOverride: number | null
   controlSafety: ControlSafetyState
   controlLease: ControlLeaseState
+  observerMode: boolean
+  setObserverMode: (observe: boolean) => void
   revokeControlLease: (reason: string) => void
   qualityReport: QualityReport | null
   recordSession: RecordSessionState
@@ -808,7 +811,7 @@ let lastBackendFrameCommitAt = 0
 let lastBackendHistoryCommitAt = 0
 let backendVisibilityHandler: (() => void) | null = null
 let backendConnectionGeneration = 0
-let backendObserverMode = false
+let backendObserverMode: boolean | null = null
 /** 页面重新可见时立即提交积压 frame，避免切回后仍按隐藏节流。 */
 function installBackendVisibilityFlush(set: TelemetryStoreSet, get: TelemetryStoreGet) {
   if (backendVisibilityHandler || typeof document === 'undefined') return
@@ -863,6 +866,15 @@ function finishRecordSessionNow(set: TelemetryStoreSet) {
   }))
 }
 /** 描述当前方法的功能边界。 */
+function recordProgressFromStatus(session: RecordSessionState, status: RecordStatusApi) {
+  const count = (value: number | undefined, fallback: number) =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : fallback
+  return {
+    currentEpisode: count(status.episodeIndex, session.currentEpisode),
+    savedEpisodes: count(status.savedEpisodes, session.savedEpisodes),
+    sessionSavedEpisodes: count(status.sessionSavedEpisodes, session.sessionSavedEpisodes),
+  }
+}
 function recordSessionFromStatus(
   state: TelemetryStore,
   status: RecordStatusApi,
@@ -878,6 +890,7 @@ function recordSessionFromStatus(
   const resetPending = Boolean(status.resetPending)
   return {
     ...state.recordSession,
+    ...recordProgressFromStatus(state.recordSession, status),
     datasetName: typeof status.datasetName === 'string' ? status.datasetName : datasetName,
     task: typeof status.task === 'string' ? status.task : task,
     latestQualityReport: null,
@@ -1295,6 +1308,12 @@ function reportFromSavedEpisode(fallback: RecordQualityReport, episode?: RecordE
     },
     warnings,
     passed: warnings.length === 0,
+    // 后端评估和时序统计原先没带进报告，弹窗只能按前端旧规则推断，后端判"接受"也会显示"建议复核"。
+    ...(episode.qualityAssessment ? { qualityAssessment: episode.qualityAssessment } : {}),
+    ...(typeof episode.maxSkewMs === 'number' ? { maxSkewMs: episode.maxSkewMs } : {}),
+    ...(episode.cameraMinFps ? { cameraMinFps: episode.cameraMinFps } : {}),
+    ...(episode.cameraWorkerFallbacks ? { cameraWorkerFallbacks: episode.cameraWorkerFallbacks } : {}),
+    ...(episode.trainingQuality ? { trainingQuality: episode.trainingQuality } : {}),
   }
 }
 /** 构建当前流程需要的数据结构。 */
@@ -1409,6 +1428,14 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
   frameCount: 0,
   logPanelOpen: false,
   controlSafety: initialSessionControlSafety(),
+  observerMode: false,
+  setObserverMode: (observe) => {
+    // 沿用关闭控制连接的执行侧保护；只切换租约，不自动解除急停或使能。
+    get().stopBackend()
+    backendObserverMode = observe
+    set({ observerMode: observe })
+    get().startBackend()
+  },
   controlLease: initialControlLease(!mockMode),
   revokeControlLease: (reason) => {
     const required = get().controlLease.required
@@ -1495,8 +1522,9 @@ stopMock: () => {
 /** 启动对应流程。 */
 startBackend: () => {
     if (get().backendWs) return
-    backendObserverMode ||= new URL(wsUrl).searchParams.get('mode') === 'observe'
+    backendObserverMode ??= new URL(wsUrl).searchParams.get('mode') === 'observe'
       || new URLSearchParams(window.location.search).get('mode') === 'observe'
+    set({ observerMode: backendObserverMode })
     const connectionGeneration = ++backendConnectionGeneration
     const connectionIsCurrent = () => backendConnectionGeneration === connectionGeneration
     motionCommands.invalidate('遥测连接中，未获得执行确认')
@@ -1557,6 +1585,7 @@ startBackend: () => {
     try {
       const target = new URL(wsUrl)
       if (backendObserverMode) target.searchParams.set('mode', 'observe')
+      else target.searchParams.delete('mode')
       ws = new WebSocket(target.toString())
     } catch (error) {
       backendConnectionGeneration += 1
@@ -1694,7 +1723,7 @@ startBackend: () => {
           backendWs: null,
           backendReconnectTimer: null,
           controlSafety: interruptedControlSafety(state.controlSafety),
-          controlLease: { ...initialControlLease(), status: 'expired', reason: transportRestartReason ?? '另一页面持有控制权；可用 ?mode=observe 打开观察页，或稍后显式重连' },
+          controlLease: { ...initialControlLease(), status: 'expired', reason: transportRestartReason ?? '另一页面持有控制权；可切换到观察模式，或稍后显式重连' },
           frame: { ...state.frame, wsOk: false },
           telemetryLink: { state: 'offline', lastFrameReceivedAt: state.telemetryLink.lastFrameReceivedAt },
         }))
@@ -1803,6 +1832,7 @@ setRecordDatasetName: (name) =>
       recordSession: {
         ...state.recordSession,
         datasetName: name,
+        ...(name !== state.recordSession.datasetName ? { currentEpisode: 0, savedEpisodes: 0, sessionSavedEpisodes: 0 } : {}),
       },
     })),
 
@@ -1979,14 +2009,17 @@ saveRecordEpisode: () => {
         set((state) => {
           if (state.recordSession.phase !== 'saving') return state
           const report = reportFromSavedEpisode(reportSnapshot, payload.data?.episode)
-          const nextSavedEpisodes = state.recordSession.savedEpisodes + 1
-          const nextCurrentEpisode = report.index + 1
+          const progress = recordProgressFromStatus({
+            ...state.recordSession,
+            savedEpisodes: state.recordSession.savedEpisodes + 1,
+            sessionSavedEpisodes: state.recordSession.sessionSavedEpisodes + 1,
+            currentEpisode: report.index + 1,
+          }, payload.data?.status ?? {})
           return {
             recording: false,
             recordSession: {
               ...state.recordSession,
-              savedEpisodes: nextSavedEpisodes,
-              currentEpisode: nextCurrentEpisode,
+              ...progress,
               latestQualityReport: report,
               phase: 'reviewing',
               phaseStartedAt: Date.now(),
@@ -2058,15 +2091,17 @@ discardRecordEpisode: () => {
     const record = makeDiscardedEpisodeRecord(session)
     set((state) => ({ recording: false, recordSession: { ...state.recordSession,
       phase: 'discarding', phaseStartedAt: Date.now(), resetPending: false, resetReady: false } }))
-    void discardRecordEpisodeApi().then(() => set((state) => {
+    void discardRecordEpisodeApi().then((payload) => set((state) => {
       if (state.recordSession.phase !== 'discarding') return state
       return {
         recording: false,
         recordSession: {
           ...state.recordSession,
-          savedEpisodes: discardingSavedEpisode
-            ? Math.max(0, state.recordSession.savedEpisodes - 1)
-            : state.recordSession.savedEpisodes,
+          ...recordProgressFromStatus({
+            ...state.recordSession,
+            savedEpisodes: Math.max(0, state.recordSession.savedEpisodes - (discardingSavedEpisode ? 1 : 0)),
+            sessionSavedEpisodes: Math.max(0, state.recordSession.sessionSavedEpisodes - (discardingSavedEpisode ? 1 : 0)),
+          }, payload.data ?? {}),
           phase: 'resetting',
           phaseStartedAt: Date.now(),
           recorderFps: 0,
@@ -2175,6 +2210,7 @@ skipRecordReset: () => {
       return
     }
     recordResetSkipInFlight = true
+    set((state) => ({ recordSession: { ...state.recordSession, startError: null } }))
     void skipRecordResetApi()
       .then((payload) => {
         assertControlGeneration(get, generation)
@@ -2183,6 +2219,7 @@ skipRecordReset: () => {
           recording: true,
           recordSession: {
             ...state.recordSession,
+            ...recordProgressFromStatus(state.recordSession, status),
             phase: 'recording',
             phaseStartedAt: Date.now(),
             recorderFps: typeof status.fps === 'number' ? status.fps : 30,
@@ -2198,8 +2235,10 @@ skipRecordReset: () => {
         }))
       })
       .catch((error) => {
+        // 只写日志时按钮看起来"没反应"；把后端拒绝原因留在复位面板上。
         set((state) => ({
           recording: false,
+          recordSession: { ...state.recordSession, startError: error instanceof Error ? error.message : String(error) },
           logs: appendLog(state.logs, makeLog('ERROR', `record reset skip failed: ${String(error)}`, '[LEROBOT]')),
         }))
       })

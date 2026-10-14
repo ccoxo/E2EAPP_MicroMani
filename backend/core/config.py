@@ -782,9 +782,17 @@ class SettingsService:
                 temp_file.write(json.dumps(payload, ensure_ascii=False, indent=2))
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
-            if before_commit is not None:
-                before_commit()
-            os.replace(temp_name, path)
+            for attempt in range(5):
+                if before_commit is not None:
+                    before_commit()
+                try:
+                    os.replace(temp_name, path)
+                    break
+                except PermissionError as exc:
+                    # Windows 读句柄可能短暂阻止替换；只重试落盘，不重发设备命令。
+                    if getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == 4:
+                        raise
+                    time.sleep(0.05)
         finally:
             if temp_name is not None:
                 temp_path = Path(temp_name)

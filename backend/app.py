@@ -12,6 +12,7 @@ import math
 import os
 import subprocess
 import time
+import traceback
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -32,6 +33,8 @@ from backend.core.data_contract import (
 )
 from backend.core.force_config import hal_force_config_payload
 from backend.core.logging import LOG_SCHEMA_VERSION, LogService, PollingErrorLog, now_ms, stable_config_hash
+from backend.core.loop_watchdog import LoopStallWatchdog
+from backend.core.queued_log_handlers import install_queued_handlers, stop_queued_handlers
 from backend.core.motion_safety import MotionSafetyToken
 from backend.core.operator_view import hardware_side_for_operator_side
 from backend.core.schemas import (
@@ -160,16 +163,20 @@ def backend_deployment_status(
     latest_mtime = 0.0
     excluded_parts = {".venv", "__pycache__", "runtime", "tests"}
     if backend_dir.exists():
-        for source_path in backend_dir.rglob("*.py"):
-            if any(part in excluded_parts for part in source_path.relative_to(backend_dir).parts):
-                continue
-            try:
-                mtime = source_path.stat().st_mtime
-            except OSError:
-                continue
-            if mtime > latest_mtime:
-                latest_mtime = mtime
-                latest_path = source_path
+        # 遍历时剪掉排除目录；先 rglob 再过滤会扫完 .venv/runtime 上万个文件（约 1 s 纯 Python，抢 GIL）。
+        for dirpath, dirnames, filenames in os.walk(backend_dir):
+            dirnames[:] = [name for name in dirnames if name not in excluded_parts]
+            for filename in filenames:
+                if not filename.endswith(".py"):
+                    continue
+                source_path = Path(dirpath) / filename
+                try:
+                    mtime = source_path.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime > latest_mtime:
+                    latest_mtime = mtime
+                    latest_path = source_path
     native_status = _backend_native_deployment_status(backend_dir)
     source_restart_required = latest_mtime > process_started_at + 1.0
     fastdds_status = native_status.get("fastddsBinding", {})
@@ -420,7 +427,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
-        allow_origin_regex=r"http://(127\.0\.0\.1|localhost):\d+",
+        allow_origin_regex=r"https?://(127\.0\.0\.1|localhost|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}):\d+",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -865,6 +872,27 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             cwd=repo,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+
+    @app.on_event("startup")
+    async def move_server_logging_off_loop() -> None:
+        # uvicorn 已在创建应用前配置好处理器；启动时接管，关闭步骤排在最后并还原。
+        installed = install_queued_handlers()
+
+        async def restore() -> None:
+            stop_queued_handlers(installed)
+
+        app.router.on_shutdown.append(restore)
+
+    @app.on_event("startup")
+    async def start_loop_stall_watchdog() -> None:
+        # 只读诊断：事件循环卡顿超过 0.25 s 时把各线程调用栈写入 logs/loop_stalls.log；设为 0 关闭。
+        if os.environ.get("APPSTATION_LOOP_WATCHDOG", "1") == "0":
+            return
+        watchdog = LoopStallWatchdog(active_runtime_dir / "logs" / "loop_stalls.log")
+        watchdog.start(asyncio.get_running_loop())
+        app.state.loop_stall_watchdog = watchdog
+        # 启动时才登记，排在全部关闭步骤之后，不改变原有关闭顺序。
+        app.router.on_shutdown.append(watchdog.stop)
 
     @app.on_event("startup")
     async def prepare_recording_runtime() -> None:
@@ -1518,6 +1546,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/policy/action")
     async def policy_action(payload: Annotated[dict[str, Any], Body()]) -> ApiEnvelope:
+        t_entry = time.perf_counter()
         safety_token = commands.safety.capture()
         action = payload.get("action")
         if not isinstance(action, list) or len(action) != 14:
@@ -1562,18 +1591,35 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 detail={"code": "BAD_POLICY_SIDES", "message": "controlledSides must include left or right"},
             )
         results: dict[str, Any] = {"motion": {}, "grippers": {}}
+        dispatch_started = False
+        t_mark = time.perf_counter()
+        timing_ms: dict[str, float] = {"plan": (t_mark - t_entry) * 1e3}  # 诊断：策略请求各阶段耗时
+        # gripperAsync=True：夹爪目标交给后台串行下发（只保留最新目标），机械臂命令不再等串口往返。
+        gripper_async = payload.get("gripperAsync") is True
+        failed = _take_policy_gripper_failures(request_control_session.get()) if gripper_async else {}
+        if failed:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "POLICY_GRIPPER_FAILED", "message": f"background gripper target failed: {failed}"},
+            )
         try:
             with commands.safety.operation():
                 for side in controlled_sides:
                     commands.safety.check(safety_token)
                     motion_plan = plan["motion"][side]
                     hardware_side = dataset_side_to_hardware_side(side)
-                    await commands.enable_motion_side(hardware_side)
+                    dispatch_started = True
+                    if not await _policy_side_already_enabled(hardware_side, motion_plan):
+                        await commands.enable_motion_side(hardware_side)
+                    timing_ms["enableCheck"] = (time.perf_counter() - t_mark) * 1e3
+                    t_mark = time.perf_counter()
                     commands.safety.check(safety_token)
                     results["motion"][side] = await hal.command(
                         "motion.teleop_target_update",
                         _policy_motion_payload(hardware_side, motion_plan, config),
                     )
+                    timing_ms["motion"] = (time.perf_counter() - t_mark) * 1e3
+                    t_mark = time.perf_counter()
                 for side, target_key in (("left", "leftMm"), ("right", "rightMm")):
                     if side not in controlled_sides:
                         continue
@@ -1587,9 +1633,31 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         targetMm=plan["grippers"][target_key],
                     )
                     commands.safety.check(safety_token)
-                    results["grippers"][side] = await commands.gripper_command(request)
+                    if gripper_async:
+                        results["grippers"][side] = _queue_policy_gripper_target(hardware_side, request)
+                    else:
+                        results["grippers"][side] = await commands.gripper_command(request)
+                    timing_ms["gripper"] = (time.perf_counter() - t_mark) * 1e3
+                    t_mark = time.perf_counter()
         except ControlLeaseUnavailable as exc:
             raise HTTPException(status_code=409, detail={"code": "CONTROL_LEASE_UNAVAILABLE", "message": str(exc)}) from exc
+        except OSError as exc:
+            logs.error("[POLICY]", f"policy action I/O failed: {traceback.format_exc()}")
+            stop_accepted = False
+            if dispatch_started:
+                try:
+                    await commands.emergency_stop()
+                    stop_accepted = True
+                except Exception:
+                    logs.error("[POLICY]", f"policy failure stop failed: {traceback.format_exc()}")
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "POLICY_ACTION_UNAVAILABLE", "message": str(exc),
+                    "executionMayHaveStarted": dispatch_started,
+                    "retrySafe": False, "stopRequestAccepted": stop_accepted,
+                },
+            ) from exc
         except RuntimeError as exc:
             logs.error("[POLICY]", f"policy action send failed: {exc}")
             raise HTTPException(
@@ -1601,6 +1669,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
             "sent": True,
             "plan": plan,
             "results": results,
+            "timingMs": timing_ms,
             "dataContract": data_contract_metadata(),
         })
 
@@ -1608,12 +1677,66 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
         mode = os.environ.get("APPSTATION_HAL_MODE") or config.get("hal", {}).get("mode", "real")
         return str(mode).lower() == "real"
 
+    # 按 (硬件侧, 控制会话) 分开：后台任务继承创建时的会话，上一轮会话的残留目标/失败不影响新一轮。
+    policy_gripper_latest: dict[tuple[str, str | None], GripperCommandRequest] = {}
+    policy_gripper_senders: dict[tuple[str, str | None], asyncio.Task[None]] = {}
+    policy_gripper_failures: dict[tuple[str, str | None], str] = {}
+
+    def _take_policy_gripper_failures(session: str | None) -> dict[str, str]:
+        mine = {key[0]: msg for key, msg in policy_gripper_failures.items() if key[1] == session}
+        policy_gripper_failures.clear()  # 其他会话的失败已随该会话结束，不再阻断新会话
+        return mine
+
+    def _queue_policy_gripper_target(side: str, request: GripperCommandRequest) -> dict[str, Any]:
+        """策略流夹爪目标后台串行下发：每侧只保留最新目标，不排队、不阻塞机械臂命令。"""
+        key = (side, request_control_session.get())
+        replaced = key in policy_gripper_latest
+        policy_gripper_latest[key] = request
+        sender = policy_gripper_senders.get(key)
+        if sender is None or sender.done():
+            policy_gripper_senders[key] = asyncio.create_task(_drain_policy_gripper(key))
+        return {"queued": True, "targetMm": request.targetMm, "replacedPending": replaced}
+
+    async def _drain_policy_gripper(key: tuple[str, str | None]) -> None:
+        try:
+            while (request := policy_gripper_latest.pop(key, None)) is not None:
+                try:
+                    await commands.gripper_command(request)
+                except OSError as exc:
+                    # 与同步路径一致：串口/配置 I/O 失败视为执行状态不明，急停。
+                    policy_gripper_latest.pop(key, None)
+                    policy_gripper_failures[key] = f"{type(exc).__name__}: {exc}"
+                    logs.error("[POLICY]", f"background gripper target I/O failed: {traceback.format_exc()}")
+                    try:
+                        await commands.emergency_stop()
+                    except Exception:
+                        logs.error("[POLICY]", f"background gripper failure stop failed: {traceback.format_exc()}")
+                    return
+                except Exception as exc:
+                    policy_gripper_latest.pop(key, None)
+                    policy_gripper_failures[key] = str(exc)
+                    logs.error("[POLICY]", f"background gripper target failed: {exc}")
+                    return
+        finally:
+            if policy_gripper_senders.get(key) is asyncio.current_task():
+                policy_gripper_senders.pop(key, None)
+
     def _policy_gripper_positions(config: dict[str, Any]) -> list[float]:
         gripper = config.get("gripper", {}) if isinstance(config.get("gripper"), dict) else {}
         cached = list(telemetry.gripper_positions)
         left = cached[0] if len(cached) > 0 and cached[0] >= 0 else float(gripper.get("targetLeftMm", 0.0))
         right = cached[1] if len(cached) > 1 and cached[1] >= 0 else float(gripper.get("targetRightMm", 0.0))
         return [float(left), float(right)]
+
+    async def _policy_side_already_enabled(hardware_side: str, motion_plan: dict[str, Any]) -> bool:
+        """连续策略流保持 HAL 外部控制；重复使能会被当成切换控制来源而冲突。"""
+        state = await hal.motion_state()
+        raw = state.get("enabled")
+        if not (isinstance(raw, list) and len(raw) == 12):
+            return False  # 读不到使能反馈时按原逻辑使能
+        values = raw[:6] if hardware_side == "left" else raw[6:12]
+        wanted = list(motion_plan.get("enabledAxes") or [True] * 6)
+        return all(bool(value) for value, want in zip(values, wanted) if want)
 
     def _policy_motion_payload(side: str, motion_plan: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         teleop = config.get("teleop", {}) if isinstance(config.get("teleop"), dict) else {}
@@ -2359,6 +2482,12 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
     @app.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket) -> None:
         await ws.accept()
+        send_lock = asyncio.Lock()
+
+        async def send_json(message: dict[str, Any]) -> None:
+            # 租约通知和遥测共用连接，避免并发发送触发底层 drain 断言。
+            async with send_lock:
+                await ws.send_json(message)
         shutdown_task = app.state.shutdown_task
         if shutdown_task is not None:
             if not shutdown_task.done():
@@ -2416,7 +2545,7 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                 if control_watchdog.clients:
                     await ws.close(code=1008, reason="another browser owns control; use ?mode=observe")
                     return
-                control_session_id = control_watchdog.register(ws.send_json)
+                control_session_id = control_watchdog.register(send_json)
                 receive_task = asyncio.create_task(receive_control_connection(), name="browser-control-connection")
             while True:
                 try:
@@ -2591,16 +2720,16 @@ def create_app(runtime_dir: Path | None = None) -> FastAPI:
                         recorder.interrupt_for_safety()
                     frame.processStatus[0].label = "HalServer.exe" if hal_health.mode == "real" else "Test HAL boundary"
                     frame.processStatus[0].status = "running" if hal_health.connected else "error"
-                    await ws.send_json({"type": "telemetry", "data": frame.model_dump(mode="json")})
+                    await send_json({"type": "telemetry", "data": frame.model_dump(mode="json")})
                     if recorder.safety_interrupted:
                         if not interruption_reported:
-                            await ws.send_json({"type": "record_status", "data": await asyncio.to_thread(recorder.status)})
+                            await send_json({"type": "record_status", "data": await asyncio.to_thread(recorder.status)})
                             interruption_reported = True
                     else:
                         interruption_reported = False
                     # 日志和遥测走同一条 WebSocket，前端不需要再轮询日志接口。
                     for entry in logs.entries_after(last_log_id):
-                        await ws.send_json({"type": "log", "data": entry.model_dump(mode="json")})
+                        await send_json({"type": "log", "data": entry.model_dump(mode="json")})
                         last_log_id = max(last_log_id, entry.id)
                     await asyncio.sleep(ws_period)
                 except WebSocketDisconnect:

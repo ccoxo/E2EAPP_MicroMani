@@ -96,11 +96,29 @@ class TeleopMappingService:
         home_side: SideName | None = None,
         *,
         pre_home: bool = True,
+        prepare_only: bool = False,
     ) -> dict[str, Any]:
         token = self._transition_token.set((self.safety.capture(), source, self._source_stop_generation.get(source, 0)))
         try:
             self._check_transition_current()
-            return await self._start_current(source, home_side, pre_home=pre_home)
+            return await self._start_current(source, home_side, pre_home=pre_home, prepare_only=prepare_only)
+        finally:
+            self._transition_token.reset(token)
+
+    @motion_operation()
+    async def release_recording(self) -> None:
+        """录制数据通路就绪后放行；不重新归位，也不重建主手旧参考。"""
+        token = self._transition_token.set((
+            self.safety.capture(), "recording", self._source_stop_generation.get("recording", 0)))
+        try:
+            async with self._native_transition_lock:
+                self._check_transition_current()
+                payload = self._last_native_payload
+                if "recording" not in self._arm_sources or not payload or not payload.get("recordingPreparing"):
+                    raise RuntimeError("recording preparation is not active")
+                payload = {**payload, "recordingPreparing": False}
+                await self._native_command("teleop.native.configure", payload)
+                self._last_native_payload = payload
         finally:
             self._transition_token.reset(token)
 
@@ -129,8 +147,17 @@ class TeleopMappingService:
         home_side: SideName | None = None,
         *,
         pre_home: bool = True,
+        prepare_only: bool = False,
     ) -> dict[str, Any]:
         config = await self._get_config_async()
+        if prepare_only:
+            if source != "recording" or pre_home:
+                raise RuntimeError("recording preparation requires recording source without automatic homing")
+            if self._hal_mode(config) == "real":
+                health = await self.hal.health()
+                if "record_start_hold_v1" not in (getattr(health, "capabilities", None) or []):
+                    raise RuntimeError("HAL 不支持录制准备期动作锁定，请更新配套 HAL 后再录制")
+            config = {**config, "_recordingPreparing": True}
         self._check_transition_current()
         op_id = self.logs.new_op_id("teleop") if self.logs is not None else None
         mode = self._hal_mode(config)
@@ -139,6 +166,8 @@ class TeleopMappingService:
             # serialize it even when UI connect and recording start race.
             async with self._native_transition_lock:
                 self._check_transition_current()
+                if prepare_only and self._task is not None and not self._task.done():
+                    raise RuntimeError("stop active teleop before preparing recording")
                 return await self._start_native_locked(config, op_id, source, home_side, pre_home)
         if self._task is not None and not self._task.done():
             self._arm_sources.add(source)
@@ -1384,6 +1413,7 @@ class TeleopMappingService:
             "rightConnected": arm_motion_active and bool(teleop.get("rightConnected", False)),
             "swapTeleopChannels": bool(teleop.get("swapTeleopChannels", True)),
             "requireClutch": bool(teleop.get("requireClutch", False)),
+            "recordingPreparing": bool(config.get("_recordingPreparing", False)),
             "leftGravityCompensation": bool(teleop.get("leftGravityCompensation", True)),
             "rightGravityCompensation": bool(teleop.get("rightGravityCompensation", True)),
             "leftGravityScale": float(teleop.get("leftGravityScale", ICF_TELEOP_DEFAULTS["leftGravityScale"])),

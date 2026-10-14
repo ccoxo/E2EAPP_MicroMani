@@ -129,3 +129,140 @@ def test_hal_version_does_not_imply_unimplemented_calibration_capability():
     supported = hal_capability_status(SimpleNamespace(capabilities=["force_calibration_state_v1"]))
     assert supported["compatible"] is True
     assert supported["missing"] == []
+
+
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_policy_persistence_failure_stops_without_replaying_action(app, stop_fails):
+    async def exercise():
+        await confirm_mock_browser_lease(app.state.control_watchdog)
+        config = app.state.settings.get_config()
+        config["gripper"]["leftEnabled"] = True
+        app.state.settings.save_config(config)
+        commands = app.state.commands
+        commands.enable_motion_side = AsyncMock()
+        commands.gripper_command = AsyncMock(side_effect=PermissionError("config.json busy"))
+        commands.emergency_stop = AsyncMock(side_effect=RuntimeError("stop failed") if stop_fails else None)
+        app.state.hal.command = AsyncMock(return_value={"ok": True})
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", "") == "/api/policy/action")
+        with pytest.raises(HTTPException) as failed:
+            await endpoint({
+                "action": [0.0] * 14, "dataContract": data_contract_metadata(),
+                "dryRun": False, "controlledSides": ["right"],
+            })
+        assert failed.value.status_code == 503
+        assert failed.value.detail["executionMayHaveStarted"] is True
+        assert failed.value.detail["retrySafe"] is False
+        assert failed.value.detail["stopRequestAccepted"] is (not stop_fails)
+        assert "config.json busy" in failed.value.detail["message"]
+        commands.gripper_command.assert_awaited_once()
+        commands.emergency_stop.assert_awaited_once()
+        app.state.hal.command.assert_awaited_once()
+
+    asyncio.run(exercise())
+
+
+def _async_gripper_action(target_mm: float) -> dict:
+    action = lerobot_state_from_ui([0.0] * 12, [4.5, 5.5])
+    action[6] = target_mm
+    return {"action": action, "dataContract": data_contract_metadata(), "dryRun": False,
+            "controlledSides": ["left"], "gripperAsync": True, "maxGripperMm": 10.0}
+
+
+def test_policy_async_gripper_returns_before_serial_and_keeps_latest_target(app):
+    async def exercise():
+        await confirm_mock_browser_lease(app.state.control_watchdog)
+        config = app.state.settings.get_config()
+        config["gripper"]["rightEnabled"] = True
+        app.state.settings.save_config(config)
+        app.state.telemetry.motion_positions = [0.0] * 12
+        app.state.telemetry.gripper_positions = [4.5, 5.5]
+        release = asyncio.Event()
+        sent: list[float] = []
+
+        async def slow_gripper(request):
+            sent.append(request.targetMm)
+            await release.wait()
+            return {"ok": True}
+
+        commands = app.state.commands
+        commands.enable_motion_side = AsyncMock()
+        commands.gripper_command = slow_gripper
+        app.state.hal.command = AsyncMock(return_value={"ok": True})
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", "") == "/api/policy/action")
+        first = await endpoint(_async_gripper_action(6.0))
+        await asyncio.sleep(0)
+        await endpoint(_async_gripper_action(7.0))
+        third = await endpoint(_async_gripper_action(8.0))
+        # 串口命令仍在进行时，策略请求已返回；中间的 7.0 被最新的 8.0 覆盖。
+        assert first.data["results"]["grippers"]["left"]["queued"] is True
+        assert third.data["results"]["grippers"]["left"]["replacedPending"] is True
+        assert app.state.hal.command.await_count == 3
+        assert sent == [6.0]
+        release.set()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert sent == [6.0, 8.0]
+
+    asyncio.run(exercise())
+
+
+def test_policy_async_gripper_failure_stops_and_blocks_next_action(app):
+    async def exercise():
+        await confirm_mock_browser_lease(app.state.control_watchdog)
+        config = app.state.settings.get_config()
+        config["gripper"]["rightEnabled"] = True
+        app.state.settings.save_config(config)
+        app.state.telemetry.motion_positions = [0.0] * 12
+        app.state.telemetry.gripper_positions = [4.5, 5.5]
+        commands = app.state.commands
+        commands.enable_motion_side = AsyncMock()
+        commands.gripper_command = AsyncMock(side_effect=PermissionError("config.json busy"))
+        commands.emergency_stop = AsyncMock()
+        app.state.hal.command = AsyncMock(return_value={"ok": True})
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", "") == "/api/policy/action")
+        await endpoint(_async_gripper_action(6.0))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        commands.emergency_stop.assert_awaited_once()
+        with pytest.raises(HTTPException) as failed:
+            await endpoint(_async_gripper_action(6.0))
+        assert failed.value.status_code == 503
+        assert failed.value.detail["code"] == "POLICY_GRIPPER_FAILED"
+        assert "config.json busy" in failed.value.detail["message"]
+        app.state.hal.command.assert_awaited_once()
+
+    asyncio.run(exercise())
+
+
+def test_policy_async_gripper_failure_of_previous_session_does_not_block_new_session(app):
+    from backend.services.control_watchdog import request_control_session
+
+    async def exercise():
+        old_session = await confirm_mock_browser_lease(app.state.control_watchdog)
+        config = app.state.settings.get_config()
+        config["gripper"]["rightEnabled"] = True
+        app.state.settings.save_config(config)
+        app.state.telemetry.motion_positions = [0.0] * 12
+        app.state.telemetry.gripper_positions = [4.5, 5.5]
+        commands = app.state.commands
+        commands.enable_motion_side = AsyncMock()
+        commands.emergency_stop = AsyncMock()
+        app.state.hal.command = AsyncMock(return_value={"ok": True})
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", "") == "/api/policy/action")
+        # 上一轮会话结束后，残留目标被拒绝（会话已失去控制权）。
+        commands.gripper_command = AsyncMock(side_effect=RuntimeError("request does not own the current browser control session"))
+        token = request_control_session.set(old_session)
+        try:
+            await endpoint(_async_gripper_action(6.0))
+            for _ in range(5):
+                await asyncio.sleep(0)
+        finally:
+            request_control_session.reset(token)
+        commands.gripper_command = AsyncMock(return_value={"ok": True})
+        result = await endpoint(_async_gripper_action(7.0))
+        assert result.data["sent"] is True
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert commands.gripper_command.call_args.args[0].targetMm == 7.0
+
+    asyncio.run(exercise())

@@ -36,6 +36,8 @@ struct NativeTeleopConfig {
   bool swapTeleopChannels{true};
   // requireClutch=true 时，主手 clutch 按钮未按下会阻断该侧 motion 输出。
   bool requireClutch{false};
+  // 录制准备期间保留采样与目标预览，禁止主手驱动机械臂和夹爪。
+  bool recordingPreparing{false};
   // Force Dimension 侧的力输出/重力补偿开关，和从端 LTDMC 伺服使能无关。
   bool leftGravityCompensation{true};
   bool rightGravityCompensation{true};

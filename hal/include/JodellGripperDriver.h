@@ -28,6 +28,7 @@ struct JodellGripperConfig {
   bool processWorkersEnabled{true};
   std::string workerExePath{};
   double workerCommandTimeoutMs{2000.0};
+  bool operator==(const JodellGripperConfig&) const = default;
 };
 
 // JodellGripperDriver 封装久德夹爪 DLL/串口协议。默认通过独立 worker 进程执行命令，
@@ -37,7 +38,7 @@ class JodellGripperDriver {
   JodellGripperDriver();
   ~JodellGripperDriver();
 
-  // 更新端口、从站号、速度和 worker 策略；会关闭已打开资源，让下一次命令按新配置重建。
+  // 相同配置保留资源；配置变化时关闭资源，让下一次命令按新配置重建。
   void configure(const JodellGripperConfig& config);
   // 下发目标开口，targetMm 单位为毫米；message 返回 vendor/worker 诊断信息。
   bool commandTarget(

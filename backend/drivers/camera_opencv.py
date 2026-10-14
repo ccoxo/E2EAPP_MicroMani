@@ -63,6 +63,9 @@ CAMERA_INITIAL_FRAME_GRACE_SEC = 1.5
 CAMERA_FRAME_WAIT_SEC = 1.5
 CAMERA_FPS_WINDOW_SEC = 1.0
 CAMERA_RELEASE_JOIN_SEC = 2.0
+CAMERA_SHM_WORKER_OPEN_SEC = 8.0
+SHM_POLL_IDLE_S = 0.004
+SHM_POLL_AFTER_FRAME_S = 0.020
 CAMERA_CAPTURE_FOURCC = "YUYV"
 CAMERA_TUNING_DEFAULTS: dict[str, dict[str, float | bool]] = {
     "global": {
@@ -419,6 +422,68 @@ class _ProcessCameraCapture:
                     self.process.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
                     pass
+
+    def apply_status(self, status: dict[str, Any]) -> None:
+        self.status.update(status)
+        backend = status.get("backend")
+        if backend:
+            self.backend_label = str(backend)
+
+
+@dataclass
+class _ShmCameraCapture:
+    """独立进程采集 + 共享内存原始帧（APPSTATION_CAMERA_CAPTURE_MODE=shm）。"""
+
+    process: Any
+    shm: Any
+    reader: Any
+    prop_ids: dict[str, int]
+    backend_label: str = ""
+    status: dict[str, Any] = field(default_factory=dict)
+
+    is_process_capture = True
+
+    def isOpened(self) -> bool:
+        return self.is_alive() and bool(self.status.get("opened", False))
+
+    def is_alive(self) -> bool:
+        return self.process.poll() is None
+
+    def exitcode(self) -> int | None:
+        return cast(int | None, self.process.poll())
+
+    def get(self, prop: int) -> float:
+        if prop == self.prop_ids.get("width"):
+            return float(self.status.get("actualWidth") or 0)
+        if prop == self.prop_ids.get("height"):
+            return float(self.status.get("actualHeight") or 0)
+        if prop == self.prop_ids.get("fps"):
+            return float(self.status.get("actualFps") or self.status.get("fps") or 0)
+        return 0.0
+
+    def release(self) -> None:
+        try:
+            if self.reader is not None:
+                self.reader.request_stop()
+        except Exception:
+            pass
+        try:
+            self.process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+        self.reader = None
+        try:
+            self.shm.close()
+        except Exception:
+            pass
+        try:
+            self.shm.unlink()
+        except Exception:
+            pass
 
     def apply_status(self, status: dict[str, Any]) -> None:
         self.status.update(status)
@@ -1193,6 +1258,42 @@ class OpenCVCameraDriver:
         if camera in {"wrist_left", "wrist_right"} and profile and profile["autoExposure"]:
             self._disable_low_light_compensation(index)
         backend_candidates = _backend_candidates(cv2)
+        if self._shm_capture_enabled(cv2, backend_candidates):
+            shm_capture = self._start_shm_capture(cv2, index, width, height, fps, camera, profile, backend_candidates)
+            if shm_capture is not None:
+                backend_label = shm_capture.backend_label or backend_candidates[0][1]
+                self._backend_label = backend_label
+                self._captures[index] = shm_capture
+                self._capture_sizes[index] = (width, height, fps)
+                self._capture_opened_at[index] = time.monotonic()
+                if camera is not None:
+                    self._capture_roles[index] = camera
+                self._capture_backend_labels[index] = f"{backend_label} shm-worker"
+                self._stale_indices.discard(index)
+                self._frame_locks[index] = Lock()
+                self._frame_events[index] = Event()
+                self._jpeg_events[index] = Event()
+                self._start_shm_reader(index, shm_capture)
+                self._start_encoder(cv2, index)
+                self._log(
+                    "info",
+                    f"{camera or 'camera'} opened index {index} via {backend_label} shm-worker {width}x{height}@{fps:g}",
+                )
+                return shm_capture
+            worker_fallback = True
+            self._event(
+                "warning",
+                "camera_worker_unavailable",
+                role=camera or "unknown",
+                logicalIndex=camera or "unknown",
+                device=index,
+                backendTried=[label for _, label in backend_candidates],
+                requested={"width": width, "height": height, "fps": fps},
+                deviceName="",
+                deviceClass="opencv-shm-worker",
+                ownerHint="shared-memory camera worker failed; falling back to in-process OpenCV capture",
+                configPath="runtime/config.json",
+            )
         if self._process_capture_enabled(cv2, backend_candidates):
             capture = self._start_process_capture(cv2, index, width, height, fps, camera, profile, backend_candidates)
             if capture is None:
@@ -1338,6 +1439,174 @@ class OpenCVCameraDriver:
                 self._log("info", f"camera index {index}: low-light compensation disabled; verify measured frame rate")
         except (OSError, subprocess.TimeoutExpired) as exc:
             self._log("warning", f"camera index {index}: fixed frame rate setup failed: {exc}")
+
+    def _shm_capture_enabled(self, cv2: Any, backend_candidates: list[tuple[int, str]]) -> bool:
+        mode = os.environ.get("APPSTATION_CAMERA_CAPTURE_MODE", "").strip().lower()
+        # 默认启用共享内存模式；显式设为 thread/process 等其他值时退回对应模式。
+        if mode not in {"", "shm", "shared-memory", "sharedmemory"}:
+            return False
+        if getattr(cv2, "__name__", "cv2") != "cv2":
+            return False
+        return any(label == "CAP_DSHOW" for _backend, label in backend_candidates)
+
+    def _start_shm_capture(
+        self,
+        cv2: Any,
+        index: int,
+        width: int,
+        height: int,
+        fps: float,
+        camera: str | None,
+        profile: dict[str, float | bool] | None,
+        backend_candidates: list[tuple[int, str]],
+    ) -> _ShmCameraCapture | None:
+        from multiprocessing import shared_memory
+
+        from backend.workers.camera_shm_worker import ShmFrameReader, shm_size
+
+        try:
+            shm = shared_memory.SharedMemory(create=True, size=shm_size(width, height))
+        except Exception as exc:
+            self._log("warning", f"camera index {index}: shared memory unavailable: {exc}")
+            return None
+        startup = {
+            "index": index,
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "profile": profile,
+            "backendCandidates": backend_candidates,
+            "parentPid": os.getpid(),
+            "shmName": shm.name,
+        }
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        stderr_target: Any = subprocess.DEVNULL
+        try:
+            log_dir = os.path.join(os.getcwd(), "backend", "runtime", "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            stderr_target = open(os.path.join(log_dir, f"camera_shm_worker_{index}.err.log"), "ab")
+        except Exception:
+            stderr_target = subprocess.DEVNULL
+        started_at = time.monotonic()
+        try:
+            process = subprocess.Popen(
+                [sys.executable, "-m", "backend.workers.camera_shm_worker", json.dumps(startup, separators=(",", ":"))],
+                cwd=os.getcwd(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=stderr_target,
+                text=True,
+                bufsize=1,
+                creationflags=creation_flags,
+            )
+        except Exception as exc:
+            self._log("warning", f"camera index {index}: shm worker start failed: {exc}")
+            shm.close()
+            shm.unlink()
+            return None
+        finally:
+            if stderr_target is not subprocess.DEVNULL:
+                stderr_target.close()
+        prop_ids = {
+            "width": int(getattr(cv2, "CAP_PROP_FRAME_WIDTH", -1)),
+            "height": int(getattr(cv2, "CAP_PROP_FRAME_HEIGHT", -1)),
+            "fps": int(getattr(cv2, "CAP_PROP_FPS", -1)),
+        }
+        capture = _ShmCameraCapture(process, shm, ShmFrameReader(shm.buf, width, height), prop_ids)
+        opened = Event()
+        failed = Event()
+        role = camera or "unknown"
+        last_stage = {"stage": "spawned"}
+
+        def read_stdout() -> None:
+            stdout = process.stdout
+            if stdout is None:
+                return
+            try:
+                for line in stdout:
+                    try:
+                        status = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if status.get("type") == "stage":
+                        last_stage["stage"] = str(status.get("stage"))
+                        self._log(
+                            "info",
+                            f"camera index {index} shm worker stage {status.get('stage')} "
+                            f"+{(time.monotonic() - started_at) * 1000:.0f}ms",
+                        )
+                        continue
+                    if status.get("type") == "gap":
+                        self._event("warning", "camera_capture_gap", role=role, device=index,
+                                    gapMs=status.get("gapMs"), sequence=status.get("sequence"))
+                        continue
+                    capture.apply_status(status)
+                    if bool(status.get("opened")):
+                        opened.set()
+                    elif status.get("ok") is False:
+                        self._log("warning", f"camera index {index} shm worker status: {status.get('message', '')}")
+                        failed.set()
+            finally:
+                try:
+                    stdout.close()
+                except Exception:
+                    pass
+
+        Thread(target=read_stdout, name=f"camera-shm-stdout-{process.pid}", daemon=True).start()
+        deadline = time.monotonic() + CAMERA_SHM_WORKER_OPEN_SEC
+        while time.monotonic() < deadline and not opened.is_set() and not failed.is_set() and capture.is_alive():
+            opened.wait(timeout=0.05)
+        if opened.is_set() and capture.is_alive():
+            return capture
+        self._log(
+            "warning",
+            f"camera index {index} shm worker not opened after {(time.monotonic() - started_at) * 1000:.0f}ms "
+            f"(alive={capture.is_alive()} failed={failed.is_set()} lastStage={last_stage['stage']})",
+        )
+        capture.release()
+        return None
+
+    def _start_shm_reader(self, index: int, capture: _ShmCameraCapture) -> None:
+        if index in self._reader_threads:
+            return
+        stop = Event()
+        self._reader_stops[index] = stop
+        frame_lock = self._frame_locks[index]
+        frame_event = self._frame_events[index]
+
+        def read_loop() -> None:
+            last_seq = 0
+            try:
+                while not stop.is_set():
+                    reader = capture.reader
+                    if reader is None:
+                        break
+                    got = reader.read_latest(last_seq)
+                    if got is None:
+                        if not capture.is_alive():
+                            self._stale_indices.add(index)
+                            self._log("warning", f"camera index {index} shm worker exited exitcode={capture.exitcode()}")
+                            break
+                        # 轮询过密会频繁抢 GIL，拖慢后端其他线程；4 ms 对 30 fps 相机足够。
+                        time.sleep(SHM_POLL_IDLE_S)
+                        continue
+                    last_seq, frame, frame_time, _gap_ms = got
+                    # 采集时刻来自工作进程读到帧的瞬间，不受本进程调度延迟影响。
+                    self._record_frame_timestamp(index, frame_time)
+                    with frame_lock:
+                        self._latest_at[index] = frame_time
+                        self._latest_frames[index] = frame
+                    frame_event.set()
+                    # 下一帧约 33 ms 后才到，先睡一段再开始轮询。
+                    time.sleep(SHM_POLL_AFTER_FRAME_S)
+            finally:
+                if self._reader_threads.get(index) is current_thread():
+                    self._reader_threads.pop(index, None)
+                    self._reader_stops.pop(index, None)
+
+        thread = Thread(target=read_loop, name=f"camera-shm-reader-{index}", daemon=True)
+        self._reader_threads[index] = thread
+        thread.start()
 
     def _process_capture_enabled(self, cv2: Any, backend_candidates: list[tuple[int, str]]) -> bool:
         mode = os.environ.get("APPSTATION_CAMERA_CAPTURE_MODE", "").strip().lower()

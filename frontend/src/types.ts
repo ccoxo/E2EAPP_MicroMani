@@ -404,6 +404,7 @@ export interface RecordSessionState {
   resetTimeS: number
   currentEpisode: number
   savedEpisodes: number
+  sessionSavedEpisodes: number
   episodeHistory: EpisodeRecord[]
   latestQualityReport: RecordQualityReport | null
   phase: RecorderPhase

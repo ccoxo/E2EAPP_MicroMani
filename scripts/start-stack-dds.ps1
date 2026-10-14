@@ -46,7 +46,7 @@ Start-Sleep -Seconds 1
 
 $backend = Start-Process `
   -FilePath $python `
-  -ArgumentList @("-m", "uvicorn", "backend.app:create_app", "--factory", "--host", "127.0.0.1", "--port", "$BackendPort") `
+  -ArgumentList @("-m", "uvicorn", "backend.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "$BackendPort") `
   -WorkingDirectory $repo `
   -WindowStyle Hidden `
   -RedirectStandardOutput $backendOutLog `

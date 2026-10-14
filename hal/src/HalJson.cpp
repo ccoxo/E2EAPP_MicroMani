@@ -747,6 +747,7 @@ appstation::hal::NativeTeleopConfig jsonNativeTeleopConfig(const std::string& bo
   config.loopHz = static_cast<int>(jsonNumberValue(body, "nativeLoopHz", config.loopHz));
   config.swapTeleopChannels = jsonBoolValue(body, "swapTeleopChannels", config.swapTeleopChannels);
   config.requireClutch = jsonBoolValue(body, "requireClutch", config.requireClutch);
+  config.recordingPreparing = jsonBoolValue(body, "recordingPreparing", false);
   config.leftGravityCompensation =
       jsonBoolValue(body, "leftGravityCompensation", config.leftGravityCompensation);
   config.rightGravityCompensation =
